@@ -15,7 +15,7 @@ from . import watchdog
 from .kv_pool import PagePool
 from .model_runner import ModelRunner
 from .radix_cache import RadixCache
-from .request import Request, SamplingParams, Status
+from .request import Request, SamplingParams, Status, unsupported
 from .sampler import unpack
 from .scheduler import NeedSync, Scheduler, SchedulerConfig
 
@@ -42,17 +42,6 @@ class StepStats:
     prefill_calls: int = 0
     num_restored: int = 0  # state checkpoints copied into requests (prefix hits of a recurrent model)
     prefill_chunks: int = 0  # prefill entries (one sequence's chunk each)
-
-
-def unsupported(params: SamplingParams) -> str | None:
-    """What in a request's sampling the engine does not serve, or None. Every graph samples on the device from the
-    logits alone; penalties and a thinking budget's forced tokens need graph variants with host inputs, which the
-    engine neither compiles nor warms. add_request refuses them before anything is queued (the API answers 400)."""
-    if params.repetition_penalty != 1.0 or params.frequency_penalty != 0.0 or params.presence_penalty != 0.0:
-        return "repetition / frequency / presence penalties"
-    if params.thinking_token_budget is not None:
-        return "a thinking token budget"
-    return None
 
 
 def resolve_attention_tp(mcfg: ModelConfig, cfg: EngineConfig) -> int:

@@ -24,9 +24,21 @@ class SamplingParams:
     stop_token_ids: tuple[int, ...] = ()
     ignore_eos: bool = False
     seed: int | None = None
-    # vLLM's thinking_token_budget: once this many tokens follow the reasoning start, the
-    # reasoning end string is forced (engine.LLMEngine._advance_thinking).
+    # vLLM's thinking_token_budget. Not served: unsupported() refuses any value but None.
     thinking_token_budget: int | None = None
+
+
+def unsupported(params: SamplingParams) -> str | None:
+    """What in a request's sampling the engine does not serve, or None. Every graph samples on the device from the
+    logits alone; penalties and a thinking budget's forced tokens need graph variants with host inputs, which the
+    engine neither compiles nor warms. add_request refuses them before anything is queued (the API answers 400)."""
+    # Only values that change the output are refused: clients send the neutral ones (penalties of 1 / 0 / 0, no
+    # budget) by default.
+    if params.repetition_penalty != 1.0 or params.frequency_penalty != 0.0 or params.presence_penalty != 0.0:
+        return "repetition / frequency / presence penalties"
+    if params.thinking_token_budget is not None:
+        return "a thinking token budget"
+    return None
 
 
 class Status(Enum):
