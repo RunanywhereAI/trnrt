@@ -15,10 +15,11 @@ dependencies = [
   "transformers",
   "fastapi",
   "uvicorn",
+  "httpx",
 ]
 
 [project.optional-dependencies]
-test = ["pytest", "httpx"]
+test = ["pytest"]
 
 [tool.setuptools.dynamic]
 version = { attr = "trnrt.__version__" }
