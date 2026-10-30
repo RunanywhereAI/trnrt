@@ -175,6 +175,12 @@ def test_open_sessions_are_bounded_least_recently_used_first():
     assert list(rc._session_open) == ["s3", "s2", "s4"] and nodes[0].session_refs == 0
     assert rc.total_pages() == 5  # closing by the cap frees nothing
     assert not rc.session_register("s1", gens["s1"], nodes[1])  # an expired session's late request cannot re-attach
+    # The same id sent again (an agent that paused and resumed) is a fresh session: a new generation at the most
+    # recently used end, whose request registers as any other's; the oldest open session is closed instead.
+    again = rc.session_open("s1")
+    assert again == gens["s1"] + 1 and list(rc._session_open)[-1] == "s1" and "s3" not in rc._session_open
+    assert rc.session_register("s1", again, nodes[1]) and nodes[1].session_refs == 1 and nodes[1].sessions == {"s1"}
+    rc.session_close("s1")
     for k in range(100):  # any number of sessions: the open map and the registrations stay at the cap
         g = rc.session_open(f"x{k}")
         rc.session_register(f"x{k}", g, nodes[k % 5])
