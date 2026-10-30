@@ -312,7 +312,17 @@ class _Detok:
         return delta
 
 
+# Request fields asking for what no served graph computes (guided decoding, prompt logprobs): refused, never ignored.
+_REFUSED = ("prompt_logprobs", "guided_json", "guided_regex", "guided_choice", "guided_grammar", "structured_outputs")
+
+
 def _params(body: dict, default_max: int, chat: bool) -> SamplingParams:
+    rf = body.get("response_format")
+    asked = [k for k in _REFUSED if body.get(k) is not None]
+    if rf is not None and (not isinstance(rf, dict) or rf.get("type", "text") != "text"):
+        asked.append("response_format")
+    if asked:
+        raise HTTPException(status_code=400, detail=f"not supported: {', '.join(asked)}")
     stop = body.get("stop") or ()
     stop = (stop,) if isinstance(stop, str) else tuple(stop)
     if chat:  # chat: `logprobs` turns them on, `top_logprobs` asks for alternatives

@@ -202,6 +202,13 @@ def test_refused_requests_are_4xx_not_a_stream(serve):
                   "tool_choice": {"type": "function", "function": {"name": "nope"}}}
     assert client.post("/v1/chat/completions", json=bad_choice).status_code == 400
     assert client.post("/v1/chat/completions", json={"messages": []}).status_code == 400
+    # What no served graph computes is refused, not ignored; a plain-text response_format is no request at all.
+    msg = {"messages": [{"role": "user", "content": "x"}]}
+    for extra in ({"response_format": {"type": "json_object"}}, {"guided_json": {"type": "object"}},
+                  {"prompt_logprobs": 1}):
+        r = client.post("/v1/chat/completions", json={**msg, **extra})
+        assert r.status_code == 400 and "not supported" in r.text, (extra, r.text)
+    assert client.post("/v1/chat/completions", json={**msg, "response_format": {"type": "text"}}).status_code == 200
 
 
 def test_health_stats_models_and_metrics(serve):
