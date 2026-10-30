@@ -410,6 +410,15 @@ class ModelRunner:
                             max_rows=max(max(ecfg.resolved_prefill_token_buckets()),
                                          max(ecfg.resolved_decode_batch_buckets())),
                             max_keys=scratch_keys(ecfg, self.ps))
+        # Token-slot state beside K and V, in the model dtype, addressed by the same slots, so the prefix cache and the
+        # host cache treat it as KV: under an fp8 KV cache every DSA layer keeps its pool keys here (layer.pool_key,
+        # mla.pool_cache_mode "separate"), which context-parallel DSA requires. One dict per KV layer, allocated and
+        # bound in layer order.
+        states = [{n: torch.zeros((slots, *shp), dtype=ecfg.dtype, device=device) for n, shp in d.items()}
+                  for d in model.token_state_shapes()]
+        if any(states):
+            model.bind_token_states(states)
+        self.s_caches = [t for d in states for t in d.values()]
         # Per-token caches beside K and V (paged like them: the host cache copies them with the page).
         self.aux_caches = [torch.zeros((slots, *a), dtype=kv_dtype, device=device) for a in model.aux_kv_shapes()]
         model.bind_aux_kv(self.aux_caches)
@@ -422,12 +431,6 @@ class ModelRunner:
             if odd:
                 model.prefill_sp = False
                 print(f"trnrt: sequence-parallel prefill streams off: prefill buckets {odd} do not divide over "
-                      f"tp={model.tp_size}", flush=True)
-        if getattr(model, "decode_sp", False):  # the same for decode calls (models/decoder.py decode_sp_enabled)
-            odd = [b for b in self.decode_buckets if b % model.tp_size]
-            if odd:
-                model.decode_sp = False
-                print(f"trnrt: sequence-parallel decode streams off: decode buckets {odd} do not divide over "
                       f"tp={model.tp_size}", flush=True)
         self.page_buckets = ecfg.resolved_page_buckets()
         self.prefill_page_buckets = ecfg.resolved_prefill_page_buckets()
@@ -781,7 +784,7 @@ class ModelRunner:
         self._kv_drop(slot)
 
     def _paged_caches(self) -> list[torch.Tensor]:
-        return self.k_caches + self.v_caches + self.aux_caches
+        return self.k_caches + self.v_caches + self.aux_caches + self.s_caches
 
     def _kv_save(self, slot: int, page: int) -> None:
         sl = slice(page * self.lps, (page + 1) * self.lps)  # a page is ps (cp: ps / cp) contiguous rows of every cache
@@ -836,7 +839,8 @@ class ModelRunner:
         self._host_ckpt.pop(slot, None)
 
     def kv_page_bytes(self) -> int:
-        """Host bytes one page takes on this rank (every layer's K and V, and the per-token caches beside them)."""
+        """Host bytes one page takes on this rank (every layer's K and V, and the per-token caches and token-slot states
+        beside them)."""
         return sum(self.lps * c[0].numel() * c.element_size() for c in self._paged_caches())
 
     # -- tensor-parallel worker -----------------------------------------------------
