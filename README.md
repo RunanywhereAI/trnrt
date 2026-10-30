@@ -46,10 +46,15 @@ python -m trnrt compile compile --out $OUT --workers <cores / 2>                
 python -m trnrt compile strip --out $OUT                                                      # drop the NEFFs' debug info
 ```
 
-Run `capture` and `compile` on the same host: graphs that call NKI kernels name the kernel binaries the capture built
-by absolute path. Whether the serving host also needs those binaries on a cache hit is [unverified]. `strip` is not
-optional at 1M-token buckets: the runtime holds each loaded NEFF in host memory several times over, and two engines'
-unstripped NEFFs do not fit.
+Run `capture` and `compile` on the same host. A graph that calls an NKI kernel names the kernel's compiled binary by
+absolute path under `/var/tmp/nki-intermediate-cache`. The capture writes those binaries, and neuronx-cc adds its own
+kernels there while compiling. A compile on another host fails every such graph ("NKI kernel binaries missing") unless
+that directory comes along to the same path. To split the steps across hosts, copy `/var/tmp/nki-intermediate-cache`
+with the cache. A serving engine traces its graphs again and rewrites the directory; whether it needs the compile
+host's copy on a cache hit is [unverified].
+
+`strip` is not optional at 1M-token buckets: the runtime holds each loaded NEFF in host memory several times over, and
+two engines' unstripped NEFFs do not fit.
 
 The arguments after `capture --` must be the ones the server runs with. The defaults are the served configuration, so
 `--model` alone is enough.
