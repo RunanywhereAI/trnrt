@@ -19,7 +19,7 @@ What is compared, and what is normalized away:
     metadata (without its cache key).
 
     python tools/graph_equiv.py REF_ROOT NEW_ROOT --ref-package NAME [--new-package trnrt] [--json OUT]
-                               [--name-map MAP.json] [--hlo-proto-path DIR] [--kernels / --no-kernels]
+                               [--name-map MAP.json] [--pair-by order|signature] [--hlo-proto-path DIR] [--no-kernels]
 
 Exit status 0 iff every pair is equal. --json writes one record per pair (rank, index, both keys, the parts that differ)
 and the summary. A name map ({"kernels.old_mod.old_kernel": "kernels.new_mod.new_kernel"}) covers kernels the new tree
@@ -98,6 +98,32 @@ def pair(ref_ranks, new_ranks):
             if seen_r.setdefault(ka, kb) != kb or seen_n.setdefault(kb, ka) != ka:
                 problems.append(f"rank {r} graph {i}: {ka} / {kb} pair differently on another rank")
             pairs.append((r, i, ka, kb))
+    return pairs, problems
+
+
+def pair_by_signature(ref_ranks, new_ranks, sig_ref, sig_new):
+    """As pair(), but each rank's graphs match by input signature (example_inputs.txt) rather than by visit order, with
+    visit order breaking ties between graphs that share a signature. For a new tree whose warmup visits buckets in
+    another order."""
+    pairs, problems, seen_r, seen_n = [], [], {}, {}
+    if set(ref_ranks) != set(new_ranks):
+        problems.append(f"rank sets differ: {sorted(ref_ranks)} vs {sorted(new_ranks)}")
+    for r in sorted(set(ref_ranks) & set(new_ranks)):
+        pool = {}
+        for kb in new_ranks[r]:
+            pool.setdefault(sig_new(kb), []).append(kb)
+        for i, ka in enumerate(ref_ranks[r]):
+            cands = pool.get(sig_ref(ka), [])
+            if not cands:
+                problems.append(f"rank {r} graph {i} ({ka}): no graph with its input signature")
+                continue
+            kb = cands.pop(0)
+            if seen_r.setdefault(ka, kb) != kb or seen_n.setdefault(kb, ka) != ka:
+                problems.append(f"rank {r} graph {i}: {ka} / {kb} pair differently on another rank")
+            pairs.append((r, i, ka, kb))
+        extra = sum(len(v) for v in pool.values())
+        if extra:
+            problems.append(f"rank {r}: {extra} graphs only in the new capture")
     return pairs, problems
 
 
@@ -364,6 +390,8 @@ def main(argv=None):
     ap.add_argument("--cache-subdir", default="cache/neuron/compile_cache")
     ap.add_argument("--hlo-proto-path", help="a directory holding hlo_pb2 when libtorch_neuronx_lite is not installed")
     ap.add_argument("--no-kernels", dest="kernels", action="store_false", help="skip the kernel-body comparison")
+    ap.add_argument("--pair-by", choices=("order", "signature"), default="order",
+                    help="pair each rank's graphs by visit order (default) or by input signature")
     ap.add_argument("--json", help="write per-pair records and the summary here")
     a = ap.parse_args(argv)
     pb2 = hlo_pb2(a.hlo_proto_path)
@@ -371,7 +399,11 @@ def main(argv=None):
     names_ref, names_new = Names([a.ref_package], nmap), Names([a.new_package])
     ref_ranks, ref_cache = load_capture(a.ref_root, a.cache_subdir)
     new_ranks, new_cache = load_capture(a.new_root, a.cache_subdir)
-    pairs, problems = pair(ref_ranks, new_ranks)
+    if a.pair_by == "signature":
+        sig = lambda cache: (lambda k: _read(os.path.join(cache, k, "example_inputs.txt")))
+        pairs, problems = pair_by_signature(ref_ranks, new_ranks, sig(ref_cache), sig(new_cache))
+    else:
+        pairs, problems = pair(ref_ranks, new_ranks)
     done, records, bad = {}, [], 0
     for r, i, ka, kb in pairs:
         if (ka, kb) not in done:
