@@ -1,7 +1,9 @@
 # Results
 
-GLM-5.3-Flash served by this code on one AWS trn2.48xlarge, under a coding-agent load, measured on 2026-10-26 (UTC) with the
-configuration this repository ships. Numbers carry a tag: **[M]** measured, **[D]** arithmetic on measured numbers,
+GLM-5.3-Flash on one AWS trn2.48xlarge under a coding-agent load, measured on 2026-10-26 (UTC) with the engine this
+repository was extracted from, in the serving configuration this repository hard-wires. A graph-equivalence gate
+(`tools/graph_equiv.py`) holds this repository to building the same compiled graphs as that engine; the gate's full run and
+an on-device confirmation are pending. Numbers carry a tag: **[M]** measured, **[D]** arithmetic on measured numbers,
 **[E]** an estimate, **[P]** published by a third party.
 
 ## Headline
@@ -13,7 +15,7 @@ configuration this repository ships. Numbers carry a tag: **[M]** measured, **[D
 | Time to first token | **0.96 s** (p50), 2.90 s (p90) [M] |
 | Tokens per minute | **5.27M** input + output [M]; 97.8% of input tokens come from the prefix cache |
 | Cost per agent request | **$0.0123** [D] at the public trn2 capacity-block price, $35.76/h; a request averages 108.1K input tokens (mostly cached) and 447 output |
-| Answer over a cached 1M-token context | **1.84 s** [M]; the same 1.04M-token prompt takes 210.8 s cold |
+| Answer over a cached 1M-token context | **1.84 s** [M]; a 1.04M-token prompt takes 210.8 s cold |
 
 ## Serving layout
 
