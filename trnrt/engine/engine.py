@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import atexit
-import functools
 import itertools
 import os
 import time
@@ -47,17 +46,12 @@ class StepStats:
 
 def unsupported(params: SamplingParams) -> str | None:
     """What in a request's sampling the engine does not serve, or None. Every graph samples on the device from the
-    logits alone; penalties, guided decoding, a thinking budget's forced tokens and prompt logprobs need graph variants
-    with host inputs, which the engine neither compiles nor warms. add_request refuses them before anything is queued
-    (the API answers 400)."""
+    logits alone; penalties and a thinking budget's forced tokens need graph variants with host inputs, which the
+    engine neither compiles nor warms. add_request refuses them before anything is queued (the API answers 400)."""
     if params.repetition_penalty != 1.0 or params.frequency_penalty != 0.0 or params.presence_penalty != 0.0:
         return "repetition / frequency / presence penalties"
-    if getattr(params, "thinking_token_budget", None) is not None:
+    if params.thinking_token_budget is not None:
         return "a thinking token budget"
-    if getattr(params, "grammar", None) is not None:
-        return "structured output (response_format / guided decoding)"
-    if getattr(params, "prompt_logprobs", None) is not None:
-        return "prompt logprobs"
     return None
 
 
@@ -165,11 +159,6 @@ class LLMEngine:
             self.mcfg = self.mcfg.truncated(cfg.num_layers)
         self.attn_tp = resolve_attention_tp(self.mcfg, cfg)
         num_pages = pool_pages(cfg, self.mcfg)
-        # Linear-attention layers carry per-request recurrent state (engine/state_pool.py), which only moves forward: a
-        # prefix is resumed from a state checkpoint, and nothing ever rewinds it.
-        from ..config import LinearSpec
-
-        self.recurrent = any(isinstance(sp, LinearSpec) for sp in self.mcfg.attn_layers or ())
         self._workers = []
         self._tp_saved = None  # rank 0's process state before init_rank (tp.process_state), restored by close
         if cfg.tp > 1:
@@ -216,9 +205,6 @@ class LLMEngine:
             _OPEN.add(self)
         self.pool = PagePool(num_pages)
         self.radix = RadixCache(self.pool, cfg.page_size)
-        # A state checkpoint dominated by a newer one on the same unbranched path is freed when a request releases
-        # that path (radix_cache.py free_dominated): a multi-turn session keeps one checkpoint row, not one per turn.
-        self.radix.on_dominated = True
         scfg = SchedulerConfig(
             page_size=cfg.page_size,
             max_num_seqs=cfg.max_num_seqs,
@@ -226,36 +212,30 @@ class LLMEngine:
             max_model_len=cfg.max_model_len,
             eos_token_ids=self.mcfg.eos_token_ids,
             admission_decode_tokens=cfg.admission_decode_tokens,
-            # A recurrent model's hit stops at its deepest state checkpoint (radix_cache.py).
-            recurrent=self.recurrent,
-            # Decode tracks every page boundary, and a finished request leaves a checkpoint at its last one: a returning
-            # turn whose prompt replays this one's reply resumes there.
-            ckpt_track=cfg.page_size,
-            # A checkpoint target inside a prefill chunk is written by the chunk's own graph instead of splitting it.
-            ckpt_mid=True,
         )
+        # The scheduler (engine/scheduler.py) runs the served prefix-cache rules for a recurrent model: a hit resumes from
+        # the deepest state checkpoint at or below it, checkpoints are written inside prefill chunks and at every page
+        # boundary in decode, and a checkpoint a newer one dominates is freed when its path is released.
+        if self.runner.state is None:
+            raise ValueError("trnRT serves models with linear-attention layers: this model has no recurrent state")
         self.scheduler = Scheduler(scfg, self.pool, self.radix)
-        if self.runner.state is not None:  # checkpoint rows of the state pool back the radix nodes
-            self.scheduler.states = self.runner.state
-            self.radix.free_ckpt = functools.partial(self.runner.state.free_ckpt, group=0)
+        self.scheduler.states = self.runner.state  # checkpoint rows of the state pool back the radix nodes
+        self.radix.free_ckpt = self.runner.state.free_ckpt
         # Host memory under the radix cache (engine/host_cache.py), per rank: half for state checkpoints, the rest for
-        # KV pages. Evicted pages and checkpoints go there, and a later hit copies them back.
-        self.host_cache = None
+        # KV pages. Evicted pages and checkpoints go there (a checkpoint on a running request's path too, when no row is
+        # free), and a later hit copies them back.
+        self.host_tier = None
         if cfg.host_cache_gb > 0:
-            from .host_cache import HostCache
+            from .host_cache import HostTier
 
             budget = cfg.host_cache_gb * 2**30
-            ckpts = 0
-            if self.runner.state is not None:
-                ckpts = max(1, int(budget / 2 // self.runner.state.bytes_per_row()))
-                budget -= ckpts * self.runner.state.bytes_per_row()
+            ckpts = max(1, int(budget / 2 // self.runner.state.bytes_per_row()))
+            budget -= ckpts * self.runner.state.bytes_per_row()
             page_bytes = self.runner.kv_page_bytes()
             pages = int(budget // page_bytes) if page_bytes else cfg.max_num_seqs * cfg.max_pages_per_seq
-            self.host_cache = HostCache(self.runner, cfg.page_size, max(1, pages), ckpts)
-            self.radix.offload, self.radix.offload_ckpt = self.host_cache.offload, self.host_cache.offload_ckpt
-            self.scheduler.host = self.host_cache
-            # A checkpoint on a running request's path may go to host memory too when no row is free.
-            self.radix.offload_running = ckpts > 0
+            self.host_tier = HostTier(self.runner, cfg.page_size, max(1, pages), ckpts)
+            self.radix.offload, self.radix.offload_ckpt = self.host_tier.offload, self.host_tier.offload_ckpt
+            self.scheduler.host = self.host_tier
         self._ids = itertools.count()
         self.last_step = StepStats()
         self._inflight = None  # (plan, launches) of a step whose results are not read yet
@@ -271,8 +251,8 @@ class LLMEngine:
 
     def flush_cache(self) -> None:
         """Drop every cached prefix (device pages and the host cache)."""
-        if self.host_cache is not None:
-            self.host_cache.clear()
+        if self.host_tier is not None:
+            self.host_tier.clear()
         offload, self.radix.offload = self.radix.offload, None
         self.radix.evict(self.radix.total_pages())
         self.radix.offload = offload

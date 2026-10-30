@@ -471,8 +471,8 @@ class ModelRunner:
         # traced graph changes. Host and meta outputs are not counted.
         bound = self.launch_bound = LaunchBound()
         # engine/iopool.py: a decode call's host arguments and outputs at fixed device addresses, so the runtime's IO
-        # ring cache holds a few sets per NEFF instead of filling. Host-side only.
-        self.iopool = iopool.Pool.from_env(getattr(model, "tp_rank", 0))
+        # ring cache holds a few sets per NEFF instead of filling. Host-side only; on a NeuronCore only.
+        self.iopool = iopool.Pool(rank=getattr(model, "tp_rank", 0)) if device.type == "neuron" else None
 
         def counted(c):
             return lambda f: bound.counted(c(f))
