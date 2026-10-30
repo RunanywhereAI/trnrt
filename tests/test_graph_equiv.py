@@ -141,3 +141,13 @@ def test_pairing_flags_a_length_mismatch(tmp_path):
     pairs, problems = G.pair(ranks_a, ranks_b)
     assert pairs == [(0, 0, "k1", "n1"), (8, 0, "k3", "n3")]
     assert problems == ["rank 0: 2 graphs vs 1"]
+
+
+def test_pairing_by_signature_survives_a_reordered_warmup():
+    sig = {"k1": b"A", "k2": b"B", "n1": b"B", "n2": b"A"}.get
+    pairs, problems = G.pair_by_signature({0: ["k1", "k2"]}, {0: ["n1", "n2"]}, sig, sig)
+    assert pairs == [(0, 0, "k1", "n2"), (0, 1, "k2", "n1")] and not problems
+    pairs, problems = G.pair_by_signature({0: ["k1"]}, {0: ["n1", "n2"]}, sig, sig)
+    assert pairs == [(0, 0, "k1", "n2")] and problems == ["rank 0: 1 graphs only in the new capture"], (pairs, problems)
+    pairs, problems = G.pair_by_signature({0: ["k1", "k2"]}, {0: ["n2"]}, sig, sig)
+    assert pairs == [(0, 0, "k1", "n2")] and problems == ["rank 0 graph 1 (k2): no graph with its input signature"]
