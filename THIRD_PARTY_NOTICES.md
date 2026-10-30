@@ -7,6 +7,7 @@ requires. The files below include source from other projects, each under its own
 
 | Path | Origin | License | Changes |
 |---|---|---|---|
+| `trnrt/serve/parsers.py` | vLLM, https://github.com/vllm-project/vllm, Copyright contributors to the vLLM project. Portions adapted from v0.30.0 (commit ced6857afa0ea7b2e3f0846a62e1394e90f15607): `vllm/parser/glm47_moe.py`, `vllm/parser/engine/parser_engine.py`, `vllm/tool_parsers/utils.py`. Rules also followed: `tool_choice` checks (`vllm/entrypoints/openai/chat_completion/protocol.py`), the finish reason (`vllm/entrypoints/openai/chat_completion/serving.py`), and normalization of assistant tool-call arguments (`vllm/entrypoints/chat_utils.py`, commit 36fa72d2d0). | Apache-2.0 | Adapted: the GLM tool-call regexes, the argument typing by tool schema, and the rule that streamed arguments only extend what was sent follow vLLM. Reasoning and tool calls are parsed by one state machine over the detokenized text, shared by streaming and non-streaming. Whether output starts inside a reasoning block is read from the rendered prompt. A tool block that yields no call is returned as content. A call cut off by the token limit keeps its partial last argument. |
 
 ## Designs followed, no source copied
 
@@ -17,6 +18,7 @@ for credit, not because their licenses require it.
 |---|---|---|
 | KDA chunked prefill (the per-chunk quantities of the delta-rule recurrence) | flash-linear-attention, `fla/ops/kda/chunk_fwd.py` (`chunk_kda_fwd`), https://github.com/fla-org/flash-linear-attention | MIT |
 | Radix prefix cache | SGLang's RadixAttention, https://github.com/sgl-project/sglang | Apache-2.0 |
+| GLM tool-call and reasoning parsing behaviour (cross-checked against vLLM's, above) | SGLang v0.5.21 (commit e00930c5489053f26d86b179cee0d087f846acbb): `python/sglang/srt/function_call/glm4_moe_detector.py`, `python/sglang/srt/parser/reasoning_parser.py` | Apache-2.0 |
 
 ## Models and services this code works with
 
