@@ -312,15 +312,26 @@ class _Detok:
         return delta
 
 
-# Request fields asking for what no served graph computes (guided decoding, prompt logprobs): refused, never ignored.
-_REFUSED = ("prompt_logprobs", "guided_json", "guided_regex", "guided_choice", "guided_grammar", "structured_outputs")
+# Request fields that would change the output in a way no served graph computes (guided decoding, prompt logprobs,
+# several choices, logit biases, an echoed or suffixed prompt): refused with a 400, never ignored. Each is accepted at
+# its neutral values, absent or listed here, which OpenAI SDKs and agent harnesses send by default. A plain-text
+# response_format is neutral too; penalties and a thinking budget are the engine's to refuse (engine.unsupported),
+# also only when they would change the output.
+_NEUTRAL = {"prompt_logprobs": (None,), "guided_json": (None,), "guided_regex": (None,), "guided_choice": (None,),
+            "guided_grammar": (None,), "structured_outputs": (None,), "n": (None, 1), "best_of": (None, 1),
+            "logit_bias": (None, {}), "echo": (None, False), "suffix": (None, "")}
+
+
+def _refused(body: dict) -> list[str]:
+    out = [k for k, neutral in _NEUTRAL.items() if body.get(k) not in neutral]
+    rf = body.get("response_format")
+    if rf is not None and not (isinstance(rf, dict) and rf.get("type", "text") == "text"):
+        out.append("response_format")
+    return out
 
 
 def _params(body: dict, default_max: int, chat: bool) -> SamplingParams:
-    rf = body.get("response_format")
-    asked = [k for k in _REFUSED if body.get(k) is not None]
-    if rf is not None and (not isinstance(rf, dict) or rf.get("type", "text") != "text"):
-        asked.append("response_format")
+    asked = _refused(body)
     if asked:
         raise HTTPException(status_code=400, detail=f"not supported: {', '.join(asked)}")
     stop = body.get("stop") or ()

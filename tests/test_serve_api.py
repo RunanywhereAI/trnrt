@@ -18,7 +18,7 @@ import pytest
 pytest.importorskip("fastapi")
 pytest.importorskip("httpx")  # fastapi.testclient
 
-from trnrt.engine.request import Request, Status  # noqa: E402
+from trnrt.engine.request import Request, Status, unsupported  # noqa: E402
 
 WORDS = ["<unk>", "<think>", "</think>", "<tool_call>", "</tool_call>", "<arg_key>", "</arg_key>", "<arg_value>",
          "</arg_value>", "The user wants weather.", "Let me check.", "get_weather", "city", "Paris", "Hello", " there",
@@ -62,6 +62,9 @@ class ScriptedEngine:
         self.closed = False
 
     def add_request(self, prompt_ids, params, rid=None, session_id=None):
+        why = unsupported(params)  # the engine's own refusal (LLMEngine.add_request)
+        if why:
+            raise ValueError(f"{why} is not supported; send the request without it")
         if len(prompt_ids) > 64:
             raise ValueError(f"prompt of {len(prompt_ids)} tokens does not fit max_model_len=64")
         req = Request(rid, list(prompt_ids), params, session_id=session_id)
@@ -209,6 +212,43 @@ def test_refused_requests_are_4xx_not_a_stream(serve):
         r = client.post("/v1/chat/completions", json={**msg, **extra})
         assert r.status_code == 400 and "not supported" in r.text, (extra, r.text)
     assert client.post("/v1/chat/completions", json={**msg, "response_format": {"type": "text"}}).status_code == 200
+
+
+# What an OpenAI SDK or an agent harness sends by default: every field at its neutral value.
+SDK_CHAT = {"model": "glm", "temperature": 0.7, "top_p": 1, "n": 1, "presence_penalty": 0, "frequency_penalty": 0,
+            "logprobs": False, "top_logprobs": None, "logit_bias": None, "stop": None, "seed": None, "user": "u-1",
+            "max_completion_tokens": 64, "response_format": {"type": "text"}, "tool_choice": "auto",
+            "parallel_tool_calls": True, "metadata": {}, "store": False, "service_tier": "auto",
+            "prompt_logprobs": None, "thinking_token_budget": None, "repetition_penalty": 1.0, "top_k": -1, "min_p": 0}
+SDK_COMPLETION = {"model": "glm", "prompt": "Hello", "max_tokens": 8, "n": 1, "best_of": 1, "echo": False,
+                  "suffix": None, "logprobs": None, "logit_bias": {}, "presence_penalty": 0, "frequency_penalty": 0,
+                  "stop": None, "temperature": 1, "top_p": 1, "user": "u-1"}
+
+
+def test_an_sdk_request_with_every_neutral_field_is_served(serve):
+    """Neutral values are accepted, so ordinary clients work; the same fields at a value that would change the output
+    are refused. GLM's thinking switch works both ways; only a thinking budget is refused."""
+    client, _ = serve(PLAIN)
+    msgs = {"messages": [{"role": "user", "content": "hi"}], "tools": TOOLS}
+    for thinking in (True, False):
+        body = {**SDK_CHAT, **msgs, "chat_template_kwargs": {"enable_thinking": thinking}}
+        r = client.post("/v1/chat/completions", json=body)
+        assert r.status_code == 200, (thinking, r.text)
+        msg = r.json()["choices"][0]["message"]
+        assert (msg.get("reasoning_content"), msg.get("content")) == (
+            ("Hello there again!", None) if thinking else (None, "Hello there again!")), msg
+        events = _events(client, {**body, "stream": True, "stream_options": {"include_usage": True}})
+        assert events[-1]["usage"]["completion_tokens"] == len(PLAIN)
+    r = client.post("/v1/completions", json=SDK_COMPLETION)
+    assert r.status_code == 200 and r.json()["choices"][0]["text"] == "Hello there again!", r.text
+    for field, value in (("presence_penalty", 0.5), ("frequency_penalty", -0.2), ("repetition_penalty", 1.1),
+                         ("thinking_token_budget", 128), ("n", 2), ("logit_bias", {"13": 5}),
+                         ("response_format", {"type": "json_object"}), ("prompt_logprobs", 0)):
+        r = client.post("/v1/chat/completions", json={**SDK_CHAT, **msgs, field: value})
+        assert r.status_code == 400 and "not supported" in r.text, (field, r.text)
+    for field, value in (("echo", True), ("best_of", 2), ("suffix", "!")):
+        r = client.post("/v1/completions", json={**SDK_COMPLETION, field: value})
+        assert r.status_code == 400 and "not supported" in r.text, (field, r.text)
 
 
 def test_health_stats_models_and_metrics(serve):
