@@ -47,10 +47,13 @@ class StepStats:
 
 def unsupported(params: SamplingParams) -> str | None:
     """What in a request's sampling the engine does not serve, or None. Every graph samples on the device from the
-    logits alone; penalties, guided decoding and prompt logprobs need graph variants with host inputs, which the
-    engine neither compiles nor warms. add_request refuses them before anything is queued (the API answers 400)."""
+    logits alone; penalties, guided decoding, a thinking budget's forced tokens and prompt logprobs need graph variants
+    with host inputs, which the engine neither compiles nor warms. add_request refuses them before anything is queued
+    (the API answers 400)."""
     if params.repetition_penalty != 1.0 or params.frequency_penalty != 0.0 or params.presence_penalty != 0.0:
         return "repetition / frequency / presence penalties"
+    if getattr(params, "thinking_token_budget", None) is not None:
+        return "a thinking token budget"
     if getattr(params, "grammar", None) is not None:
         return "structured output (response_format / guided decoding)"
     if getattr(params, "prompt_logprobs", None) is not None:
