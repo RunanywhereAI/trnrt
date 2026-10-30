@@ -14,7 +14,8 @@ Ownership rules:
   #29173): a finished request that carries a session_id registers its prefix under that
   session; eviction takes unreferenced prefixes first, then fewer-referenced ones, each least
   recently used first. Referenced KV is soft-protected, not pinned, and closing the session
-  drops its references without freeing anything.
+  drops its references without freeing anything. Clients seldom close their sessions, so at most
+  MAX_OPEN_SESSIONS stay open: past that, the least recently used one is closed.
 - State checkpoints (GLM-5.3-Flash's linear-attention layers, engine/state_pool.py): the model can
   resume a prefix only where the recurrent state after it was saved, so a node may own one
   checkpoint row (`ckpt`), the state after the tokens up to the END of its key. A hit is the
@@ -91,7 +92,8 @@ class RadixCache:
         self.num_dominated_freed = 0
         self.num_running_offloaded = 0
         self._session_nodes: dict[str, list[RadixNode]] = {}
-        self._session_open: dict[str, int] = {}  # session id -> generation
+        self._session_open: OrderedDict[str, int] = OrderedDict()  # session id -> generation, oldest use first
+        self.num_sessions_expired = 0  # sessions closed by the MAX_OPEN_SESSIONS cap
         self._session_closed: OrderedDict[str, int] = OrderedDict()  # bounded tombstones
 
     # -- lookup -------------------------------------------------------------------
@@ -209,6 +211,11 @@ class RadixCache:
 
     MAX_SESSION_NODES = 8  # registrations kept per session (fan-out branches), oldest dropped
     MAX_CLOSED_SESSIONS = 4096
+    # Open sessions kept, least recently used closed first. Nothing else ends a session a client never closes, and a
+    # stale session's references would protect its prefix from eviction for as long as the server runs. Each open
+    # session costs ~250 B of bookkeeping with its id (CPython, a 32-character id, one registration); the device KV
+    # pool holds the prefixes of a few dozen long sessions, so the cap only ever drops references to KV already gone.
+    MAX_OPEN_SESSIONS = 4096
 
     def session_open(self, sid: str) -> int:
         """The generation a request of session `sid` arriving now belongs to. A session closed
@@ -218,6 +225,11 @@ class RadixCache:
         if gen is None:
             gen = self._session_closed.pop(sid, -1) + 1
             self._session_open[sid] = gen
+            while len(self._session_open) > self.MAX_OPEN_SESSIONS:
+                self.session_close(next(iter(self._session_open)))
+                self.num_sessions_expired += 1
+        else:
+            self._session_open.move_to_end(sid)
         return gen
 
     def session_close(self, sid: str) -> bool:
@@ -236,6 +248,7 @@ class RadixCache:
         """Reference the prefix ending at `node` from session `sid` (generation `gen`)."""
         if self._session_open.get(sid) != gen or node is self.root:
             return False
+        self._session_open.move_to_end(sid)
         self._register(sid, node)
         return True
 

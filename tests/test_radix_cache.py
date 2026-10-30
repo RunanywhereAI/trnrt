@@ -154,6 +154,34 @@ def test_session_referenced_prefix_is_evicted_last_and_released_on_close():
     assert rc.match_prefix(a).num_pages == 0 and rc.match_prefix(b).num_pages == 2
 
 
+def test_open_sessions_are_bounded_least_recently_used_first():
+    """A server runs for weeks and clients seldom close sessions: past MAX_OPEN_SESSIONS the least recently used
+    session is closed (its references dropped, nothing freed), so the bookkeeping stays bounded and a stale session
+    stops protecting its prefix. A request or a registration counts as use."""
+    pool, rc = make()
+    rc.MAX_OPEN_SESSIONS = 3
+    nodes = [rc.insert(list(range(100 * i, 100 * i + 4)), pool.alloc(1)).node for i in range(1, 6)]
+    gens = {}
+    for i, sid in enumerate(["s0", "s1", "s2"]):
+        gens[sid] = rc.session_open(sid)
+        assert rc.session_register(sid, gens[sid], nodes[i])
+    rc.session_open("s0")  # s0's next request: now s1 is the least recently used
+    gens["s3"] = rc.session_open("s3")
+    assert list(rc._session_open) == ["s2", "s0", "s3"] and rc.num_sessions_expired == 1
+    assert nodes[1].session_refs == 0 and not nodes[1].sessions and "s1" not in rc._session_nodes
+    assert nodes[0].session_refs == 1 and nodes[2].session_refs == 1
+    assert rc.session_register("s2", gens["s2"], nodes[3])  # a registration is use too: s0 is now the oldest
+    gens["s4"] = rc.session_open("s4")
+    assert list(rc._session_open) == ["s3", "s2", "s4"] and nodes[0].session_refs == 0
+    assert rc.total_pages() == 5  # closing by the cap frees nothing
+    assert not rc.session_register("s1", gens["s1"], nodes[1])  # an expired session's late request cannot re-attach
+    for k in range(100):  # any number of sessions: the open map and the registrations stay at the cap
+        g = rc.session_open(f"x{k}")
+        rc.session_register(f"x{k}", g, nodes[k % 5])
+    assert len(rc._session_open) == 3 and len(rc._session_nodes) <= 3
+    assert sum(n.session_refs for n in nodes) <= 3 * rc.MAX_SESSION_NODES
+
+
 def test_session_registration_is_generation_checked_and_split_safe():
     pool, rc = make()
     ids = list(range(12))
