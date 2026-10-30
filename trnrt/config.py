@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import torch
 
@@ -587,12 +587,16 @@ class EngineConfig:
     state_checkpoints: int | None = None
     tp: int = 1  # tensor-parallel ranks, one process and one logical NeuronCore each
     tp_core_base: int = 0  # first logical NeuronCore of this engine (a second engine on the host offsets it)
-    # Selected-expert MoE: "xla" (the gather in DecoderForCausalLM._moe) or "nki" (trnrt/kernels).
-    moe_kernel: str = field(default_factory=lambda: os.environ.get("TRNRT_MOE_KERNEL", "xla"))
+    # Selected-expert MoE: "nki" (trnrt/kernels) or "xla" (the gather in DecoderForCausalLM._moe). None: "nki" on a
+    # NeuronCore and in a capture of one (device "meta"), the served path; "xla" on CPU, where NKI kernels do not run.
+    moe_kernel: str | None = None
     # Layers per piecewise graph, MoE layers included, for decode and for prefill chunks.
     piecewise_moe_group: int = 12
     piecewise_prefill_moe_group: int = 12
     num_layers: int | None = None  # debugging: run only the first n layers of the checkpoint
+
+    def resolved_moe_kernel(self) -> str:
+        return self.moe_kernel or ("nki" if self.device in ("neuron", "meta") else "xla")
 
     @property
     def max_pages_per_seq(self) -> int:
