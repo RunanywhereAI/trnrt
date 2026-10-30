@@ -20,5 +20,3 @@ compiler_workdir/
 *.log
 .env
 
-# Local worktrees
-.claude/worktrees/
