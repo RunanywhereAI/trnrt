@@ -3,7 +3,7 @@
     python -m trnrt compile shapes zai-org/GLM-5.3-Flash --revision <commit>
     python -m trnrt compile decisions --model zai-org/GLM-5.3-Flash --revision <commit>
     python -m trnrt compile capture -- <the serve arguments>
-    python -m trnrt compile compile --workers 8
+    python -m trnrt compile compile
     python -m trnrt compile strip
 
 Every step works in one directory, --out (default ~/.cache/trnrt; trnrt/compile/cache.py):
@@ -21,8 +21,10 @@ Every step works in one directory, --out (default ~/.cache/trnrt; trnrt/compile/
   arguments after `--` must be the ones the server will run with, and the serving host must load
   the checkpoint revision the shape directory was read at: the cache keys hash the shapes, the
   compiler arguments and the package versions.
-- compile: neuronx-cc on every captured entry that has no NEFF yet, --workers at once, longest HLO
-  first, each in LNL's layout with the completion marker written last, so the entry is a cache hit.
+- compile: neuronx-cc on every captured entry that has no NEFF yet, longest HLO first, each in LNL's
+  layout with the completion marker written last, so the entry is a cache hit. A compile can take tens
+  of GB of host memory, so they run as many at once as MemAvailable admits (--mem-per-compile-gb each,
+  at most --workers), and one the OOM killer takes runs once more, alone.
   neuronx-cc is a plain CLI on an HLO file and runs on any host with the Neuron compiler installed,
   CPU-only instance types included. Run it on the host that captured: graphs that call NKI kernels
   name the kernel binaries the capture compiled by absolute path (cache.py NKI_KERNEL_DIR).
@@ -51,6 +53,9 @@ from dataclasses import asdict, dataclass, field
 
 from . import cache
 from .cache import COMMAND, HLO, LOG, neff_name
+
+GiB = 2**30
+MEM_PER_COMPILE_GB = 30.0  # compile --mem-per-compile-gb
 
 # -- one entry ----------------------------------------------------------------------------------
 
@@ -142,6 +147,7 @@ class Result:
     neff_bytes: int = 0
     args: list[str] = field(default_factory=list)
     error: str = ""
+    attempt: int = 1  # 2: the run again, alone, of a compile the OOM killer took
 
 
 def _tree_rss(pid: int) -> int:
@@ -165,9 +171,10 @@ def _tree_rss(pid: int) -> int:
 
 
 def run_compile(entry: str, *, work_root: str | None = None, neuronx_cc: str | None = None,
-                sample_seconds: float = 1.0) -> Result:
+                sample_seconds: float = 1.0, rss: list[int] | None = None) -> Result:
     """Compile `entry`'s graph.hlo with its own compiler arguments into the entry: the NEFF, the log
-    and command.txt, then the completion marker LAST, which makes it an LNL cache hit."""
+    and command.txt, then the completion marker LAST, which makes it an LNL cache hit. rss: a
+    one-element list kept at the compiler's process-tree resident bytes, as last sampled."""
     key = cache.key_of(entry)
     try:
         target, args = entry_args(entry)
@@ -201,7 +208,10 @@ def run_compile(entry: str, *, work_root: str | None = None, neuronx_cc: str | N
 
     def sample():
         while not done.wait(sample_seconds):
-            peak[0] = max(peak[0], _tree_rss(proc.pid))
+            now = _tree_rss(proc.pid)
+            peak[0] = max(peak[0], now)
+            if rss is not None:
+                rss[0] = now
 
     th = threading.Thread(target=sample, daemon=True)
     th.start()
@@ -230,29 +240,87 @@ def oom_killed(r: Result) -> bool:
     return r.returncode in (-9, 137) or (r.returncode == 70 and "[F137]" in r.error)
 
 
+def host_mem_available(path: str = "/proc/meminfo") -> int | None:
+    """MemAvailable, bytes: the kernel's estimate of what new processes can take without swapping.
+    None without /proc/meminfo (not Linux)."""
+    try:
+        with open(path) as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024  # kB
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def admits(avail: int | None, held: list[int], workers: int, reserve: float) -> bool:
+    """Whether one more compile may start beside the running ones, whose process trees hold `held`
+    bytes: fewer than `workers` run, and MemAvailable `avail` (None: unknown, `workers` alone decide),
+    less what the running compiles have yet to take of their `reserve` bytes each, still holds
+    `reserve`. MemAvailable already counts what a running compile holds, so it owes `reserve` less
+    that. With nothing running one starts regardless: waiting would free nothing of ours."""
+    if not held:
+        return True
+    if len(held) >= workers:
+        return False
+    if avail is None:
+        return True
+    return avail - sum(max(0.0, reserve - h) for h in held) >= reserve
+
+
 def compile_entries(entries: list[str], workers: int, work_root: str | None = None,
-                    neuronx_cc: str | None = None, on_result=None) -> list[Result]:
-    """run_compile over `entries`, `workers` at once, the largest graph.hlo first (size is the best
-    cheap proxy for compile time), so the tail of the batch is short graphs. An entry that fails, by
-    an exception too, fails alone: its Result says why and the others go on."""
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+                    neuronx_cc: str | None = None, on_result=None, mem_per_compile: float = MEM_PER_COMPILE_GB * GiB,
+                    mem_available=host_mem_available, poll_seconds: float = 1.0) -> list[Result]:
+    """run_compile over `entries`, the largest graph.hlo first (size is the best cheap proxy for
+    compile time), so the tail of the batch is short graphs. A compile starts when `admits` allows
+    it: at most `workers` at once, each reserving `mem_per_compile` bytes of mem_available(), which
+    is read again every `poll_seconds` while entries wait. An entry that fails, by an exception too,
+    fails alone: its Result says why and the others go on. A compile the OOM killer took (oom_killed)
+    runs once more after all the others, alone. on_result sees every attempt; the list returned holds
+    each entry's last."""
+    import collections
+    import queue
 
-    def one(d):
+    todo = collections.deque(sorted(entries, key=lambda d: -os.path.getsize(os.path.join(d, HLO))))
+    done: queue.Queue = queue.Queue()
+    running: dict[str, list[int]] = {}  # entry -> its compiler's process-tree resident bytes, as last sampled
+    last: dict[str, Result] = {}
+
+    def attempt(d: str, n: int, rss: list[int]) -> None:
         try:
-            return run_compile(d, work_root=work_root, neuronx_cc=neuronx_cc)
+            r = run_compile(d, work_root=work_root, neuronx_cc=neuronx_cc, rss=rss)
         except Exception as err:  # that entry's failure: the others go on
-            return Result(cache.key_of(d), False, 0.0, -1, error=f"{type(err).__name__}: {err}")
+            r = Result(cache.key_of(d), False, 0.0, -1, error=f"{type(err).__name__}: {err}")
+        r.attempt = n
+        done.put((d, r))
 
-    todo = sorted(entries, key=lambda d: -os.path.getsize(os.path.join(d, HLO)))
-    results = []
-    with ThreadPoolExecutor(max(1, workers)) as pool:
-        futs = [pool.submit(one, d) for d in todo]
-        for f in as_completed(futs):
-            r = f.result()
-            results.append(r)
-            if on_result is not None:
-                on_result(r)
-    return results
+    def start(d: str, n: int) -> None:
+        running[d] = [0]
+        threading.Thread(target=attempt, args=(d, n, running[d])).start()
+
+    def collect(timeout: float | None) -> tuple[str, Result] | None:
+        try:
+            d, r = done.get(timeout=timeout)
+        except queue.Empty:
+            return None
+        del running[d]
+        last[d] = r
+        if on_result is not None:
+            on_result(r)
+        return d, r
+
+    workers = max(1, workers)
+    killed = []
+    while todo or running:
+        while todo and admits(mem_available(), [h[0] for h in running.values()], workers, mem_per_compile):
+            start(todo.popleft(), 1)
+        got = collect(poll_seconds if todo else None)  # memory frees as compiles end, and goes as they grow
+        if got is not None and oom_killed(got[1]):
+            killed.append(got[0])
+    for d in killed:  # with every other compile ended
+        start(d, 2)
+        collect(None)
+    return list(last.values())
 
 
 # -- the command line ----------------------------------------------------------------------------
@@ -334,7 +402,12 @@ def cmd_compile(a, dirs) -> int:
     want = _keys_filter(a)
     if want is not None:
         todo = [d for d in todo if cache.key_of(d) in want]
-    print(f"{len(todo)} entries to compile under {root} with {a.workers} workers", flush=True)
+    workers, reserve = a.workers or os.cpu_count() or 1, a.mem_per_compile_gb * GiB
+    avail = host_mem_available()
+    room = ("MemAvailable unknown: --workers alone limits them" if avail is None else
+            f"MemAvailable {avail / GiB:.0f} GB, room for {int(avail // reserve)} now")
+    print(f"{len(todo)} entries to compile under {root}: at most {workers} at once, each reserving "
+          f"{a.mem_per_compile_gb:g} GB of host memory ({room})", flush=True)
     t0 = time.time()
 
     def show(r: Result) -> None:
@@ -344,12 +417,15 @@ def cmd_compile(a, dirs) -> int:
             with open(a.log, "a") as f:
                 f.write(json.dumps(row) + "\n")
 
-    results = compile_entries(todo, a.workers, a.work_root, a.neuronx_cc, on_result=show)
+    results = compile_entries(todo, workers, a.work_root, a.neuronx_cc, on_result=show, mem_per_compile=reserve,
+                              mem_available=host_mem_available)
     bad = [r for r in results if not r.ok]
-    summary = {"summary": True, "entries": len(results), "failed": len(bad), "workers": a.workers,
-               "wall_seconds": round(time.time() - t0, 1)}
+    summary = {"summary": True, "entries": len(results), "failed": len(bad),
+               "retried": sum(r.attempt > 1 for r in results), "workers": workers,
+               "mem_per_compile_gb": a.mem_per_compile_gb, "wall_seconds": round(time.time() - t0, 1)}
     if any(oom_killed(r) for r in bad):
-        summary["hint"] = "the OOM killer took compiles: rerun with fewer --workers"
+        summary["hint"] = ("the OOM killer took compiles that ran alone: this host has too little memory for them "
+                           "(see each one's peak_tree_rss_gb)")
     print(json.dumps(summary), flush=True)
     return 1 if bad else 0
 
@@ -402,8 +478,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     c = sub.add_parser("compile", help="neuronx-cc on every captured entry without a NEFF")
     common(c)
-    c.add_argument("--workers", type=int, default=4,
-                   help="compiles at once (default %(default)s); each can take tens of GB of host memory")
+    c.add_argument("--workers", type=int, default=None,
+                   help="most compiles at once (default: one per CPU); host memory admits fewer: "
+                        "--mem-per-compile-gb")
+    c.add_argument("--mem-per-compile-gb", type=float, default=MEM_PER_COMPILE_GB,
+                   help="host memory each compile reserves, GB (default %(default)g): neuronx-cc can take tens of "
+                        "GB on one of these graphs. A compile starts only while MemAvailable, less what the running "
+                        "ones have yet to take of theirs, holds it; one the OOM killer takes runs once more, alone")
     c.add_argument("--keys", default=None, help="only these keys (comma list)")
     c.add_argument("--keys-file", default=None, help="only these keys (a capture's keys.json)")
     c.add_argument("--work-root", default=None, help="where neuronx-cc's scratch trees go (default: the temp dir)")
