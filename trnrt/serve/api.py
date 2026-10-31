@@ -21,8 +21,11 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import contextlib
 import copy
+import functools
 import json
+import math
 import queue
 import re
 import signal
@@ -37,7 +40,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from fastapi import FastAPI, HTTPException, Request as HTTPRequest
-from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
 
 from ..engine.request import Request, SamplingParams, Status
 from ..metrics import Metrics, kv_pages
@@ -58,9 +61,10 @@ class _Stream:
 
 @dataclass
 class _Submit:
-    """A request on its way to the engine thread. `out` receives, in order: ("accepted", Request), or ("error", why)
-    if the engine refused it (400); then ("tokens", new ids, finish reason or None, their logprobs or None) until the
-    finish reason is set, or ("error", why) if the engine fails."""
+    """A request on its way to the engine thread. `out` receives, in order: ("accepted", Request), or ("error", why,
+    HTTP status) if it was not accepted; then ("tokens", new ids, finish reason or None, their logprobs or None) until
+    the finish reason is set, or ("error", why, HTTP status) if the engine fails. The status is 400 for a request the
+    engine refuses, 500 for an internal error that leaves the engine serving and 503 once the engine has failed."""
     rid: str
     prompt_ids: list[int]
     params: SamplingParams
@@ -101,6 +105,7 @@ class EngineLoop:
         self.engine = engine
         self._stopping = threading.Event()
         self.metrics = Metrics()
+        self.vocab = engine.mcfg.vocab_size  # the embedding's rows: a prompt id outside them fails the step
         self.inbox: queue.Queue = queue.Queue()
         self.streams: dict[str, _Stream] = {}
         # Why the engine can no longer serve (a rank or this loop failed), None while it can: /health and every new
@@ -144,8 +149,11 @@ class EngineLoop:
             self.inbox.put((kind, payload))
 
     def submit(self, prompt_ids: list[int], params: SamplingParams, session_id: str | None = None) -> _Submit:
-        if not prompt_ids or not all(isinstance(t, int) for t in prompt_ids):
-            raise HTTPException(status_code=400, detail="prompt must be a non-empty list of token ids")
+        # Checked here, before the engine sees the request: an id outside the vocabulary fails the step, and at tp > 1
+        # one failed step fails the engine for every request (_fail).
+        if not prompt_ids or not all(type(t) is int and 0 <= t < self.vocab for t in prompt_ids):
+            raise HTTPException(status_code=400,
+                                detail=f"prompt must be a non-empty list of token ids in [0, {self.vocab})")
         if session_id is not None and not isinstance(session_id, str):
             raise HTTPException(status_code=400, detail="session_id must be a string")
         sub = _Submit(uuid.uuid4().hex, prompt_ids, params, asyncio.get_running_loop(), session_id)
@@ -168,10 +176,10 @@ class EngineLoop:
                     req = self.engine.add_request(payload.prompt_ids, payload.params, rid=payload.rid,
                                                   session_id=payload.session_id)
                 except ValueError as e:
-                    post(payload.out.put_nowait, ("error", str(e)))
+                    post(payload.out.put_nowait, ("error", str(e), 400))
                 except Exception as e:  # noqa: BLE001  add_request raised before the request reached the scheduler
                     traceback.print_exc()  # (its last step): that request fails, the engine keeps serving
-                    post(payload.out.put_nowait, ("error", f"request refused: {e!r}"))
+                    post(payload.out.put_nowait, ("error", f"request refused: {e!r}", 500))
                 else:
                     self.streams[payload.rid] = _Stream(req, payload.loop, payload.out)
                     post(payload.out.put_nowait, ("accepted", req))
@@ -220,14 +228,14 @@ class EngineLoop:
         print(f"trnrt: {reason}; /health answers 503 and the engine shuts down", flush=True)
         streams, self.streams = self.streams, {}
         for st in streams.values():
-            st.loop.call_soon_threadsafe(st.out.put_nowait, ("error", f"engine failed: {reason}"))
+            st.loop.call_soon_threadsafe(st.out.put_nowait, ("error", f"engine failed: {reason}", 503))
         while True:
             try:
                 kind, payload = self.inbox.get_nowait()
             except queue.Empty:
                 break
             if kind == "add":
-                payload.loop.call_soon_threadsafe(payload.out.put_nowait, ("error", f"engine failed: {reason}"))
+                payload.loop.call_soon_threadsafe(payload.out.put_nowait, ("error", f"engine failed: {reason}", 503))
         try:
             self.engine.close_failed()
         except Exception:  # noqa: BLE001  the requests are answered; a teardown error must not hide the reason
@@ -252,7 +260,7 @@ class EngineLoop:
                     self._fail(f"engine step failed: {e!r}{gone}")
                     return
                 for st in self.streams.values():
-                    st.loop.call_soon_threadsafe(st.out.put_nowait, ("error", f"engine step failed: {e}"))
+                    st.loop.call_soon_threadsafe(st.out.put_nowait, ("error", f"engine step failed: {e}", 500))
                     if st.req.status is not Status.FINISHED:
                         self.engine.abort(st.req)
                 self.streams.clear()
@@ -319,7 +327,10 @@ class _Detok:
 # also only when they would change the output.
 _NEUTRAL = {"prompt_logprobs": (None,), "guided_json": (None,), "guided_regex": (None,), "guided_choice": (None,),
             "guided_grammar": (None,), "structured_outputs": (None,), "n": (None, 1), "best_of": (None, 1),
-            "logit_bias": (None, {}), "echo": (None, False), "suffix": (None, "")}
+            "logit_bias": (None, {}), "echo": (None, False), "suffix": (None, ""), "min_tokens": (None, 0),
+            "include_stop_str_in_output": (None, False), "add_generation_prompt": (None, True),
+            "continue_final_message": (None, False), "skip_special_tokens": (None, True), "functions": (None, []),
+            "function_call": (None, "none", "auto")}
 
 
 def _refused(body: dict) -> list[str]:
@@ -330,34 +341,92 @@ def _refused(body: dict) -> list[str]:
     return out
 
 
-def _params(body: dict, default_max: int, chat: bool) -> SamplingParams:
+_INT64_MAX = 2 ** 63 - 1
+
+
+def _bad(detail: str) -> HTTPException:
+    return HTTPException(status_code=400, detail=detail)
+
+
+def _int(body: dict, key: str, default, lo: int, hi: int = _INT64_MAX):
+    """body[key] as an int in [lo, hi] (a float with no fraction counts), or `default` when it is absent or null. 400
+    otherwise: a value the engine would only fail on in a step must not get there (numpy refuses a negative or
+    fractional seed, and the sampling inputs are int64 arrays), since at tp > 1 one failed step fails the engine for
+    every request (EngineLoop._fail)."""
+    v = body.get(key)
+    if v is None:
+        return default
+    if isinstance(v, float) and v.is_integer():
+        v = int(v)
+    if type(v) is not int or not lo <= v <= hi:
+        raise _bad(f"{key} must be an integer in [{lo}, {hi}]")
+    return v
+
+
+def _num(body: dict, key: str, default: float, lo: float = -math.inf, hi: float = math.inf,
+         lo_open: bool = False) -> float:
+    """body[key] as a finite number in [lo, hi] ((lo, hi] with lo_open), or `default` when it is absent or null (null
+    is the OpenAI SDKs' way to leave a field unset). 400 otherwise: a NaN temperature reaches the device's top-k."""
+    v = body.get(key)
+    if v is None:
+        return default
+    try:
+        ok = type(v) in (int, float) and math.isfinite(v) and (lo < v if lo_open else lo <= v) and v <= hi
+    except OverflowError:  # an int too large for a float
+        ok = False
+    if not ok:
+        raise _bad(f"{key} must be a number in {'(' if lo_open else '['}{lo}, {hi}]")
+    return float(v)
+
+
+def _flag(body: dict, key: str, default: bool = False) -> bool:
+    v = body.get(key)
+    if v is None:
+        return default
+    if not isinstance(v, bool):
+        raise _bad(f"{key} must be true or false")
+    return v
+
+
+def _params(body: dict, default_max: int, chat: bool, vocab: int) -> SamplingParams:
+    """A request's sampling. Every field is checked here, before the request is queued: 400 for a value of the wrong
+    type or out of range, and the default for a null. default_max is used when the request sets no max_tokens."""
     asked = _refused(body)
     if asked:
-        raise HTTPException(status_code=400, detail=f"not supported: {', '.join(asked)}")
-    stop = body.get("stop") or ()
-    stop = (stop,) if isinstance(stop, str) else tuple(stop)
+        raise _bad(f"not supported: {', '.join(asked)}")
+    stop = body.get("stop")
+    stop = () if stop is None else (stop,) if isinstance(stop, str) else stop
+    if not (isinstance(stop, (list, tuple)) and all(isinstance(x, str) and x for x in stop)):
+        raise _bad("stop must be a non-empty string or a list of them")
+    stop_ids = body.get("stop_token_ids") or ()
+    if not (isinstance(stop_ids, (list, tuple)) and all(type(t) is int and 0 <= t < vocab for t in stop_ids)):
+        raise _bad(f"stop_token_ids must be a list of token ids in [0, {vocab})")
     if chat:  # chat: `logprobs` turns them on, `top_logprobs` asks for alternatives
-        logprobs = int(body.get("top_logprobs") or 0) if body.get("logprobs") else None
-    else:  # completions: `logprobs` is the number of alternatives
-        logprobs = int(body["logprobs"]) if body.get("logprobs") is not None else None
-    if logprobs is not None and not 0 <= logprobs <= 20:  # the device returns at most 20 alternatives per token
-        raise HTTPException(status_code=400, detail="logprobs / top_logprobs must be between 0 and 20")
-    budget = body.get("thinking_token_budget")  # vLLM's: the reasoning is closed after this many tokens
+        top = _int(body, "top_logprobs", 0, 0, 20)  # the device returns at most 20 alternatives per token
+        if top and not _flag(body, "logprobs"):
+            raise _bad("top_logprobs needs logprobs set to true")
+        logprobs = top if _flag(body, "logprobs") else None
+    else:  # completions: `logprobs` is the number of alternatives (false: none, as absent)
+        logprobs = None if body.get("logprobs") is False else _int(body, "logprobs", None, 0, 20)
+    max_new = _int(body, "max_tokens", None, 1)
+    if max_new is None:
+        max_new = _int(body, "max_completion_tokens", default_max, 1)
+    top_k = _int(body, "top_k", 0, -1)  # -1 and 0 both turn it off (vLLM's -1, the engine's 0)
     return SamplingParams(
-        max_new_tokens=int(body.get("max_tokens") or body.get("max_completion_tokens") or default_max),
-        temperature=float(body.get("temperature", 1.0)),
-        top_p=float(body.get("top_p", 1.0)),
-        top_k=int(body.get("top_k", 0) or 0),
-        min_p=float(body.get("min_p", 0.0) or 0.0),
-        repetition_penalty=float(body.get("repetition_penalty", 1.0) or 1.0),
-        frequency_penalty=float(body.get("frequency_penalty", 0.0) or 0.0),
-        presence_penalty=float(body.get("presence_penalty", 0.0) or 0.0),
+        max_new_tokens=max_new,
+        temperature=_num(body, "temperature", 1.0, lo=0.0),
+        top_p=_num(body, "top_p", 1.0, lo=0.0, hi=1.0, lo_open=True),
+        top_k=max(top_k, 0),
+        min_p=_num(body, "min_p", 0.0, lo=0.0, hi=1.0),
+        repetition_penalty=_num(body, "repetition_penalty", 1.0, lo=0.0, lo_open=True),
+        frequency_penalty=_num(body, "frequency_penalty", 0.0),
+        presence_penalty=_num(body, "presence_penalty", 0.0),
         logprobs=logprobs,
-        thinking_token_budget=int(budget) if budget is not None else None,
-        stop=stop,
-        stop_token_ids=tuple(body.get("stop_token_ids") or ()),
-        ignore_eos=bool(body.get("ignore_eos", False)),
-        seed=body.get("seed"),
+        thinking_token_budget=_int(body, "thinking_token_budget", None, 0),  # vLLM's; the engine refuses any value
+        stop=tuple(stop),
+        stop_token_ids=tuple(stop_ids),
+        ignore_eos=_flag(body, "ignore_eos"),
+        seed=_int(body, "seed", None, 0),
     )
 
 
@@ -374,10 +443,87 @@ def template_knows_developer(tok) -> bool:
 
 
 def _template_ids(tok, messages: list, kwargs: dict) -> list[int]:
-    ids = tok.apply_chat_template(messages, add_generation_prompt=True, tokenize=True, **kwargs)
+    import jinja2
+
+    try:
+        ids = tok.apply_chat_template(messages, add_generation_prompt=True, tokenize=True, **kwargs)
+    except jinja2.TemplateError as e:  # the template's own raise_exception, on messages it cannot render
+        raise _bad(f"the chat template refused the messages: {e}") from None
     if hasattr(ids, "keys"):  # transformers 5 returns a BatchEncoding, not a list
         ids = ids["input_ids"]
     return list(ids)
+
+
+# apply_chat_template's own arguments: the server sets them from the request (messages, tools) or fixes them.
+_TEMPLATE_ARGS = {"conversation", "messages", "tools", "documents", "add_generation_prompt", "continue_final_message",
+                  "tokenize", "chat_template", "return_dict", "return_assistant_tokens_mask", "tokenizer_kwargs",
+                  "padding", "truncation", "max_length", "return_tensors"}
+# GLM-5.3-Flash's template (chat_template.jinja at eb9eb208) renders reasoning_effort "low" or "high" as that effort
+# and any other value as "Max", its default: every other value would be answered at Max without a word.
+REASONING_EFFORTS = ("low", "high", "max")
+
+
+@functools.lru_cache(maxsize=8)
+def _variables(src: str) -> frozenset[str] | None:
+    import jinja2.meta
+    from transformers.utils.chat_template_utils import _compile_jinja_template
+
+    try:
+        return frozenset(jinja2.meta.find_undeclared_variables(_compile_jinja_template(src).environment.parse(src)))
+    except Exception:  # noqa: BLE001  an unparseable template is answered by apply_chat_template itself
+        return None
+
+
+def template_variables(tok) -> set[str] | None:
+    """The variables the tokenizer's chat template (one, or a dict of named ones) reads from its context, parsed with
+    transformers' own Jinja environment; None if one cannot be parsed."""
+    t = getattr(tok, "chat_template", None)
+    out: set[str] = set()
+    for src in [t] if isinstance(t, str) else (t or {}).values():
+        v = _variables(src)
+        if v is None:
+            return None
+        out |= v
+    return out
+
+
+def template_kwargs(tok, body: dict) -> tuple[dict, bool | None]:
+    """The chat template's extra variables for a request: its chat_template_kwargs, plus a top-level reasoning_effort
+    (the OpenAI field). 400 for a variable the template never reads, which would be ignored, and for a reasoning
+    effort GLM-5.3-Flash's template does not honour.
+
+    enable_thinking (vLLM's convention) is the exception: GLM-5.3-Flash's template has none and always opens the
+    reasoning block. On a template without it, it is taken out and returned second, so chat_prompt can check it against
+    the rendered prompt: the value the template renders anyway is accepted, the other refused."""
+    kw = body.get("chat_template_kwargs")
+    if kw is None:
+        kw = {}
+    if not isinstance(kw, dict):
+        raise _bad("chat_template_kwargs must be an object")
+    kw = dict(kw)
+    taken = sorted(set(kw) & _TEMPLATE_ARGS)
+    if taken:
+        raise _bad(f"chat_template_kwargs cannot set {', '.join(taken)}: the server sets them from the request")
+    effort = body.get("reasoning_effort")
+    if effort is not None:
+        if kw.get("reasoning_effort", effort) != effort:
+            raise _bad("reasoning_effort and chat_template_kwargs.reasoning_effort differ")
+        kw["reasoning_effort"] = effort
+    used = template_variables(tok)
+    if used is None:
+        return kw, None
+    thinking = None
+    if "enable_thinking" in kw and "enable_thinking" not in used:
+        thinking = kw.pop("enable_thinking")
+        if not isinstance(thinking, bool) and thinking is not None:
+            raise _bad("chat_template_kwargs.enable_thinking must be true or false")
+    unread = sorted(k for k in kw if k not in used)
+    if unread:
+        raise _bad(f"the model's chat template does not use {', '.join(unread)}; it would be ignored")
+    if "reasoning_effort" in kw and kw["reasoning_effort"] not in REASONING_EFFORTS:
+        raise _bad(f"reasoning_effort must be one of {', '.join(REASONING_EFFORTS)} (max is the default); the chat "
+                   f"template answers any other value at max")
+    return kw, thinking
 
 
 def chat_prompt(tok, body: dict) -> tuple[list[int], dict]:
@@ -391,9 +537,9 @@ def chat_prompt(tok, body: dict) -> tuple[list[int], dict]:
         messages = template_messages(messages, developer_to_system=not template_knows_developer(tok))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from None
-    kwargs = dict(body.get("chat_template_kwargs") or {})
+    kwargs, thinking = template_kwargs(tok, body)
     tool_choice = body.get("tool_choice")
-    error = tool_choice_error(tool_choice, body.get("tools"))
+    error = tool_choice_error(tool_choice)
     if error:
         raise HTTPException(status_code=400, detail=error)
     tools = body.get("tools") if tool_choice != "none" else None
@@ -403,11 +549,51 @@ def chat_prompt(tok, body: dict) -> tuple[list[int], dict]:
     # With thinking on, the template opens the reasoning block in the prompt and the output starts inside it; with
     # thinking off it closes the block there, and the output starts with the answer.
     tail = tok.decode(ids[-4:]).rstrip()
+    if thinking is not None and thinking != tail.endswith(THINK_OPEN):
+        raise _bad(f"this model's chat template has no enable_thinking: thinking is always "
+                   f"{'on' if tail.endswith(THINK_OPEN) else 'off'}. For less reasoning send reasoning_effort \"low\"")
     # parallel_tool_calls=False keeps only the first call (vLLM maybe_filter_parallel_tool_calls,
     # entrypoints/serve/utils/tool_calls_utils.py).
     parse = dict(tools=bool(tools), thinking_open=tail.endswith(THINK_OPEN), tool_defs=tools,
                  parallel_tool_calls=body.get("parallel_tool_calls") is not False)
     return ids, parse
+
+
+async def _body(http: HTTPRequest) -> dict:
+    """The request's JSON object; 400 for anything else (FastAPI's raw request would answer malformed JSON 500)."""
+    try:
+        body = await http.json()
+    except ValueError:  # json.JSONDecodeError and UnicodeDecodeError
+        raise _bad("the request body must be a JSON object") from None
+    if not isinstance(body, dict):
+        raise _bad("the request body must be a JSON object")
+    return body
+
+
+async def _disconnected(http: HTTPRequest) -> None:
+    """Returns once the client has gone away (vLLM's listen_for_disconnect). The body is read already, so the next
+    ASGI message is the disconnect."""
+    while (await http.receive())["type"] != "http.disconnect":
+        pass
+
+
+async def _unless_disconnected(http: HTTPRequest, aw):
+    """`aw`'s result, or None if the client disconnected first (aw is then cancelled). aw's exceptions propagate."""
+    task = asyncio.ensure_future(aw)
+    gone = asyncio.ensure_future(_disconnected(http))
+    try:
+        await asyncio.wait({task, gone}, return_when=asyncio.FIRST_COMPLETED)
+    except BaseException:  # this handler was cancelled itself
+        task.cancel()
+        raise
+    finally:
+        gone.cancel()
+    if not task.done():  # the client went away first
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        return None
+    return task.result()
 
 
 def build_app(engine: LLMEngine, model_name: str) -> FastAPI:
@@ -441,17 +627,17 @@ def build_app(engine: LLMEngine, model_name: str) -> FastAPI:
     async def models():
         return {"object": "list", "data": [{"id": model_name, "object": "model", "owned_by": "trnrt"}]}
 
-    async def _generate(body: dict, prompt_ids: list[int], params: SamplingParams, chat: bool,
+    async def _generate(http: HTTPRequest, body: dict, prompt_ids: list[int], params: SamplingParams, chat: bool,
                         parse: dict | None = None):
-        stream = bool(body.get("stream"))
-        include_usage = bool((body.get("stream_options") or {}).get("include_usage"))
-        tool_choice = body.get("tool_choice")
+        stream = _flag(body, "stream")
+        opts = body.get("stream_options") or {}
+        include_usage = isinstance(opts, dict) and _flag(opts, "include_usage")
         sub = loop_.submit(prompt_ids, params, body.get("session_id"))
         # Admission errors (a prompt that does not fit, an unsupported parameter) arrive before any token: surface
         # them as HTTP status codes rather than inside a 200 stream.
         first = await sub.out.get()
         if first[0] == "error":
-            raise HTTPException(status_code=400, detail=first[1])
+            raise HTTPException(status_code=first[2], detail=first[1])
         req = first[1]
         created = int(time.time())
         oid = ("chatcmpl-" if chat else "cmpl-") + sub.rid
@@ -493,7 +679,7 @@ def build_app(engine: LLMEngine, model_name: str) -> FastAPI:
 
         def chat_chunks(text: str, finish: str | None, pairs):
             deltas = sparser.push(text, finish is not None)
-            finish = chat_finish_reason(finish, sparser.saw_tool, tool_choice)
+            finish = chat_finish_reason(finish, sparser.saw_tool)
             if not deltas:
                 return [chunk("", finish, pairs)] if (finish or pairs) else []
             out = []
@@ -508,11 +694,15 @@ def build_app(engine: LLMEngine, model_name: str) -> FastAPI:
             completed = False
             n_streamed = 0
             try:
+                if chat:  # OpenAI's first chunk names the role
+                    c = chunk("", None)
+                    c["choices"][0]["delta"] = {"role": "assistant", "content": ""}
+                    yield f"data: {json.dumps(c)}\n\n"
                 while True:
                     kind, *rest = await sub.out.get()
                     if kind == "error":
                         completed = True
-                        yield f"data: {json.dumps({'error': {'message': rest[0]}})}\n\n"
+                        yield f"data: {json.dumps({'error': {'message': rest[0], 'code': rest[1]}})}\n\n"
                         return
                     ids, finish, lps = rest
                     n_streamed += len(ids)
@@ -534,26 +724,36 @@ def build_app(engine: LLMEngine, model_name: str) -> FastAPI:
                 if not completed:
                     loop_.abort(sub.rid)
 
-        if stream:
+        if stream:  # StreamingResponse closes events() when the client goes away, and its finally aborts
             return StreamingResponse(events(), media_type="text/event-stream")
 
-        text, finish, n_out, all_lps = "", None, 0, []
-        try:
+        async def collect():
+            text, finish, n_out, all_lps = "", None, 0, []
             while finish is None:
                 kind, *rest = await sub.out.get()
                 if kind == "error":
-                    raise HTTPException(status_code=400, detail=rest[0])
+                    raise HTTPException(status_code=rest[1], detail=rest[0])
                 ids, finish, lps = rest
                 n_out += len(ids)
                 if lps is not None:
                     all_lps.extend(zip(ids, lps))
                 text += detok.push(ids, finish is not None)
+            return text, finish, n_out, all_lps
+
+        # Nothing cancels a plain response's handler when its client disconnects, so the request would hold its seat
+        # until max_tokens: watch for the disconnect, and abort.
+        try:
+            done = await _unless_disconnected(http, collect())
         except asyncio.CancelledError:
             loop_.abort(sub.rid)
             raise
+        if done is None:
+            loop_.abort(sub.rid)
+            return Response(status_code=499)  # nginx's "client closed request"; nobody reads it
+        text, finish, n_out, all_lps = done
         if chat:
             msg = parse_full(text, **parse)
-            finish = chat_finish_reason(finish, bool(msg.get("tool_calls")), tool_choice)
+            finish = chat_finish_reason(finish, bool(msg.get("tool_calls")))
             choice = {"index": 0, "message": msg, "finish_reason": finish}
         else:
             choice = {"index": 0, "text": text, "finish_reason": finish}
@@ -564,7 +764,7 @@ def build_app(engine: LLMEngine, model_name: str) -> FastAPI:
 
     @app.post("/v1/completions")
     async def completions(http: HTTPRequest):
-        body = await http.json()
+        body = await _body(http)
         prompt = body.get("prompt", "")
         if isinstance(prompt, list) and prompt and isinstance(prompt[0], int):
             ids = prompt
@@ -572,12 +772,17 @@ def build_app(engine: LLMEngine, model_name: str) -> FastAPI:
             ids = tok(prompt)["input_ids"]
         else:
             raise HTTPException(status_code=400, detail="prompt must be a string or a list of token ids")
-        return await _generate(body, ids, _params(body, 16, chat=False), chat=False)
+        # max_tokens defaults to 16, the OpenAI completions API's default
+        return await _generate(http, body, ids, _params(body, 16, chat=False, vocab=loop_.vocab), chat=False)
 
     @app.post("/v1/chat/completions")
     async def chat(http: HTTPRequest):
-        body = await http.json()
+        body = await _body(http)
         ids, parse = await asyncio.get_running_loop().run_in_executor(prompt_pool, chat_prompt, prompt_tok, body)
-        return await _generate(body, ids, _params(body, 512, chat=True), chat=True, parse=parse)
+        # max_tokens defaults to the rest of the context (vLLM's default): reasoning at the template's default effort
+        # (Max) can run long, and a smaller hidden default would cut the answer off
+        room = max(engine.cfg.max_model_len - len(ids), 1)
+        return await _generate(http, body, ids, _params(body, room, chat=True, vocab=loop_.vocab), chat=True,
+                               parse=parse)
 
     return app
