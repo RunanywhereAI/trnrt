@@ -8,7 +8,8 @@ Every default is the served configuration of GLM-5.3-Flash on one trn2.48xlarge:
 ranks each (logical NeuronCores 0-31 and 32-63 at LNC 2), 1M-token context, FP8 KV cache, 256-token pages, decode
 batches of up to 8, 4,096-token prefill chunks, and 4 GiB per rank of host memory under the prefix cache. The bucket
 ladders are graph shapes: a server finds its graphs in the compile cache only if `compile capture` ran with the same
-arguments.
+arguments. An engine compiles nothing on the serving host: a graph missing from the cache ends its start-up with the
+likely cause (NEURON_LIBTORCH_ASSERT_CACHE_HIT=1; --allow-compile compiles it there instead, minutes to hours a graph).
 """
 
 from __future__ import annotations
@@ -21,6 +22,11 @@ import sys
 import time
 
 GiB = 2**30
+# libtorch-neuronx-lite raises on a graph missing from the compile cache instead of compiling it (neuronx-cc on the
+# serving host: minutes to hours per graph, while the engine is not serving).
+CACHE_HIT_ENV = "NEURON_LIBTORCH_ASSERT_CACHE_HIT"
+CACHE_MISS_STATUS = 3  # an engine's exit status when its start-up stopped at a graph missing from the compile cache
+HEALTH_POLL_S = 5.0  # serve: how often it asks a starting engine's /health
 
 
 def _ints(s: str) -> tuple[int, ...]:
@@ -71,6 +77,43 @@ def engine_config(argv: list[str], core_base: int = 0):
         moe_kernel=a.moe_kernel, num_layers=a.num_layers)
 
 
+def add_compile_arg(ap: argparse.ArgumentParser) -> None:
+    ap.add_argument("--allow-compile", action="store_true",
+                    help="compile a graph missing from the compile cache here (neuronx-cc: minutes to hours per graph) "
+                         "instead of failing start-up")
+
+
+def compile_env(allow_compile: bool) -> dict[str, str]:
+    """The engines' environment for the compile cache: NEURON_LIBTORCH_ASSERT_CACHE_HIT=1 unless --allow-compile (then
+    0, which also overrides a 1 in the caller's environment)."""
+    return {CACHE_HIT_ENV: "0" if allow_compile else "1"}
+
+
+def cache_miss(e: BaseException | None) -> str | None:
+    """The line of `e`, or of an exception it chains (torch.compile wraps its backend's), in which libtorch-neuronx-lite
+    refuses to compile a graph missing from the compile cache ("NEURON_LIBTORCH_ASSERT_CACHE_HIT: compile cache miss for
+    key ..."); None if there is none."""
+    seen = set()
+    while e is not None and id(e) not in seen:
+        seen.add(id(e))
+        for line in str(e).splitlines():
+            if CACHE_HIT_ENV in line and "miss" in line.lower():
+                return line.strip()
+        e = e.__cause__ or e.__context__
+    return None
+
+
+def cache_miss_help() -> str:
+    root = os.environ.get("NEURON_LIBTORCH_CACHE_ROOT")
+    return ("A graph this engine needs is not in the compile cache "
+            f"(NEURON_LIBTORCH_CACHE_ROOT={root if root else 'unset: ~/.cache/neuron_libtorch'}), and the engine does "
+            "not compile on the serving host. The cache was most likely built for other engine arguments (the "
+            "arguments after `compile capture --` must be the server's), another checkpoint revision, another trnrt "
+            "version or another Neuron SDK; or NEURON_LIBTORCH_CACHE_ROOT does not point at it. Rebuild the cache for "
+            "this server (python -m trnrt compile), or pass --allow-compile to compile the missing graphs here "
+            "(minutes to hours per graph).")
+
+
 def cmd_engine(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="python -m trnrt engine", description="One engine and its OpenAI API.")
     add_engine_args(ap)
@@ -78,15 +121,25 @@ def cmd_engine(argv: list[str]) -> int:
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8001)
     ap.add_argument("--served-model-name", default="glm")
+    add_compile_arg(ap)
     a = ap.parse_args(argv)
     cfg = engine_config(argv, a.core_base)
+    os.environ.update(compile_env(a.allow_compile))  # before the engine spawns its ranks: they inherit it
     from .engine.engine import LLMEngine
     from .serve.api import build_app, serve
 
     t = time.perf_counter()
-    eng = LLMEngine(cfg)
-    print(f"engine up in {time.perf_counter() - t:.1f} s (cores {a.core_base}-{a.core_base + cfg.tp - 1})", flush=True)
-    w = eng.warmup()
+    try:
+        eng = LLMEngine(cfg)
+        print(f"engine up in {time.perf_counter() - t:.1f} s (cores {a.core_base}-{a.core_base + cfg.tp - 1})",
+              flush=True)
+        w = eng.warmup()
+    except Exception as e:
+        miss = cache_miss(e)
+        if miss is None:
+            raise
+        print(f"trnrt engine: {miss}\n{cache_miss_help()}", file=sys.stderr, flush=True)
+        return CACHE_MISS_STATUS
     print(f"bucket warmup {w['seconds']:.1f} s over {w['graphs']} graphs", flush=True)
     # The router keeps its connections to the engines alive and drops idle ones after 30 s: uvicorn closing them first
     # (its default keep-alive is 5 s) raced a request onto a closing connection.
@@ -116,24 +169,32 @@ def _without(argv: list[str], flag: str) -> list[str]:
     return out
 
 
-def _wait_healthy(urls: list[str], procs: list[subprocess.Popen]) -> None:
+def _start_failed(i: int, status: int) -> str:
+    if status == CACHE_MISS_STATUS:
+        return (f"engine {i} stopped at start-up: a graph it needs is not in the compile cache (its message above "
+                "names the key and the likely cause). Rebuild the cache for these arguments, or pass --allow-compile.")
+    return f"engine {i} exited during start-up (status {status}); see its log above"
+
+
+def _wait_healthy(url: str, procs: list[subprocess.Popen], timeout_s: float, poll_s: float) -> float:
+    """Wait for GET `url`/health to answer 200 and return the seconds that took. SystemExit (status 1, with the reason)
+    if one of `procs` (the engines started so far, engine i at index i) exits first, or after `timeout_s` (0: never)."""
     import httpx
 
     t0 = time.monotonic()
-    todo = list(urls)
-    while todo:
-        for p in procs:
+    while True:
+        for i, p in enumerate(procs):
             if p.poll() is not None:
-                raise SystemExit(f"an engine exited during start-up (status {p.returncode})")
-        for u in list(todo):
-            try:
-                if httpx.get(u + "/health", timeout=2).status_code == 200:
-                    todo.remove(u)
-                    print(f"{u} ready after {time.monotonic() - t0:.0f} s", flush=True)
-            except httpx.HTTPError:
-                pass
-        if todo:
-            time.sleep(5)
+                raise SystemExit(_start_failed(i, p.returncode))
+        try:
+            if httpx.get(url + "/health", timeout=2).status_code == 200:
+                return time.monotonic() - t0
+        except httpx.HTTPError:
+            pass
+        if timeout_s and time.monotonic() - t0 >= timeout_s:
+            raise SystemExit(f"{url} did not answer /health within --startup-timeout {timeout_s:g} s: stopping the "
+                             "engines")
+        time.sleep(poll_s)
 
 
 def cmd_serve(argv: list[str]) -> int:
@@ -144,12 +205,17 @@ def cmd_serve(argv: list[str]) -> int:
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8000, help="the router's port; engine i listens on port + 1 + i")
     ap.add_argument("--served-model-name", default="glm")
+    ap.add_argument("--startup-timeout", type=float, default=3600.0,
+                    help="seconds each engine has, from its start, to load and warm every graph and answer /health "
+                         "(0: no limit); past it every engine is stopped and serve exits 1")
+    add_compile_arg(ap)
     a = ap.parse_args(argv)
-    # Two engines whose ranks load collective graphs at the same moment collide in the runtime's collectives
-    # bootstrap: each graph's first call holds this host-wide lock (engine/start_lock.py).
-    env = dict(os.environ)
+    # The engines start one at a time, each healthy (its weights loaded, every graph warmed) before the next starts. The
+    # host-wide start lock stays on too (engine/start_lock.py: each graph's first call holds it): two engines whose
+    # ranks load collective graphs at the same moment collide in the runtime's collectives bootstrap.
+    env = dict(os.environ, **compile_env(a.allow_compile))
     env.setdefault("TRNRT_START_LOCK", os.path.join("/tmp", f"trnrt-start-lock-{a.port}"))
-    engine_argv = _without(argv, "--engines")
+    engine_argv = _without(_without(argv, "--engines"), "--startup-timeout")  # --allow-compile goes on: engine takes it
     procs: list[subprocess.Popen] = []
     urls = []
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(128 + signal.SIGTERM))  # unwind through the finally below
@@ -161,7 +227,8 @@ def cmd_serve(argv: list[str]) -> int:
             procs.append(subprocess.Popen(cmd, env=dict(env, TRNRT_START_LOCK_OWNER=f"engine{i}"),
                                           preexec_fn=_dies_with_parent))
             urls.append(f"http://127.0.0.1:{port}")
-        _wait_healthy(urls, procs)
+            s = _wait_healthy(urls[-1], procs, a.startup_timeout, HEALTH_POLL_S)
+            print(f"engine {i} ({urls[-1]}) ready after {s:.0f} s", flush=True)
         import uvicorn
 
         from .serve.router import Router, build_router_app
