@@ -702,6 +702,40 @@ def test_capture_refuses_arguments_the_engine_does_not_take(tmp_path, monkeypatc
         farm.check_engine_args(["--tp", "2"])  # --model is required
 
 
+def test_capture_stops_when_rank_0_fails(tmp_path, monkeypatch):
+    """Rank 0 runs alone first and writes the graphs every rank shares: when it fails, the other ranks do not run. A
+    later rank's failure stops nothing. The rank processes are stand-ins that exit as told."""
+    import dataclasses
+    import multiprocessing
+
+    from trnrt.compile import capture
+
+    @dataclasses.dataclass
+    class Cfg:
+        tp: int = 4
+
+    def run(failing):
+        started = []
+
+        class Process:
+            def __init__(self, target, args):
+                self.rank, self.exitcode = args[0], None
+
+            def start(self):
+                started.append(self.rank)
+
+            def join(self):
+                self.exitcode = 1 if self.rank == failing else 0
+
+        monkeypatch.setattr(multiprocessing, "get_context", lambda method: types.SimpleNamespace(Process=Process))
+        return started, capture.capture_all(Cfg(), str(tmp_path / "shapes"), str(tmp_path / "out"), procs=2)
+
+    started, s = run(failing=0)
+    assert started == [0] and s["failed_ranks"] == [(0, 1)] and s["skipped_ranks"] == [1, 2, 3]
+    started, s = run(failing=2)
+    assert started == [0, 1, 2, 3] and s["failed_ranks"] == [(2, 1)] and s["skipped_ranks"] == []
+
+
 # -- the capture itself (needs libtorch_neuronx_lite) -------------------------------------------------
 
 def tiny_engine_config(argv):
