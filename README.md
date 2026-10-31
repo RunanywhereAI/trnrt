@@ -29,7 +29,8 @@ docker build -f docker/Dockerfile \
   --build-arg TRNRT_REVISION=$(git rev-parse HEAD) -t trnrt .
 ```
 
-The build checks every Neuron piece trnRT imports (`docker/check_image.py`).
+The build checks every Neuron piece trnRT imports and its version, and that the image's transformers has `glm5_next`
+(`docker/check_image.py`).
 
 ### 2. Build the compile cache (CPU host)
 
@@ -39,19 +40,23 @@ config and safetensors headers (a few MB, read without downloading the weights) 
 ```bash
 OUT=/data/trnrt            # everything goes under one directory
 REV=<GLM-5.3-Flash commit>
-python -m trnrt compile shapes zai-org/GLM-5.3-Flash --revision $REV --out $OUT
-python -m trnrt compile decisions --model zai-org/GLM-5.3-Flash --revision $REV --out $OUT   # a few range reads per MoE layer
-python -m trnrt compile capture --out $OUT -- --model $OUT/shapes                            # every graph, all 32 ranks
-python -m trnrt compile compile --out $OUT --workers <cores / 2>                              # neuronx-cc on each graph
-python -m trnrt compile strip --out $OUT                                                      # drop the NEFFs' debug info
+mkdir -p $OUT/nki          # the NKI kernel binaries, shared by every step
+# each step: `python -m trnrt` in a new container of the image, with $OUT at the same path and $OUT/nki mounted
+trnrt() { docker run --rm -v $OUT:$OUT -v $OUT/nki:/var/tmp/nki-intermediate-cache trnrt "$@"; }
+trnrt compile shapes zai-org/GLM-5.3-Flash --revision $REV --out $OUT
+trnrt compile decisions --model zai-org/GLM-5.3-Flash --revision $REV --out $OUT   # a few range reads per MoE layer
+trnrt compile capture --out $OUT -- --model $OUT/shapes                            # every graph, all 32 ranks
+trnrt compile compile --out $OUT --workers <cores / 2>                              # neuronx-cc on each graph
+trnrt compile strip --out $OUT                                                      # drop the NEFFs' debug info
 ```
 
-Run `capture` and `compile` on the same host. A graph that calls an NKI kernel names the kernel's compiled binary by
-absolute path under `/var/tmp/nki-intermediate-cache`. The capture writes those binaries, and neuronx-cc adds its own
-kernels there while compiling. A compile on another host fails every such graph ("NKI kernel binaries missing") unless
-that directory comes along to the same path. To split the steps across hosts, copy `/var/tmp/nki-intermediate-cache`
-with the cache. A serving engine traces its graphs again and rewrites the directory; whether it needs the compile
-host's copy on a cache hit is [unverified].
+Each step is its own `docker run --rm`, so whatever a step leaves inside its container is gone by the next. A graph
+that calls an NKI kernel names the kernel's compiled binary by absolute path under `/var/tmp/nki-intermediate-cache`.
+The capture writes those binaries, and neuronx-cc adds its own kernels there while compiling. So `capture` and
+`compile` must see the same directory at that path: the host's `$OUT/nki`, mounted into every step above. Without it,
+or on another host without a copy of it, `compile` fails every such graph ("NKI kernel binaries missing"). To split the
+steps across hosts, copy `$OUT/nki` with the cache. A serving engine traces its graphs again and rewrites the
+directory; whether it needs the compile host's copy on a cache hit is [unverified], so `serve` below mounts it too.
 
 `strip` is not optional at 1M-token buckets: the runtime holds each loaded NEFF in host memory several times over, and
 two engines' unstripped NEFFs do not fit.
@@ -61,19 +66,31 @@ The arguments after `capture --` must be the ones the server runs with. The defa
 
 ### 3. Serve (trn2.48xlarge)
 
-Copy `$OUT/cache` to the serving host, download the checkpoint at the same revision, and start the server:
+Copy `$OUT/cache` and `$OUT/nki` to the serving host, download the checkpoint at the same revision, and start the
+server:
 
 ```bash
 docker run --rm --privileged --network host \
-  -v /data/trnrt/cache:/cache -v /models/GLM-5.3-Flash:/model \
+  -v /data/trnrt/cache:/cache -v /data/trnrt/nki:/var/tmp/nki-intermediate-cache -v /models/GLM-5.3-Flash:/model \
   -e NEURON_LIBTORCH_CACHE_ROOT=/cache \
   trnrt serve --model /model --port 8000
 ```
 
-`serve` starts two engines, on logical NeuronCores 0-31 and 32-63, each on port 8001 and 8002 of the host. Each loads its
-weights and warms every compiled graph from the cache before it answers. Then the router answers on `--port`. A
-graph missing from the cache is compiled on the spot, which takes minutes per graph: if start-up compiles, the cache was
-built for other arguments or another revision.
+`serve` starts two engines, on logical NeuronCores 0-31 and 32-63, on ports 8001 and 8002 of the host, one at a time:
+each loads its weights and warms every compiled graph from the cache, and the next starts once it answers `/health`.
+Then the router answers on `--port`.
+
+- **A graph missing from the cache fails start-up.** The engines run with `NEURON_LIBTORCH_ASSERT_CACHE_HIT=1`: instead
+  of compiling on the serving host (neuronx-cc, minutes to hours per graph), the engine stops and names the missing
+  key, and `serve` stops every engine and exits nonzero. The cache was built for other arguments, another checkpoint
+  revision, another trnRT version or another Neuron SDK, or `NEURON_LIBTORCH_CACHE_ROOT` does not point at it.
+  `--allow-compile` compiles the missing graphs on the spot instead; give it a `--startup-timeout` that allows for that
+  (0: none).
+- **`--startup-timeout`** (default 3600 s): how long each engine has, from its start, to answer `/health`. Past it,
+  `serve` stops every engine and exits nonzero.
+- The router's `/health` answers 200 while both engines are up, 200 with `"status": "degraded"` while one is (its
+  requests and sessions go to the other), and 503 while neither is. The body names the engines that are down.
+- SIGTERM (`docker stop`) stops the router, then each engine, and `serve` exits with status 143.
 
 ### 4. Use it
 
