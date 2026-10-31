@@ -1,10 +1,12 @@
 """The HTTP layer (trnrt/serve/api.py) over a scripted stand-in for the engine, so it runs anywhere in seconds.
 
 The stand-in implements exactly the engine API the server uses (add_request, has_work, step, abort, dead_ranks,
-close_failed, close, tokenizer, cfg.tp, scheduler, pool, radix) with real Request objects, and generates a fixed
-GLM-format output one token per step. Its tokenizer is a word-level one whose words are GLM's tags and a few phrases,
-decoded by plain concatenation, and whose chat template opens `<think>` in the prompt unless enable_thinking is false,
-as GLM-5.3-Flash's does. The real engine behind the same server: tests/test_api*.py.
+close_failed, close, tokenizer, cfg.tp, cfg.max_model_len, mcfg.vocab_size, scheduler, pool, radix) with real Request
+objects, and generates a fixed GLM-format output one token per step. Its tokenizer is a word-level one whose words are
+GLM's tags and a few phrases, decoded by plain concatenation, and whose chat template opens `<think>` in the prompt
+unless enable_thinking is false. That switch is the stand-in's: GLM-5.3-Flash's own template has no enable_thinking and
+always opens `<think>` (tests/test_glm53_template.py runs the server on it). The real engine behind the same server:
+tests/test_api*.py.
 """
 
 from __future__ import annotations
@@ -52,30 +54,35 @@ class ScriptedEngine:
 
     def __init__(self, script: list[int]):
         self.tokenizer = _tokenizer()
-        self.cfg = types.SimpleNamespace(tp=1)
+        self.cfg = types.SimpleNamespace(tp=1, max_model_len=64)
+        self.mcfg = types.SimpleNamespace(vocab_size=len(self.tokenizer))
         self.scheduler = types.SimpleNamespace(running=[], waiting=[], num_preemptions=0)
         self.pool = types.SimpleNamespace(num_usable=100, num_free=90)
         self.radix = types.SimpleNamespace(evictable_pages=4)
         self.script = script
         self.dead: list[int] = []
         self.aborted: list[str] = []
+        self.added: list[Request] = []
         self.closed = False
+        self.step_delay = 0.0
 
     def add_request(self, prompt_ids, params, rid=None, session_id=None):
         why = unsupported(params)  # the engine's own refusal (LLMEngine.add_request)
         if why:
             raise ValueError(f"{why} is not supported; send the request without it")
-        if len(prompt_ids) > 64:
+        if len(prompt_ids) >= self.cfg.max_model_len:
             raise ValueError(f"prompt of {len(prompt_ids)} tokens does not fit max_model_len=64")
         req = Request(rid, list(prompt_ids), params, session_id=session_id)
         req.num_cached_tokens = 2
         self.scheduler.running.append(req)
+        self.added.append(req)
         return req
 
     def has_work(self) -> bool:
         return bool(self.scheduler.running)
 
     def step(self) -> None:
+        time.sleep(self.step_delay)
         for req in list(self.scheduler.running):
             n = len(req.output_ids)
             t = self.script[n]
@@ -275,3 +282,157 @@ def test_a_dead_rank_turns_health_503_and_refuses_new_requests(serve):
     loop.thread.join(10)  # the loop's own check between steps fails the engine and ends the thread
     assert not loop.thread.is_alive() and loop.failed == "tensor-parallel rank(s) [1] exited"
     assert eng.closed and eng.aborted == []
+
+
+def test_request_fields_are_checked_before_the_engine(serve):
+    """api._params and EngineLoop.submit: a value the engine would only fail on in a step (numpy's seed, the int64
+    sampling arrays, the embedding's rows, a NaN reaching the device's top-k) is a 400 before anything is queued, since
+    at tp > 1 one failed step fails the engine for every request (tests/test_api_request_checks.py, on a real engine).
+    A null is the field's default."""
+    client, eng = serve(PLAIN)
+    base = {"prompt": [1, 2], "temperature": 1.0}
+    bad = [("seed", -1), ("seed", "abc"), ("seed", 1.5), ("seed", 2 ** 63), ("seed", True), ("top_k", 2 ** 63),
+           ("top_k", -2), ("top_k", "5"), ("temperature", -0.5), ("temperature", "hot"), ("top_p", 0), ("top_p", 1.5),
+           ("min_p", 2), ("max_tokens", 0), ("max_tokens", -3), ("max_tokens", "16"), ("logprobs", 1.5),
+           ("stop", ""), ("stop", [3]), ("stop_token_ids", [-1]), ("ignore_eos", "yes"), ("stream", "false"),
+           ("prompt", [-1]), ("prompt", [len(WORDS)]), ("prompt", [1, True]), ("min_tokens", 4),
+           ("include_stop_str_in_output", True), ("thinking_token_budget", "lots"), ("temperature", 10 ** 400)]
+    for field, value in bad:
+        r = client.post("/v1/completions", json={**base, field: value})
+        assert r.status_code == 400, (field, value, r.text)
+    for raw in (b'{"prompt": [1], "temperature": NaN}', b'{"prompt": [1], "top_p": Infinity}', b'{"prompt": [1],',
+                b'[1, 2]'):
+        r = client.post("/v1/completions", content=raw, headers={"content-type": "application/json"})
+        assert r.status_code == 400, (raw, r.text)
+    assert eng.added == []  # none reached the engine
+    ok = {**base, "seed": 2 ** 63 - 1, "top_k": 2 ** 63 - 1, "max_tokens": 4.0, "temperature": None, "top_p": None,
+          "min_p": None, "frequency_penalty": None, "prompt": [0, len(WORDS) - 1]}
+    r = client.post("/v1/completions", json=ok)
+    assert r.status_code == 200, r.text
+    p = eng.added[-1].params
+    assert (p.seed, p.top_k, p.max_new_tokens, p.temperature, p.top_p, p.min_p) == (2 ** 63 - 1, 2 ** 63 - 1, 4, 1.0,
+                                                                                    1.0, 0.0)
+    for k in (-1, 0):  # both turn top-k off
+        assert client.post("/v1/completions", json={**base, "top_k": k}).status_code == 200
+        assert eng.added[-1].params.top_k == 0
+    assert client.post("/v1/completions", json={"prompt": [1]}).status_code == 200
+    assert eng.added[-1].params.max_new_tokens == 16  # the OpenAI completions default
+
+
+def test_chat_fields_default_max_tokens_and_the_role_chunk(serve):
+    """Chat: max_tokens defaults to the rest of the context (no hidden small default that reasoning could use up);
+    top_logprobs needs logprobs; chat_template_kwargs is an object, cannot set apply_chat_template's own arguments and
+    names only variables the template reads (a top-level reasoning_effort too: the stand-in's template has none); the
+    first streamed chunk names the role, as OpenAI's does."""
+    client, eng = serve(PLAIN)
+    msg = {"messages": [{"role": "user", "content": "hi"}]}
+    r = client.post("/v1/chat/completions", json=msg)
+    assert r.status_code == 200, r.text
+    req = eng.added[-1]
+    assert req.params.max_new_tokens == eng.cfg.max_model_len - len(req.prompt_ids)
+    for extra in ({"top_logprobs": 3}, {"logprobs": "yes"}, {"chat_template_kwargs": "x"},
+                  {"chat_template_kwargs": {"tools": []}}, {"chat_template_kwargs": {"add_generation_prompt": False}},
+                  {"chat_template_kwargs": {"no_such_variable": 1}}, {"reasoning_effort": "low"},
+                  {"add_generation_prompt": False}, {"continue_final_message": True}):
+        r = client.post("/v1/chat/completions", json={**msg, **extra})
+        assert r.status_code == 400, (extra, r.text)
+    r = client.post("/v1/chat/completions", json={**msg, "top_logprobs": 0, "logprobs": False})
+    assert r.status_code == 200 and "logprobs" not in r.json()["choices"][0]
+    events = _events(client, {**msg, "stream": True})
+    assert events[0]["choices"][0] == {"index": 0, "delta": {"role": "assistant", "content": ""},
+                                       "finish_reason": None}
+
+
+def test_tool_choice_required_or_named_is_refused(serve):
+    """No guided decoding runs, so "required" and a named function cannot be enforced: 400, never a 200 with whatever
+    the model chose. "auto" and "none" are served."""
+    client, eng = serve(PLAIN)
+    msg = {"messages": [{"role": "user", "content": "x"}], "tools": TOOLS}
+    for choice in ("required", {"type": "function", "function": {"name": "get_weather"}}):
+        r = client.post("/v1/chat/completions", json={**msg, "tool_choice": choice})
+        assert r.status_code == 400 and "guided decoding" in r.text, (choice, r.text)
+    for choice in ("auto", "none", None):
+        assert client.post("/v1/chat/completions", json={**msg, "tool_choice": choice}).status_code == 200
+    assert len(eng.added) == 3
+
+
+def test_a_tool_call_cut_off_by_max_tokens_finishes_length(serve):
+    """A call the token limit cut short is returned with finish_reason "length", streamed or not, so an agent does not
+    run a truncated call as complete; a call the model finished is "tool_calls"."""
+    client, _ = serve(TOOL_TURN)
+    body = {"messages": [{"role": "user", "content": "weather?"}], "tools": TOOLS, "max_tokens": len(TOOL_TURN) - 2}
+    r = client.post("/v1/chat/completions", json=body)
+    choice = r.json()["choices"][0]
+    assert choice["message"].get("tool_calls") and choice["finish_reason"] == "length", choice
+    events = _events(client, {**body, "stream": True})
+    assert any(e["choices"][0]["delta"].get("tool_calls") for e in events)
+    assert events[-1]["choices"][0]["finish_reason"] == "length"
+    r = client.post("/v1/chat/completions", json={**body, "max_tokens": len(TOOL_TURN)})
+    assert r.json()["choices"][0]["finish_reason"] == "tool_calls"
+
+
+def test_engine_errors_are_5xx_and_refusals_400(serve):
+    """An error inside the engine is the server's (500; 503 once the engine has failed: the dead-rank test above), so
+    SDKs retry it and the router can fail over; a request the engine refuses stays 400."""
+    client, eng = serve(PLAIN)
+    real_step = eng.step
+
+    def failing_step():
+        raise RuntimeError("device fault")
+    eng.step = failing_step
+    r = client.post("/v1/completions", json={"prompt": [1], "max_tokens": 4})
+    assert r.status_code == 500 and "device fault" in r.text, r.text
+    eng.step = real_step
+    real_add = eng.add_request
+
+    def failing_add(*a, **k):
+        raise RuntimeError("allocator bug")
+    eng.add_request = failing_add
+    assert client.post("/v1/completions", json={"prompt": [1]}).status_code == 500
+    eng.add_request = real_add
+    assert client.post("/v1/completions", json={"prompt": [1]}).status_code == 200  # tp 1: the engine still serves
+    assert client.post("/v1/completions", json={"prompt": [1] * 64}).status_code == 400  # does not fit
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_a_client_that_disconnects_aborts_its_request(stream):
+    """Non-streaming too: nothing cancels a plain response's handler when its client goes away, so without the server's
+    own watch the request would hold its seat until max_tokens. Real uvicorn (the TestClient never disconnects)."""
+    import socket
+    import threading
+
+    import uvicorn
+
+    from trnrt.serve import api
+
+    eng = ScriptedEngine(PLAIN * 40)
+    eng.step_delay = 0.05  # 160 tokens: 8 s to finish on its own
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    srv = uvicorn.Server(uvicorn.Config(api.build_app(eng, "glm"), host="127.0.0.1", port=port, log_level="warning"))
+    th = threading.Thread(target=srv.run, daemon=True)
+    th.start()
+    try:
+        deadline = time.monotonic() + 30
+        while not srv.started and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert srv.started
+        body = json.dumps({"prompt": [1], "max_tokens": 160, "stream": stream}).encode()
+        c = socket.create_connection(("127.0.0.1", port))
+        c.sendall(b"POST /v1/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+                  b"Content-Length: %d\r\n\r\n%s" % (len(body), body))
+        deadline = time.monotonic() + 10
+        while not eng.scheduler.running and time.monotonic() < deadline:
+            time.sleep(0.02)
+        (req,) = eng.scheduler.running
+        c.close()
+        deadline = time.monotonic() + 3
+        while not eng.aborted and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert eng.aborted == [req.rid] and len(req.output_ids) < 160
+    finally:
+        srv.should_exit = True
+        th.join(timeout=30)
+        for lp in [lp for lp in api._LOOPS if lp.engine is eng]:
+            lp.stop()
