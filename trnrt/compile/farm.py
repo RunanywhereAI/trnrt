@@ -2,7 +2,7 @@
 
     python -m trnrt compile shapes zai-org/GLM-5.3-Flash --revision <commit>
     python -m trnrt compile decisions --model zai-org/GLM-5.3-Flash --revision <commit>
-    python -m trnrt compile capture -- <the serve arguments>
+    python -m trnrt compile capture -- <the server's engine arguments>
     python -m trnrt compile compile
     python -m trnrt compile strip
 
@@ -17,8 +17,9 @@ Every step works in one directory, --out (default ~/.cache/trnrt; trnrt/compile/
   reads (a few tensors per MoE layer) into the shape directory. The capture refuses to guess them.
 - capture: every graph the served engine runs, one process per tensor-parallel rank on the meta
   device (no NeuronCore needed): graph.hlo, the metadata and command.txt per cache entry under
-  <out>/cache/neuron/compile_cache/<key>/, and the run's records under <out>/capture/. The serve
-  arguments after `--` must be the ones the server will run with, and the serving host must load
+  <out>/cache/neuron/compile_cache/<key>/, and the run's records under <out>/capture/. The
+  arguments after `--` must be the engine arguments the server will run with (capture refuses any
+  other, since the engine's parser would drop it unseen), and the serving host must load
   the checkpoint revision the shape directory was read at: the cache keys hash the shapes, the
   compiler arguments and the package versions.
 - compile: neuronx-cc on every captured entry that has no NEFF yet, longest HLO first, each in LNL's
@@ -375,12 +376,30 @@ def cmd_decisions(a, dirs) -> int:
     return 0
 
 
+def check_engine_args(argv: list[str]) -> None:
+    """Refuse capture arguments the engine does not take. engine_config reads its arguments with
+    parse_known_args, since the server hands it its own as well, so it drops one it does not know:
+    a mistyped bucket ladder would capture the default ladder's graphs. Here every argument must be
+    an engine argument (trnrt/__main__.py add_engine_args), spelled out in full."""
+    from ..__main__ import add_engine_args
+
+    ap = argparse.ArgumentParser(prog="python -m trnrt compile capture --", allow_abbrev=False, add_help=False)
+    add_engine_args(ap)
+    _, unknown = ap.parse_known_args(argv)
+    if unknown:
+        raise SystemExit(f"capture: not engine arguments: {shlex.join(unknown)}. After `--` come the engine arguments "
+                         "the server runs with, spelled out in full (the engine group of `python -m trnrt serve "
+                         "--help`); the server's own, such as --engines and --port, do not change the graphs: leave "
+                         "them out")
+
+
 def cmd_capture(a, dirs, engine_config) -> int:
     from . import capture
 
     if engine_config is None:
         raise SystemExit("capture needs the serve command line's engine_config(argv) -> EngineConfig "
                          "(trnrt/__main__.py passes it to main)")
+    check_engine_args(list(a.serve))
     shape_dir = a.shape_dir or dirs["shapes"]
     if not os.path.exists(os.path.join(shape_dir, capture.HEADERS)):
         raise SystemExit(f"{shape_dir}: no {capture.HEADERS}; write the shape directory first (`shapes`)")
@@ -474,7 +493,7 @@ def build_parser() -> argparse.ArgumentParser:
     cp.add_argument("--procs", type=int, default=None,
                     help="rank processes at once after rank 0 (default: tp, at most half the CPUs)")
     cp.add_argument("--target", default="trn2", help="the Neuron target to compile for (default %(default)s)")
-    cp.add_argument("serve", nargs=argparse.REMAINDER, help="-- then the serve arguments")
+    cp.add_argument("serve", nargs=argparse.REMAINDER, help="-- then the engine arguments the server runs with")
 
     c = sub.add_parser("compile", help="neuronx-cc on every captured entry without a NEFF")
     common(c)
