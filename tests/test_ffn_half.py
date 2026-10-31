@@ -416,6 +416,25 @@ def fp8_layer(E=8, H=256, Is=8, seed=0):
     return layer
 
 
+def test_pack_returns_fn_in_the_kernels_layout():
+    """FH.pack's "fn" is the layout the kernel's front reads (mhc_fnj.fn_j of the raw [O, hc H] fn, the copy
+    models/hybrid.py makes at load as hc_ffn_fnj, which decode_args hands the kernel), one element placed by hand: the
+    raw fn would put it elsewhere (control)."""
+    from trnrt.kernels import mhc_fnj as MF
+
+    E, H, Is, hc = 8, 256, 8, 4
+    O, F = 2 * hc + hc * hc, hc * H
+    L = fp8_layer(E, H, Is)
+    fn = torch.zeros(O, F, dtype=torch.bfloat16)
+    fn[5, 3 * (F // P) + 2] = 1.0  # o 5, p 3, j 2 -> [p, j, o] = [3, 2, 5]
+    b = FH.pack(L.router, L.router_bias, L.shared_gate_up, L.shared_gate_up_scale, L.shared_down, L.shared_down_scale,
+                fn, torch.ones(H), torch.zeros(O), torch.ones(3), npg=2)
+    assert b["fn"].shape == (P, F // P, O) and b["fn"].dtype == torch.bfloat16
+    assert b["fn"][3, 2, 5] == 1 and b["fn"].float().abs().sum() == 1
+    assert torch.equal(b["fn"], MF.fn_j(fn))
+    assert b["fn"].shape != fn.shape  # the raw layout is [O, hc H]
+
+
 def test_fill_lays_out_the_loaded_weights(monkeypatch):
     """Every unit of the packed copies against quant.dequant of the loaded weights (model._w's read): the router as
     [i, c, e] = W_r[e, c 128 + i]; program p's gate_up [i, c, j] = Wgu[row_p(j), c 128 + i] with its gate rows, then
@@ -570,7 +589,6 @@ def _ffn_case(T: int, npg: int, seed: int = 5):
     """A stand-in MoE layer (FP8 shared expert with block scales, the routed experts in the tile blob, the FFN block's
     hyper-connection) and the call's inputs: the streams and the attention output's pending mix."""
     from tests.test_moe_dedupe import experts128
-    from trnrt.kernels import mhc_fnj as MF
 
     g = torch.Generator().manual_seed(seed)
     layer = fp8_layer(E, H, IS, seed)
@@ -585,7 +603,6 @@ def _ffn_case(T: int, npg: int, seed: int = 5):
     blobs = FH.pack(layer.router, layer.router_bias, layer.shared_gate_up, layer.shared_gate_up_scale,
                     layer.shared_down, layer.shared_down_scale, layer.hc_ffn_fn, layer.post_norm, layer.hc_ffn_base,
                     layer.hc_ffn_scale, npg=npg)
-    blobs["fn"] = MF.fn_j(layer.hc_ffn_fn)  # the kernel's front reads fn j-major (mhc_fnj)
     S = (torch.randn(T, HC, H, generator=g) * 0.5).bfloat16()
     pend = (torch.rand(T, HC, generator=g) * 2, torch.softmax(torch.randn(T, HC, HC, generator=g), -1),
             (torch.randn(npg, T, H, generator=g) * 0.3).bfloat16())

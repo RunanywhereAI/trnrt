@@ -43,8 +43,9 @@ def pack(router, router_bias, shared_gate_up, shared_gate_up_scale, shared_down,
          base, scale, *, npg: int) -> dict:
     """The kernel's weights for npg programs, from the loaded tensors: {torch.bfloat16: bb, torch.float32: bf} (the
     MoE half's packed blobs, built by moe_half.fill itself, so its bits) plus the FFN hyper-connection as the kernel
-    reads it: fn bf16 [2 hc + hc^2, hc H] (mhc_pre's raw layout), post_norm bf16 [H], base fp32 [2 hc + hc^2],
-    scale fp32 [3]. The shared expert is FP8 with its block scales, the router bf16, its bias fp32."""
+    reads it: fn given in mhc_pre's raw layout bf16 [2 hc + hc^2, hc H] and returned j-major (mhc_fnj.fn_j, the copy
+    models/hybrid.py makes at load as hc_ffn_fnj: the kernel's front reads that layout), post_norm bf16 [H], base fp32
+    [2 hc + hc^2], scale fp32 [3]. The shared expert is FP8 with its block scales, the router bf16, its bias fp32."""
     E, H = router.shape
     Is = shared_gate_up.shape[0] // 2
     layer = torch.nn.Module()
@@ -53,7 +54,9 @@ def pack(router, router_bias, shared_gate_up, shared_gate_up_scale, shared_down,
     layer.shared_down, layer.shared_down_scale = shared_down, shared_down_scale
     SH.register_packed(layer, MH.PREFIX, MH.shapes(E, H, Is, npg))
     MH.fill(layer, BF16, npg=npg)
-    return {BF16: layer.mh_blob_bf16.data, F32: layer.mh_blob_f32.data, "fn": fn.to(BF16).contiguous(),
+    from .mhc_fnj import fn_j
+
+    return {BF16: layer.mh_blob_bf16.data, F32: layer.mh_blob_f32.data, "fn": fn_j(fn.to(BF16)),
             "post_norm": post_norm.to(BF16).contiguous(), "base": base.float().contiguous(),
             "scale": scale.float().contiguous()}
 
