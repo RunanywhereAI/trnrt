@@ -153,7 +153,7 @@ def device_graph():
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(allow_abbrev=False)
     ap.add_argument("--device", action="store_true", help="also run a graph on a NeuronCore")
     args = ap.parse_args()
 
