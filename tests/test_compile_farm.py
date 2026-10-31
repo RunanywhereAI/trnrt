@@ -189,6 +189,30 @@ def test_compile_command_line_compiles_the_pending_entries(tmp_path, capsys):
     assert cache.pending(str(root)) == []
 
 
+def test_compile_and_strip_refuse_an_out_with_nothing_to_do(tmp_path):
+    """A missing or mistyped --out, or a step run before the one that feeds it, is an error, not a run over nothing."""
+    from trnrt.compile import farm
+
+    cc = _fake_cc(tmp_path)
+    out = tmp_path / "out"
+    root = out / "cache" / "neuron" / "compile_cache"
+
+    def refused(cmd, why):
+        with pytest.raises(SystemExit, match=why):
+            farm.main([*cmd, "--out", str(out)])
+
+    refused(["compile", "--neuronx-cc", cc], "no captured entries")  # no --out at all
+    refused(["strip"], "no compiled entries")
+    root.mkdir(parents=True)
+    refused(["compile", "--neuronx-cc", cc], "no captured entries")
+    refused(["strip"], "no compiled entries")
+    _captured(root, "a" * 32)
+    refused(["strip"], "no compiled entries")  # captured, not compiled
+    assert farm.main(["compile", "--out", str(out), "--neuronx-cc", cc]) == 0
+    assert farm.main(["compile", "--out", str(out), "--neuronx-cc", cc]) == 0  # all compiled: nothing left to do
+    assert farm.main(["strip", "--out", str(out)]) == 1  # strip reaches the entry: the stand-in NEFF is no tar.gz
+
+
 def test_an_incomplete_entry_fails_alone_run_after_run(tmp_path, capsys):
     """A capture killed between graph.hlo and command.txt leaves an entry with no command, or a cut one: each run
     reports it and goes on with the others, and exits nonzero. A killed capture's lowering directory is no entry."""
