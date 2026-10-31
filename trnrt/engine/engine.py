@@ -128,8 +128,7 @@ def build_shard(cfg: EngineConfig, path: str, num_pages: int, rank: int = 0):
     keep_fp8 = mcfg.quant_block is not None or mcfg.quant_expert_block is not None
     model = load_model(path, mcfg, cfg.dtype, device, cfg.max_model_len, rank, cfg.tp, group,
                        keep_fp8=keep_fp8, fp8_max=fp8_e4m3_max(device), vocab_parallel=True,
-                       moe_kernel=cfg.resolved_moe_kernel(), attn_tp=atp, attn_group=attn_group,
-                       max_num_seqs=cfg.max_num_seqs)
+                       moe_kernel=cfg.resolved_moe_kernel(), attn_tp=atp, attn_group=attn_group)
     if cp_group is not None:
         model.cp_group = cp_group
     runner = ModelRunner(model, mcfg, cfg, num_pages, device, kv_heads=model.nkv, model_path=path)
