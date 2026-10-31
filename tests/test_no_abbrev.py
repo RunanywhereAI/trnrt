@@ -12,9 +12,6 @@ import os
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DIRS = ("trnrt", "tools", "docker")
-# Its parsers change with the compile pipeline's own fix (which parses capture's engine arguments strictly); remove it
-# from here with that change.
-EXEMPT = {"trnrt/compile/farm.py"}
 
 
 def abbreviating(src: str, where: str) -> list[str]:
@@ -38,7 +35,7 @@ def test_every_parser_refuses_abbreviations():
         for dirpath, _, files in os.walk(os.path.join(ROOT, d)):
             for fn in files:
                 rel = os.path.relpath(os.path.join(dirpath, fn), ROOT)
-                if fn.endswith(".py") and rel not in EXEMPT:
+                if fn.endswith(".py"):
                     with open(os.path.join(ROOT, rel)) as f:
                         src = f.read()
                     seen += src.count("ArgumentParser(")
