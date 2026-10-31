@@ -8,6 +8,12 @@ requires. The files below include source from other projects, each under its own
 | Path | Origin | License | Changes |
 |---|---|---|---|
 
+## Data included in this repository
+
+| Path | Origin | License | Changes |
+|---|---|---|---|
+| `tests/fixtures/GLM-5.3-Flash-config.json` | `config.json` of zai-org/GLM-5.3-Flash at revision eb9eb208eb0d988989d07a6a12d0fdeb5f52574a, https://huggingface.co/zai-org/GLM-5.3-Flash | MIT | none (byte-identical) |
+
 ## Designs followed, no source copied
 
 These are implemented here from their published descriptions or reference code, without copying source; they are listed
