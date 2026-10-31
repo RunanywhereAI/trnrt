@@ -42,7 +42,7 @@ REV=<GLM-5.3-Flash commit>
 python -m trnrt compile shapes zai-org/GLM-5.3-Flash --revision $REV --out $OUT
 python -m trnrt compile decisions --model zai-org/GLM-5.3-Flash --revision $REV --out $OUT   # a few range reads per MoE layer
 python -m trnrt compile capture --out $OUT -- --model $OUT/shapes                            # every graph, all 32 ranks
-python -m trnrt compile compile --out $OUT --workers <cores / 2>                              # neuronx-cc on each graph
+python -m trnrt compile compile --out $OUT                                                    # neuronx-cc on each graph
 python -m trnrt compile strip --out $OUT                                                      # drop the NEFFs' debug info
 ```
 
@@ -52,6 +52,9 @@ kernels there while compiling. A compile on another host fails every such graph 
 that directory comes along to the same path. To split the steps across hosts, copy `/var/tmp/nki-intermediate-cache`
 with the cache. A serving engine traces its graphs again and rewrites the directory; whether it needs the compile
 host's copy on a cache hit is [unverified].
+
+`compile` runs as many neuronx-cc processes at once as host memory admits. One can take tens of GB, so each
+reserves `--mem-per-compile-gb` (default 30) of MemAvailable, and one the OOM killer takes runs once more, alone.
 
 `strip` is not optional at 1M-token buckets: the runtime holds each loaded NEFF in host memory several times over, and
 two engines' unstripped NEFFs do not fit.
