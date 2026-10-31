@@ -468,7 +468,7 @@ def cmd_strip(a, dirs) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(prog="python -m trnrt compile", description=__doc__,
+    ap = argparse.ArgumentParser(prog="python -m trnrt compile", description=__doc__, allow_abbrev=False,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
@@ -477,14 +477,14 @@ def build_parser() -> argparse.ArgumentParser:
                        help="the pipeline's work directory: shapes/, capture/ and the cache root cache/ "
                             "(default %(default)s)")
 
-    sh = sub.add_parser("shapes", help="config and safetensors headers of a checkpoint")
+    sh = sub.add_parser("shapes", allow_abbrev=False, help="config and safetensors headers of a checkpoint")
     common(sh)
     sh.add_argument("model", help="a Hugging Face repo id, or a local checkpoint directory")
     sh.add_argument("--revision", default=None, help="the repo's commit (default: its default branch, resolved "
                                                      "and printed)")
     sh.add_argument("--shape-dir", default=None, help="default <out>/shapes")
 
-    dc = sub.add_parser("decisions", help="the load-time decisions that read weight values")
+    dc = sub.add_parser("decisions", allow_abbrev=False, help="the load-time decisions that read weight values")
     common(dc)
     dc.add_argument("--model", required=True, help="a Hugging Face repo id (range reads) or a local checkpoint dir")
     dc.add_argument("--revision", default=None, help="the repo's commit (default: its current one, recorded)")
@@ -494,7 +494,7 @@ def build_parser() -> argparse.ArgumentParser:
     dc.add_argument("--layers", default=None, help="comma list of layer prefixes (default: every MoE layer)")
     dc.add_argument("--procs", type=int, default=16, help="worker processes (default %(default)s)")
 
-    cp = sub.add_parser("capture", help="every graph the engine runs, on the meta device")
+    cp = sub.add_parser("capture", allow_abbrev=False, help="every graph the engine runs, on the meta device")
     common(cp)
     cp.add_argument("--shape-dir", default=None, help="default <out>/shapes")
     cp.add_argument("--ranks", default="all", help="all, or a comma list")
@@ -503,7 +503,7 @@ def build_parser() -> argparse.ArgumentParser:
     cp.add_argument("--target", default="trn2", help="the Neuron target to compile for (default %(default)s)")
     cp.add_argument("serve", nargs=argparse.REMAINDER, help="-- then the engine arguments the server runs with")
 
-    c = sub.add_parser("compile", help="neuronx-cc on every captured entry without a NEFF")
+    c = sub.add_parser("compile", allow_abbrev=False, help="neuronx-cc on every captured entry without a NEFF")
     common(c)
     c.add_argument("--workers", type=int, default=None,
                    help="most compiles at once (default: one per CPU); host memory admits fewer: "
@@ -518,7 +518,7 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--neuronx-cc", default=None, help="the compiler (default: neuronx-cc on PATH)")
     c.add_argument("--log", default=None, help="also append each result as a JSON line to this file")
 
-    st = sub.add_parser("strip", help="drop the NEFFs' debug info, in place")
+    st = sub.add_parser("strip", allow_abbrev=False, help="drop the NEFFs' debug info, in place")
     common(st)
     st.add_argument("--keys", default=None, help="only these keys (comma list)")
     st.add_argument("--keys-file", default=None, help="only these keys (a capture's keys.json)")
