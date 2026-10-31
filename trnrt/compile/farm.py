@@ -169,7 +169,11 @@ def run_compile(entry: str, *, work_root: str | None = None, neuronx_cc: str | N
     """Compile `entry`'s graph.hlo with its own compiler arguments into the entry: the NEFF, the log
     and command.txt, then the completion marker LAST, which makes it an LNL cache hit."""
     key = cache.key_of(entry)
-    target, args = entry_args(entry)
+    try:
+        target, args = entry_args(entry)
+    except (OSError, ValueError) as err:  # a capture killed after renaming graph.hlo into place, before command.txt
+        return Result(key, False, 0.0, -1, error=f"{type(err).__name__}: {err}: an incomplete entry; remove {entry} "
+                                                 "and run capture again")
     hlo = os.path.join(entry, HLO)
     neff, log = os.path.join(entry, neff_name(key)), os.path.join(entry, LOG)
     cc = neuronx_cc or shutil.which("neuronx-cc")
@@ -181,8 +185,10 @@ def run_compile(entry: str, *, work_root: str | None = None, neuronx_cc: str | N
         return Result(key, False, 0.0, -1, args=args,
                       error=f"{len(gone)} NKI kernel binaries missing, e.g. {gone[0]}: compile on the host that "
                             "captured, or copy its NKI kernel directory here")
-    with open(os.path.join(entry, COMMAND), "w") as f:
+    tmp = os.path.join(entry, f"{COMMAND}.tmp-{os.getpid()}")
+    with open(tmp, "w") as f:
         f.write(shlex.join(cmd))
+    os.replace(tmp, os.path.join(entry, COMMAND))  # a kill here must not leave the entry without its command
     # neuronx-cc leaves its scratch tree (neuronxcc-<random>) in the cwd; its stderr goes to a file there,
     # not a pipe, which a long error report could fill and block the compiler on.
     cwd = tempfile.mkdtemp(prefix=f"ncc-{key[:8]}-", dir=work_root)
@@ -227,13 +233,20 @@ def oom_killed(r: Result) -> bool:
 def compile_entries(entries: list[str], workers: int, work_root: str | None = None,
                     neuronx_cc: str | None = None, on_result=None) -> list[Result]:
     """run_compile over `entries`, `workers` at once, the largest graph.hlo first (size is the best
-    cheap proxy for compile time), so the tail of the batch is short graphs."""
+    cheap proxy for compile time), so the tail of the batch is short graphs. An entry that fails, by
+    an exception too, fails alone: its Result says why and the others go on."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def one(d):
+        try:
+            return run_compile(d, work_root=work_root, neuronx_cc=neuronx_cc)
+        except Exception as err:  # that entry's failure: the others go on
+            return Result(cache.key_of(d), False, 0.0, -1, error=f"{type(err).__name__}: {err}")
 
     todo = sorted(entries, key=lambda d: -os.path.getsize(os.path.join(d, HLO)))
     results = []
     with ThreadPoolExecutor(max(1, workers)) as pool:
-        futs = [pool.submit(run_compile, d, work_root=work_root, neuronx_cc=neuronx_cc) for d in todo]
+        futs = [pool.submit(one, d) for d in todo]
         for f in as_completed(futs):
             r = f.result()
             results.append(r)
