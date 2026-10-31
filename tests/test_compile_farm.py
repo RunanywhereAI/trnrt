@@ -489,8 +489,8 @@ def tiny_engine_config(argv):
     """engine_config for the capture test: the serve arguments are the model path alone."""
     from trnrt.config import EngineConfig
 
-    return EngineConfig(model_path=argv[0], device="neuron", dtype=torch.bfloat16, tp=2, page_size=4,
-                        kv_cache_gb=0.01, max_num_seqs=2, max_model_len=64, max_prefill_tokens=8,
+    return EngineConfig(model_path=argv[0], device="neuron", dtype=torch.bfloat16, tp=2, page_size=8,
+                        kv_cache_dtype="fp8", kv_cache_gb=0.01, max_num_seqs=2, max_model_len=64, max_prefill_tokens=8,
                         decode_batch_buckets=(2,), prefill_token_buckets=(8,), page_buckets=(2,))
 
 
@@ -504,7 +504,9 @@ def test_capture_tp2_writes_one_entry_per_graph(tmp_path):
     from trnrt.compile import capture, farm
 
     ckpt, out = tmp_path / "ckpt", tmp_path / "out"
-    c = glm_config(dense_mlps=4)  # every MLP dense: no routed experts, so no load-time decisions
+    # every MLP dense: no routed experts, so no load-time decisions. At tp=2 the DSA caches are context-parallel:
+    # hidden a multiple of 512, pages of kpool x cp = 8 tokens and an FP8 KV cache (tiny_engine_config), as served.
+    c = glm_config(dense_mlps=4, hidden=512)
     c.pop("quantization_config")
     model = tf.Glm5NextForConditionalGeneration(tf.Glm5NextConfig(
         text_config=c["text_config"], vision_config=dict(depth=1, hidden_size=32, intermediate_size=64, num_heads=2,
