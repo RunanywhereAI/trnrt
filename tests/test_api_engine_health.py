@@ -4,7 +4,8 @@ down without aborting its requests. Without this, the engine thread could die in
 offload broadcast into the dead workers) while /health kept answering 200, and clients kept sending into a dead engine.
 
 A tiny random GLM-5.3-Flash-architecture model (tests/test_glm5_next.py) at tp=2 over gloo on CPU; prompts are token
-ids.
+ids. At attention TP 2 the DSA caches are context-parallel, so the model takes the served form's constraints (hidden a
+multiple of 512, pages of kpool x cp = 8 tokens, an FP8 KV cache; test_glm5_next.test_tp2_matches_tp1).
 """
 
 from __future__ import annotations
@@ -29,10 +30,10 @@ def _server(tmp_path):
     from trnrt.serve import api
 
     glm = pytest.importorskip("tests.test_glm5_next")
-    glm.build(str(tmp_path))
+    glm.build(str(tmp_path), hidden_size=512)
     _save_tokenizer(tmp_path, 384)
     faulthandler.dump_traceback_later(HANG_S, exit=True)
-    eng = glm.engine(str(tmp_path), tp=2)
+    eng = glm.engine(str(tmp_path), tp=2, page_size=8, kv_cache_dtype="fp8")
     try:
         with TestClient(api.build_app(eng, "test-model")) as c:
             loop = next(lp for lp in api._LOOPS if lp.engine is eng)
