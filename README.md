@@ -94,11 +94,22 @@ curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -
 
 - `session_id` pins a conversation to one engine, so each turn resumes from the prefix cache. Without it, the router
   routes by the longest prefix it has sent to each engine.
-- Reasoning comes back as `reasoning_content`, and tool calls as OpenAI `tool_calls`. Pass
-  `"chat_template_kwargs": {"enable_thinking": false}` to turn reasoning off.
+- Reasoning comes back as `reasoning_content`, and tool calls as OpenAI `tool_calls`.
+- GLM-5.3-Flash always reasons: its chat template has no switch to turn thinking off, so
+  `"chat_template_kwargs": {"enable_thinking": false}` is refused. `"reasoning_effort"` sets how hard it reasons:
+  `"low"`, `"high"` or `"max"`, the default. Other values are refused, since the template would answer them at max.
+- `max_tokens` counts reasoning too. Without it, a chat request may generate up to the rest of the context
+  (`--max-model-len` minus the prompt), as vLLM does; a completion stops at 16 tokens, the OpenAI API's default.
+- A response cut off by `max_tokens` has `finish_reason` `"length"`, even when it ends in a tool call: that call may
+  be incomplete.
+- A client that disconnects aborts its request, streamed or not.
 - Endpoints: `/v1/chat/completions`, `/v1/completions`, `/v1/models`, `/health`, `/metrics` (Prometheus).
-- Not supported, answered with 400: repetition, frequency and presence penalties, guided decoding, prompt logprobs and
-  thinking budgets. Every graph samples on the device, and these need host inputs no served graph takes.
+- Not supported, answered with 400: repetition, frequency and presence penalties, guided decoding (`response_format`
+  other than text, `tool_choice` `"required"` or a named tool), prompt logprobs and thinking budgets. Every graph
+  samples on the device, and these need host inputs no served graph takes.
+- Status codes: 400 for a request that cannot be served as sent (a field of the wrong type or out of range, a prompt
+  longer than the context, a chat template variable the template never reads); 500 for an error inside the engine;
+  503 once the engine has failed, with the reason on `/health`.
 
 ## Configuration
 

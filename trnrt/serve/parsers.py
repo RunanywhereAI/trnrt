@@ -252,34 +252,25 @@ def template_messages(messages: list, developer_to_system: bool = False) -> list
     return out
 
 
-def tool_choice_error(tool_choice, tools) -> str | None:
-    """vLLM's checks of tool_choice (chat_completion/protocol.py check_tool_usage, v0.30.0),
-    without its refusal of tool_choice auto / required when no tools are sent."""
-    if tool_choice is None or tool_choice in ("none", "auto", "required"):
+def tool_choice_error(tool_choice) -> str | None:
+    """None for the tool_choice values this server honours, "none" and "auto" (or absent), else why not. "required" and
+    a named function are what vLLM enforces with guided decoding, which no served graph runs: accepting them would
+    answer 200 with whatever the model chose, so they are refused. vLLM's check (chat_completion/protocol.py
+    check_tool_usage, v0.30.0) without its refusal of "auto" when no tools are sent."""
+    if tool_choice is None or tool_choice in ("none", "auto"):
         return None
-    if not isinstance(tool_choice, dict):
-        return (f"Invalid value for `tool_choice`: {tool_choice}! Only named tools, \"none\", \"auto\" "
-                "or \"required\" are supported.")
-    usage = 'Correct usage: `{"type": "function", "function": {"name": "my_function"}}`'
-    function = tool_choice.get("function")
-    if not isinstance(function, dict):
-        return f"Invalid value for `function`: `{function}` in `tool_choice`! {usage}"
-    if "name" not in function:
-        return f"Expected field `name` in `function` in `tool_choice`! {usage}"
-    name = function["name"]
-    if not isinstance(name, str) or not name:
-        return f"Invalid `name` in `function`: `{name}` in `tool_choice`! {usage}"
-    if not tools:
-        return "When using `tool_choice`, `tools` must be set."
-    if not any((t.get("function") or {}).get("name") == name for t in tools if isinstance(t, dict)):
-        return "The tool specified in `tool_choice` does not match any of the specified `tools`"
-    return None
+    if tool_choice == "required" or isinstance(tool_choice, dict):
+        return ("`tool_choice` \"required\" and named tools are not supported: they need guided decoding, which this "
+                "server does not run. Send \"auto\" or \"none\".")
+    return f"Invalid value for `tool_choice`: {tool_choice}! Only \"none\" and \"auto\" are supported."
 
 
-def chat_finish_reason(finish: str | None, called: bool, tool_choice) -> str | None:
-    """vLLM chat_completion/serving.py: "tool_calls" once a call was parsed, except for a named
-    tool_choice, which keeps the engine's reason ("stop"), as OpenAI's API does."""
-    if finish is not None and called and not isinstance(tool_choice, dict):
+def chat_finish_reason(finish: str | None, called: bool) -> str | None:
+    """vLLM chat_completion/serving.py: "tool_calls" once a call was parsed, but only when the model stopped by itself.
+    A request cut off by its token limit stays "length" even when it holds a call: that call may be truncated (the
+    parser closes its partial last argument), and an agent must not run it as complete. (vLLM kept the engine's reason
+    for a named tool_choice; this server refuses one: tool_choice_error.)"""
+    if finish == "stop" and called:
         return "tool_calls"
     return finish
 

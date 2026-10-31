@@ -68,14 +68,13 @@ def test_streaming_matches_full_parse_for_any_chunking():
 def test_tool_choice_rules():
     from trnrt.serve.parsers import chat_finish_reason, tool_choice_error
 
-    tools = [{"type": "function", "function": {"name": "get_weather"}}]
-    assert tool_choice_error("auto", tools) is None and tool_choice_error("required", tools) is None
-    assert tool_choice_error({"type": "function", "function": {"name": "get_weather"}}, tools) is None
-    assert "does not match" in tool_choice_error({"type": "function", "function": {"name": "nope"}}, tools)
-    assert "Invalid value for `tool_choice`" in tool_choice_error("sometimes", tools)
-    assert "Expected field `name`" in tool_choice_error({"type": "function", "function": {}}, tools)
-    # "tool_calls" once a call was parsed; a named choice keeps "stop" (vLLM serving.py).
-    assert chat_finish_reason("stop", True, "auto") == "tool_calls"
-    assert chat_finish_reason("length", True, "required") == "tool_calls"
-    assert chat_finish_reason("stop", True, {"type": "function", "function": {"name": "get_weather"}}) == "stop"
-    assert chat_finish_reason("stop", False, "auto") == "stop" and chat_finish_reason(None, True, None) is None
+    assert tool_choice_error("auto") is None and tool_choice_error("none") is None
+    assert tool_choice_error(None) is None
+    # Enforcing these needs guided decoding, which no served graph runs: refused, never served unenforced.
+    assert "guided decoding" in tool_choice_error("required")
+    assert "guided decoding" in tool_choice_error({"type": "function", "function": {"name": "get_weather"}})
+    assert "Invalid value for `tool_choice`" in tool_choice_error("sometimes")
+    # "tool_calls" once a call was parsed and the model stopped; a call cut off by the token limit stays "length".
+    assert chat_finish_reason("stop", True) == "tool_calls"
+    assert chat_finish_reason("length", True) == "length"
+    assert chat_finish_reason("stop", False) == "stop" and chat_finish_reason(None, True) is None
