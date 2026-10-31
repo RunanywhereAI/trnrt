@@ -1,8 +1,10 @@
 # trnRT on the AWS Neuron vLLM inference image: Neuron SDK 2.32 (neuronx-cc 2.27), Python 3.13, Ubuntu 24.04.
 #
 # The base already holds everything trnRT imports (torch, libtorch-neuronx-lite, nki, neuronx-cc, transformers,
-# tokenizers, safetensors, huggingface_hub, fastapi, uvicorn, pydantic, pytest), so this layer installs trnRT alone,
-# without dependencies, and checks every Neuron piece before the build may finish (docker/check_image.py).
+# tokenizers, safetensors, huggingface_hub, fastapi, uvicorn, pydantic, pytest) but one: its transformers (5.15.0)
+# predates the glm5_next architecture. So this layer pins transformers 5.17.0 and tokenizers 0.23.3 (the versions the
+# tests run with), installs trnRT without dependencies, and checks every Neuron piece before the build may finish
+# (docker/check_image.py).
 #
 # Build from the root of this repository:
 #   docker build -f docker/Dockerfile \
@@ -30,10 +32,11 @@ LABEL org.opencontainers.image.title="trnRT" \
 
 COPY . /opt/trnrt
 
-# --no-deps: nothing trnRT imports is missing from the base; --no-build-isolation: build with the base's own
+# --no-deps: nothing else trnRT imports is missing from the base; --no-build-isolation: build with the base's own
 # setuptools instead of fetching one; --no-cache-dir: no pip cache in the layer.
 RUN test -n "${TRNRT_VERSION}" && test -n "${TRNRT_REVISION}" \
     || { echo "build with --build-arg TRNRT_VERSION=... --build-arg TRNRT_REVISION=..." >&2; exit 1; } \
+ && pip install --no-cache-dir transformers==5.17.0 tokenizers==0.23.3 \
  && pip install --no-cache-dir --no-deps --no-build-isolation /opt/trnrt \
  && rm -rf /opt/trnrt/build /opt/trnrt/trnrt.egg-info \
  && find /opt/trnrt -name __pycache__ -type d -prune -exec rm -rf {} + \

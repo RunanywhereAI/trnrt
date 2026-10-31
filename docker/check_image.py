@@ -14,6 +14,9 @@ What is checked is what trnrt/ imports (grep for libtorch_neuronx_lite and nki u
     trnrt/kernels/*.py use;
   - nki (nki.isa, nki.language, nki.isa.constants.oob_mode): every kernel in trnrt/kernels/;
   - neuronx-cc: the compiler LNL and the compile farm (trnrt/compile/farm.py) run as a CLI;
+  - the versions: neuronx-cc and LNL of the Neuron SDK README.md states (2.32: neuronx-cc 2.27, LNL 2.11), since a
+    compile cache built by another compiler is not this one's; and a transformers with the glm5_next architecture
+    (5.17 and later): the engine tests build their tiny GLM-5.3-Flash with it, and skip without it;
   - every trnrt module imports.
 """
 
@@ -29,6 +32,9 @@ import subprocess
 import sys
 
 FAILED: list[str] = []
+# distribution -> the version prefix it must have (README.md "What you need": Neuron SDK 2.32, neuronx-cc 2.27; SDK
+# 2.32 ships libtorch-neuronx-lite 2.11)
+WANT_VERSION = {"neuronx-cc": "2.27.", "libtorch-neuronx-lite": "2.11."}
 
 
 def check(name: str, fn):
@@ -49,6 +55,23 @@ def attr(module: str, *names: str):
         if not hasattr(m, n):
             importlib.import_module(f"{module}.{n}")
     return None
+
+
+def dist_version(dist: str, version=importlib.metadata.version) -> str:
+    """The installed version of `dist`; RuntimeError if WANT_VERSION gives it a prefix that it lacks."""
+    v = version(dist)
+    want = WANT_VERSION.get(dist)
+    if want is not None and not v.startswith(want):
+        raise RuntimeError(f"{dist} {v}, want {want}*")
+    return v
+
+
+def glm5_next():
+    """transformers has GLM-5.3-Flash's architecture (model_type glm5_next: transformers 5.17 and later)."""
+    import transformers
+
+    importlib.import_module("transformers.models.glm5_next")
+    return f"transformers {transformers.__version__}"
 
 
 def cli(*argv: str) -> str:
@@ -130,7 +153,7 @@ def device_graph():
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(allow_abbrev=False)
     ap.add_argument("--device", action="store_true", help="also run a graph on a NeuronCore")
     args = ap.parse_args()
 
@@ -138,7 +161,8 @@ def main() -> int:
     check("trnrt version", trnrt_versions)
     for dist in ("torch", "libtorch-neuronx-lite", "nki", "neuronx-cc", "transformers", "tokenizers",
                  "safetensors", "huggingface_hub", "fastapi", "uvicorn", "pydantic", "numpy"):
-        check(f"dist {dist}", lambda d=dist: importlib.metadata.version(d))
+        check(f"dist {dist}", lambda d=dist: dist_version(d))
+    check("transformers glm5_next", glm5_next)
     check("nki", lambda: attr("nki", "jit", "simulate"))
     check("nki.isa", lambda: attr("nki.isa", "nc_matmul", "dma_copy", "activation", "memset"))
     check("nki.language", lambda: attr("nki.language", "ndarray", "sbuf", "psum", "shared_hbm"))

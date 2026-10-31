@@ -381,7 +381,7 @@ def compare_pair(ref_dir, new_dir, names_ref, names_new, pb2, kernels=True):
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0], allow_abbrev=False)
     ap.add_argument("ref_root")
     ap.add_argument("new_root")
     ap.add_argument("--ref-package", required=True, help="the reference tree's package name, dropped from kernel names")
