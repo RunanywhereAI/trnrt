@@ -94,13 +94,15 @@ def is_complete(entry: str) -> bool:
 
 
 def entries(root: str) -> list[str]:
-    """Every entry directory under `root` (an entry directory holds graph.hlo), sorted by key."""
+    """Every entry directory under `root` (an entry directory holds graph.hlo), sorted by key. A
+    capture's private lowering directory (<key>.capture.<pid>, capture.capture_graph: renamed into
+    place once complete, left behind by a killed capture) is not an entry."""
     if not os.path.isdir(root):
         return []
     out = []
     for k in sorted(os.listdir(root)):
         d = os.path.join(root, k)
-        if os.path.isdir(d) and os.path.exists(os.path.join(d, HLO)):
+        if ".capture." not in k and os.path.isdir(d) and os.path.exists(os.path.join(d, HLO)):
             out.append(d)
     return out
 

@@ -42,7 +42,7 @@ REV=<GLM-5.3-Flash commit>
 python -m trnrt compile shapes zai-org/GLM-5.3-Flash --revision $REV --out $OUT
 python -m trnrt compile decisions --model zai-org/GLM-5.3-Flash --revision $REV --out $OUT   # a few range reads per MoE layer
 python -m trnrt compile capture --out $OUT -- --model $OUT/shapes                            # every graph, all 32 ranks
-python -m trnrt compile compile --out $OUT --workers <cores / 2>                              # neuronx-cc on each graph
+python -m trnrt compile compile --out $OUT                                                    # neuronx-cc on each graph
 python -m trnrt compile strip --out $OUT                                                      # drop the NEFFs' debug info
 ```
 
@@ -53,11 +53,15 @@ that directory comes along to the same path. To split the steps across hosts, co
 with the cache. A serving engine traces its graphs again and rewrites the directory; whether it needs the compile
 host's copy on a cache hit is [unverified].
 
+`compile` runs as many neuronx-cc processes at once as host memory admits. One can take tens of GB, so each
+reserves `--mem-per-compile-gb` (default 30) of MemAvailable, and one the OOM killer takes runs once more, alone.
+
 `strip` is not optional at 1M-token buckets: the runtime holds each loaded NEFF in host memory several times over, and
 two engines' unstripped NEFFs do not fit.
 
-The arguments after `capture --` must be the ones the server runs with. The defaults are the served configuration, so
-`--model` alone is enough.
+The arguments after `capture --` must be the engine arguments the server runs with, spelled out in full. Capture refuses
+any other; the server's own, such as `--engines` and `--port`, do not change the graphs. The defaults are the served
+configuration, so `--model` alone is enough.
 
 ### 3. Serve (trn2.48xlarge)
 

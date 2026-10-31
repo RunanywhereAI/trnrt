@@ -732,13 +732,13 @@ def capture_all(cfg, shape_dir: str, out: str, target: str = DEFAULT_TARGET, ran
     (cache.out_dirs): the entries under <out>/cache/neuron/compile_cache/<key>/, the records under
     <out>/capture/. One spawned process per rank, `procs` at once; rank 0 runs alone first: it
     compiles the NKI kernels and writes every graph shared by all ranks, so the others mostly find
-    their entries already there.
+    their entries already there. When rank 0 fails the capture has failed, and the others do not run.
 
     Records: rank<R>.json per rank (capture_rank), keys.json ({key: [ranks]}) and config.json (the
     target, the serve arguments `argv`, the EngineConfig, the environment and the checkpoint
     revision the load-time decisions came from: the serving host must run the same configuration
     on the same revision, or its keys differ). Returns a summary; failed_ranks lists (rank, exit
-    code) of every rank process that failed."""
+    code) of every rank process that failed, skipped_ranks the ranks not run."""
     import dataclasses
     import multiprocessing as mp
 
@@ -771,7 +771,7 @@ def capture_all(cfg, shape_dir: str, out: str, target: str = DEFAULT_TARGET, ran
         return bad
 
     bad = run(ranks[:1])
-    rest = ranks[1:]
+    rest, skipped = (ranks[1:], []) if not bad else ([], ranks[1:])
     for i in range(0, len(rest), procs):
         bad += run(rest[i:i + procs])
     keys: dict[str, list[int]] = {}
@@ -797,5 +797,6 @@ def capture_all(cfg, shape_dir: str, out: str, target: str = DEFAULT_TARGET, ran
                    # the checkpoint revision the load-time decisions came from: the device must load the same one
                    "decisions": {k: dec.get(k) for k in ("model", "revision", "written")}},
                   f, indent=1, default=str)
-    return {"ranks": len(ranks), "failed_ranks": bad, "distinct_graphs": len(keys), "per_rank": per_rank,
-            "cache_root": cache_root, "records": out_dir, "wall_seconds": round(time.time() - t0, 1)}
+    return {"ranks": len(ranks), "failed_ranks": bad, "skipped_ranks": skipped, "distinct_graphs": len(keys),
+            "per_rank": per_rank, "cache_root": cache_root, "records": out_dir,
+            "wall_seconds": round(time.time() - t0, 1)}

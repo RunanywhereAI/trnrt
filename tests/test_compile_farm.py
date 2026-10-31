@@ -159,6 +159,18 @@ def test_run_compile_refuses_an_hlo_whose_kernel_binaries_are_missing(tmp_path):
     assert not (d / ".compilation_complete").exists()
 
 
+def test_entries_skip_a_capture_lowering_directory(tmp_path):
+    """A capture lowers each graph in <key>.capture.<pid> and renames it into place: one a killed capture left
+    behind holds graph.hlo and no command.txt, and is no entry."""
+    from trnrt.compile import cache
+
+    d = _captured(tmp_path, "a" * 32)
+    left = tmp_path / f"{'b' * 32}.capture.4242"
+    left.mkdir()
+    (left / "graph.hlo").write_bytes(b"hlo")
+    assert cache.entries(str(tmp_path)) == cache.pending(str(tmp_path)) == [str(d)]
+
+
 def test_compile_command_line_compiles_the_pending_entries(tmp_path, capsys):
     from trnrt.compile import cache, farm
 
@@ -175,6 +187,185 @@ def test_compile_command_line_compiles_the_pending_entries(tmp_path, capsys):
     assert summary["entries"] == 2 and summary["failed"] == 0
     assert farm.main(["compile", "--out", str(tmp_path / "out"), "--neuronx-cc", cc]) == 0  # the one left
     assert cache.pending(str(root)) == []
+
+
+def test_compile_and_strip_refuse_an_out_with_nothing_to_do(tmp_path):
+    """A missing or mistyped --out, or a step run before the one that feeds it, is an error, not a run over nothing."""
+    from trnrt.compile import farm
+
+    cc = _fake_cc(tmp_path)
+    out = tmp_path / "out"
+    root = out / "cache" / "neuron" / "compile_cache"
+
+    def refused(cmd, why):
+        with pytest.raises(SystemExit, match=why):
+            farm.main([*cmd, "--out", str(out)])
+
+    refused(["compile", "--neuronx-cc", cc], "no captured entries")  # no --out at all
+    refused(["strip"], "no compiled entries")
+    root.mkdir(parents=True)
+    refused(["compile", "--neuronx-cc", cc], "no captured entries")
+    refused(["strip"], "no compiled entries")
+    _captured(root, "a" * 32)
+    refused(["strip"], "no compiled entries")  # captured, not compiled
+    assert farm.main(["compile", "--out", str(out), "--neuronx-cc", cc]) == 0
+    assert farm.main(["compile", "--out", str(out), "--neuronx-cc", cc]) == 0  # all compiled: nothing left to do
+    assert farm.main(["strip", "--out", str(out)]) == 1  # strip reaches the entry: the stand-in NEFF is no tar.gz
+
+
+def test_compile_without_the_compiler_stops_before_any_entry(tmp_path, monkeypatch, capsys):
+    from trnrt.compile import farm
+
+    out = tmp_path / "out"
+    for c in "ab":
+        _captured(out / "cache" / "neuron" / "compile_cache", c * 32)
+    monkeypatch.setenv("PATH", str(tmp_path / "nothing"))
+    with pytest.raises(SystemExit, match="neuronx-cc: no such compiler"):
+        farm.main(["compile", "--out", str(out)])
+    with pytest.raises(SystemExit, match="gone: no such compiler"):
+        farm.main(["compile", "--out", str(out), "--neuronx-cc", str(tmp_path / "gone")])
+    assert '"key"' not in capsys.readouterr().out  # no entry tried
+
+
+def test_an_incomplete_entry_fails_alone_run_after_run(tmp_path, capsys):
+    """A capture killed between graph.hlo and command.txt leaves an entry with no command, or a cut one: each run
+    reports it and goes on with the others, and exits nonzero. A killed capture's lowering directory is no entry."""
+    from trnrt.compile import cache, farm
+
+    cc = _fake_cc(tmp_path)
+    out = tmp_path / "out"
+    root = out / "cache" / "neuron" / "compile_cache"
+    good = _captured(root, "a" * 32)
+    (_captured(root, "b" * 32) / "command.txt").unlink()
+    _captured(root, "c" * 32, command="/usr/local/bin/neuronx-cc compile")
+    left = root / f"{'d' * 32}.capture.4242"
+    left.mkdir()
+    (left / "graph.hlo").write_bytes(b"hlo")
+    for entries in (3, 2):  # the second run finds the good entry compiled
+        assert farm.main(["compile", "--out", str(out), "--neuronx-cc", cc]) == 1
+        rows = [json.loads(x) for x in capsys.readouterr().out.splitlines() if x.startswith("{")]
+        bad = {r["key"]: r["error"] for r in rows if "key" in r and not r["ok"]}
+        assert sorted(bad) == ["b" * 32, "c" * 32]
+        assert all("run capture again" in e for e in bad.values()), bad
+        assert (rows[-1]["entries"], rows[-1]["failed"]) == (entries, 2)
+        assert cache.is_complete(str(good))
+    assert not list(root.rglob("command.txt.tmp-*"))
+
+
+def test_admits_reserves_what_running_compiles_have_yet_to_take():
+    from trnrt.compile.farm import admits
+
+    G = 2**30
+    assert admits(0, [], 8, 30 * G)  # nothing running: one starts, whatever memory says
+    assert admits(61 * G, [0], 8, 30 * G) and not admits(59 * G, [0], 8, 30 * G)
+    assert admits(31 * G, [30 * G, 40 * G], 8, 30 * G)  # MemAvailable already counts what they hold
+    assert not admits(31 * G, [10 * G, 40 * G], 8, 30 * G)  # the first owes 20 more
+    assert admits(None, [0] * 7, 8, 30 * G) and not admits(None, [0] * 8, 8, 30 * G)  # unknown: workers decide
+    assert not admits(10**6 * G, [0] * 8, 8, 30 * G)
+
+
+def test_host_mem_available_reads_meminfo(tmp_path):
+    from trnrt.compile.farm import host_mem_available
+
+    p = tmp_path / "meminfo"
+    p.write_text("MemTotal:       389000000 kB\nMemFree:          1000000 kB\nMemAvailable:   370000000 kB\n")
+    assert host_mem_available(str(p)) == 370000000 * 1024
+    assert host_mem_available(str(tmp_path / "none")) is None
+
+
+# A stand-in for neuronx-cc that takes a while and notes how many compiles run at once: each holds a file under
+# LIVE while it runs and logs "<key> <files there>" as it starts. An HLO starting OOM kills itself with SIGKILL, as
+# the OOM killer would, the first time (OOM-ALWAYS: every time).
+SLOW_CC = r'''
+import os, signal, sys, time
+a = sys.argv[1:]
+out, live = a[a.index("--output") + 1], LIVE
+hlo = open(a[1], "rb").read()
+mine = os.path.join(live, str(os.getpid()))
+open(mine, "w").close()
+with open(os.path.join(live, os.pardir, "log"), "a") as f:
+    f.write(f"{os.path.basename(os.path.dirname(a[1]))} {len(os.listdir(live))}\n")
+time.sleep(0.4)
+os.remove(mine)
+if hlo.startswith(b"OOM") and (hlo == b"OOM-ALWAYS" or not os.path.exists(out + ".killed")):
+    open(out + ".killed", "w").close()
+    os.kill(os.getpid(), signal.SIGKILL)
+open(out, "wb").write(b"NEFF")
+'''
+
+
+def _slow_cc(tmp_path):
+    live = tmp_path / "ncc" / "live"
+    live.mkdir(parents=True)
+    p = tmp_path / "ncc" / "neuronx-cc"
+    p.write_text(f"#!{sys.executable}\nLIVE = {str(live)!r}\n{SLOW_CC}")
+    p.chmod(0o755)
+    return str(p), tmp_path / "ncc" / "log"
+
+
+def _starts(log):
+    """(key, compiles running as it started) per compile start, in order."""
+    return [(k, int(n)) for k, n in (x.split() for x in log.read_text().splitlines())]
+
+
+@pytest.mark.parametrize("avail_gb,most", [(0.5, 1), (2.5, 2), (None, 6)])
+def test_compiles_start_only_while_host_memory_admits_them(tmp_path, avail_gb, most):
+    """At 1 GB per compile, MemAvailable 2.5 GB admits two at once and 0.5 GB one (with nothing running one starts
+    anyway); every entry compiles. The control: with MemAvailable unknown, --workers alone limits them, and the
+    stand-in sees more than two at once."""
+    from trnrt.compile import cache
+    from trnrt.compile.farm import compile_entries
+
+    cc, log = _slow_cc(tmp_path)
+    ds = [str(_captured(tmp_path / "cc", c * 32, b"hlo" * (i + 1))) for i, c in enumerate("abcdef")]
+    G = 2**30
+    rs = compile_entries(ds, 8, str(tmp_path), cc, mem_per_compile=G, poll_seconds=0.05,
+                         mem_available=lambda: None if avail_gb is None else int(avail_gb * G))
+    assert sorted(r.key for r in rs if r.ok) == sorted(cache.key_of(d) for d in ds)
+    assert all(cache.is_complete(d) for d in ds)
+    seen = max(n for _, n in _starts(log))
+    if avail_gb is None:
+        assert seen > 2, _starts(log)
+    else:
+        assert seen == most, _starts(log)
+
+
+def test_the_command_line_admits_by_mem_per_compile_gb(tmp_path, monkeypatch, capsys):
+    from trnrt.compile import cache, farm
+
+    cc, log = _slow_cc(tmp_path)
+    root = tmp_path / "out" / "cache" / "neuron" / "compile_cache"
+    for c in "abcd":
+        _captured(root, c * 32)
+    monkeypatch.setattr(farm, "host_mem_available", lambda path="/proc/meminfo": 5 * 2**30)
+    assert farm.main(["compile", "--out", str(tmp_path / "out"), "--neuronx-cc", cc, "--mem-per-compile-gb", "2"]) == 0
+    assert cache.pending(str(root)) == []
+    assert max(n for _, n in _starts(log)) == 2
+    out = capsys.readouterr().out.splitlines()
+    assert "each reserving 2 GB of host memory (MemAvailable 5 GB, room for 2 now)" in out[0]
+    assert json.loads(out[-1])["workers"] == os.cpu_count()
+
+
+def test_a_compile_the_oom_killer_took_runs_once_more_alone(tmp_path, capsys):
+    from trnrt.compile import cache, farm
+
+    cc, log = _slow_cc(tmp_path)
+    root = tmp_path / "out" / "cache" / "neuron" / "compile_cache"
+    hlos = {"a" * 32: b"OOM", "b" * 32: b"OOM-ALWAYS", "c" * 32: b"hlo-c", "d" * 32: b"hlo-d"}
+    for k, h in hlos.items():
+        _captured(root, k, h)
+    assert farm.main(["compile", "--out", str(tmp_path / "out"), "--neuronx-cc", cc, "--workers", "4"]) == 1
+    rows = [json.loads(x) for x in capsys.readouterr().out.splitlines() if x.startswith("{")]
+    tries = [(r["key"], r["attempt"], r["ok"], r["oom_killed"]) for r in rows if "key" in r]
+    assert sorted(tries) == sorted([("a" * 32, 1, False, True), ("a" * 32, 2, True, False),
+                                    ("b" * 32, 1, False, True), ("b" * 32, 2, False, True),
+                                    ("c" * 32, 1, True, False), ("d" * 32, 1, True, False)])
+    assert sorted(t[:2] for t in tries[-2:]) == [("a" * 32, 2), ("b" * 32, 2)]  # after the others
+    starts = _starts(log)
+    assert len(starts) == 6 and sorted(starts[-2:]) == [("a" * 32, 1), ("b" * 32, 1)]  # alone
+    assert [cache.is_complete(str(root / k)) for k in hlos] == [True, False, True, True]
+    s = rows[-1]
+    assert (s["entries"], s["failed"], s["retried"]) == (4, 1, 2) and "too little memory" in s["hint"]
 
 
 def test_oom_killed_reads_neuronx_cc_own_report():
@@ -483,15 +674,77 @@ def test_capture_replays_the_decisions_and_refuses_without_them(tmp_path, monkey
     assert capture._ACTIVE[0] is None and capture._PENDING[0] is None
 
 
-# -- the capture (needs libtorch_neuronx_lite) --------------------------------------------------------
+# -- the capture ------------------------------------------------------------------------------------
+
+def test_capture_refuses_arguments_the_engine_does_not_take(tmp_path, monkeypatch):
+    """engine_config drops an argument it does not know (the server hands it its own too), so capture refuses one,
+    and an abbreviation, before it builds anything; the engine's own arguments pass."""
+    import re
+
+    from trnrt.compile import capture, farm
+
+    out = tmp_path / "out"
+    (out / "shapes").mkdir(parents=True)
+    (out / "shapes" / capture.HEADERS).write_text("{}")
+    for k in ("NEURON_PLATFORM_TARGET_OVERRIDE", "NEURON_LIBTORCH_CPU_COMPILE"):
+        monkeypatch.delenv(k, raising=False)  # put back afterwards: capture.configure_env sets them
+
+    def engine_config(argv):
+        raise AssertionError(f"engine_config({argv}) ran")
+
+    for argv, named in ((["--model", "m", "--decode-bucket", "1,2"], "--decode-bucket 1,2"),
+                        (["--model", "m", "--tp", "2", "--prefill-bukets", "2048"], "--prefill-bukets 2048"),
+                        (["--model", "m", "--engines", "2", "--port", "8000"], "--engines 2 --port 8000")):
+        with pytest.raises(SystemExit, match=re.escape(f"not engine arguments: {named}.")):
+            farm.main(["capture", "--out", str(out), "--", *argv], engine_config=engine_config)
+    farm.check_engine_args(["--model", "m", "--tp", "2", "--decode-buckets=1,2", "--kv-cache-dtype", "fp8"])
+    with pytest.raises(SystemExit):
+        farm.check_engine_args(["--tp", "2"])  # --model is required
+
+
+def test_capture_stops_when_rank_0_fails(tmp_path, monkeypatch):
+    """Rank 0 runs alone first and writes the graphs every rank shares: when it fails, the other ranks do not run. A
+    later rank's failure stops nothing. The rank processes are stand-ins that exit as told."""
+    import dataclasses
+    import multiprocessing
+
+    from trnrt.compile import capture
+
+    @dataclasses.dataclass
+    class Cfg:
+        tp: int = 4
+
+    def run(failing):
+        started = []
+
+        class Process:
+            def __init__(self, target, args):
+                self.rank, self.exitcode = args[0], None
+
+            def start(self):
+                started.append(self.rank)
+
+            def join(self):
+                self.exitcode = 1 if self.rank == failing else 0
+
+        monkeypatch.setattr(multiprocessing, "get_context", lambda method: types.SimpleNamespace(Process=Process))
+        return started, capture.capture_all(Cfg(), str(tmp_path / "shapes"), str(tmp_path / "out"), procs=2)
+
+    started, s = run(failing=0)
+    assert started == [0] and s["failed_ranks"] == [(0, 1)] and s["skipped_ranks"] == [1, 2, 3]
+    started, s = run(failing=2)
+    assert started == [0, 1, 2, 3] and s["failed_ranks"] == [(2, 1)] and s["skipped_ranks"] == []
+
+
+# -- the capture itself (needs libtorch_neuronx_lite) -------------------------------------------------
 
 def tiny_engine_config(argv):
-    """engine_config for the capture test: the serve arguments are the model path alone."""
+    """engine_config for the capture test: the serve arguments are --model alone."""
     from trnrt.config import EngineConfig
 
-    return EngineConfig(model_path=argv[0], device="neuron", dtype=torch.bfloat16, tp=2, page_size=8,
-                        kv_cache_dtype="fp8", kv_cache_gb=0.01, max_num_seqs=2, max_model_len=64, max_prefill_tokens=8,
-                        decode_batch_buckets=(2,), prefill_token_buckets=(8,), page_buckets=(2,))
+    return EngineConfig(model_path=argv[argv.index("--model") + 1], device="neuron", dtype=torch.bfloat16, tp=2,
+                        page_size=8, kv_cache_dtype="fp8", kv_cache_gb=0.01, max_num_seqs=2, max_model_len=64,
+                        max_prefill_tokens=8, decode_batch_buckets=(2,), prefill_token_buckets=(8,), page_buckets=(2,))
 
 
 @needs("libtorch_neuronx_lite", "transformers.models.glm5_next", "trnrt.engine.model_runner", "trnrt.models.loader")
@@ -513,7 +766,7 @@ def test_capture_tp2_writes_one_entry_per_graph(tmp_path):
                                                          out_hidden_size=256, projection_intermediate_size=64)))
     model.save_pretrained(str(ckpt), safe_serialization=True)
     assert farm.main(["shapes", str(ckpt), "--out", str(out)]) == 0
-    assert farm.main(["capture", "--out", str(out), "--", str(ckpt)], engine_config=tiny_engine_config) == 0
+    assert farm.main(["capture", "--out", str(out), "--", "--model", str(ckpt)], engine_config=tiny_engine_config) == 0
     keys = json.loads((out / "capture" / "keys.json").read_text())
     assert keys and all(ranks == [0, 1] for ranks in keys.values())
     ranks = [json.loads((out / "capture" / f"rank{r}.json").read_text()) for r in (0, 1)]
@@ -525,5 +778,5 @@ def test_capture_tp2_writes_one_entry_per_graph(tmp_path):
         assert ".compilation_complete" not in files
         assert farm.entry_args(str(cache_dir / k))[0] == "trn2"
     cfg = json.loads((out / "capture" / "config.json").read_text())
-    assert cfg["target"] == "trn2" and cfg["graphs"] == len(keys) and cfg["argv"] == [str(ckpt)]
+    assert cfg["target"] == "trn2" and cfg["graphs"] == len(keys) and cfg["argv"] == ["--model", str(ckpt)]
     assert capture.HEADERS in os.listdir(out / "shapes")
