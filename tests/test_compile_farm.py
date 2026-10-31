@@ -213,6 +213,20 @@ def test_compile_and_strip_refuse_an_out_with_nothing_to_do(tmp_path):
     assert farm.main(["strip", "--out", str(out)]) == 1  # strip reaches the entry: the stand-in NEFF is no tar.gz
 
 
+def test_compile_without_the_compiler_stops_before_any_entry(tmp_path, monkeypatch, capsys):
+    from trnrt.compile import farm
+
+    out = tmp_path / "out"
+    for c in "ab":
+        _captured(out / "cache" / "neuron" / "compile_cache", c * 32)
+    monkeypatch.setenv("PATH", str(tmp_path / "nothing"))
+    with pytest.raises(SystemExit, match="neuronx-cc: no such compiler"):
+        farm.main(["compile", "--out", str(out)])
+    with pytest.raises(SystemExit, match="gone: no such compiler"):
+        farm.main(["compile", "--out", str(out), "--neuronx-cc", str(tmp_path / "gone")])
+    assert '"key"' not in capsys.readouterr().out  # no entry tried
+
+
 def test_an_incomplete_entry_fails_alone_run_after_run(tmp_path, capsys):
     """A capture killed between graph.hlo and command.txt leaves an entry with no command, or a cut one: each run
     reports it and goes on with the others, and exits nonzero. A killed capture's lowering directory is no entry."""
