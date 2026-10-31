@@ -50,6 +50,13 @@ The tree is text-level, like SGLang's router, so it needs no tokenizer; it is pr
 evicting least-recently-used leaves (128M characters: above 32 sessions of a 1M-token context's ~4 MB of text, so long
 sessions' prefixes are not evicted under load).
 
+The router's own endpoints:
+- GET /health: 200 {"status": "ok"} while every worker is up; 200 {"status": "degraded"} while some are (requests and
+  sessions go to the live ones, so a load balancer in front keeps sending); 503 {"status": "down"} once none is. Each
+  body names the workers down ("down": their URLs) and carries the routing counters. Up and down are the router's view
+  (above): the /health polls and the requests' refused connections and 503s;
+- GET /v1/models: the answer of the first live worker that gives one (least loaded first), 503 if none does.
+
     python -m trnrt.serve.router --worker-urls http://127.0.0.1:8111,http://127.0.0.1:8112 --port 8000
 """
 
@@ -322,6 +329,11 @@ class Router:
         self.trees[w].insert(text)
         return w
 
+    def status(self) -> str:
+        """"ok" while every worker is up, "degraded" while some are, "down" once none is."""
+        n = sum(self.up)
+        return "ok" if n == len(self.workers) else "degraded" if n else "down"
+
     def health(self) -> dict:
         return {"workers": self.workers, "load": self.load, "routed": self.routed, "up": self.up, "fails": self.fails,
                 "kv_used": self.kv_used, "sessions": [sum(1 for i in self.sessions.values() if i == w)
@@ -425,12 +437,28 @@ def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: floa
 
     @app.get("/health")
     async def health():
-        return {"status": "ok", **router.health()}
+        """200 while any worker is up ("ok" or "degraded"), 503 once none is (module docstring)."""
+        status = router.status()
+        down = [u for u, ok in zip(router.workers, router.up) if not ok]
+        return JSONResponse({"status": status, "down": down, **router.health()},
+                            status_code=503 if status == "down" else 200)
 
     @app.get("/v1/models")
     async def models():
-        r = await client.get(router.workers[router.least_loaded()] + "/v1/models")
-        return JSONResponse(r.json(), status_code=r.status_code)
+        """Every worker serves the same model: the first live one that answers, least loaded first. A refused
+        connection marks a worker down, as in a request."""
+        for w in sorted(router._live(), key=lambda i: (router.load[i], i)):
+            try:
+                r = await client.get(router.workers[w] + "/v1/models", timeout=health_timeout_s)
+            except httpx.ConnectError:
+                router.note_failure(w, hard=True)
+                continue
+            except httpx.HTTPError:
+                continue
+            if r.status_code == 200:
+                with contextlib.suppress(ValueError):
+                    return JSONResponse(r.json())
+        raise HTTPException(status_code=503, detail="no engine answered /v1/models")
 
     async def proxy(path: str, http: Request):
         body = await http.json()
@@ -439,12 +467,20 @@ def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: floa
         tools = bool(body.get("tools"))
         w = router.pick(_request_text(path, body) if sid is None else "", session=sid,
                         head=_request_head(path, body) if sid is None else 0, key=key, tools=tools)
-        for attempt in (0, 1):  # an unreachable worker: note it, re-pick once (a session fails over if it went down)
+        # An unreachable worker, or one that answers 503 (a failed engine refuses every request before it queues it,
+        # serve/api.py): note it, re-pick once (a session fails over if it went down).
+        for attempt in (0, 1):
             url = router.workers[w] + path
             router.load[w] += 1
             try:
                 if body.get("stream"):
                     resp = await client.send(client.build_request("POST", url, json=body), stream=True)
+                    if resp.status_code == 503:
+                        try:
+                            await resp.aread()
+                        finally:
+                            await resp.aclose()
+                        r = resp
                 else:
                     r = await client.post(url, json=body)
             except (httpx.ConnectError, httpx.ConnectTimeout) as e:
@@ -458,6 +494,14 @@ def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: floa
             except BaseException:
                 router.load[w] -= 1
                 raise
+            if (resp if body.get("stream") else r).status_code == 503:
+                router.load[w] -= 1
+                router.note_failure(w, hard=True)
+                if attempt == 1 or all(not ok for ok in router.up):
+                    return Response(r.content, status_code=503, media_type=r.headers.get("content-type"))
+                w = router.pick(_request_text(path, body) if sid is None else "", session=sid,
+                                head=_request_head(path, body) if sid is None else 0, key=key, tools=tools)
+                continue
             break
         if body.get("stream"):
             ww = w
