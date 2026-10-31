@@ -423,6 +423,10 @@ def cmd_compile(a, dirs) -> int:
     want = _keys_filter(a)
     if want is not None:
         todo = [d for d in todo if cache.key_of(d) in want]
+    cc = shutil.which(a.neuronx_cc or "neuronx-cc")  # once, not as every entry's failure
+    if todo and cc is None:
+        raise SystemExit(f"{a.neuronx_cc or 'neuronx-cc'}: no such compiler (activate the Neuron SDK's environment, or "
+                         "pass --neuronx-cc)")
     workers, reserve = a.workers or os.cpu_count() or 1, a.mem_per_compile_gb * GiB
     avail = host_mem_available()
     room = ("MemAvailable unknown: --workers alone limits them" if avail is None else
@@ -438,7 +442,7 @@ def cmd_compile(a, dirs) -> int:
             with open(a.log, "a") as f:
                 f.write(json.dumps(row) + "\n")
 
-    results = compile_entries(todo, workers, a.work_root, a.neuronx_cc, on_result=show, mem_per_compile=reserve,
+    results = compile_entries(todo, workers, a.work_root, cc, on_result=show, mem_per_compile=reserve,
                               mem_available=host_mem_available)
     bad = [r for r in results if not r.ok]
     summary = {"summary": True, "entries": len(results), "failed": len(bad),
