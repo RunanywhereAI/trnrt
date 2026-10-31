@@ -217,8 +217,13 @@ def init_rank(rank: int, world: int, port: int) -> None:
     # rank 0 failed to bind its store. Put the count back so a failed init leaves the process as it
     # found it.
     count = c10d._world.group_count
+    # c10d's own init_process_group, not the torch.distributed attribute: vllm_neuron (imported with
+    # libtorch_neuronx_lite in some Neuron images) replaces that attribute for tcp://127.0.0.1 init methods
+    # (vllm_neuron/vllm/patches/port_hold_patch.py), and its rank 0 may rebind to another port that only a patched
+    # rank finds. A process that imported it before starting an engine had a patched rank 0 and unpatched workers,
+    # and the gloo mesh never formed (measured: a tp=2 CPU engine hung). The port here is chosen by this module.
     try:
-        dist.init_process_group("gloo", rank=rank, world_size=world, init_method=f"tcp://127.0.0.1:{port}",
+        c10d.init_process_group("gloo", rank=rank, world_size=world, init_method=f"tcp://127.0.0.1:{port}",
                                 timeout=TIMEOUT)
     except BaseException:
         if not dist.is_initialized():
