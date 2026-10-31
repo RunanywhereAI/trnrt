@@ -421,6 +421,9 @@ class DecoderForCausalLM(nn.Module):
         self.page_size = page_size
         self.fp8_max = fp8_max
         if self.cp > 1:
+            if fp8_max is None:
+                raise ValueError("context-parallel DSA (attention TP > 1) reads its pool keys from the separate "
+                                 "token-slot cache, which exists under an FP8 KV cache only (kv_cache_dtype fp8)")
             kp = next(l.spec.mla.dsa.kpool for l in self.kv_layers())
             if page_size % kp or (page_size // kp) % self.cp:
                 raise ValueError(f"context-parallel DSA: {page_size // kp} pools per page do not divide over "
