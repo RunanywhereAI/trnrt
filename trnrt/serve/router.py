@@ -537,7 +537,7 @@ def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: floa
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(prog="trnrt.serve.router")
+    ap = argparse.ArgumentParser(prog="trnrt.serve.router", allow_abbrev=False)
     ap.add_argument("--worker-urls", required=True,
                     help="comma list of the engines' base URLs, e.g. http://127.0.0.1:8111,http://127.0.0.1:8112")
     ap.add_argument("--host", default="0.0.0.0")
