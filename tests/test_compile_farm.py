@@ -159,6 +159,18 @@ def test_run_compile_refuses_an_hlo_whose_kernel_binaries_are_missing(tmp_path):
     assert not (d / ".compilation_complete").exists()
 
 
+def test_entries_skip_a_capture_lowering_directory(tmp_path):
+    """A capture lowers each graph in <key>.capture.<pid> and renames it into place: one a killed capture left
+    behind holds graph.hlo and no command.txt, and is no entry."""
+    from trnrt.compile import cache
+
+    d = _captured(tmp_path, "a" * 32)
+    left = tmp_path / f"{'b' * 32}.capture.4242"
+    left.mkdir()
+    (left / "graph.hlo").write_bytes(b"hlo")
+    assert cache.entries(str(tmp_path)) == cache.pending(str(tmp_path)) == [str(d)]
+
+
 def test_compile_command_line_compiles_the_pending_entries(tmp_path, capsys):
     from trnrt.compile import cache, farm
 
