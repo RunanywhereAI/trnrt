@@ -64,7 +64,9 @@ def engine_config(argv: list[str], core_base: int = 0):
 
     from .config import EngineConfig
 
-    ap = argparse.ArgumentParser(prog="trnrt")
+    # No abbreviations: the server's own arguments pass through here unparsed, and one that is a prefix of an engine
+    # argument would be read as it (serve's `--host 127.0.0.1` for each engine as --host-cache-gb).
+    ap = argparse.ArgumentParser(prog="trnrt", allow_abbrev=False)
     add_engine_args(ap)
     a, _ = ap.parse_known_args(argv)  # the server's own arguments (--port, --engines, ...) are not the engine's
     return EngineConfig(
@@ -115,7 +117,9 @@ def cache_miss_help() -> str:
 
 
 def cmd_engine(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="python -m trnrt engine", description="One engine and its OpenAI API.")
+    # allow_abbrev=False here too: an abbreviation this parser took would reach engine_config, which ignores it
+    ap = argparse.ArgumentParser(prog="python -m trnrt engine", description="One engine and its OpenAI API.",
+                                 allow_abbrev=False)
     add_engine_args(ap)
     ap.add_argument("--core-base", type=int, default=0, help="the engine's first logical NeuronCore")
     ap.add_argument("--host", default="0.0.0.0")
@@ -198,7 +202,9 @@ def _wait_healthy(url: str, procs: list[subprocess.Popen], timeout_s: float, pol
 
 
 def cmd_serve(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="python -m trnrt serve",
+    # allow_abbrev=False: the engines get this argv (less --engines and --startup-timeout, by their full names), and an
+    # abbreviation would pass through to them unrecognized
+    ap = argparse.ArgumentParser(prog="python -m trnrt serve", allow_abbrev=False,
                                  description="Engines on disjoint NeuronCores and the session-affine router in front.")
     add_engine_args(ap)
     ap.add_argument("--engines", type=int, default=2, help="engines of --tp ranks each, on consecutive cores")
