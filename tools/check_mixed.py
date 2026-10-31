@@ -223,7 +223,8 @@ def main() -> None:
         sys.exit(compare(sys.argv[2], sys.argv[3], q))
     from trnrt.__main__ import add_engine_args, engine_config
 
-    ap = argparse.ArgumentParser(prog="tools/check_mixed.py", description=__doc__.split("\n")[0])
+    # allow_abbrev=False: engine_config below reads the same argv without abbreviations, and would ignore one this took
+    ap = argparse.ArgumentParser(prog="tools/check_mixed.py", description=__doc__.split("\n")[0], allow_abbrev=False)
     add_engine_args(ap)
     ap.add_argument("--core-base", type=int, default=0, help="the engine's first logical NeuronCore")
     ap.add_argument("--out", required=True)
