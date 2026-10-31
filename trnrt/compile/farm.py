@@ -417,6 +417,8 @@ def cmd_capture(a, dirs, engine_config) -> int:
 
 def cmd_compile(a, dirs) -> int:
     root = cache.local_root(dirs["cache_root"])
+    if not cache.entries(root):
+        raise SystemExit(f"{root}: no captured entries; run capture first, with this --out")
     todo = cache.pending(root)
     want = _keys_filter(a)
     if want is not None:
@@ -453,6 +455,8 @@ def cmd_strip(a, dirs) -> int:
     from . import strip
 
     root = cache.local_root(dirs["cache_root"])
+    if not any(os.path.exists(os.path.join(d, cache.MARKER)) for d in cache.entries(root)):
+        raise SystemExit(f"{root}: no compiled entries; run compile first, with this --out")
     s = strip.strip_cache(root, keys=_keys_filter(a), workers=a.workers,
                           on_entry=lambda rep: print(json.dumps(rep), flush=True))
     print(json.dumps({"summary": True, "root": root, **s}), flush=True)
