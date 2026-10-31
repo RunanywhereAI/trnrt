@@ -214,6 +214,122 @@ def test_an_incomplete_entry_fails_alone_run_after_run(tmp_path, capsys):
     assert not list(root.rglob("command.txt.tmp-*"))
 
 
+def test_admits_reserves_what_running_compiles_have_yet_to_take():
+    from trnrt.compile.farm import admits
+
+    G = 2**30
+    assert admits(0, [], 8, 30 * G)  # nothing running: one starts, whatever memory says
+    assert admits(61 * G, [0], 8, 30 * G) and not admits(59 * G, [0], 8, 30 * G)
+    assert admits(31 * G, [30 * G, 40 * G], 8, 30 * G)  # MemAvailable already counts what they hold
+    assert not admits(31 * G, [10 * G, 40 * G], 8, 30 * G)  # the first owes 20 more
+    assert admits(None, [0] * 7, 8, 30 * G) and not admits(None, [0] * 8, 8, 30 * G)  # unknown: workers decide
+    assert not admits(10**6 * G, [0] * 8, 8, 30 * G)
+
+
+def test_host_mem_available_reads_meminfo(tmp_path):
+    from trnrt.compile.farm import host_mem_available
+
+    p = tmp_path / "meminfo"
+    p.write_text("MemTotal:       389000000 kB\nMemFree:          1000000 kB\nMemAvailable:   370000000 kB\n")
+    assert host_mem_available(str(p)) == 370000000 * 1024
+    assert host_mem_available(str(tmp_path / "none")) is None
+
+
+# A stand-in for neuronx-cc that takes a while and notes how many compiles run at once: each holds a file under
+# LIVE while it runs and logs "<key> <files there>" as it starts. An HLO starting OOM kills itself with SIGKILL, as
+# the OOM killer would, the first time (OOM-ALWAYS: every time).
+SLOW_CC = r'''
+import os, signal, sys, time
+a = sys.argv[1:]
+out, live = a[a.index("--output") + 1], LIVE
+hlo = open(a[1], "rb").read()
+mine = os.path.join(live, str(os.getpid()))
+open(mine, "w").close()
+with open(os.path.join(live, os.pardir, "log"), "a") as f:
+    f.write(f"{os.path.basename(os.path.dirname(a[1]))} {len(os.listdir(live))}\n")
+time.sleep(0.4)
+os.remove(mine)
+if hlo.startswith(b"OOM") and (hlo == b"OOM-ALWAYS" or not os.path.exists(out + ".killed")):
+    open(out + ".killed", "w").close()
+    os.kill(os.getpid(), signal.SIGKILL)
+open(out, "wb").write(b"NEFF")
+'''
+
+
+def _slow_cc(tmp_path):
+    live = tmp_path / "ncc" / "live"
+    live.mkdir(parents=True)
+    p = tmp_path / "ncc" / "neuronx-cc"
+    p.write_text(f"#!{sys.executable}\nLIVE = {str(live)!r}\n{SLOW_CC}")
+    p.chmod(0o755)
+    return str(p), tmp_path / "ncc" / "log"
+
+
+def _starts(log):
+    """(key, compiles running as it started) per compile start, in order."""
+    return [(k, int(n)) for k, n in (x.split() for x in log.read_text().splitlines())]
+
+
+@pytest.mark.parametrize("avail_gb,most", [(0.5, 1), (2.5, 2), (None, 6)])
+def test_compiles_start_only_while_host_memory_admits_them(tmp_path, avail_gb, most):
+    """At 1 GB per compile, MemAvailable 2.5 GB admits two at once and 0.5 GB one (with nothing running one starts
+    anyway); every entry compiles. The control: with MemAvailable unknown, --workers alone limits them, and the
+    stand-in sees more than two at once."""
+    from trnrt.compile import cache
+    from trnrt.compile.farm import compile_entries
+
+    cc, log = _slow_cc(tmp_path)
+    ds = [str(_captured(tmp_path / "cc", c * 32, b"hlo" * (i + 1))) for i, c in enumerate("abcdef")]
+    G = 2**30
+    rs = compile_entries(ds, 8, str(tmp_path), cc, mem_per_compile=G, poll_seconds=0.05,
+                         mem_available=lambda: None if avail_gb is None else int(avail_gb * G))
+    assert sorted(r.key for r in rs if r.ok) == sorted(cache.key_of(d) for d in ds)
+    assert all(cache.is_complete(d) for d in ds)
+    seen = max(n for _, n in _starts(log))
+    if avail_gb is None:
+        assert seen > 2, _starts(log)
+    else:
+        assert seen == most, _starts(log)
+
+
+def test_the_command_line_admits_by_mem_per_compile_gb(tmp_path, monkeypatch, capsys):
+    from trnrt.compile import cache, farm
+
+    cc, log = _slow_cc(tmp_path)
+    root = tmp_path / "out" / "cache" / "neuron" / "compile_cache"
+    for c in "abcd":
+        _captured(root, c * 32)
+    monkeypatch.setattr(farm, "host_mem_available", lambda path="/proc/meminfo": 5 * 2**30)
+    assert farm.main(["compile", "--out", str(tmp_path / "out"), "--neuronx-cc", cc, "--mem-per-compile-gb", "2"]) == 0
+    assert cache.pending(str(root)) == []
+    assert max(n for _, n in _starts(log)) == 2
+    out = capsys.readouterr().out.splitlines()
+    assert "each reserving 2 GB of host memory (MemAvailable 5 GB, room for 2 now)" in out[0]
+    assert json.loads(out[-1])["workers"] == os.cpu_count()
+
+
+def test_a_compile_the_oom_killer_took_runs_once_more_alone(tmp_path, capsys):
+    from trnrt.compile import cache, farm
+
+    cc, log = _slow_cc(tmp_path)
+    root = tmp_path / "out" / "cache" / "neuron" / "compile_cache"
+    hlos = {"a" * 32: b"OOM", "b" * 32: b"OOM-ALWAYS", "c" * 32: b"hlo-c", "d" * 32: b"hlo-d"}
+    for k, h in hlos.items():
+        _captured(root, k, h)
+    assert farm.main(["compile", "--out", str(tmp_path / "out"), "--neuronx-cc", cc, "--workers", "4"]) == 1
+    rows = [json.loads(x) for x in capsys.readouterr().out.splitlines() if x.startswith("{")]
+    tries = [(r["key"], r["attempt"], r["ok"], r["oom_killed"]) for r in rows if "key" in r]
+    assert sorted(tries) == sorted([("a" * 32, 1, False, True), ("a" * 32, 2, True, False),
+                                    ("b" * 32, 1, False, True), ("b" * 32, 2, False, True),
+                                    ("c" * 32, 1, True, False), ("d" * 32, 1, True, False)])
+    assert sorted(t[:2] for t in tries[-2:]) == [("a" * 32, 2), ("b" * 32, 2)]  # after the others
+    starts = _starts(log)
+    assert len(starts) == 6 and sorted(starts[-2:]) == [("a" * 32, 1), ("b" * 32, 1)]  # alone
+    assert [cache.is_complete(str(root / k)) for k in hlos] == [True, False, True, True]
+    s = rows[-1]
+    assert (s["entries"], s["failed"], s["retried"]) == (4, 1, 2) and "too little memory" in s["hint"]
+
+
 def test_oom_killed_reads_neuronx_cc_own_report():
     """neuronx-cc reports a subprocess the OOM killer took as exit 70 with [F137]; any other exit 70 is a
     compile error."""
