@@ -148,18 +148,27 @@ def pin_mask(core: int, devices: list[dict], launched, lnc: int | None = None) -
     return (numa_cpus(core, devices, lnc) or set()) & set(launched) or None
 
 
+# What numa_pin saw (core base, devices, launch mask, LNC), for rank_threads: which of the engine's ranks share this
+# rank's CPUs. None when the device listing failed (every rank then runs as launched).
+_PIN: dict | None = None
+
+
 def numa_pin(rank: int, core_base: int, devices: list[dict] | None = None) -> set[int] | None:
     """Pin the calling thread, and so every thread it starts after, to pin_mask of logical core core_base + rank
     (the runtime's NEURON_LOGICAL_NC_CONFIG when set, else neuron-ls's). Returns the mask, or None."""
+    global _PIN
     import sys
 
+    _PIN = None
     lnc = os.environ.get("NEURON_LOGICAL_NC_CONFIG")
+    launched = os.sched_getaffinity(0)
     try:
-        mask = pin_mask(core_base + rank, neuron_devices() if devices is None else devices, os.sched_getaffinity(0),
-                        int(lnc) if lnc else None)
+        devs = neuron_devices() if devices is None else devices
+        mask = pin_mask(core_base + rank, devs, launched, int(lnc) if lnc else None)
     except (OSError, ValueError, KeyError, RuntimeError) as e:  # neuron-ls missing or failing: run as launched
         print(f"NUMA pin: rank {rank} not pinned ({type(e).__name__}: {e})", file=sys.stderr, flush=True)
         return None
+    _PIN = {"core_base": core_base, "devices": devs, "launched": set(launched), "lnc": int(lnc) if lnc else None}
     if mask is None:
         print(f"NUMA pin: rank {rank} not pinned (no CPU of core {core_base + rank}'s node in the launch "
               f"mask)", file=sys.stderr, flush=True)
@@ -175,13 +184,29 @@ def neuron_env(rank: int, port: int, core_base: int) -> None:
     numa_pin(rank, core_base)
 
 
+def rank_threads(world: int) -> int:
+    """Intra-op threads for this rank: the CPUs it may run on (its affinity, after numa_pin) split over the engine's
+    ranks that run on those same CPUs (numa_pin's masks for every rank; all `world` ranks when nothing was pinned).
+    os.cpu_count() ignores taskset, cgroups and the pin: a tp=32 engine launched on 80 of a host's 192 CPUs got 6 threads
+    a rank, 192 threads on 80 CPUs, and its start ran ~13x slower than with 2 (measured). Launched on every CPU and
+    unpinned, this is cpu_count() // world."""
+    mine = os.sched_getaffinity(0) if hasattr(os, "sched_getaffinity") else set(range(os.cpu_count() or 1))
+    sharers = world
+    if _PIN is not None:
+        p = _PIN
+        sharers = sum(1 for r in range(world)
+                      if (pin_mask(p["core_base"] + r, p["devices"], p["launched"], p["lnc"]) or p["launched"]) == mine)
+        sharers = sharers or world  # the affinity moved since numa_pin: no rank's mask is it, so assume all
+    return max(1, len(mine) // sharers)
+
+
 def init_rank(rank: int, world: int, port: int) -> None:
     # Each rank's torch would otherwise start one intra-op thread per CPU: measured load
     # average 364 on a 128-vCPU host with 8 ranks loading weights.
     import torch
     from torch.distributed import distributed_c10d as c10d
 
-    torch.set_num_threads(max(1, (os.cpu_count() or 1) // world))
+    torch.set_num_threads(rank_threads(world))
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
     # torch 2.11 init_process_group names the default group from _world.group_count BEFORE its
