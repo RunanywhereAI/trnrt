@@ -59,8 +59,9 @@ reserves `--mem-per-compile-gb` (default 30) of MemAvailable, and one the OOM ki
 `strip` is not optional at 1M-token buckets: the runtime holds each loaded NEFF in host memory several times over, and
 two engines' unstripped NEFFs do not fit.
 
-The arguments after `capture --` must be the ones the server runs with. The defaults are the served configuration, so
-`--model` alone is enough.
+The arguments after `capture --` must be the engine arguments the server runs with, spelled out in full. Capture refuses
+any other; the server's own, such as `--engines` and `--port`, do not change the graphs. The defaults are the served
+configuration, so `--model` alone is enough.
 
 ### 3. Serve (trn2.48xlarge)
 
