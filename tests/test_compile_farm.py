@@ -189,6 +189,31 @@ def test_compile_command_line_compiles_the_pending_entries(tmp_path, capsys):
     assert cache.pending(str(root)) == []
 
 
+def test_an_incomplete_entry_fails_alone_run_after_run(tmp_path, capsys):
+    """A capture killed between graph.hlo and command.txt leaves an entry with no command, or a cut one: each run
+    reports it and goes on with the others, and exits nonzero. A killed capture's lowering directory is no entry."""
+    from trnrt.compile import cache, farm
+
+    cc = _fake_cc(tmp_path)
+    out = tmp_path / "out"
+    root = out / "cache" / "neuron" / "compile_cache"
+    good = _captured(root, "a" * 32)
+    (_captured(root, "b" * 32) / "command.txt").unlink()
+    _captured(root, "c" * 32, command="/usr/local/bin/neuronx-cc compile")
+    left = root / f"{'d' * 32}.capture.4242"
+    left.mkdir()
+    (left / "graph.hlo").write_bytes(b"hlo")
+    for entries in (3, 2):  # the second run finds the good entry compiled
+        assert farm.main(["compile", "--out", str(out), "--neuronx-cc", cc]) == 1
+        rows = [json.loads(x) for x in capsys.readouterr().out.splitlines() if x.startswith("{")]
+        bad = {r["key"]: r["error"] for r in rows if "key" in r and not r["ok"]}
+        assert sorted(bad) == ["b" * 32, "c" * 32]
+        assert all("run capture again" in e for e in bad.values()), bad
+        assert (rows[-1]["entries"], rows[-1]["failed"]) == (entries, 2)
+        assert cache.is_complete(str(good))
+    assert not list(root.rglob("command.txt.tmp-*"))
+
+
 def test_oom_killed_reads_neuronx_cc_own_report():
     """neuronx-cc reports a subprocess the OOM killer took as exit 70 with [F137]; any other exit 70 is a
     compile error."""
