@@ -191,6 +191,10 @@ def init_layer(layer, cfg: ModelConfig, spec: AttnSpec, p, lin, tp: int) -> None
         # whole-step decode traces the module and reads them
         layer._decode_only = getattr(layer, "_decode_only", ()) + tuple(n + "_dec" for n in dec)
         # the fused layer calls' pre-tiled decode weights (filled in load_layer)
+        if H % 512 or r % 128 or (nh * dv) % 128:
+            raise ValueError(f"context-parallel DSA (attention TP {tp} > 1) needs hidden_size a multiple of 512 and "
+                             f"kv_lora_rank and the rank's value width multiples of 128 (the fused decode layer's "
+                             f"pre-tiled o_proj and W_UV); have hidden {H}, kv_lora {r}, {nh} heads x {dv}")
         layer.w_uv_t = p(128, nh * r // 128, dv)
         layer.o_t = p(128, H // 512 * (nh * dv // 128), 512)
         layer._decode_only = layer._decode_only + ("w_uv_t", "o_t")

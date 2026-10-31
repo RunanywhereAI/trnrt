@@ -218,17 +218,23 @@ def test_fp8_kv_keeps_a_separate_pool_key_cache(sparse):
     assert len(got.output_ids) == 6
 
 
-def test_tp2_matches_tp1(sparse):
-    """KDA heads, MLA heads, the MLP and experts' intermediate split over two ranks; the latent,
-    the indexer and the hyper-connections replicated."""
+def test_tp2_matches_tp1(tmp_path):
+    """KDA heads, MLA heads, the MLP and experts' intermediate split over two ranks; the latent, the indexer and the
+    hyper-connections replicated. At attention TP 2 the DSA caches are context-parallel over the two ranks (each holds
+    1 / 2 of every sequence's latent, indexer rows and pool keys), so the model takes the served form's constraints:
+    hidden a multiple of 512 (the fused decode layer's tiles), pages of kpool x cp = 8 tokens, an FP8 KV cache (the
+    separate pool-key cache). tp=1 runs the same model replicated."""
     from trnrt.engine.request import SamplingParams
 
-    path, _ = sparse
+    path = str(tmp_path)
+    build(path, seed=1, index_topk=16, hidden_size=512)
     ps = prompts(3, (11, 41))
     sp = SamplingParams(max_new_tokens=10, ignore_eos=True)
-    want = [r.output_ids for r in engine(path, max_num_seqs=2).generate(ps, sp)]
-    two = engine(path, max_num_seqs=2, tp=2)
+    kw = dict(max_num_seqs=2, page_size=8, kv_cache_dtype="fp8")
+    want = [r.output_ids for r in engine(path, **kw).generate(ps, sp)]
+    two = engine(path, tp=2, **kw)
     try:
+        assert two.model.cp == 2
         got = [r.output_ids for r in two.generate(ps, sp)]
     finally:
         two.close()
