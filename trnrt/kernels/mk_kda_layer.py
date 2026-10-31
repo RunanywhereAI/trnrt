@@ -25,12 +25,12 @@ except ImportError:
     nki = None
 
 
-def layer_takes(model, T: int) -> bool:
+def layer_takes(model, layer, T: int) -> bool:
     """The split form applies to this decode call: T a multiple of the programs (the glue, _b5, splits the rows between
-    them), and this program's rows x H / 128 chunks <= 128."""
-    from .. import platform
-
-    npg = platform.nki_grid()
+    them), and this program's rows x H / 128 chunks <= 128. The programs are the ones the layer's shell blobs were
+    packed for (layer.ks_dims, as decode_layer_split reads them; the runtime's NKI grid at serve), so the rule holds
+    on a host whose runtime was never configured too."""
+    npg = layer.ks_dims[3]
     return T % npg == 0 and (T // npg) * (model.cfg.hidden_size // 128) <= 128
 
 

@@ -464,7 +464,7 @@ def layer(model, layer, h, positions, slot_mapping, table, bias, state_slot=None
         if fh:  # asked only with the FFN half taking (its guard reads ints only: no tensor enters a helper first)
             from ..kernels import mk_kda_layer as MK
 
-            mk = MK.layer_takes(model, T) and layer.moe
+            mk = MK.layer_takes(model, layer, T) and layer.moe
         if mk:  # both halves, with XLA's sums between them, as ffn_half.decode
             S, post, comb, y = MK.decode_layer_split(model, layer, streams.view(T, hy.hc, H), positions, state_slot,
                                                      pend=pend)  # (post, comb, y) as is: the kernel builds y's slots
