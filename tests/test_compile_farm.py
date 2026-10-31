@@ -636,15 +636,43 @@ def test_capture_replays_the_decisions_and_refuses_without_them(tmp_path, monkey
     assert capture._ACTIVE[0] is None and capture._PENDING[0] is None
 
 
-# -- the capture (needs libtorch_neuronx_lite) --------------------------------------------------------
+# -- the capture ------------------------------------------------------------------------------------
+
+def test_capture_refuses_arguments_the_engine_does_not_take(tmp_path, monkeypatch):
+    """engine_config drops an argument it does not know (the server hands it its own too), so capture refuses one,
+    and an abbreviation, before it builds anything; the engine's own arguments pass."""
+    import re
+
+    from trnrt.compile import capture, farm
+
+    out = tmp_path / "out"
+    (out / "shapes").mkdir(parents=True)
+    (out / "shapes" / capture.HEADERS).write_text("{}")
+    for k in ("NEURON_PLATFORM_TARGET_OVERRIDE", "NEURON_LIBTORCH_CPU_COMPILE"):
+        monkeypatch.delenv(k, raising=False)  # put back afterwards: capture.configure_env sets them
+
+    def engine_config(argv):
+        raise AssertionError(f"engine_config({argv}) ran")
+
+    for argv, named in ((["--model", "m", "--decode-bucket", "1,2"], "--decode-bucket 1,2"),
+                        (["--model", "m", "--tp", "2", "--prefill-bukets", "2048"], "--prefill-bukets 2048"),
+                        (["--model", "m", "--engines", "2", "--port", "8000"], "--engines 2 --port 8000")):
+        with pytest.raises(SystemExit, match=re.escape(f"not engine arguments: {named}.")):
+            farm.main(["capture", "--out", str(out), "--", *argv], engine_config=engine_config)
+    farm.check_engine_args(["--model", "m", "--tp", "2", "--decode-buckets=1,2", "--kv-cache-dtype", "fp8"])
+    with pytest.raises(SystemExit):
+        farm.check_engine_args(["--tp", "2"])  # --model is required
+
+
+# -- the capture itself (needs libtorch_neuronx_lite) -------------------------------------------------
 
 def tiny_engine_config(argv):
-    """engine_config for the capture test: the serve arguments are the model path alone."""
+    """engine_config for the capture test: the serve arguments are --model alone."""
     from trnrt.config import EngineConfig
 
-    return EngineConfig(model_path=argv[0], device="neuron", dtype=torch.bfloat16, tp=2, page_size=8,
-                        kv_cache_dtype="fp8", kv_cache_gb=0.01, max_num_seqs=2, max_model_len=64, max_prefill_tokens=8,
-                        decode_batch_buckets=(2,), prefill_token_buckets=(8,), page_buckets=(2,))
+    return EngineConfig(model_path=argv[argv.index("--model") + 1], device="neuron", dtype=torch.bfloat16, tp=2,
+                        page_size=8, kv_cache_dtype="fp8", kv_cache_gb=0.01, max_num_seqs=2, max_model_len=64,
+                        max_prefill_tokens=8, decode_batch_buckets=(2,), prefill_token_buckets=(8,), page_buckets=(2,))
 
 
 @needs("libtorch_neuronx_lite", "transformers.models.glm5_next", "trnrt.engine.model_runner", "trnrt.models.loader")
@@ -666,7 +694,7 @@ def test_capture_tp2_writes_one_entry_per_graph(tmp_path):
                                                          out_hidden_size=256, projection_intermediate_size=64)))
     model.save_pretrained(str(ckpt), safe_serialization=True)
     assert farm.main(["shapes", str(ckpt), "--out", str(out)]) == 0
-    assert farm.main(["capture", "--out", str(out), "--", str(ckpt)], engine_config=tiny_engine_config) == 0
+    assert farm.main(["capture", "--out", str(out), "--", "--model", str(ckpt)], engine_config=tiny_engine_config) == 0
     keys = json.loads((out / "capture" / "keys.json").read_text())
     assert keys and all(ranks == [0, 1] for ranks in keys.values())
     ranks = [json.loads((out / "capture" / f"rank{r}.json").read_text()) for r in (0, 1)]
@@ -678,5 +706,5 @@ def test_capture_tp2_writes_one_entry_per_graph(tmp_path):
         assert ".compilation_complete" not in files
         assert farm.entry_args(str(cache_dir / k))[0] == "trn2"
     cfg = json.loads((out / "capture" / "config.json").read_text())
-    assert cfg["target"] == "trn2" and cfg["graphs"] == len(keys) and cfg["argv"] == [str(ckpt)]
+    assert cfg["target"] == "trn2" and cfg["graphs"] == len(keys) and cfg["argv"] == ["--model", str(ckpt)]
     assert capture.HEADERS in os.listdir(out / "shapes")
