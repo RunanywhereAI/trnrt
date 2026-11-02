@@ -223,6 +223,7 @@ class LLMEngine:
             pages = int(budget // page_bytes) if page_bytes else cfg.max_num_seqs * cfg.max_pages_per_seq
             self.host_tier = HostTier(self.runner, cfg.page_size, max(1, pages), ckpts)
             self.radix.offload, self.radix.offload_ckpt = self.host_tier.offload, self.host_tier.offload_ckpt
+            self.radix.offload_ckpt_hash = self.host_tier.offload_ckpt_hash
             self.scheduler.host = self.host_tier
         self._ids = itertools.count()
         self.last_step = StepStats()
