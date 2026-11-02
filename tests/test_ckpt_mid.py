@@ -2,8 +2,8 @@
 config: KDA, pooled-DSA MLA, MoE; page size 4), fp32 on CPU. A checkpoint target strictly inside a prefill chunk (the
 prompt's last page boundary, a junction) is written by the chunk's own graph instead of splitting the chunk there:
 - the checkpoint it leaves at the prompt's last page boundary is BIT-equal, every KDA layer's recurrent state and conv
-  window, to the one a chunk ending at that boundary leaves (a copy of the state row after it); a checkpoint one page
-  off is not (positive control); the square [K, V] state is not its transpose;
+  window, to the one a chunk ending at that boundary leaves (a copy of the state row after it), both chunks padded to
+  the same rows; a checkpoint one page off is not (positive control); the square [K, V] state is not its transpose;
 - a returning turn resumes from it and its output equals a cold prefill's;
 - it costs no prefill call;
 - with no free checkpoint row the target is dropped, not split, and the scheduler counts both outcomes.
@@ -75,7 +75,10 @@ WIDE = dict(max_prefill_tokens=64)
 
 def test_the_in_chunk_checkpoint_is_bit_equal_to_one_a_chunk_ends_at(glm, monkeypatch):
     (p,) = mk(91, (29,))   # last page boundary 28
-    ends = eng_(glm, max_prefill_tokens=28)   # the first chunk ends at 28: its state row is copied there
+    # The first chunk ends at 28 (its state row is copied there), padded to the 32 rows the in-chunk prompt takes: on an
+    # x86 host a 28-row chunk rounds differently from a 32-row one (up to 25 ULP from the second KDA layer on), and with
+    # equal rows the two are bit-equal there too, as everywhere on Apple's BLAS.
+    ends = eng_(glm, max_prefill_tokens=28, prefill_token_buckets=(32,))
     try:
         want = _checkpoint_states(ends, p, 7, monkeypatch)
         (q,) = mk(91, (25,))  # the same tokens' first 25: its boundary is one page earlier (24)
