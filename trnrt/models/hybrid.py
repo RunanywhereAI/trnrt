@@ -383,7 +383,7 @@ def _moe_clamped(model, layer, x: torch.Tensor, limit: float, route=None) -> tor
 
     On the device a packed layer always runs an NKI kernel: the XLA paths cannot read the blob there (LNL rejects the
     in-graph uint8 -> float8 view the unpack needs), so they serve packed layers on the CPU only. From
-    MOE_PREFILL_MIN_TOKENS tokens on that is kernels/moe_prefill.py (a grouped GEMM over the whole chunk), below it
+    MOE_PREFILL_MIN_TOKENS tokens on that is kernels/moe_prefill_tsb.py (a grouped GEMM over the whole chunk), below it
     kernels/moe_dedupe.py."""
     cfg = model.cfg
     topv, topi = model._route(layer, x) if route is None else route
@@ -394,11 +394,11 @@ def _moe_clamped(model, layer, x: torch.Tensor, limit: float, route=None) -> tor
         from ..kernels.moe_dedupe import ACTS, moe_dedupe
         from .decoder import MOE_PREFILL_MIN_TOKENS, moe_prefill_down
 
-        if T >= MOE_PREFILL_MIN_TOKENS:
-            from ..kernels.moe_prefill import moe_prefill
+        if T >= MOE_PREFILL_MIN_TOKENS:  # the fused stage-C drain with the token scatter built in SBUF
+            from ..kernels.moe_prefill_tsb import moe_prefill_tsb
 
-            return moe_prefill(x, topv, topi, layer.w_blob, act=ACTS["silu_clamp"], limit=limit,
-                               dq=layer.moe_prefill_dq, down=moe_prefill_down(layer))
+            return moe_prefill_tsb(x, topv, topi, layer.w_blob, act=ACTS["silu_clamp"], limit=limit,
+                                   down=moe_prefill_down(layer))
         return moe_dedupe(x, topv, topi, layer.w_blob, act=ACTS["silu_clamp"], limit=limit)
 
     def act(gu):
