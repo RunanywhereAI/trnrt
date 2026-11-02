@@ -36,7 +36,7 @@ def serve(path, monkeypatch, host: bool, drop_y: bool = False, seen: list | None
         mp.setattr(HY, "SHELL_HOST", host)
         # the split fused KDA + MoE layer has no host form (its second call is a kernel): the shell call and the FFN
         # half as two calls, which hand over the same way
-        mp.setattr(MK, "layer_takes", lambda model, T: False)
+        mp.setattr(MK, "layer_takes", lambda model, layer, T: False)
         if drop_y:  # the mutation: the hand-off without the previous block's output
             real_pend = HY._shell_pend
 
