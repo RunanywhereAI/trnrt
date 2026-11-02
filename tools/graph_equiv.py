@@ -16,7 +16,7 @@ What is compared, and what is normalized away:
     with their `debug` entries (source file and line, op names) dropped and package prefixes removed. The binary tables
     are compared for information only: some are byte offsets into the JSON, which move with string lengths.
   - Inputs (example_inputs.txt), compiler arguments (command.txt, absolute paths reduced to file names) and the artifact
-    metadata (without its cache key).
+    metadata (without its cache key and creation time).
 
     python tools/graph_equiv.py REF_ROOT NEW_ROOT --ref-package NAME [--new-package trnrt] [--json OUT]
                                [--name-map MAP.json] [--pair-by order|signature] [--hlo-proto-path DIR] [--no-kernels]
@@ -340,7 +340,8 @@ def norm_meta(txt):
         d = json.loads(txt)
     except ValueError:
         return txt
-    return {k: v for k, v in d.items() if k != "cache_key"} if isinstance(d, dict) else d
+    # the cache key, and the capture's own time (LNL writes one per capture: two captures of one tree differ in it only)
+    return {k: v for k, v in d.items() if k not in ("cache_key", "created_timestamp")} if isinstance(d, dict) else d
 
 
 def compare_pair(ref_dir, new_dir, names_ref, names_new, pb2, kernels=True):
