@@ -508,12 +508,14 @@ def test_cp_row_groups_match_replicated(tmp_path, monkeypatch):
     writing its share of every chunk row and selecting and attending its half of the rows with every head (index_topk
     1024: keep 256 pools, so the local-K merge of CP_LOCAL_K = 120 per rank runs, with its certificate and redo), decode
     batches through attention_cp inside each row group. The greedy tokens equal the replicated long path's at tp 1.
-    (16 spawned CPU ranks; the model is cut to 16 heads so they split, hidden 512, pages of kpool x cp = 32 tokens.)"""
+    (16 spawned CPU ranks; the model is cut to 16 heads so they split, hidden 512, pages of kpool x cp = 32 tokens; a
+    vocabulary of 1,024, so each rank's shard holds the vocab-parallel sampler's 64 candidates: 384 / 16 = 24 rows made its
+    top-k ask for more ids than the shard has.)"""
     from trnrt.models import mla
 
     path = str(tmp_path)
     glm.build(path, seed=3, layers=4, linear_heads=16, num_attention_heads=16, num_key_value_heads=16,
-              index_topk=1024, max_position_embeddings=4096, hidden_size=512)
+              index_topk=1024, max_position_embeddings=4096, hidden_size=512, vocab_size=1024)
     ps = glm.prompts(6, (1400, 301, 9))
     kw = dict(page_size=32, max_prefill_tokens=64, max_num_seqs=4, max_model_len=2048, num_pages=200)
     assert mla.CP_LOCAL_K == 120 and mla._local_k(256, 8) == 120
