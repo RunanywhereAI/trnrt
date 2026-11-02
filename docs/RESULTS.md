@@ -6,6 +6,11 @@ repository was extracted from, in the serving configuration this repository hard
 an on-device confirmation are pending. Numbers carry a tag: **[M]** measured, **[D]** arithmetic on measured numbers,
 **[E]** an estimate, **[P]** published by a third party.
 
+**Port to the frozen configuration in progress.** This branch carries that configuration's code (the KDA prefill norm kernel,
+the context-parallel DSA merge kernel, the prefill MoE kernels, the 512-token prefill bucket and the scheduler's prefix-hash
+compares). Its graph-equivalence gate (144 graphs) has not run yet. Until it passes, the numbers below are the earlier
+configuration's, as measured.
+
 ## Headline
 
 | | |
