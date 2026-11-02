@@ -69,6 +69,8 @@ class SchedulerConfig:
     # every preemption recomputes from the request's last state checkpoint. (vLLM's v1 scheduler admits
     # whenever the first chunk fits.)
     admission_decode_tokens: int = 256
+    # EngineConfig.max_running: running requests at most (None: max_num_seqs). Admission only, never the graphs' seats.
+    max_running: int | None = None
 
 
 def shared_pages(a: list[int], b: list[int], ps: int, limit: int) -> int:
@@ -332,6 +334,11 @@ class Scheduler:
 
     # -- planning -----------------------------------------------------------------
 
+    def _seats(self) -> int:
+        """Requests that may run at once: the compiled seats (max_num_seqs), or fewer under max_running."""
+        cap = self.cfg.max_running
+        return self.cfg.max_num_seqs if cap is None else min(self.cfg.max_num_seqs, cap)
+
     def _schedule(self) -> StepPlan:
         plan = StepPlan()
         ps = self.cfg.page_size
@@ -369,7 +376,7 @@ class Scheduler:
         # 3. Admit waiting requests, first come first served, while budget and capacity remain.
         owed = sum(self._still_needs(r) for r in self.running)
         deferred = []  # waiting for a running request to checkpoint the prefix they share
-        while self.waiting and budget > 0 and len(self.running) < self.cfg.max_num_seqs:
+        while self.waiting and budget > 0 and len(self.running) < self._seats():
             req = self.waiting[0]
             if self._prefix_in_progress(req):
                 deferred.append(self.waiting.popleft())
