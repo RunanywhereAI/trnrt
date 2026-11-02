@@ -915,9 +915,14 @@ def attention_cp_rows(model, layer, x, positions, slot_mapping, table):
         every_val = _cp_gather(model, lval[:, :K + 1].contiguous()).permute(1, 0, 2)  # [n, A, K + 1]
         every_c = _cp_gather(model, cpool.to(torch.float32)).permute(1, 0, 2)  # [n, A, K]
         vk = every_val[:, :, :K]
-        sel = _dsa_long.cp_merge(vk, every_c, keep, None, Pl * A)  # [n, A, K]
-        fail = _local_k_fail(vk, every_val[:, :, K], sel, keep)  # [n], the same on every rank of the row group
-        chosen = _cp_chosen(sel, rank, A, n, K)
+        glue = not cpu and _cp_glue_takes(n, A, K, keep, ps // (kp * A))  # ints only
+        if glue:  # the main rows' mask through their slot buffer in one call; its rows / bias feed the attention below
+            g_rows, g_bias, fail = _cp_glue(model, table, every_val, every_c, vk, lp, npool, pos_b, rank, keep, A, K,
+                                            Pl, ps // (kp * A), kp)
+        else:
+            sel = _dsa_long.cp_merge(vk, every_c, keep, None, Pl * A)  # [n, A, K]
+            fail = _local_k_fail(vk, every_val[:, :, K], sel, keep)  # [n], the same on every rank of the row group
+            chosen = _cp_chosen(sel, rank, A, n, K)
         # the failed rows again from every rank's whole keep list (up to nF of them, the first ones)
         nF = min(CP_LOCAL_F, n)
         fi, nf = _dsa_long.compact(fail.to(torch.float32).view(1, n), nF)
@@ -960,8 +965,14 @@ def attention_cp_rows(model, layer, x, positions, slot_mapping, table):
         o_r, lse_r = _cp_attend_classes(q_lat, layer.k_cache, rows_sel, rows_tail, chosen, tail_own, npool, pos_b,
                                         m.softmax_scale, kp, CP_SLOTS_SMALL, n_slots)
     else:  # every row in one buffer of CP_SLOTS_SMALL slots (its K entries and the tail), the failed rows replaced
-        o_r, lse_r = _cp_attend_classes(q_lat, layer.k_cache, rows_sel, rows_tail, chosen, tail_own, npool, pos_b,
-                                        m.softmax_scale, kp, CP_SLOTS_SMALL, n_slots, single=True)
+        if glue:  # the buffer the glue kernel built (_cp_attend_classes single's, bit for bit)
+            from ..kernels import dsa_slots_n
+
+            o_r, lse_r = dsa_slots_n.attend(q_lat, layer.k_cache, g_rows, g_bias, m.softmax_scale,
+                                            torch.full((1,), n, dtype=torch.int64, device=q_lat.device), lse=True)
+        else:
+            o_r, lse_r = _cp_attend_classes(q_lat, layer.k_cache, rows_sel, rows_tail, chosen, tail_own, npool, pos_b,
+                                            m.softmax_scale, kp, CP_SLOTS_SMALL, n_slots, single=True)
         tb_f = table.view(1, -1).expand(nF, -1)
         pg_f = torch.floor(lp_f.to(torch.float32) * (1.0 / ppl)).to(torch.int64)
         rows_f = tb_f.gather(1, pg_f.clamp(max=tb_f.shape[1] - 1)) * ppl + (lp_f - pg_f * ppl)
@@ -1006,6 +1017,38 @@ def _cp_local_lists(q_, w_, pk, nloc, L: int, scale: float, Pl: int, cpu: bool, 
     fill_ = sc_.new_full((rr, L), NEG_INF) if Pl < L else torch.full_like(sc_[:, :L], NEG_INF)
     lv = torch.where(k_ < lc_.view(rr, 1), sc_.gather(1, lp_), fill_)
     return dsa_long_select.value_order(lp_, lc_, lv)
+
+
+def _cp_glue_takes(n: int, A: int, K: int, keep: int, ppl: int) -> bool:
+    """Whether the glue kernel (kernels/dsa_cp_glue.py) holds attention_cp_rows' local-K call: its shapes
+    (dsa_cp_glue.takes, the single buffer of CP_SLOTS_SMALL slots), a merge that selects (A K > keep) in one dsa_topk
+    call. Ints only."""
+    from .. import platform
+    from ..kernels import dsa_cp_glue, dsa_topk
+
+    return (A * K > keep and dsa_topk.supported(n, A * K)
+            and dsa_cp_glue.takes(n, A, K, CP_SLOTS_SMALL, ppl, platform.nki_grid()))
+
+
+def _cp_glue(model, table, every_val, every_c, vk, lp, npool, pos_b, rank, keep: int, A: int, K: int, Pl: int,
+             ppl: int, kp: int):
+    """(rows [n, CP_SLOTS_SMALL] int32, bias [n, CP_SLOTS_SMALL, kp], fail [n] bool) of the main rows, as cp_merge ->
+    _local_k_fail / _cp_chosen -> pool_row -> _cp_attend_classes(single=True) give them: the merge's dsa_topk selection
+    (cp_merge_rows' call, on the same scores), the tail's row and ownership (attention_cp_rows' lines, here before the
+    kernel that needs them), then kernels/dsa_cp_glue.py with the merge's TIE_BITS. A module function, not a
+    closure."""
+    from ..kernels import dsa_cp_glue, dsa_topk
+
+    n = vk.shape[0]
+    s = vk.reshape(n, A * K).float()  # cp_merge_rows' scores: dsa_topk's input and the kernel's, row-major
+    sel0 = dsa_topk.select(s, keep, vis_only=True)
+    tail_m = torch.floor(npool.to(torch.float32) * (1.0 / A)).to(torch.int64)
+    tail_own = (npool - tail_m * A) == rank.view(())
+    pg = torch.floor(tail_m.clamp(max=Pl - 1).to(torch.float32) * (1.0 / ppl)).to(torch.int64)
+    rows_tail = _pool_row_flat(table, pg, tail_m.clamp(max=Pl - 1), ppl)
+    npos = torch.stack([npool.to(torch.float32), pos_b.to(torch.float32)], dim=1)
+    return dsa_cp_glue.glue(s, every_c.reshape(n, A * K).float(), every_val[:, :, K].float(), sel0, lp, table, rows_tail,
+                            tail_own, npos, model.long_grp_onehot, keep, ppl, kp, CP_SLOTS_SMALL, _dsa_long.TIE_BITS)
 
 
 def _cp_chosen(sel_, rank, A: int, rr: int, L: int):
