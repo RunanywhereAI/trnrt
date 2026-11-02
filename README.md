@@ -146,6 +146,11 @@ Every `serve` default is the served configuration:
 The bucket ladders, the pool sizes and the page size are graph shapes: changing any of them needs a new capture.
 `python -m trnrt engine` runs one engine without the router.
 
+Supported scope is that configuration. Decode is supported up to 8 requests at once per engine (`--max-num-seqs` 8,
+decode buckets up to 8 rows): larger decode batches are not supported. A prefill MoE call of 512 rows runs one dedupe
+kernel call and one of 600 rows or more the grouped-GEMM kernel; a call of 129 to 256 rows, which no served bucket makes,
+runs 128-row dedupe calls.
+
 ## Tests
 
 ```bash
