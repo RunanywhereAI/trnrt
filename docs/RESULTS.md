@@ -56,8 +56,8 @@ differ in content and pacing.
 
 OpenCode agents working through 16 fixed coding tasks with a 1M-token client context window, at 1 to 32 concurrent sessions
 (C), 300 seconds per level, on the same configuration [M]. A level counts only if every agent seat sent a request in it. In
-this run one agent made no change to its task for 32 minutes and sent no request for 10 until the load generator restarted
-it, so only C = 1 and C = 4 are valid; the other levels are shown as measured.
+this run one agent sent no successful request for about 10 minutes and changed nothing in its worktree for 32, until the
+load generator restarted it, so only C = 1 and C = 4 are valid; the other levels are shown as measured.
 
 | C | Validity | RPM | TPM in / out | Decode p50 / p10 (tok/s/user) | TTFT p50 / p90 (s) | Prefix hit |
 |---|---|---|---|---|---|---|
@@ -69,9 +69,10 @@ it, so only C = 1 and C = 4 are valid; the other levels are shown as measured.
 | 24 | no verdict | 54.0 | 5.28M / 25,365 | 30.1 / 23.7 | 7.70 / 15.46 | 98.0% |
 | 32 | no verdict | 56.6 | 5.08M / 19,495 | 26.8 / 20.0 | 17.28 / 24.12 | 97.2% |
 
-A second run of the same shape, on a fresh server start, ended the same way: a different agent stalled on a different task
-(no change for 25 minutes), so again only C = 1 and C = 4 are valid (C = 4: 28.0 requests per minute, decode p50 63.8
-tokens/s per user, TTFT p50 0.62 s) [M].
+A second run of the same shape, on a fresh server start and registered before its data, ended the same way: one agent on a
+different seat and task sent no successful request for about 10 minutes and changed nothing in its worktree for 25, so
+again only C = 1 and C = 4 are valid (C = 4: 28.0 requests per minute, decode p50 63.8 tokens/s per user, TTFT p50 0.62 s)
+[M]. Both stalls are on the client side: the server kept answering the other seats.
 
 ## Long prompts, one output token
 
@@ -115,9 +116,9 @@ On the measured configuration a 4,096-token prefill call takes 716.9 ms end to e
 
 ## Known issues
 
-One CPU test is open: `tests/test_dsa_long.py::test_cp_engine_matches_replicated`, whose logprobs differ from the
-replicated path by more than its tolerance while every greedy token agrees. It failed the same way before the port to the
-measured configuration. [KNOWN_ISSUES.md](KNOWN_ISSUES.md) gives what is known and what is not.
+One CPU test is marked as a strict expected failure: `tests/test_dsa_long.py::test_cp_engine_matches_replicated`, whose
+logprobs differ from the replicated path by more than its tolerance while every greedy token agrees. It failed the same
+way before the port to the measured configuration. [KNOWN_ISSUES.md](KNOWN_ISSUES.md) gives what is known and what is not.
 
 ## Methodology
 
