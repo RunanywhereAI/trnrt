@@ -69,6 +69,10 @@ it, so only C = 1 and C = 4 are valid; the other levels are shown as measured.
 | 24 | no verdict | 54.0 | 5.28M / 25,365 | 30.1 / 23.7 | 7.70 / 15.46 | 98.0% |
 | 32 | no verdict | 56.6 | 5.08M / 19,495 | 26.8 / 20.0 | 17.28 / 24.12 | 97.2% |
 
+A second run of the same shape, on a fresh server start, ended the same way: a different agent stalled on a different task
+(no change for 25 minutes), so again only C = 1 and C = 4 are valid (C = 4: 28.0 requests per minute, decode p50 63.8
+tokens/s per user, TTFT p50 0.62 s) [M].
+
 ## Long prompts, one output token
 
 Unique prompts with one output token, so the cost is all prefill [M]:
