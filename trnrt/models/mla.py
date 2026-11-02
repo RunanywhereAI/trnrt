@@ -92,8 +92,17 @@ SEL2_CS = 1
 # A decode step of at most SHELL_MAXB rows merges and attends in the DSA shell's attend call
 # (kernels/dsa_shell.py attend); a larger one merges in dsa_long.cp_merge. A decode step of at most
 # LAYER_MK_MAXB rows runs the fused layer calls (kernels/dsa_sat.py, kernels/dsa_satwf.py).
+# LAYER_MK_MAXB is the engine's --dsa-layer-max-rows (EngineConfig.dsa_layer_max_rows, set on every rank by
+# engine.build_shard before it builds the shard; 8 served, 16 under the batch-12 preset).
 SHELL_MAXB = 6
 LAYER_MK_MAXB = 8
+# _cp_scores' kernel scores (kernels/dsa_index.py) of a call of more than CP_INDEX_ROWS rows run as one kernel call
+# per CP_INDEX_ROWS rows, each with its rows' weights, page groups and candidates; 0 (served): one call. Rows are
+# independent in the kernel, so the scores are the same. Each call builds the kernel's query layout [D, rows Hi] by an
+# XLA transpose of [rows Hi, D], which neuronx-cc lowers as an ordinary transpose at 8 rows but at 16 as a DMA transpose
+# of 16,384 16-byte descriptors per DSA layer. The engine's --dsa-index-rows (EngineConfig.dsa_index_rows, set by
+# build_shard; 8 under the batch-12 preset). Only graphs whose calls reach _cp_scores with more rows move.
+CP_INDEX_ROWS = 0
 
 
 def _shell_rows_on(rows: int) -> bool:
@@ -104,6 +113,16 @@ def _shell_rows_on(rows: int) -> bool:
 def _mk_rows_on(rows: int) -> bool:
     """Whether a decode step of `rows` rows takes the fused layer call."""
     return rows <= LAYER_MK_MAXB
+
+
+def _cp_scores_rows(q, w, pkc, table, cand):
+    """CP_INDEX_ROWS: dsa_index.scores of q [T, Hi, D] in calls of CP_INDEX_ROWS rows (each with its rows' weights,
+    page groups and candidates), concatenated: [T, Pl] fp32."""
+    from ..kernels import dsa_index
+
+    n = CP_INDEX_ROWS
+    return torch.cat([dsa_index.scores(q[i : i + n], w[i : i + n], pkc, dsa_index.page_groups(table[i : i + n]),
+                                       cand[i : i + n]) for i in range(0, q.shape[0], n)])
 
 
 def pool_cache_mode(kv_fp8: bool) -> str:
@@ -589,6 +608,8 @@ def _cp_scores(model, layer, q_p, w2, pk, table, nloc, scale: float) -> torch.Te
     T, Pl, Di = pk.shape
     ppk = Pl // table.shape[1]  # local pools per page row (page_size / (kpool cp))
     cand = torch.where(torch.arange(Pl, device=q_p.device).view(1, Pl) < nloc.view(-1, 1), 0.0, NEG_INF)
+    if CP_INDEX_ROWS and T > CP_INDEX_ROWS:  # one kernel call per piece of rows
+        return _cp_scores_rows(q_p, w2.float() * scale, layer.pool_key.view(-1, ppk * Di), table, cand)
     return dsa_index.scores(q_p, w2.float() * scale, layer.pool_key.view(-1, ppk * Di), dsa_index.page_groups(table),
                             cand)
 
