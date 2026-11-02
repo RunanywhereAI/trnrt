@@ -72,7 +72,11 @@ class HostTier:
         """Keep the state checkpoint `row`, the state after the page-aligned `path`."""
         if not path:
             return
-        h = self.hashes(path, len(path) // self.ps)[-1]
+        self.offload_ckpt_hash(self.hashes(path, len(path) // self.ps)[-1], row)
+
+    def offload_ckpt_hash(self, h: int, row: int) -> None:
+        """offload_ckpt by the path's last page hash (hashes(path)[-1]): the radix tree keeps it per node
+        (RadixCache.path_hash), so a checkpoint eviction needn't rebuild and rehash the whole path."""
         if h in self.ckpts:
             self.ckpts.move_to_end(h)
             return
@@ -85,12 +89,13 @@ class HostTier:
         self.ckpts[h] = slot
         self.ckpts_saved += 1
 
-    def find_ckpt(self, ids: list[int], lo: int, hi: int) -> tuple[int, int] | None:
+    def find_ckpt(self, ids: list[int], lo: int, hi: int, chain: list[int] | None = None) -> tuple[int, int] | None:
         """The deepest page count j in [lo, hi] whose prefix ids[: j * page_size] has a host
-        checkpoint, and its slot."""
+        checkpoint, and its slot. chain: ids' page hashes as hashes() gives them (scheduler.page_chain), used
+        when it covers the hi pages."""
         if hi < max(lo, 1):
             return None
-        hs = self.hashes(ids, hi)
+        hs = chain if chain is not None and len(chain) >= hi else self.hashes(ids, hi)
         for j in range(hi, max(lo, 1) - 1, -1):
             slot = self.ckpts.get(hs[j - 1])
             if slot is not None:
@@ -113,13 +118,14 @@ class HostTier:
                 return slot
         return None
 
-    def lookup(self, ids: list[int], start_page: int, limit: int) -> list[int]:
+    def lookup(self, ids: list[int], start_page: int, limit: int, chain: list[int] | None = None) -> list[int]:
         """Host slots of the pages start_page .. that continue a device match, up to page
-        `limit` (exclusive), pinned until load() or unpin()."""
+        `limit` (exclusive), pinned until load() or unpin(). chain: as find_ckpt's."""
         if start_page >= limit:
             return []
         slots = []
-        for h in self.hashes(ids, limit)[start_page:]:
+        hs = chain[:limit] if chain is not None and len(chain) >= limit else self.hashes(ids, limit)
+        for h in hs[start_page:]:
             slot = self.entries.get(h)
             if slot is None:
                 break
