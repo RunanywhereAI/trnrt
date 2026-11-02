@@ -23,7 +23,7 @@ One engine is tensor-parallel over 32 logical NeuronCores (8 Trainium2 chips) at
 physical cores, so every kernel runs as **two NKI programs** (grid 2). The DSA caches are additionally
 context-parallel over groups of 8 ranks: each rank holds 1/8 of every sequence's latent, indexer keys and pool keys.
 A decode call carries 1, 2, 4, 6 or 8 rows (requests), one graph per row count, and the whole step is one compiled
-graph.
+graph. Under `--preset batch12` (README, Configuration) it also carries 12 rows, on the same kernels.
 
 ## Why fuse
 
@@ -55,7 +55,9 @@ Per layer, at every served row count (1-8) [D, from the model code]:
 | DSA (11 layers) | `dsa_satwfc`: **one kernel for the whole layer**, from the indexer's selection to the FFN half's partials (below) | |
 
 That is **79 fused kernel calls for the 45 layers**, with an all-reduce between consecutive calls (in XLA), plus the
-sampler's graph tail [D].
+sampler's graph tail [D]. A 12-row call (`--preset batch12`) runs the same table: there a program's rows pass the one
+128-partition chunk `mk_kda_layer`'s glue takes, so its second kernel runs the same glue in chunks of rows
+(`mk_ffn_b5c_kernel`; calls of 8 rows or fewer keep `mk_ffn_b5_kernel`).
 
 ### The KDA shell (`kda_shell.py`)
 
