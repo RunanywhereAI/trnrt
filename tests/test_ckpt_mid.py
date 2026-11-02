@@ -74,11 +74,12 @@ WIDE = dict(max_prefill_tokens=64)
 
 
 def test_the_in_chunk_checkpoint_is_bit_equal_to_one_a_chunk_ends_at(glm, monkeypatch):
+    """Both chunks run as 32 rows. On an x86 host (MKL) a 28-row chunk end differs from the 32-row in-chunk prompt by up
+    to 25 ULP from the second KDA layer on, and with equal rows the two are bit-equal there too, as on Apple's BLAS. The
+    cause is the row count, at engine level; which operation rounds by it is not identified (a plain fp32 GEMM and
+    sigmoid at 28, 29 and 32 rows are bit-equal on that host)."""
     (p,) = mk(91, (29,))   # last page boundary 28
-    # The first chunk ends at 28 (its state row is copied there), padded to the 32 rows the in-chunk prompt takes: on an
-    # x86 host a 28-row chunk rounds differently from a 32-row one (up to 25 ULP from the second KDA layer on), and with
-    # equal rows the two are bit-equal there too, as everywhere on Apple's BLAS.
-    ends = eng_(glm, max_prefill_tokens=28, prefill_token_buckets=(32,))
+    ends = eng_(glm, max_prefill_tokens=28, prefill_token_buckets=(32,))  # chunk 1 ends at 28 (its row is copied), 32 rows
     try:
         want = _checkpoint_states(ends, p, 7, monkeypatch)
         (q,) = mk(91, (25,))  # the same tokens' first 25: its boundary is one page earlier (24)
