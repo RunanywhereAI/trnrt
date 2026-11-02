@@ -35,7 +35,8 @@ class EngineConfig:
     The engine always runs the served configuration: overlap scheduling, piecewise layer graphs with each decode call
     compiled whole, the radix prefix cache with state checkpoints for the linear-attention layers (at every page
     boundary in decode, inside prefill chunks, and at a finished request's end), and FCFS scheduling with reserve
-    admission. Only the shapes and sizes below vary."""
+    admission. Only the shapes and sizes below vary, with the decode kernel routes' row caps (graph structure, like
+    the shapes) and the admission cap max_running (host only)."""
     model_path: str
     device: str = "cpu"  # "cpu" or "neuron"
     dtype: torch.dtype = torch.bfloat16
@@ -81,6 +82,36 @@ class EngineConfig:
     piecewise_moe_group: int = 12
     piecewise_prefill_moe_group: int = 12
     num_layers: int | None = None  # debugging: run only the first n layers of the checkpoint
+    # At most this many requests running at once, the rest waiting in arrival order (None: max_num_seqs). Host only: no
+    # graph or cache key changes, since max_num_seqs is the graph shape (the state pool's rows) and the decode buckets
+    # are compiled whatever runs. A deployment that wants fewer concurrent requests than its compiled seats caps them
+    # here.
+    max_running: int | None = None
+    # The decode kernel routes' row caps (engine.build_shard sets them on every rank before the shard is built, so the
+    # ranks of an engine and of a capture trace the same routes). Each one decides which graph a decode step of a given
+    # row count traces, so a change needs a new capture. The defaults are the served configuration's (decode steps of
+    # up to 8 rows); the batch-12 preset (trnrt/__main__.py PRESETS) raises them for steps of up to 12 rows.
+    # - kda_shell_max_rows (models/hybrid.py KDA_SHELL_MAXB): a KDA layer's decode attention block runs as the KDA
+    #   shell's kernel at most this many rows, the XLA half above.
+    # - dsa_layer_max_rows (models/mla.py LAYER_MK_MAXB): a DSA layer's decode attention block and FFN half run as the
+    #   fused layer's one call at most this many rows.
+    # - ffn_half_below (models/hybrid.py MOE_HALF_BELOW): a decode FFN block runs as the FFN half's one call below this
+    #   many rows.
+    # - dsa_index_rows (models/mla.py CP_INDEX_ROWS): context-parallel DSA indexer scores of a call of more rows than
+    #   this run as one kernel call per this many rows (0: one call).
+    kda_shell_max_rows: int = 8
+    dsa_layer_max_rows: int = 8
+    ffn_half_below: int = 16
+    dsa_index_rows: int = 0
+
+    def __post_init__(self):
+        if self.max_running is not None and self.max_running < 1:
+            raise ValueError(f"max_running={self.max_running}: at least 1, or None (max_num_seqs)")
+        for name in ("kda_shell_max_rows", "dsa_layer_max_rows", "ffn_half_below"):
+            if getattr(self, name) < 1:
+                raise ValueError(f"{name}={getattr(self, name)}: at least 1")
+        if self.dsa_index_rows < 0:
+            raise ValueError(f"dsa_index_rows={self.dsa_index_rows}: 0 (one call) or more")
 
     def resolved_moe_kernel(self) -> str:
         return self.moe_kernel or ("nki" if self.device in ("neuron", "meta") else "xla")
