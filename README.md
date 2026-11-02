@@ -137,7 +137,7 @@ Every `serve` default is the served configuration:
 | `--engines`, `--tp` | 2, 32 | engines per host, tensor-parallel ranks per engine |
 | `--max-model-len` | 1048576 | context per request |
 | `--max-num-seqs`, `--decode-buckets` | 8; 1,2,4,6,8 | requests decoding at once per engine, compiled batch sizes |
-| `--max-prefill-tokens`, `--prefill-buckets` | 4096; 1024,2048,4096 | prefill chunk per step, compiled chunk sizes |
+| `--max-prefill-tokens`, `--prefill-buckets` | 4096; 512,1024,2048,4096 | prefill chunk per step, compiled chunk sizes |
 | `--page-size`, `--page-buckets`, `--prefill-page-buckets` | 256; 512,1024,4096; 1024,4096 | KV page, compiled context lengths in pages |
 | `--kv-cache-gb`, `--kv-cache-dtype` | 4.0, fp8 | KV pool per rank |
 | `--state-checkpoints` | 16 | linear-attention state rows kept for the prefix cache |
