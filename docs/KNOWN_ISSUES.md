@@ -16,7 +16,8 @@ What is known:
   its prefill chunk size changed (16 tokens to 12), already moves logprobs by up to 5.7e-4, above the 1e-4 tolerance.
 
 Not shown: that context parallelism adds nothing beyond that ordering noise. Its difference is about 4 times the
-chunk-size floor, so the test is left failing rather than loosened until the cause is isolated.
+chunk-size floor, so the tolerance is not loosened. The test is marked as an expected failure, strict: if a change makes it
+pass, the suite fails until this entry and the mark are revisited.
 
 This CPU test does not gate served accuracy: the served configuration's accuracy is checked on the device, against the
 reference model, by its own gates.
