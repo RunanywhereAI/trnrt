@@ -550,8 +550,24 @@ def checkpoint_experts(E=6, H=1024, Im=64, seed=0):
 
 # -- the header checkpoint and the load-time decisions (need the model loader) ------------------------
 
+@pytest.fixture
+def restore_capture(monkeypatch):
+    """capture.install_header_checkpoint patches the loader, DecoderLayer.pack_experts and moe_prefill's check_blob /
+    down_factors for the rest of the process (a capture runs in a process of its own). A test that installs them puts
+    them back after it; otherwise every later engine in the session loads through them (test_decode_composition's
+    KDA shells then received no FFN hand-off when this file ran before it)."""
+    from trnrt.kernels import moe_prefill as mp
+    from trnrt.models import decoder, loader
+
+    for obj, name in ((loader._Checkpoint, "__init__"), (loader, "_load_experts"),
+                      (decoder.DecoderLayer, "pack_experts"), (mp, "check_blob"), (mp, "down_factors")):
+        monkeypatch.setattr(obj, name, getattr(obj, name))
+    for obj in (loader._Checkpoint, mp):  # the install guards: absent again afterwards
+        monkeypatch.setattr(obj, "_trnrt_capture", False, raising=False)
+
+
 @MODELS
-def test_a_shape_dir_reads_like_the_checkpoint(tmp_path):
+def test_a_shape_dir_reads_like_the_checkpoint(tmp_path, restore_capture):
     """The loader's checkpoint over a shape directory answers every question about names, shapes and dtypes
     as it does over the checkpoint, slices included, under both namings of GLM-5.3-Flash's text model."""
     from trnrt.compile import capture
@@ -641,7 +657,7 @@ def test_compute_decisions_writes_every_layer_and_rank(tmp_path):
 
 
 @MODELS
-def test_capture_replays_the_decisions_and_refuses_without_them(tmp_path, monkeypatch):
+def test_capture_replays_the_decisions_and_refuses_without_them(tmp_path, monkeypatch, restore_capture):
     """A layer packed from a shape directory (zeros) gets the recorded answers, and the tensors the real
     values give it (moe_prefill_dsc / moe_prefill_dfr: their presence, shapes and dtypes enter the graphs);
     an answer the record lacks raises."""
