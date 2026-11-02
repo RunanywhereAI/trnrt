@@ -433,6 +433,10 @@ def _mix_rows(model, layer, x: torch.Tensor, positions: torch.Tensor, slot_mappi
     q = q * dk ** -0.5
     v = v.float()
     nki_prefill = form in ("chunk", "sequence") and x.device.type != "cpu" and kernel_takes(sp)
+    # The gated norm below as one kernel on the delta rule's output at LNC = 2 (kernels/gated_norm.py): ints only.
+    from ..kernels import gated_norm
+
+    norm2 = nki_prefill and dt == torch.bfloat16 and gated_norm.takes2(dv, T)
     if nki_prefill:  # the delta rule's unit group of 6
         scan = lambda *a: _nki_chunk(*a, keep_pad=False, ug=6)  # noqa: E731
     else:
@@ -466,6 +470,8 @@ def _mix_rows(model, layer, x: torch.Tensor, positions: torch.Tensor, slot_mappi
         o, _ = scan(q, k, v, g, beta, q.new_zeros(nv, dk, dv))
 
     # Gated RMSNorm per head (KimiLinearRMSNormGated: fp32 throughout), then the output projection.
+    if norm2:  # the 128-row tiles split between the LNC programs
+        return F.linear(gated_norm.apply2(o, z, layer.o_norm, cfg.rms_norm_eps), model._w(layer, "out"))
     of = o.to(dt).float()
     of = of * torch.rsqrt(of.pow(2).mean(-1, keepdim=True) + cfg.rms_norm_eps)
     of = layer.o_norm * of

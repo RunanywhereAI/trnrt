@@ -214,7 +214,8 @@ def test_the_loaded_glm_layout():
 @pytest.mark.parametrize("fmt", ["glm", "glm-rows", "loaded"])
 def test_pack_experts_records_the_prefill_path(fmt):
     """DecoderLayer.pack_experts checks the blob once and records the kernel path the layer's prefill calls take
-    (hybrid._moe_clamped passes dq and moe_prefill_down). loaded: GLM-5.3-Flash's experts as the loader leaves them."""
+    (hybrid._moe_clamped passes moe_prefill_down). loaded: GLM-5.3-Flash's experts as the loader leaves them, whose
+    per-column down scales are stored as the fused drain's table (kernels/moe_prefill_mdr.fused_drain_table)."""
     from trnrt.models import decoder
 
     if fmt == "loaded":
@@ -227,12 +228,11 @@ def test_pack_experts_records_the_prefill_path(fmt):
     decoder.DecoderLayer.pack_experts(layer)
     assert layer.moe_tiles and layer.w_gu is None
     assert layer.moe_prefill_dq == (fmt == "glm")
-    if fmt == "loaded":  # per-column down scales: chunk scales times powers of two
-        dsc, dfr = decoder.moe_prefill_down(layer)
-        assert dsc.dtype == torch.float32 and dfr.dtype == torch.bfloat16 and tuple(dfr.shape) == (6, 1024)
-        k = torch.arange(8)
-        assert torch.equal(dsc[:, 2 * (k % 4) + k // 4].repeat_interleave(128, 1) * dfr.float(),
-                           mdd.unpack_down(layer.w_blob.data, 1024)[1][:, 0, :].float())
+    if fmt == "loaded":  # per-column down scales (chunk scales times powers of two) as three bf16 pieces each
+        dsc, tab = decoder.moe_prefill_down(layer)
+        assert dsc.dtype == torch.float32 and tab.dtype == torch.bfloat16 and tuple(tab.shape) == (6, 3 * 1024)
+        t = tab.float().view(6, 3, 1024).sum(1)  # exact in fp32 (split3)
+        assert torch.equal(t, mdd.unpack_down(layer.w_blob.data, 1024)[1][:, 0, :].float())
     else:
         assert decoder.moe_prefill_down(layer) is None
 
