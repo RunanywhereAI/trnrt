@@ -66,7 +66,8 @@ two engines' unstripped NEFFs do not fit.
 
 The arguments after `capture --` must be the engine arguments the server runs with, spelled out in full. Capture refuses
 any other; the server's own, such as `--engines` and `--port`, do not change the graphs. The defaults are the served
-configuration, so `--model` alone is enough.
+configuration, so `--model` alone is enough. For the batch-12 configuration ([Configuration](#configuration)), pass
+`--preset batch12` to both `capture` and `serve`.
 
 ### 3. Serve (trn2.48xlarge)
 
@@ -130,13 +131,14 @@ curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -
 
 ## Configuration
 
-Every `serve` default is the served configuration:
+Every `serve` default is the served configuration, decode batches of up to 8 requests per engine:
 
 | Argument | Default | |
 |---|---|---|
 | `--engines`, `--tp` | 2, 32 | engines per host, tensor-parallel ranks per engine |
 | `--max-model-len` | 1048576 | context per request |
-| `--max-num-seqs`, `--decode-buckets` | 8; 1,2,4,6,8 | requests decoding at once per engine, compiled batch sizes |
+| `--max-num-seqs`, `--decode-buckets` | 8; 1,2,4,6,8 | request seats per engine, compiled batch sizes |
+| `--max-running` | (`--max-num-seqs`) | requests running at once per engine; host only |
 | `--max-prefill-tokens`, `--prefill-buckets` | 4096; 512,1024,2048,4096 | prefill chunk per step, compiled chunk sizes |
 | `--page-size`, `--page-buckets`, `--prefill-page-buckets` | 256; 512,1024,4096; 1024,4096 | KV page, compiled context lengths in pages |
 | `--kv-cache-gb`, `--kv-cache-dtype` | 4.0, fp8 | KV pool per rank |
@@ -146,10 +148,55 @@ Every `serve` default is the served configuration:
 The bucket ladders, the pool sizes and the page size are graph shapes: changing any of them needs a new capture.
 `python -m trnrt engine` runs one engine without the router.
 
-Supported scope is that configuration. Decode is supported up to 8 requests at once per engine (`--max-num-seqs` 8,
-decode buckets up to 8 rows): larger decode batches are not supported. A prefill MoE call of 512 rows runs one dedupe
-kernel call and one of 600 rows or more the grouped-GEMM kernel; a call of 129 to 256 rows, which no served bucket makes,
-runs 128-row dedupe calls.
+### Batch 12: `--preset batch12`
+
+Decode batches of up to 12 requests per engine. The preset sets these engine arguments; everything else stays at the
+defaults above:
+
+| Argument | Default | `--preset batch12` | |
+|---|---|---|---|
+| `--max-num-seqs` | 8 | 16 | request seats per engine (the state pool's rows) |
+| `--decode-buckets` | 1,2,4,6,8 | 1,2,4,6,8,12 | compiled decode batch sizes |
+| `--max-running` | (`--max-num-seqs`) | 12 | requests running at once per engine |
+| `--kda-shell-max-rows` | 8 | 12 | KDA layers' decode attention as one fused kernel up to this many rows |
+| `--dsa-layer-max-rows` | 8 | 16 | DSA layers' decode attention and FFN as one fused kernel up to this many rows |
+| `--ffn-half-below` | 16 | 17 | decode FFN blocks as one fused kernel below this many rows |
+| `--dsa-index-rows` | 0 | 8 | the DSA indexer's decode scores in kernel calls of at most this many rows (0: one call) |
+
+So every decode step of up to 12 rows runs on the same fused decode kernels as the default configuration's steps of up
+to 8. The preset has its own graphs: 16 seats change every graph that carries the linear-attention state, prefill
+graphs included, and the 12-row decode graphs are new. Capture and serve with the same preset (step 2's shape
+directory and `trnrt` function; its entries sit beside the default configuration's in the cache, under their own keys,
+and `$OUT/capture` then holds this capture's records):
+
+```bash
+trnrt compile capture --out $OUT -- --model $OUT/shapes --preset batch12
+trnrt compile compile --out $OUT
+trnrt compile strip --out $OUT
+docker run ... trnrt serve --model /model --port 8000 --preset batch12   # the mounts and variables of step 3
+```
+
+An argument given explicitly overrides the preset's value. `--max-running` is host only; any other override changes
+the graphs and needs its own capture. As for the defaults, the graph-equivalence gate's run on this configuration and
+an on-device check are pending.
+
+### Batch 4: `--max-running 4`
+
+`--max-running N` admits at most N requests at once per engine (never more than `--max-num-seqs`); the rest wait in
+arrival order. It changes no graph, so it runs on the compile cache of the configuration it is added to. Batch 4 is
+the default configuration with `--max-running 4`, on the default compile cache:
+
+```bash
+docker run ... trnrt serve --model /model --port 8000 --max-running 4   # the mounts and variables of step 3
+```
+
+### Supported scope
+
+Supported scope is these configurations: the defaults (decode batches of up to 8 requests per engine), the defaults
+with a lower `--max-running` (batch 4: `--max-running 4`), and `--preset batch12` (decode batches of up to 12). Larger
+decode batches, and values of `--kda-shell-max-rows`, `--dsa-layer-max-rows`, `--ffn-half-below` and
+`--dsa-index-rows` other than the defaults and the preset's, are not supported. A prefill MoE call of 512 rows runs one dedupe kernel call and one of 600 rows or more
+the grouped-GEMM kernel; a call of 129 to 256 rows, which no served bucket makes, runs 128-row dedupe calls.
 
 ## Tests
 
