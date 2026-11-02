@@ -45,7 +45,7 @@ def add_engine_args(ap: argparse.ArgumentParser) -> None:
     g.add_argument("--max-num-seqs", type=int, default=8, help="requests decoding at once per engine")
     g.add_argument("--max-prefill-tokens", type=int, default=4096, help="prefill tokens per step (the chunk size)")
     g.add_argument("--decode-buckets", type=_ints, default=(1, 2, 4, 6, 8))
-    g.add_argument("--prefill-buckets", type=_ints, default=(1024, 2048, 4096))
+    g.add_argument("--prefill-buckets", type=_ints, default=(512, 1024, 2048, 4096))
     g.add_argument("--page-buckets", type=_ints, default=(512, 1024, 4096))
     g.add_argument("--prefill-page-buckets", type=_ints, default=(1024, 4096))
     g.add_argument("--prefill-page-min-rows", type=int, default=2048)
