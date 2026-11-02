@@ -15,8 +15,8 @@ What is compared, and what is normalized away:
     instruction records and binary tables) is decompressed. The module JSON and the instruction records are compared
     with their `debug` entries (source file and line, op names) dropped and package prefixes removed. The binary tables
     are compared for information only: some are byte offsets into the JSON, which move with string lengths.
-  - Inputs (example_inputs.txt), compiler arguments (command.txt, absolute paths reduced to file names) and the artifact
-    metadata (without its cache key and creation time).
+  - Inputs (example_inputs.txt), compiler arguments (command.txt, absolute paths reduced to file names, the cache key
+    in them masked) and the artifact metadata (without its cache key and creation time).
 
     python tools/graph_equiv.py REF_ROOT NEW_ROOT --ref-package NAME [--new-package trnrt] [--json OUT]
                                [--name-map MAP.json] [--pair-by order|signature] [--hlo-proto-path DIR] [--no-kernels]
@@ -317,7 +317,13 @@ def _read(p):
         return None
 
 
-def norm_command(txt):
+KEY_RE = re.compile(r"[0-9a-f]{32}")  # a compile-cache key (the entry's directory, and its NEFF's file name)
+
+
+def norm_command(txt, mask_key=True):
+    """command.txt's arguments with absolute paths reduced to file names and, in those, the cache key masked: the
+    compiler's input and output paths name the entry's key (compile_cache/<key>/graph_<key>.neff), and keys never match
+    across two trees, so an unmasked compare reads every pair as differing in its command."""
     if txt is None:
         return None
     try:
@@ -328,7 +334,8 @@ def norm_command(txt):
         if "/" not in a or a.startswith("--internal"):
             return a
         flag, eq, val = a.rpartition("=") if a.startswith("-") and "=" in a else ("", "", a)
-        return f"{flag}{eq}{os.path.basename(val)}"
+        base = os.path.basename(val)
+        return f"{flag}{eq}{KEY_RE.sub('<key>', base) if mask_key else base}"
 
     return [one(a) for a in args]
 
