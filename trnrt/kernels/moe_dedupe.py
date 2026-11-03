@@ -2,7 +2,7 @@
 kernels on it: one that reads each selected expert ONCE per call (moe_dedupe_v8, up to 128 tokens a call) and the
 per-pair kernel (moe_tiles_pairs_v1, under PAIRS_BELOW tokens), whose body the decode FFN half (kernels/ffn_half_pb.py)
 and kernels/moe_half.py copy. Prefill chunks of MOE_PREFILL_MIN_TOKENS (models/decoder.py) and more take
-kernels/moe_prefill.py, and decode calls the FFN half, so the two kernels here serve only device calls between.
+kernels/moe_prefill_tsb.py, and decode calls the FFN half, so the two kernels here serve only device calls between.
 
 A per-pair kernel loads one expert blob per (token, expert) pair, so its HBM traffic follows
 the pairs: with T tokens x top-8 of 288 experts, T=32 reads 256 blobs for about 171 distinct
