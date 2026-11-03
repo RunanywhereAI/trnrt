@@ -12,7 +12,8 @@ ladders and the decode kernel routes are graph structure: a server finds its gra
 `compile capture` ran with the same arguments (the same --preset included). --max-running (fewer requests running
 than the compiled seats) is host only. An engine compiles nothing on the serving host: a graph missing from the cache
 ends its start-up with the likely cause (NEURON_LIBTORCH_ASSERT_CACHE_HIT=1; --allow-compile compiles it there instead,
-minutes to hours a graph).
+minutes to hours a graph). Before it starts, an engine on Neuron checks its host (engine/start_checks.py): its devices
+free of other processes, and enough contiguous free host memory for the runtime.
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ GiB = 2**30
 # serving host: minutes to hours per graph, while the engine is not serving).
 CACHE_HIT_ENV = "NEURON_LIBTORCH_ASSERT_CACHE_HIT"
 CACHE_MISS_STATUS = 3  # an engine's exit status when its start-up stopped at a graph missing from the compile cache
+START_REFUSED_STATUS = 4  # an engine's exit status when a check of its host refused its start (engine/start_checks.py)
 HEALTH_POLL_S = 5.0  # serve: how often it asks a starting engine's /health
 
 
@@ -185,6 +187,12 @@ def cmd_engine(argv: list[str]) -> int:
     add_compile_arg(ap)
     a = ap.parse_args(argv)
     cfg = engine_config(argv, a.core_base)
+    from .engine import start_checks
+
+    why = start_checks.refusal(cfg.device, a.core_base, cfg.tp)  # its devices free, enough contiguous host memory
+    if why is not None:
+        print(f"trnrt engine: not starting: {why}", file=sys.stderr, flush=True)
+        return START_REFUSED_STATUS
     os.environ.update(compile_env(a.allow_compile))  # before the engine spawns its ranks: they inherit it
     from .engine.engine import LLMEngine
     from .serve.api import build_app, serve
@@ -234,6 +242,9 @@ def _start_failed(i: int, status: int) -> str:
     if status == CACHE_MISS_STATUS:
         return (f"engine {i} stopped at start-up: a graph it needs is not in the compile cache (its message above "
                 "names the key and the likely cause). Rebuild the cache for these arguments, or pass --allow-compile.")
+    if status == START_REFUSED_STATUS:
+        return (f"engine {i} did not start: a check of the host refused it (its message above says what it found and "
+                "how to fix it)")
     return f"engine {i} exited during start-up (status {status}); see its log above"
 
 
