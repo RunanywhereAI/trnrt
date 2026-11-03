@@ -352,17 +352,41 @@ def test_a_side_request_goes_to_the_least_loaded_worker_and_the_pin_stays():
     assert r.routed["new_session"] == 1 and r.routed["rekey"] == 0
 
 
-def test_each_pin_and_side_request_logs_its_worker(capsys):
-    """A log reader attributes requests to engines by these lines: a new pin and a side request each print the worker;
-    a continuing turn prints nothing (the last pin line per session is its worker)."""
-    r = Router(["a", "b"])
+def _pin_side_failover(r: Router) -> tuple[int, int]:
+    """A pin, a side request, a continuing turn, then the pinned worker down and the session's next turn."""
     w = r.pick("", session="s", key=MAIN, tools=True)
     r.load[w] += 1
     side = r.pick("", session="s", key=TITLE, tools=False)
     r.pick("", session="s", key=MAIN, tools=True)
-    out = capsys.readouterr().out.splitlines()
+    r.note_failure(w, hard=True)
+    r.pick("", session="s", key=MAIN, tools=True)
+    return w, side
+
+
+def test_with_the_debug_switch_each_pin_and_side_request_logs_its_worker(capsys, monkeypatch):
+    """TRNRT_ROUTER_LOG_SESSIONS=1: a log reader attributes requests to engines by these lines, which name the session:
+    a new pin and a side request each print the worker; a continuing turn prints nothing (the last pin line per
+    session is its worker); a failover names the session."""
+    monkeypatch.setenv("TRNRT_ROUTER_LOG_SESSIONS", "1")
+    r = Router(["a", "b"])
+    w, side = _pin_side_failover(r)
+    out = [ln for ln in capsys.readouterr().out.splitlines() if "is down" not in ln]
     assert out == [f"trnrt.router: session 's' pinned to worker {w} ({r.workers[w]})",
-                   f"trnrt.router: side request of session 's' to worker {side} ({r.workers[side]})"]
+                   f"trnrt.router: side request of session 's' to worker {side} ({r.workers[side]})",
+                   f"trnrt.router: session 's' failed over from worker {w} ({r.workers[w]}, down) to worker {1 - w} "
+                   f"({r.workers[1 - w]})"]
+
+
+def test_by_default_no_line_names_a_session(capsys, monkeypatch):
+    """A session id is the client's own identifier: by default nothing is printed per request, and a failover is
+    logged without the id."""
+    monkeypatch.delenv("TRNRT_ROUTER_LOG_SESSIONS", raising=False)
+    r = Router(["a", "b"])
+    w, _ = _pin_side_failover(r)
+    out = [ln for ln in capsys.readouterr().out.splitlines() if "is down" not in ln]
+    assert out == [f"trnrt.router: a session failed over from worker {w} ({r.workers[w]}, down) to worker {1 - w} "
+                   f"({r.workers[1 - w]})"]
+    assert Router(["a"], log_sessions=True).log_sessions and not Router(["a"]).log_sessions
 
 
 def test_a_side_request_that_comes_first_does_not_hold_the_main_history():
