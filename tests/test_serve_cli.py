@@ -3,6 +3,7 @@ assertion unless --allow-compile, a cache miss ends start-up with its likely cau
 time and stops them all past --startup-timeout, and the argv serve hands each engine parses there. Fake engine
 processes and a fake /health: nothing is loaded or served."""
 
+import os
 import signal
 import time
 
@@ -158,6 +159,17 @@ def test_a_cache_miss_ends_serve_with_its_cause(host):
     assert "exited during start-up (status 1)" in str(e.value.code) and "cache" not in str(e.value.code)
 
 
+def test_serve_reports_an_engine_its_host_refused(host):
+    """An engine whose host checks refused it (engine/start_checks.py) exits with START_REFUSED_STATUS: serve says so,
+    pointing at the engine's own message, and starts nothing after it."""
+    host.plan = [{"ready": 2, "exit_status": cli.START_REFUSED_STATUS}]
+    with pytest.raises(SystemExit) as e:
+        cli.cmd_serve(["--model", "m"])
+    msg = str(e.value.code)
+    assert "engine 0 did not start" in msg and "check of the host refused it" in msg and "cache" not in msg, msg
+    assert len(host.engines) == 1 and host.router is None
+
+
 def test_an_engine_that_dies_while_the_next_starts_ends_serve(host, monkeypatch):
     host.plan = [{"ready": 1}, {"ready": None}]
     fake_get = httpx.get
@@ -236,6 +248,24 @@ def test_engine_passes_other_failures_through_and_allow_compile_turns_the_assert
     assert cli.cmd_engine(ENGINE_ARGV) == 0
     assert cli.cmd_engine(ENGINE_ARGV + ["--allow-compile"]) == 0
     assert engine.seen_env == ["1", "1", "0"]
+
+
+def test_an_engine_its_host_refuses_builds_nothing(engine, monkeypatch, capsys):
+    """cmd_engine asks the host checks about its own cores before anything starts: a refusal is printed and ends it
+    with START_REFUSED_STATUS, no engine built and no environment set for one."""
+    from trnrt.engine import start_checks
+
+    asked = []
+
+    def refuse(device, core_base, tp):
+        asked.append((device, core_base, tp))
+        return "the Neuron devices of this engine's cores 32-63 (devices 8, 9) are in use by another process: pid 7"
+
+    monkeypatch.setattr(start_checks, "refusal", refuse)
+    assert cli.cmd_engine(["--model", "m", "--core-base", "32"]) == cli.START_REFUSED_STATUS
+    assert asked == [("neuron", 32, 32)] and engine.cfgs == [] and engine.seen_env == []
+    assert "trnrt engine: not starting: the Neuron devices of this engine's cores 32-63" in capsys.readouterr().err
+    assert cli.CACHE_HIT_ENV not in os.environ  # refused before the engines' environment was set
 
 
 def test_cache_miss_reads_the_chain_and_only_a_miss():
