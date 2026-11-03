@@ -2,7 +2,9 @@
 
 One process per rank; rank 0 runs the scheduler and the API, ranks > 0 replay every graph
 call rank 0 makes (ModelRunner.serve), so all ranks execute identical graphs on identical
-inputs and meet at the same in-graph collectives. Host-side coordination is gloo.
+inputs and meet at the same in-graph collectives. Host-side coordination is gloo; rank 0's
+calls reach the other ranks through a shared-memory channel (ShmChannel below; TRNRT_TP_SHM=0
+sends them over gloo instead).
 
 On Neuron each rank sees exactly one NeuronCore (NEURON_RT_VISIBLE_CORES) and all ranks
 share one CCOM bootstrap endpoint (NEURON_RT_ROOT_COMM_ID), the arrangement vllm-neuron's
@@ -250,14 +252,205 @@ def attention_group(world: int, attn_tp: int):
     return mine
 
 
+# Rank 0's calls to the other ranks (host only: no graph or cache key reads any of this) go through a shared-memory
+# channel unless TRNRT_TP_SHM=0 (rank 0's environment). Every rank of a tensor-parallel engine runs on this one host.
+# dist.broadcast_object_list pickles a call, then runs two gloo collectives (its size, then its bytes) over TCP: about
+# 3 ms per decode step at 1-4 rows (measured; flat in rows, so latency, not bytes), on the critical path while every
+# rank's device idles. Rank 0 writes the pickled call and a sequence number into the segment; each worker polls the
+# number (spinning, then backing off), copies the call and acknowledges it, and rank 0 overwrites the payload only once
+# every worker has acknowledged the last one. A call larger than the segment goes through broadcast_object_list in its
+# turn. The first call announces the segment's name over gloo, so the workers need no setting of their own; None (the
+# shutdown) closes it. The segment is TRNRT_TP_SHM_BYTES (64 MiB) in /dev/shm, one per engine.
+SHM = os.environ.get("TRNRT_TP_SHM", "1") != "0"
+SHM_BYTES = int(os.environ.get("TRNRT_TP_SHM_BYTES", str(64 << 20)))
+_SHM_HELLO = "__trnrt_tp_shm__"
+# The open channel of this process ("ch"), and whether creating one failed in this engine ("failed": its calls then go
+# over gloo, as with TRNRT_TP_SHM=0).
+_CH: dict = {"ch": None, "failed": False}
+# A waiting party asks whether its peer is still there about once a second once it has backed off to 1 ms sleeps.
+_ALIVE_EVERY = 1000
+
+
+class ShmChannel:
+    """One writer (rank 0), world - 1 readers, on a multiprocessing.shared_memory segment: header [seq, length, mode,
+    capacity], one acknowledged seq per rank, then the payload. mode 1: the payload holds the call; mode 2: the call
+    follows by broadcast_object_list (too large for the segment). The capacity is the creator's request, written into
+    the header: the OS may map more (macOS rounds a segment up to its 16 KiB page), and every party must agree."""
+
+    HDR = 64
+
+    def __init__(self, shm, world: int, rank: int, owner: bool, nbytes: int = 0):
+        import numpy as np
+
+        self.shm, self.world, self.rank, self.owner = shm, world, rank, owner
+        self.ctl = np.ndarray((4,), dtype=np.uint64, buffer=shm.buf, offset=0)
+        self.acks = np.ndarray((world,), dtype=np.uint64, buffer=shm.buf, offset=self.HDR)
+        self.off = self.HDR + -(-8 * world // 64) * 64
+        if owner:
+            self.ctl[3] = max(0, nbytes - self.off)
+        self.cap = int(self.ctl[3])
+        # every party starts at 0: a fresh segment's first call is seq 1. A reader that took the segment's current seq
+        # when it attached would skip a call written before it attached (the writer announces the segment, then
+        # writes its first call at once) and never acknowledge it: the writer would wait on it forever.
+        self.seen = 0
+
+    @classmethod
+    def create(cls, world: int, nbytes: int = 0) -> "ShmChannel":
+        from multiprocessing import shared_memory
+
+        nbytes = nbytes or SHM_BYTES
+        shm = shared_memory.SharedMemory(create=True, size=nbytes)
+        shm.buf[: cls.HDR + 8 * world] = bytes(cls.HDR + 8 * world)
+        return cls(shm, world, 0, True, nbytes)
+
+    @classmethod
+    def attach(cls, name: str, world: int, rank: int) -> "ShmChannel":
+        from multiprocessing import resource_tracker, shared_memory
+
+        # A reader never touches the resource tracker: the creator registers the segment and unlinks it. The engine's
+        # ranks share the creator's tracker, whose registry holds a name ONCE, so a reader's register-then-unregister
+        # (the usual fix for Python < 3.13 tracking every attach) dropped the creator's entry, every later unregister
+        # raised KeyError in the tracker, and a killed rank 0 then leaked the segment. Python >= 3.13: track=False;
+        # 3.12: register is a no-op during the open.
+        try:
+            shm = shared_memory.SharedMemory(name=name, track=False)
+        except TypeError:
+            real = resource_tracker.register
+            resource_tracker.register = lambda *a, **k: None
+            try:
+                shm = shared_memory.SharedMemory(name=name)
+            finally:
+                resource_tracker.register = real
+        return cls(shm, world, rank, False)
+
+    @staticmethod
+    def _wait(cond, gone=None) -> None:
+        """Until cond(). Once the wait has backed off to 1 ms sleeps, gone() (a reader's: whether rank 0's process has
+        exited) is asked about once a second, and raises when it answers yes: over gloo a worker's broadcast fails once
+        rank 0's connection drops, and a worker left polling the segment of a dead rank 0 would hold its NeuronCore for
+        good."""
+        import time
+
+        n = 0
+        while not cond():
+            n += 1
+            if n > 2000:  # ~0.5 ms of spinning, then back off: idle workers do not hold a core each
+                time.sleep(5e-5 if n < 20000 else 1e-3)
+                if gone is not None and n >= 20000 and n % _ALIVE_EVERY == 0 and gone():
+                    raise RuntimeError("tensor-parallel rank 0 exited: this rank stops")
+
+    def _acked(self, seq: int) -> bool:
+        """Whether every reader has acknowledged call `seq`. Raises once drop_channel closed the channel under a send
+        still waiting (a rank had died): that send then fails instead of waiting forever."""
+        acks = self.acks
+        if acks is None:
+            raise RuntimeError("the tensor-parallel channel was closed while rank 0 waited for the other ranks")
+        return all(int(acks[r]) >= seq for r in range(1, self.world))
+
+    def send(self, msg) -> None:
+        import pickle
+
+        seq = self.seen
+        self._wait(lambda: self._acked(seq))
+        data = pickle.dumps(msg, protocol=pickle.HIGHEST_PROTOCOL)
+        big = len(data) > self.cap
+        if not big:
+            self.shm.buf[self.off : self.off + len(data)] = data
+        self.ctl[1] = len(data)
+        self.ctl[2] = 2 if big else 1
+        self.seen = seq + 1
+        self.ctl[0] = seq + 1  # last: a reader that sees it sees the payload, length and mode
+        if big:
+            dist.broadcast_object_list([msg], src=0)
+
+    def recv(self):
+        import pickle
+
+        self._wait(lambda: int(self.ctl[0]) > self.seen, _parent_gone)
+        self.seen += 1
+        n, mode = int(self.ctl[1]), int(self.ctl[2])
+        data = bytes(self.shm.buf[self.off : self.off + n]) if mode == 1 else None
+        self.acks[self.rank] = self.seen
+        if mode == 2:
+            box = [None]
+            dist.broadcast_object_list(box, src=0)
+            return box[0]
+        return pickle.loads(data)
+
+    def close(self) -> None:
+        self.ctl = self.acks = None
+        self.shm.close()
+        if self.owner:
+            self.shm.unlink()
+
+
+def _parent_gone() -> bool:
+    """In a spawned worker (multiprocessing.parent_process: rank 0, the engine's process): whether rank 0 has exited.
+    False in a process with no parent process record (rank 0 itself, a test's reader threads)."""
+    import multiprocessing
+
+    p = multiprocessing.parent_process()
+    return p is not None and not p.is_alive()
+
+
 def send(msg) -> None:
-    dist.broadcast_object_list([msg], src=0)
+    ch = _CH["ch"]
+    if ch is None and SHM and not _CH["failed"] and msg is not None and dist.get_world_size() > 1:
+        try:
+            ch = ShmChannel.create(dist.get_world_size())
+        except (OSError, ValueError) as e:  # no usable /dev/shm: nothing was announced yet, so the calls go over gloo
+            _CH["failed"] = True
+            import sys
+
+            print(f"trnrt: no shared-memory channel for the tensor-parallel calls ({type(e).__name__}: {e}); they go "
+                  "over gloo, which is slower (TRNRT_TP_SHM=0 chooses gloo from the start)", file=sys.stderr,
+                  flush=True)
+        else:
+            _CH["ch"] = ch
+            dist.broadcast_object_list([(_SHM_HELLO, ch.shm.name)], src=0)
+    if ch is None:
+        dist.broadcast_object_list([msg], src=0)
+        return
+    ch.send(msg)
+    if msg is None:
+        ch._wait(lambda: ch._acked(ch.seen))  # every rank has read it
+        ch.close()
+        _CH["ch"] = None
 
 
 def recv():
+    ch = _CH["ch"]
+    if ch is not None:
+        msg = ch.recv()
+        if msg is None:
+            ch.close()
+            _CH["ch"] = None
+        return msg
     box = [None]
     dist.broadcast_object_list(box, src=0)
-    return box[0]
+    msg = box[0]
+    if isinstance(msg, tuple) and len(msg) == 2 and msg[0] == _SHM_HELLO:
+        _CH["ch"] = ShmChannel.attach(msg[1], dist.get_world_size(), dist.get_rank())
+        return recv()
+    return msg
+
+
+def drop_channel() -> None:
+    """Rank 0, when its engine stops: forget and unlink a channel the shutdown call did not close (an engine whose rank
+    failed, or that failed to start), so that the next engine of this process opens its own. A send still waiting for
+    a dead rank's acknowledgement then raises instead of waiting forever. A no-op after a normal close.
+
+    The mapping is not closed here: that send's thread may be reading the header at this moment, and numpy views do
+    not hold the buffer, so unmapping under it would crash the process. The mapping goes with the channel's last
+    reference (that thread's, once its send has raised)."""
+    ch, _CH["ch"], _CH["failed"] = _CH["ch"], None, False
+    if ch is None:
+        return
+    ch.ctl = ch.acks = None
+    try:
+        ch.shm.unlink()
+    except OSError:  # already gone
+        pass
 
 
 def worker_main(rank: int, cfg, path: str, num_pages: int, port: int) -> None:
