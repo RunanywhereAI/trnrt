@@ -1,6 +1,6 @@
-"""tools/check_mixed.py's compare (host only): a run against itself is the bytes gate's PASS (equal N/N, every
-parity figure zero); a divergence at a clear margin FAILS (the gate can fail); the prompts are LONG_TEXT windows 997
-tokens apart, their lengths cycling."""
+"""tools/check_mixed.py's compare (host only): a run against itself passes the byte-for-byte output comparison (equal
+N/N, every parity figure zero); a divergence at a clear margin FAILS (the comparison can fail); the prompts are
+LONG_TEXT windows 997 tokens apart, their lengths cycling."""
 
 from __future__ import annotations
 

@@ -5,8 +5,7 @@ of dozens of XLA ops and small kernel calls per layer. This page covers which ke
 fuses, the contract that lets them be fused one half at a time, and the rules every kernel here follows. The code is
 in [`trnrt/kernels/`](../trnrt/kernels); the model code that calls it is in [`trnrt/models/`](../trnrt/models).
 
-Numbers carry the same tags as [RESULTS.md](RESULTS.md): **[M]** measured on trn2, **[D]** derived from measured
-numbers or from the code, **[E]** an estimate.
+Times and rates on this page were measured on trn2; counts of calls and layers are read from the model code.
 
 ## The model and the layout
 
@@ -22,22 +21,22 @@ GLM-5.3-Flash has 45 decoder layers:
 One engine is tensor-parallel over 32 logical NeuronCores (8 Trainium2 chips) at LNC = 2. Each logical core is two
 physical cores, so every kernel runs as **two NKI programs** (grid 2). The DSA caches are additionally
 context-parallel over groups of 8 ranks: each rank holds 1/8 of every sequence's latent, indexer keys and pool keys.
-A decode call carries 1, 2, 4, 6 or 8 rows (requests), one graph per row count, and the whole step is one compiled
-graph. Under `--preset batch12` (README, Configuration) it also carries 12 rows, on the same kernels.
+A decode call carries 1, 2, 4, 6, 8 or 12 rows (requests) in the default configuration, and up to 8 in the batch-8
+configuration (README, Configuration), one graph per row count, and the whole step is one compiled graph. Every row
+count runs on the same kernels.
 
 ## Why fuse
 
 A decode step at these batch sizes reads weights and moves little else, so its floor is set by bytes and
 collectives. What it actually pays for is fixed costs, and those scale with the number of operations:
 
-- **A minimal NKI call in a dependent chain costs ~6.3 µs [M]**, before it does anything.
-- **XLA glue between kernels is not free.** At one decode row, a MoE FFN half cost ~198 µs in XLA [M], about 45% of
+- **A minimal NKI call in a dependent chain costs ~6.3 µs**, before it does anything.
+- **XLA glue between kernels is not free.** At one decode row, a MoE FFN half cost ~198 µs in XLA, about 45% of
   the step across its 42 MoE layers. Of that, ~67 µs was XLA ops (the fp32 router, its top-k, the gather and
   normalisation, the shared expert with its in-graph FP8 dequant), ~14 µs layout permutes, and only ~14 µs the expert
   kernel itself.
 - **The dense layers were worse per byte.** The FFN block of layers 0-2 was two kernel calls around a slot sum,
-  rms_norm, the in-graph dequant of 4.7M FP8 weights, two dots and their transposes: 188-191 µs of XLA glue per step
-  [M].
+  rms_norm, the in-graph dequant of 4.7M FP8 weights, two dots and their transposes: 188-191 µs of XLA glue per step.
 - **Every kernel boundary is a scheduling barrier.** Work that could hide under a collective or a weight stream
   cannot when it sits in another call.
 
@@ -46,7 +45,7 @@ after one all-reduce and ends right before the next.
 
 ## What a decode step runs
 
-Per layer, at every served row count (1-8) [D, from the model code]:
+Per layer, at every served row count (1 to 12), from the model code:
 
 | Layer | Attention half | FFN half |
 |---|---|---|
@@ -55,9 +54,9 @@ Per layer, at every served row count (1-8) [D, from the model code]:
 | DSA (11 layers) | `dsa_satwfc`: **one kernel for the whole layer**, from the indexer's selection to the FFN half's partials (below) | |
 
 That is **79 fused kernel calls for the 45 layers**, with an all-reduce between consecutive calls (in XLA), plus the
-sampler's graph tail [D]. A 12-row call (`--preset batch12`) runs the same table: there a program's rows pass the one
-128-partition chunk `mk_kda_layer`'s glue takes, so its second kernel runs the same glue in chunks of rows
-(`mk_ffn_b5c_kernel`; calls of 8 rows or fewer keep `mk_ffn_b5_kernel`).
+sampler's graph tail. A 12-row call runs the same table: there a program's rows pass the one 128-partition chunk
+`mk_kda_layer`'s glue takes, so its second kernel runs the same glue in chunks of rows (`mk_ffn_b5c_kernel`; calls of
+8 rows or fewer keep `mk_ffn_b5_kernel`).
 
 ### The KDA shell (`kda_shell.py`)
 
@@ -74,6 +73,10 @@ One call takes the residual streams to the two programs' partials of the KDA hal
   from a weight laid out for it at load, so there is no transpose and no exchange between the programs.
 - Both programs compute the mix and mhc_pre on all of S, which their projections need anyway. Each program then owns
   one KDA head: 64 heads over 32 ranks is 2 per rank.
+- Each program streams its own head's projection columns and output-projection rows and writes its own partial of the
+  output projection; the caller all-reduces both partials as one collective, and the next call adds them (the
+  contract, below). An early build exchanged the gated-norm output between the programs through shared HBM behind a
+  core barrier instead; that cost ~17 µs of a ~55 µs call, and the served kernel does without it.
 - The **mix-in** is what removes a kernel per layer. The FFN block of layer n leaves its output mix undone and hands
   `(post, comb, y)` to layer n + 1's shell, which applies it first (`hybrid.defers`, `DecoderForCausalLM._run_layers`).
 
@@ -112,14 +115,27 @@ does the rest of the layer:
    reads neither the send buffer nor the result is placed under it.
 7. **The FFN half's body**, the same function the FFN-half kernel traces (`ffn_half_shared.py`).
 8. **The attention block's Sinkhorn**, issued in three pieces after the three collectives' issue points so it runs
-   under their waits. Its only reader is step 7's mix-in. At four rows it ran ~15.5 µs alone [M].
+   under their waits. Its only reader is step 7's mix-in. At four rows it ran ~15.5 µs alone.
 
 One kernel per DSA layer means three collectives (the list merge, the all_to_all and the world sum) with the
 selection, attention, combine, projections and FFN half between and around them, and no kernel boundary at all.
 
+### The stream mix (`mix_wide.py`)
+
+Each shell's mix-in (above) mixes mHC's four residual streams: output stream n is post_n y + Σ_m comb[m, n] S_m in
+fp32, m in order, rounded to bf16 (`shell.mix_in_h`). The per-stream form ran each vector instruction over one output
+stream, T W elements per partition (128 at four rows), so about half of each instruction was the vector engine's fixed
+cost of ~153 ns. The served form, `mix_wide.py`, runs every op on all four output streams at once, [128, hc, T, W], and
+reads the operand that does not depend on the output stream through a stride-0 access pattern. Each element sees the
+per-stream form's fp32 operations in the same order, and one fp32-to-bf16 cast (round to nearest even) stands in for
+the per-stream form's rounding step. The result is the per-stream form's bit for bit on every normal value up to
+5.19e33 and on ±0 (checked exhaustively over the fp32 bit patterns); only subnormals, which the per-stream form
+double-rounds, and values above 5.19e33 can differ. At batch 4 the mix takes 2.1× less vector-engine time than the
+per-stream form.
+
 ## The contract: all-reduce to all-reduce
 
-Every shell keeps the same boundary, so shells could land one at a time and each half could be gated on its own:
+Every shell keeps the same boundary, so shells could land one at a time and each half could be checked on its own:
 
 - **In:** the streams S and the previous block's pending mix `(post, comb, Y)`, where Y is the two programs'
   all-reduced partials.
@@ -141,21 +157,22 @@ of dozens; every graph input costs launch time on the host. The blobs are decode
 them (`layer._decode_only`).
 
 **Two programs.**
-- One NKI program streams ~330 GB/s of weights on trn2, against XLA's ~545 over both cores [M]. A kernel that
-  duplicates its weight stream in both programs therefore caps itself at one core.
+- One NKI program streams 340–400 GB/s of weights on trn2; a logical core's two programs together stream
+  672–708 GB/s. A kernel that duplicates its weight stream in both programs therefore caps itself at one program's
+  rate.
 - Split by heads, experts or column tiles. Duplicate only what is replicated anyway (the router, mHC).
 - Avoid exchanging data between the programs mid-kernel when a partial will do. A gated-norm exchange in an early
-  KDA build cost ~17 µs of a ~55 µs call [M].
+  KDA build cost ~17 µs of a ~55 µs call.
 - Allocate every buffer before any branch on the program id, so that it sits at the same address in both traces.
 
 **DMA.**
 - Every static DMA uses static descriptors (`dge_mode none`). Row gathers by slot use the hardware DGE with
   out-of-bounds skip.
 - Left to the compiler, 98% of one kernel's bytes went through the GpSimd engine's software DGE; fixing it took the
-  call from 64 to 54.8 µs [M].
+  call from 64 to 54.8 µs.
 
 **Scalar engine.**
-- An activation-table switch costs ~1.3 µs [M]. The kernels use only exp and rsqrt: sigmoid and SiLU go through exp
+- An activation-table switch costs ~1.3 µs. The kernels use only exp and rsqrt: sigmoid and SiLU go through exp
   and a vector reciprocal.
 - `rsqrt` alone is ~1e-5 off, so it takes one Newton step on the vector engine.
 
@@ -197,30 +214,36 @@ them (`layer._decode_only`).
    pipeline ring bug showed only at 8 rows). Grid 1 is compared with grid 2 bit for bit, and planted mutations must be
    caught.
 3. **On one NeuronCore:** against the emulation, then priced in chains against the XLA path it replaces.
-4. **In the step:** the compiled graphs, then the accuracy gate on outputs.
+4. **In the step:** the compiled graphs, then accuracy checks on the outputs.
 
 The simulator is necessary but not sufficient. It accepted forms the device computes wrongly: accumulating matmuls
 into slices of one PSUM tile, unfenced in-kernel collectives, and cross-program reads of shared scratch. It also
 accepted forms the compiler rejects. So every new form gets a device run checked by value, with a control.
 
-This repository's own gate: the 130 graphs this code builds, and their kernel binaries, are compared with the
-engine it was extracted from. They must match modulo names and `rev` values ([`tools/graph_equiv.py`](../tools/graph_equiv.py)).
+This repository's own check: the graphs this code builds, and their kernel binaries, are compared with the engine it
+was extracted from (144 graphs in the batch-8 configuration). They must match modulo names and `rev` values
+([`tools/graph_equiv.py`](../tools/graph_equiv.py)).
 
 ## Prefill kernels
 
-Prefill runs piecewise: a prep graph, one graph per run of 12 layers, and a post graph, at chunks of 1,024 / 2,048 /
-4,096 tokens. The streams are sequence-parallel across the 32 ranks. The kernels:
+Prefill runs piecewise: a prep graph, one graph per run of 12 layers, and a post graph, at chunks of 512 / 1,024 /
+2,048 / 4,096 tokens. The streams are sequence-parallel across the 32 ranks. The kernels:
 
 | Kernel | What it does |
 |---|---|
 | `delta_rule.py` | KDA's chunked gated delta rule over a chunk (the per-chunk form of flash-linear-attention's chunk_kda); its 16-token sub-chunks stay finite in fp32 only because the gate's lower bound (-5) bounds every log decay |
 | `short_conv.py` | KDA's causal short convolution with its conv state |
-| `moe_prefill.py` | the routed experts as a grouped GEMM over the whole chunk, on the same packed FP8 tiles the decode kernels read |
+| `gated_norm.py` | KDA's gated RMSNorm after the delta rule, its 128-row tiles split between the two programs. Rows sit on the partitions, the delta rule's own output layout, so every reduction runs along the free axis and nothing is transposed: the compiler had laid these few elementwise ops on 2 of 128 partitions behind 2,048 transposes, ~1.07 ms of engine time per KDA layer in a 4,096-row piece, against 0.17 ms here |
+| `moe_prefill_tsb.py` | the routed experts of a call of 600 rows or more, as a grouped GEMM over the whole chunk on the same packed FP8 tiles the decode kernels read. It builds the token scatter that opens the call as a counting sort on the matrix engine: 0/1 matmuls accumulated in PSUM give each slot its token exactly, where the kernel it derives from wrote it with hundreds of small indirect DMAs (~0.7 ms of a 4,096-row call). Everything after that is `moe_prefill_mdr.py`'s, bit for bit |
+| `moe_prefill_mdr.py` | `moe_prefill.py`'s grouped GEMM with the down projection drained straight from the PSUM accumulator: one vector multiply per 512-column chunk by an exact per-column scale table, instead of four scaled scalar-engine drains, the kernel's largest fixed cost. Its output is `moe_prefill.py`'s bit for bit |
+| `moe_prefill.py` | the grouped-GEMM kernel the two above derive from |
+| `moe_dedupe.py` | the routed experts of a 512-row call, in one `moe_dedupe_v10` call that reads each selected expert once for all of its tokens, which saves 56 ms on a 512-token chunk. A call of 129 to 256 rows, which no served bucket makes, runs `moe_dedupe_v8` in calls of 128 rows |
 | `dsa_topk.py` | exact top-k of the pooled indexer's scores, as one kernel instead of ~32-48 dependent XLA rounds |
 | `dsa_long_pipe_s.py`, `dsa_long_select_t.py` | the long-context selection pipeline under context parallelism, its query tiles split over the two physical cores |
+| `dsa_cp_glue.py` | the context-parallel selection's glue between the merge's threshold selection (`dsa_topk.py`) and the slot attention: the merged selection with its exact tie search, the certificate that the merge holds the true top set ([KNOWN_ISSUES.md](KNOWN_ISSUES.md)), this rank's chosen pools and the attention's row and bias buffers, bit for bit XLA's. It reads the chunk's block table from SBUF instead of with one DMA descriptor per element. As one kernel, the glue saves 18 ms per chunk |
 | `dsa_slots_n_s.py` | the context-parallel attention over the selected pools, rows split over the two physical cores |
 | `mhc_pre.py`, `mhc_mix.py`, `mhc_fnj.py` | the hyper-connections around each block |
 
 The split forms (`_s`) exist because at grid 2 a kernel that never reads its program id runs all of its work on both
 physical cores, or on one while the other waits. In a served 4,096-token prefill call, `dsa_slots_n` alone took 51.6
-of a 12-layer piece's 465 ms before its rows were split [M].
+of a 12-layer piece's 465 ms before its rows were split.

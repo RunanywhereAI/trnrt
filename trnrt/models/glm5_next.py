@@ -10,8 +10,8 @@ with a lightning indexer whose keys are scored in POOLS of index_kpool = 4 conse
 routed_scaling_factor 2.5) plus one shared expert. The MTP layer (layers.45) and the vision
 tower are not loaded.
 
-Numerics follow transformers v5.18.0 src/transformers/models/glm5_next/modeling_glm5_next.py
-(https://github.com/huggingface/transformers/blob/v5.18.0/src/transformers/models/glm5_next/modeling_glm5_next.py),
+Numerics follow transformers v5.17.0 src/transformers/models/glm5_next/modeling_glm5_next.py
+(https://github.com/huggingface/transformers/blob/v5.17.0/src/transformers/models/glm5_next/modeling_glm5_next.py),
 config keys its configuration_glm5_next.py; the checkpoint's config.json:
 https://huggingface.co/zai-org/GLM-5.3-Flash/raw/eb9eb208eb0d988989d07a6a12d0fdeb5f52574a/config.json
 

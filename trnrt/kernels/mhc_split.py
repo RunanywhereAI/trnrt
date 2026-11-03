@@ -11,7 +11,7 @@ half-rounds under its own waits. Code beside mhc_pre, which keeps its own REV.
         half-rounds lo .. hi - 1 of pre_body's 2 iters - 1 (k even: the columns, k odd: the rows); the call whose hi is
         2 iters - 1 writes comb_out. A host kernel issues the 39 half-rounds in pieces between its own stages.
 
-The instructions are pre_body's, copied (tests/test_mhc_split.py pins it against mhc_pre.py's source), with one move:
+The instructions are pre_body's, copied (tests/test_mhc.py pins it against mhc_pre.py's source), with one move:
 the pre-mix (x) comes before the Sinkhorn instead of after it. It reads pre, not comb, so the values are the same;
 The kernel below (mhc_split_kernel, a test entry: no served path calls it) is checked against mhc_pre_kernel bit for bit
 in the simulator.

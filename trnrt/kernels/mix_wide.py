@@ -3,7 +3,7 @@ kernels/shell.py binds as mix_in_h outside its hashed in-kernel span. Every call
 its REV.
 
 Why: the per-stream form (shell.py's mix_in_h, "fin") runs every op once per output stream at free T W (128 at four
-rows), so about half of each vector instruction is its fixed ~140 ns. At four rows that was 1108 us per step over 75
+rows), so about half of each vector instruction is its fixed ~153 ns. At four rows that was 1108 us per step over 75
 calls, 219% of the vector engine's fp32 floor.
 
 The form (wide-cast): every op runs on [128, hc, T, W] (hc T W elements per partition) instead of hc ops on [128, T,
