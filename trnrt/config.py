@@ -38,6 +38,8 @@ class EngineConfig:
     admission. Only the shapes and sizes below vary, with the decode kernel routes' row caps (graph structure, like
     the shapes) and the admission cap max_running (host only)."""
     model_path: str
+    # With a Hugging Face repo id as model_path: the commit (or branch, tag) to download (None: the default branch).
+    model_revision: str | None = None
     device: str = "cpu"  # "cpu" or "neuron"
     dtype: torch.dtype = torch.bfloat16
     # "auto" stores KV in the model dtype; "fp8" in float8 e4m3 (vLLM / SGLang --kv-cache-dtype fp8), halving the KV
