@@ -74,6 +74,9 @@ def add_engine_args(ap: argparse.ArgumentParser) -> None:
                    help="a named configuration (README, Configuration): its values become the defaults of the "
                         "arguments it sets; an argument given explicitly still wins")
     g.add_argument("--model", required=True, help="the checkpoint directory (or a Hugging Face repo id)")
+    g.add_argument("--revision", default=None,
+                   help="with a Hugging Face repo id as --model: the commit (or branch, tag) to download; default: the "
+                        "repo's default branch. Host only: no graph changes")
     g.add_argument("--device", default="neuron", choices=["neuron", "cpu"])
     g.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float32"])
     g.add_argument("--tp", type=int, default=32, help="tensor-parallel ranks per engine, one logical NeuronCore each")
@@ -136,9 +139,9 @@ def engine_config(argv: list[str], core_base: int = 0):
 
     a = parse_engine_args(argv)
     return EngineConfig(
-        model_path=a.model, device=a.device, dtype=getattr(torch, a.dtype), kv_cache_dtype=a.kv_cache_dtype,
-        page_size=a.page_size, kv_cache_gb=a.kv_cache_gb, max_num_seqs=a.max_num_seqs, max_model_len=a.max_model_len,
-        max_prefill_tokens=a.max_prefill_tokens, decode_batch_buckets=a.decode_buckets,
+        model_path=a.model, model_revision=a.revision, device=a.device, dtype=getattr(torch, a.dtype),
+        kv_cache_dtype=a.kv_cache_dtype, page_size=a.page_size, kv_cache_gb=a.kv_cache_gb, max_num_seqs=a.max_num_seqs,
+        max_model_len=a.max_model_len, max_prefill_tokens=a.max_prefill_tokens, decode_batch_buckets=a.decode_buckets,
         prefill_token_buckets=a.prefill_buckets, page_buckets=a.page_buckets,
         prefill_page_buckets=a.prefill_page_buckets, prefill_page_min_rows=a.prefill_page_min_rows,
         host_cache_gb=a.host_cache_gb, state_checkpoints=a.state_checkpoints, tp=a.tp, tp_core_base=core_base,
