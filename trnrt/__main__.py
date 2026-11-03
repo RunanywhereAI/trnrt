@@ -96,7 +96,9 @@ def add_engine_args(ap: argparse.ArgumentParser) -> None:
     g.add_argument("--state-checkpoints", type=int, default=16, help="state-pool rows kept for prefix checkpoints")
     g.add_argument("--host-cache-gb", type=float, default=4.0,
                    help="host memory under the prefix cache per rank, GiB (0: off)")
-    g.add_argument("--moe-kernel", default="nki", choices=["nki", "xla"])
+    g.add_argument("--moe-kernel", default=None, choices=["nki", "xla"],
+                   help="the selected experts' MoE: the NKI kernels (the served path) or XLA's gather (default: nki on "
+                        "Neuron, xla on --device cpu, where NKI kernels do not run)")
     g.add_argument("--num-layers", type=int, default=None, help="debugging: the first n layers only")
     k = ap.add_argument_group("decode kernel routes", "the row counts at which a decode step takes each fused kernel. "
                               "Graph structure: a change needs a new capture. Supported: the defaults (the served "
