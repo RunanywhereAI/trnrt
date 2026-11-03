@@ -67,6 +67,7 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import os
 import time
 
 import httpx
@@ -74,6 +75,11 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 SESSION_FIELD = "session_id"  # the request body field naming the session (serve/api.py takes it too)
+# TRNRT_ROUTER_LOG_SESSIONS=1, for debugging: a line per new pin and per side request, and the failover and return-home
+# lines, each with the session's id, so a log reader can attribute requests to engines. Off (the default) the router
+# logs no session id, which is the client's own identifier: no line per request, and the failover and return-home lines
+# without it.
+LOG_SESSIONS_ENV = "TRNRT_ROUTER_LOG_SESSIONS"
 SESSION_KEY_CHARS = 4096
 ROUTES = ("/v1/completions", "/v1/chat/completions")
 
@@ -160,8 +166,10 @@ class Router:
     def __init__(self, workers: list[str], cache_threshold: float = 0.5, balance_abs: int = 32,
                  balance_rel: float = 1.5, max_tree_chars: int = 128_000_000, session_idle_s: float = 1800.0,
                  clock=time.monotonic, sticky_chars: int = 32_768, down_after: int = 3,
-                 session_ttl_s: float | None = None, max_sessions: int = 100_000):
+                 session_ttl_s: float | None = None, max_sessions: int = 100_000, log_sessions: bool | None = None):
         self.workers = workers
+        # whether lines name sessions (LOG_SESSIONS_ENV; None: from the environment)
+        self.log_sessions = os.environ.get(LOG_SESSIONS_ENV) == "1" if log_sessions is None else log_sessions
         self.trees = [PrefixTree(max_tree_chars) for _ in workers]
         self.load = [0] * len(workers)
         self.cache_threshold, self.balance_abs, self.balance_rel = cache_threshold, balance_abs, balance_rel
@@ -207,21 +215,21 @@ class Router:
             w = mv[0]
             del self.moved[sid]
             self.routed["home"] += 1
-            print(f"trnrt.router: session {sid!r} back to worker {w} ({self.workers[w]}), up again", flush=True)
+            print(f"trnrt.router: {self._session(sid)} back to worker {w} ({self.workers[w]}), up again", flush=True)
         elif w is not None and self.up[w]:
             self.routed["session"] += 1
         elif w is not None:
             old, w = w, self.least_loaded()
             self.routed["failover"] += 1
             self.moved[sid] = [mv[0] if mv is not None else old, 0]
-            print(f"trnrt.router: session {sid!r} failed over from worker {old} ({self.workers[old]}, down) to worker "
-                  f"{w} ({self.workers[w]})", flush=True)
+            print(f"trnrt.router: {self._session(sid)} failed over from worker {old} ({self.workers[old]}, down) to "
+                  f"worker {w} ({self.workers[w]})", flush=True)
         else:
             self.prune()  # a new pin: bound the map first (and on every poll), not on every request
             w = self.least_loaded()
             self.routed["new_session"] += 1
-            # one line per pin, the last per session naming its worker: a log reader can attribute requests to engines
-            print(f"trnrt.router: session {sid!r} pinned to worker {w} ({self.workers[w]})", flush=True)
+            if self.log_sessions:  # one line per pin, the last per session naming its worker
+                print(f"trnrt.router: session {sid!r} pinned to worker {w} ({self.workers[w]})", flush=True)
         self.sessions.pop(sid, None)
         self.sessions[sid] = w  # re-inserted: the map's order is least recently used first
         self.seen[sid] = self.clock()
@@ -252,8 +260,13 @@ class Router:
             return self.pick_session(sid)
         self.routed["side"] += 1
         w = self.least_loaded()
-        print(f"trnrt.router: side request of session {sid!r} to worker {w} ({self.workers[w]})", flush=True)
+        if self.log_sessions:
+            print(f"trnrt.router: side request of session {sid!r} to worker {w} ({self.workers[w]})", flush=True)
         return w
+
+    def _session(self, sid: str) -> str:
+        """A log line's name for session `sid`: its id only under LOG_SESSIONS_ENV."""
+        return f"session {sid!r}" if self.log_sessions else "a session"
 
     def turn_done(self, sid: str | None, w: int) -> None:
         """A request of session `sid` completed on worker w: once a failed-over session has a turn on its new worker,
