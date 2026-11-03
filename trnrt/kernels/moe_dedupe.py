@@ -5,7 +5,7 @@ and kernels/moe_half.py copy. Prefill chunks of MOE_PREFILL_MIN_TOKENS (models/d
 kernels/moe_prefill.py, and decode calls the FFN half, so the two kernels here serve only device calls between.
 
 A per-pair kernel loads one expert blob per (token, expert) pair, so its HBM traffic follows
-the pairs: with T tokens x top-8 of 256 experts, T=32 reads 256 blobs for about 163 distinct
+the pairs: with T tokens x top-8 of 288 experts, T=32 reads 256 blobs for about 171 distinct
 experts. Here the pairs are grouped by expert into SLOTS of up to `lanes` pairs each, and a slot
 loads its expert once and applies it to all of its lanes (one matmul column per lane).
 
@@ -261,8 +261,8 @@ def unpack(blob: torch.Tensor, H: int):
 # --- routing plan -----------------------------------------------------------------------------
 
 def default_lanes(T: int) -> int:
-    """Lanes per slot by batch: about the most pairs an expert gets at this T (top-8 of 256,
-    T / 32 pairs per expert on average). Below 8 tokens pairs rarely share an expert."""
+    """Lanes per slot by batch: about the most pairs an expert gets at this T (top-8 of 288,
+    T / 36 pairs per expert on average). Below 8 tokens pairs rarely share an expert."""
     return 1 if T < 8 else 2 if T <= 16 else 4 if T <= 64 else 8
 
 
