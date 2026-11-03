@@ -181,7 +181,7 @@ class LLMEngine:
         self.cfg = cfg
         self.t_start = time.perf_counter()  # startup_seconds counts from here to the end of warmup()
         self.startup_seconds: float | None = None
-        path = resolve_model_path(cfg.model_path)
+        path = resolve_model_path(cfg.model_path, cfg.model_revision)
         self.model_path = path
         self.mcfg = ModelConfig.from_pretrained(path)
         if cfg.num_layers is not None:
