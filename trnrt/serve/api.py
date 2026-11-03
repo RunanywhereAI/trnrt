@@ -112,6 +112,10 @@ class EngineLoop:
         # request answer 503 from then on. _gate orders setting it against queueing a request, so none goes unanswered.
         self.failed: str | None = None
         self._gate = threading.Lock()
+        # The local-K counters for /metrics (_read_local_k): whether a step ran since they were last read, and whether
+        # the engine has them at all (an engine without context-parallel row groups has none).
+        self._local_k_stale = True
+        self._local_k_none = False
         self.thread = threading.Thread(target=self._run, name="trnrt-engine", daemon=True)
         self.thread.start()
         if engine.cfg.tp > 1:
@@ -215,6 +219,22 @@ class EngineLoop:
                 self._fail(f"tensor-parallel rank(s) {dead} exited")
                 return
 
+    def _read_local_k(self) -> None:
+        """While the engine is idle (no step in flight, so the read waits for nothing): the local-K selection's counters
+        for /metrics (metrics.local_k_lines), read here because this thread alone touches the engine, and only when a
+        render asked for them and a step ran since the last read. An engine without them is asked once."""
+        if self._local_k_none or not self._local_k_stale or not self.metrics.local_k_wanted:
+            return
+        self._local_k_stale = False
+        read = getattr(self.engine, "local_k_counts", None)
+        try:
+            counts = read() if read is not None else None
+        except Exception:  # noqa: BLE001  a counter, never a reason to stop serving
+            traceback.print_exc()
+            return
+        self._local_k_none = counts is None
+        self.metrics.set_local_k(counts)
+
     def _fail(self, reason: str) -> None:
         """A rank or this loop failed: every open and queued request gets the error, and the engine stops its workers
         without another word to them (LLMEngine.close_failed): a broadcast to a dead peer raises, and one to a live peer
@@ -249,7 +269,9 @@ class EngineLoop:
                 return
             self._drain(block=not self.engine.has_work())
             if not self.engine.has_work():
+                self._read_local_k()
                 continue
+            self._local_k_stale = True
             try:
                 self.engine.step()
             except Exception as e:  # never let the engine thread die silently
