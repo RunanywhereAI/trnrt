@@ -7,6 +7,7 @@
 - engine.build_shard hands the configuration's row caps to the model modules (set_decode_routes) before anything else,
   on every rank; the defaults raise them to batch 12's, batch8 leaves the modules' own;
 - out-of-range values are refused;
+- --moe-kernel, unset, follows the device (NKI kernels on Neuron, XLA on CPU);
 - the README documents both configurations.
 """
 
@@ -97,6 +98,17 @@ def test_capture_takes_the_preset_and_the_settings():
                        "8", "--ffn-half-below", "16", "--dsa-index-rows", "0"])
     with pytest.raises(SystemExit):
         check_engine_args(["--model", "m", "--preset", "batch16"])
+
+
+def test_the_moe_kernel_follows_the_device_unless_given():
+    """Unset, --moe-kernel is EngineConfig's own choice: the NKI kernels on Neuron (and in a capture, on the meta
+    device), XLA on CPU, where NKI kernels do not run; given, it wins."""
+    neuron, cpu = cli.engine_config(["--model", "m"]), cli.engine_config(["--model", "m", "--device", "cpu"])
+    assert neuron.moe_kernel is None and neuron.resolved_moe_kernel() == "nki"
+    assert dataclasses.replace(neuron, device="meta").resolved_moe_kernel() == "nki"
+    assert cpu.resolved_moe_kernel() == "xla"
+    assert cli.engine_config(["--model", "m", "--device", "cpu", "--moe-kernel", "nki"]).resolved_moe_kernel() == "nki"
+    assert cli.engine_config(["--model", "m", "--moe-kernel", "xla"]).resolved_moe_kernel() == "xla"
 
 
 @pytest.mark.parametrize("argv", [["--max-running", "0"], ["--kda-shell-max-rows", "0"], ["--dsa-index-rows", "-1"],
