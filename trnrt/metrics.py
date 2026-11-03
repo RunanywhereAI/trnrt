@@ -57,6 +57,16 @@ class Metrics:
         self.ttft = Histogram()
         self.tpot = Histogram()
         self.e2e = Histogram(LATENCY_BUCKETS + (81.92, 163.84))
+        # The local-K selection's counters (LLMEngine.local_k_counts) as the engine thread last read them, and whether
+        # a render asked for them since. They are device buffers the graphs write, so only the engine thread reads
+        # them, and only while it is idle (serve/api.py EngineLoop): a scrape shows the counts of the last idle moment
+        # after the scrape before it.
+        self.local_k: list[float] | None = None
+        self.local_k_wanted = False
+
+    def set_local_k(self, counts: list[float] | None) -> None:
+        with self.lock:
+            self.local_k, self.local_k_wanted = counts, False
 
     def on_finish(self, req) -> None:
         with self.lock:
@@ -102,7 +112,23 @@ class Metrics:
                             ("trnrt:e2e_request_latency_seconds", self.e2e)):
                 lines.append(f"# TYPE {name} histogram")
                 lines += h.lines(name)
+            lines += local_k_lines(self.local_k)
+            self.local_k_wanted = True
         return "\n".join(lines) + "\n"
+
+
+def local_k_lines(counts: list[float] | None) -> list[str]:
+    """The context-parallel prefill's local-K selection (models/mla.py CP_LOCAL_K; engine.local_k_counts), over the
+    engine's run so far, its warmup included, on rank 0's row group: rows selected, rows that failed the certificate
+    (selected again from every rank's whole list), and failed rows past CP_LOCAL_F, whose selection was not exact (0 on
+    an exact run). None (an engine without the counters, or none read yet): no lines."""
+    if counts is None:
+        return []
+    out = []
+    for name, v in zip(("trnrt:dsa_local_k_rows_total", "trnrt:dsa_local_k_failed_rows_total",
+                        "trnrt:dsa_local_k_inexact_rows_total"), counts):
+        out += [f"# TYPE {name} counter", f"{name} {v:.0f}"]
+    return out
 
 
 def _bucket(key) -> str:
