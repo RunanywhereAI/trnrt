@@ -83,7 +83,8 @@ def test_only_runtime_users_of_the_engines_own_devices_refuse():
     busy = _trn2({9: [_rt(222, "python -m trnrt engine"), {"pid": 7, "command": "neuron-ls"}], 12: [_rt(333)]})
     why = S.device_refusal(32, 32, 2, busy)
     assert why is not None
-    assert "pid 222 on device 9 (python -m trnrt engine)" in why and "pid 333 on device 12" in why and "pid 7" not in why
+    assert "pid 222 on device 9 (python -m trnrt engine)" in why and "pid 333 on device 12" in why
+    assert "pid 7" not in why  # neuron-ls itself: no runtime
     assert "cores 32-63" in why and "TRNRT_SKIP_DEVICE_CHECK=1" in why
     assert S.device_refusal(0, 32, 2, busy) is None  # engine 0's devices are free
 
@@ -98,6 +99,11 @@ def test_a_failing_neuron_ls_refuses_and_a_missing_one_warns(monkeypatch, capsys
     monkeypatch.setattr(S, "neuron_ls", lambda: None)
     assert S.device_refusal(0, 32, 2) is None
     assert "neuron-ls not found" in capsys.readouterr().err
+
+
+def test_a_listing_it_cannot_read_refuses():
+    why = S.device_refusal(0, 32, 2, [{"neuron_device": 0}])  # no nc_count
+    assert why is not None and "could not read neuron-ls's device listing" in why and "TRNRT_SKIP_DEVICE_CHECK" in why
 
 
 def test_neuron_ls_refuses_an_empty_listing(monkeypatch):
