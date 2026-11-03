@@ -24,7 +24,7 @@ The indexer scores pools of index_kpool consecutive tokens (models/glm5_next.py)
 sum_h w[t, h] relu(q_I[t, h] . k_P[p] / sqrt(Di)), with q_I = wq_b(q latent), each pool key k_P
 the softmax-gated mean of its tokens' keys LayerNorm(wk(x)), and w = weights_proj(x) / sqrt(Hi);
 the query then attends only to the tokens of its index_topk / kpool best pools plus its own
-incomplete pool. Numerics follow transformers v5.18.0 (models/glm5_next/modeling_glm5_next.py):
+incomplete pool. Numerics follow transformers v5.17.0 (models/glm5_next/modeling_glm5_next.py):
 scores in fp32 and no Hadamard rotation or FP8 activation quantisation of q_I / k_I.
 
 On the device every DSA layer is context-parallel (models/dsa_long.py "context parallelism"):
