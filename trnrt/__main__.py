@@ -4,16 +4,17 @@
     python -m trnrt engine --model DIR --core-base 0       # one engine and its OpenAI API, no router
     python -m trnrt compile {shapes,decisions,capture,compile,strip} ...   # the compile cache (trnrt/compile/farm.py)
 
-Every default is the served configuration of GLM-5.3-Flash on one trn2.48xlarge: two engines of 32 tensor-parallel
-ranks each (logical NeuronCores 0-31 and 32-63 at LNC 2), 1M-token context, FP8 KV cache, 256-token pages, decode
-batches of up to 8, 4,096-token prefill chunks, and 4 GiB per rank of host memory under the prefix cache. `--preset
-batch12` is the other supported configuration: decode batches of up to 12 per engine (PRESETS below). The bucket
-ladders and the decode kernel routes are graph structure: a server finds its graphs in the compile cache only if
-`compile capture` ran with the same arguments (the same --preset included). --max-running (fewer requests running
-than the compiled seats) is host only. An engine compiles nothing on the serving host: a graph missing from the cache
-ends its start-up with the likely cause (NEURON_LIBTORCH_ASSERT_CACHE_HIT=1; --allow-compile compiles it there instead,
-minutes to hours a graph). Before it starts, an engine on Neuron checks its host (engine/start_checks.py): its devices
-free of other processes, and enough contiguous free host memory for the runtime.
+Every default is the served configuration of GLM-5.3-Flash on one trn2.48xlarge: two engines of 32 tensor-parallel ranks
+each (logical NeuronCores 0-31 and 32-63 at LNC 2), 1M-token context, FP8 KV cache, 256-token pages, decode batches of
+up to 12 per engine (16 seats, 12 running), 4,096-token prefill chunks, and 4 GiB per rank of host memory under the
+prefix cache (`--preset batch12` names it). `--preset batch8` is the other supported configuration: decode batches of up
+to 8 per engine (PRESETS below). The bucket ladders and the decode kernel routes are graph structure: a server finds its
+graphs in the compile cache only if `compile capture` ran with the same arguments (the same --preset included).
+--max-running (fewer requests running than the compiled seats) is host only. An engine compiles nothing on the serving
+host: a graph missing from the cache ends its start-up with the likely cause (NEURON_LIBTORCH_ASSERT_CACHE_HIT=1;
+--allow-compile compiles it there instead, minutes to hours a graph). Before it starts, an engine on Neuron checks its
+host (engine/start_checks.py): its devices free of other processes, and enough contiguous free host memory for the
+runtime.
 """
 
 from __future__ import annotations
@@ -50,13 +51,19 @@ def _at_least(lo: int):
 # Named configurations: each sets the engine arguments below (argparse dests) as defaults, and an argument given
 # explicitly still wins. A preset's graphs are its own, so `compile capture -- --preset NAME ...` must run with the
 # preset the server runs with.
-# - batch12: decode batches of up to 12 requests per engine. 16 seats (the state pool's rows: every graph that carries
-#   the linear-attention state is re-keyed against the served configuration), decode buckets 1, 2, 4, 6, 8 and 12, at
-#   most 12 requests running, and every decode step of up to 12 rows on the fused decode kernels: the KDA shell and the
-#   split KDA layer, the fused DSA layer and the FFN half.
+# - batch12: the served configuration, the defaults below; the preset names them. Decode batches of up to 12 requests
+#   per engine: 16 seats (the state pool's rows), decode buckets 1, 2, 4, 6, 8 and 12, at most 12 requests running, and
+#   every decode step of up to 12 rows on the fused decode kernels: the KDA shell and the split KDA layer, the fused
+#   DSA layer and the FFN half.
+# - batch8: decode batches of up to 8 requests per engine. 8 seats (every graph that carries the linear-attention state
+#   is re-keyed against the defaults), decode buckets 1, 2, 4, 6 and 8, all 8 seats running (--max-running unset), and
+#   the fused decode kernels' row caps of steps of up to 8 rows: the model modules' own (hybrid.KDA_SHELL_MAXB,
+#   mla.LAYER_MK_MAXB, ...) and EngineConfig's.
 PRESETS: dict[str, dict] = {
     "batch12": dict(max_num_seqs=16, decode_buckets=(1, 2, 4, 6, 8, 12), max_running=12, kda_shell_max_rows=12,
                     dsa_layer_max_rows=16, ffn_half_below=17, dsa_index_rows=8),
+    "batch8": dict(max_num_seqs=8, decode_buckets=(1, 2, 4, 6, 8), max_running=None, kda_shell_max_rows=8,
+                   dsa_layer_max_rows=8, ffn_half_below=16, dsa_index_rows=0),
 }
 
 
@@ -72,14 +79,14 @@ def add_engine_args(ap: argparse.ArgumentParser) -> None:
     g.add_argument("--tp", type=int, default=32, help="tensor-parallel ranks per engine, one logical NeuronCore each")
     g.add_argument("--max-model-len", type=int, default=1_048_576)
     g.add_argument("--page-size", type=int, default=256)
-    g.add_argument("--max-num-seqs", type=int, default=8,
+    g.add_argument("--max-num-seqs", type=int, default=16,
                    help="request seats per engine: the state pool's rows, a graph shape (--max-running caps how many "
                         "run at once)")
-    g.add_argument("--max-running", type=_at_least(1), default=None,
+    g.add_argument("--max-running", type=_at_least(1), default=12,
                    help="at most this many requests running at once per engine, the rest waiting in arrival order "
-                        "(default: --max-num-seqs). Host only: no graph changes")
+                        "(default 12; --preset batch8: --max-num-seqs). Host only: no graph changes")
     g.add_argument("--max-prefill-tokens", type=int, default=4096, help="prefill tokens per step (the chunk size)")
-    g.add_argument("--decode-buckets", type=_ints, default=(1, 2, 4, 6, 8))
+    g.add_argument("--decode-buckets", type=_ints, default=(1, 2, 4, 6, 8, 12))
     g.add_argument("--prefill-buckets", type=_ints, default=(512, 1024, 2048, 4096))
     g.add_argument("--page-buckets", type=_ints, default=(512, 1024, 4096))
     g.add_argument("--prefill-page-buckets", type=_ints, default=(1024, 4096))
@@ -93,14 +100,14 @@ def add_engine_args(ap: argparse.ArgumentParser) -> None:
     g.add_argument("--num-layers", type=int, default=None, help="debugging: the first n layers only")
     k = ap.add_argument_group("decode kernel routes", "the row counts at which a decode step takes each fused kernel. "
                               "Graph structure: a change needs a new capture. Supported: the defaults (the served "
-                              "configuration) and --preset batch12's values")
-    k.add_argument("--kda-shell-max-rows", type=_at_least(1), default=8,
+                              "configuration) and --preset batch8's values")
+    k.add_argument("--kda-shell-max-rows", type=_at_least(1), default=12,
                    help="KDA layers' decode attention as the KDA shell's kernel up to this many rows")
-    k.add_argument("--dsa-layer-max-rows", type=_at_least(1), default=8,
+    k.add_argument("--dsa-layer-max-rows", type=_at_least(1), default=16,
                    help="DSA layers' decode attention and FFN as the fused layer's one call up to this many rows")
-    k.add_argument("--ffn-half-below", type=_at_least(1), default=16,
+    k.add_argument("--ffn-half-below", type=_at_least(1), default=17,
                    help="decode FFN blocks as the FFN half's one call below this many rows")
-    k.add_argument("--dsa-index-rows", type=_at_least(0), default=0,
+    k.add_argument("--dsa-index-rows", type=_at_least(0), default=8,
                    help="the context-parallel DSA indexer's decode scores in kernel calls of at most this many rows "
                         "(0: one call)")
 
