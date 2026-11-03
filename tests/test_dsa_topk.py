@@ -17,6 +17,7 @@ import importlib.util
 import pytest
 import torch
 
+from trnrt import platform
 from trnrt.kernels import dsa_topk as dk
 from trnrt.models import dsa_select as ds
 
@@ -200,8 +201,6 @@ def test_rowsplit_cuts_a_one_tile_call_into_two_tiles(monkeypatch):
     cut for ceil(R / 2) rows instead, so it is two tiles with tiles = 1 (tile t on program t), over the same scores;
     one row, a call of several tiles and a call of more than ROWSPLIT_ROWS rows (a prefill chunk's merge, one tile at
     128 rows) keep their arguments. On a grid-2 kernel the split is the default; on grid 1 there is nothing to split."""
-    from trnrt import platform
-
     g = torch.Generator().manual_seed(11)
     # (rows, local pools, pieces, partitions): 8192 / 32768 local pools are the 1024 / 4096 rungs at CP 8
     for R, P, gp, N in ((2, 8192, 128, 256), (4, 8192, 64, 256), (6, 8192, 32, 192), (8, 8192, 32, 256),
@@ -226,18 +225,28 @@ def test_rowsplit_cuts_a_one_tile_call_into_two_tiles(monkeypatch):
 # -- the kernel in the simulator -------------------------------------------------------------------------------------
 
 
+def _simulate(grid: int, monkeypatch):
+    """The kernel in the simulator on `grid` programs, with platform.nki_grid pinned to it: kernel_inputs reads the grid
+    (the row split is on at grid 2), and nothing in a test process sets the runtime's LNC. Grid 2 is the served LNC 2
+    launch (a decode call's row split: tile t on program t), grid 1 one program over every tile."""
+    import nki
+
+    monkeypatch.setattr(platform, "nki_grid", lambda: grid)
+    return nki.simulate(dk.kernel()[grid] if grid > 1 else dk.kernel())
+
+
 @needs_nki
+@pytest.mark.parametrize("grid", [1, 2], ids=["grid1", "grid2"])
 @pytest.mark.parametrize("rows,n,keep,kind", [
     (8, 2112, 512, "pooled"), (8, 2112, 512, "integers"), (8, 2112, 512, "zeros"), (8, 2112, 512, "invisible"),
     (256, 2112, 512, "pooled"), (3, 100, 7, "wide"), (5, 96, 40, "equal"), (8, 2112, 512, "ulps"),
     (1, 2112, 512, "pooled"), (2, 640, 120, "equal"),
 ])
-def test_nki_simulator_matches_emulation(rows, n, keep, kind, monkeypatch):
+def test_nki_simulator_matches_emulation(rows, n, keep, kind, grid, monkeypatch):
     """The kernel (the served RBITS rounds) selects exactly what the emulation (the 1-bit search's arithmetic)
-    selects, on the adversarial score kinds and every output form."""
-    import nki
-
+    selects, on the adversarial score kinds and every output form, on one program and on the served two."""
     monkeypatch.setenv("NEURON_PLATFORM_TARGET_OVERRIDE", "trn2")
+    sim = _simulate(grid, monkeypatch)
     g = torch.Generator().manual_seed(rows * 31 + n)
     s = pooled(rows, n, g, visible=n // 3 if kind == "pooled" and rows == 256 else None) if kind == "pooled" \
         else _scores(kind, rows, n, g)
@@ -245,34 +254,37 @@ def test_nki_simulator_matches_emulation(rows, n, keep, kind, monkeypatch):
         s = torch.where(s.abs() < 1.2e-38, torch.zeros_like(s), s)
     for vis_only, kp, tail in ((True, 1, False), (False, 1, False), (True, 4, True), (True, 4, False)):
         args = dk.kernel_inputs(s, keep, vis_only, kp=kp, tail=tail)
-        out = torch.as_tensor(nki.simulate(dk.kernel())(**args)).reshape(rows, n * kp)
+        out = torch.as_tensor(sim(**args)).reshape(rows, n * kp)
         assert torch.equal(out, dk.emulate(s, keep, vis_only, kp, tail)), (kind, vis_only, kp, tail)
 
 
 @needs_nki
+@pytest.mark.parametrize("grid", [1, 2], ids=["grid1", "grid2"])
 @pytest.mark.parametrize("rbits", [1, 3])
-def test_other_round_widths_are_the_same_selection(rbits, monkeypatch):
+def test_other_round_widths_are_the_same_selection(rbits, grid, monkeypatch):
     """w bits a round in the radix and tie searches (the served RBITS and its neighbours) select the same: the w-bit
     search is exact for any w, so a kernel that only matched at the served w would be wrong."""
-    import nki
-
     monkeypatch.setenv("NEURON_PLATFORM_TARGET_OVERRIDE", "trn2")
+    sim = _simulate(grid, monkeypatch)
     g = torch.Generator().manual_seed(37 + rbits)
     for rows, n, keep, kind in ((8, 2112, 512, "integers"), (8, 2112, 512, "ulps"), (5, 96, 40, "equal")):
         s = _scores(kind, rows, n, g)
         args = dict(dk.kernel_inputs(s, keep, True), rbits=rbits)
-        out = torch.as_tensor(nki.simulate(dk.kernel())(**args)).reshape(rows, n)
+        out = torch.as_tensor(sim(**args)).reshape(rows, n)
         assert torch.equal(out, dk.emulate(s, keep, True)), (kind, rbits)
 
 
 @needs_nki
-def test_wbit_rounds_reach_the_kernel():
+def test_wbit_rounds_reach_the_kernel(monkeypatch):
     """The positive control for the round width: with g > 1 every round is one count matmul, so the trace holds
     1 + ceil(31 / w) + 1 + ceil(nbits / w) of them (sign, radix, above, ties), for both frontends. Were the width not
     to reach the kernel (shadowed, dropped), the equalities above would compare the 1-bit search with itself."""
     import numpy as np
     from nki.compiler.frontend import FrontendKind, source_to_mlir
 
+    # grid 1: the count is per row tile. Grid 2's row split cuts this call into two tiles, and a trace without a grid
+    # walks both, so it would hold twice the matmuls.
+    monkeypatch.setattr(platform, "nki_grid", lambda: 1)
     g = torch.Generator().manual_seed(3)
     args = dk.kernel_inputs(pooled(8, 2112, g), 512, True)
     assert args["g"] > 1 and args["rbits"] == dk.RBITS

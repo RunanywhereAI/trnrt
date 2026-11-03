@@ -118,11 +118,10 @@ class _Checkpoint:
 def load_model(path: str, cfg: ModelConfig, dtype: torch.dtype, device: torch.device, max_positions: int,
                tp_rank: int = 0, tp_size: int = 1, tp_group=None, keep_fp8: bool = False,
                fp8_max: float = 240.0, vocab_parallel: bool = False, moe_kernel: str = "xla",
-               attn_tp: int | None = None, attn_group=None, max_num_seqs: int | None = None):
+               attn_tp: int | None = None, attn_group=None):
     """keep_fp8: weights the checkpoint quantizes stay FP8 on the device (dequantized in-graph);
     otherwise they are dequantized to `dtype` here. fp8_max: the device's largest finite e4m3.
-    attn_tp / attn_group: the attention TP (DecoderForCausalLM; None = its default). max_num_seqs is the
-    engine's and does not change the model."""
+    attn_tp / attn_group: the attention TP (DecoderForCausalLM; None = its default)."""
     cls = ARCHITECTURES.get(cfg.architecture)
     if cls is None:
         raise NotImplementedError(f"architecture {cfg.architecture} is not supported (have: {sorted(ARCHITECTURES)})")

@@ -416,6 +416,25 @@ def fp8_layer(E=8, H=256, Is=8, seed=0):
     return layer
 
 
+def test_pack_returns_fn_in_the_kernels_layout():
+    """FH.pack's "fn" is the layout the kernel's front reads (mhc_fnj.fn_j of the raw [O, hc H] fn, the copy
+    models/hybrid.py makes at load as hc_ffn_fnj, which decode_args hands the kernel), one element placed by hand: the
+    raw fn would put it elsewhere (control)."""
+    from trnrt.kernels import mhc_fnj as MF
+
+    E, H, Is, hc = 8, 256, 8, 4
+    O, F = 2 * hc + hc * hc, hc * H
+    L = fp8_layer(E, H, Is)
+    fn = torch.zeros(O, F, dtype=torch.bfloat16)
+    fn[5, 3 * (F // P) + 2] = 1.0  # o 5, p 3, j 2 -> [p, j, o] = [3, 2, 5]
+    b = FH.pack(L.router, L.router_bias, L.shared_gate_up, L.shared_gate_up_scale, L.shared_down, L.shared_down_scale,
+                fn, torch.ones(H), torch.zeros(O), torch.ones(3), npg=2)
+    assert b["fn"].shape == (P, F // P, O) and b["fn"].dtype == torch.bfloat16
+    assert b["fn"][3, 2, 5] == 1 and b["fn"].float().abs().sum() == 1
+    assert torch.equal(b["fn"], MF.fn_j(fn))
+    assert b["fn"].shape != fn.shape  # the raw layout is [O, hc H]
+
+
 def test_fill_lays_out_the_loaded_weights(monkeypatch):
     """Every unit of the packed copies against quant.dequant of the loaded weights (model._w's read): the router as
     [i, c, e] = W_r[e, c 128 + i]; program p's gate_up [i, c, j] = Wgu[row_p(j), c 128 + i] with its gate rows, then
@@ -570,7 +589,6 @@ def _ffn_case(T: int, npg: int, seed: int = 5):
     """A stand-in MoE layer (FP8 shared expert with block scales, the routed experts in the tile blob, the FFN block's
     hyper-connection) and the call's inputs: the streams and the attention output's pending mix."""
     from tests.test_moe_dedupe import experts128
-    from trnrt.kernels import mhc_fnj as MF
 
     g = torch.Generator().manual_seed(seed)
     layer = fp8_layer(E, H, IS, seed)
@@ -585,7 +603,6 @@ def _ffn_case(T: int, npg: int, seed: int = 5):
     blobs = FH.pack(layer.router, layer.router_bias, layer.shared_gate_up, layer.shared_gate_up_scale,
                     layer.shared_down, layer.shared_down_scale, layer.hc_ffn_fn, layer.post_norm, layer.hc_ffn_base,
                     layer.hc_ffn_scale, npg=npg)
-    blobs["fn"] = MF.fn_j(layer.hc_ffn_fn)  # the kernel's front reads fn j-major (mhc_fnj)
     S = (torch.randn(T, HC, H, generator=g) * 0.5).bfloat16()
     pend = (torch.rand(T, HC, generator=g) * 2, torch.softmax(torch.randn(T, HC, HC, generator=g), -1),
             (torch.randn(npg, T, H, generator=g) * 0.3).bfloat16())
@@ -603,17 +620,37 @@ def _ulps(a, b):
     return (a.contiguous().view(torch.int16).int() - b.contiguous().view(torch.int16).int()).abs()
 
 
+def _norm_xla(x, w, eps: float):
+    """_norm_xc's rms_norm(post_norm) on the host: XLA's device arithmetic for decoder.rms_norm, the form ffn_half_pb's
+    NORM_1R, NORM_NN and RSQ_POOL state. r = rsqrt(mean(x^2) + eps) in fp32 with no Newton step, then one rounding,
+    bf16(w (x r)) from fp32. decoder.rms_norm on the host rounds x r to bf16 before the weight, a second rounding that
+    moves about a quarter of the elements by one bf16 ulp, so it cannot be the reference that most elements equal."""
+    xf = x.float()
+    r = torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)
+    return (w.float() * (xf * r)).to(torch.bfloat16)
+
+
+def _routed(model, layer, xn):
+    """moe_half.emulate's routed half: decoder._route's experts and weights through the pairs kernel's arithmetic, in
+    bf16."""
+    topv, topi = model._route(layer, xn)
+    return mdd.emulate_pairs(xn, topv, topi, layer.w_blob, act=mdd.ACTS["silu_clamp"],
+                             limit=model.cfg.hybrid.swiglu_limit).to(xn.dtype)
+
+
 @needs_nki
 @pytest.mark.parametrize("T,npg", [(1, 2), (4, 2), (8, 2), (4, 1)])
 def test_the_ffn_half_in_the_simulator_is_its_emulation(T, npg, monkeypatch):
     """The kernel against its host form, step by step:
     - the mixed streams bit for bit mhc_mix's emulation, post and comb within fp32 summation order of _mhc's;
-    - the normed input within two bf16 ulps of rms_norm's, most elements equal (the served norm drops one bf16 rounding
-      of x r and the Newton step of the scalar engine's rsqrt);
+    - the normed input within two bf16 ulps of the served norm's host form (_norm_xla: one rounding, no Newton step),
+      nearly all elements equal; the positive control: decoder.rms_norm's two roundings differ on over a tenth of them;
     - on the kernel's own normed input (x pinned), the kernel's experts and weights are decoder._route's, and its
       output (routed partials permuted and added, shared partials added, in bf16) is moe_half's emulation (decoder's
-      router, the pairs kernel's arithmetic, the clamped shared expert) within the bf16 output's rounding.
-    The positive controls: the emulation with a wrong routed scale or clamp misses that bound."""
+      router, the pairs kernel's arithmetic, the clamped shared expert) within the bf16 output's rounding, and the
+      routed partials alone are the emulation's routed half within the same fraction of their own size.
+    The positive controls: the emulation with a wrong clamp misses the output's bound, and with a wrong routed scale
+    the routed half's bound."""
     layer, blobs, S, pend = _ffn_case(T, npg)
     model = _Model()
     Sn, post, comb, rp, sp, xn, ids, wts = _ffn_sim(layer, blobs, S, pend, npg, monkeypatch)
@@ -622,18 +659,33 @@ def test_the_ffn_half_in_the_simulator_is_its_emulation(T, npg, monkeypatch):
     assert torch.equal(Sn, hSn), (Sn.float() - hSn.float()).abs().max()
     assert torch.allclose(post, hpost, rtol=1e-4, atol=1e-6) and torch.allclose(comb, hcomb, rtol=1e-4, atol=1e-6)
     x, _, _ = HY._mhc(model, layer, "ffn", hSn, True)
-    u = _ulps(xn, rms_norm(x, layer.post_norm, 1e-5))
-    assert int(u.max()) <= 2 and (u == 0).float().mean() > 0.9, (int(u.max()), (u == 0).float().mean())
+    # The reference is the served norm's arithmetic, not decoder.rms_norm's host order (see _norm_xla). The bound stays
+    # at two ulps; one element reaches it at T 8, where x cancels to 1e-4 of its streams.
+    assert FB.NORM_1R and FB.NORM_NN and FB.RSQ_POOL, "the form _norm_xla emulates"
+    u = _ulps(xn, _norm_xla(x, layer.post_norm, 1e-5))
+    assert int(u.max()) <= 2 and (u == 0).float().mean() > 0.99, (int(u.max()), (u == 0).float().mean())
+    u2 = _ulps(xn, rms_norm(x, layer.post_norm, 1e-5))
+    assert (u2 != 0).float().mean() > 0.1, (u2 != 0).float().mean()  # the dropped rounding reached the kernel
     with torch.no_grad():
         topv, topi = model._route(layer, xn)
         want = mh.emulate(model, layer, xn)
         got = (SH.add_partials(rp, torch.bfloat16) + SH.add_partials(sp, torch.bfloat16)).float()
+        rwant = _routed(model, layer, xn)
+        shared = HY._swiglu(model, layer, xn, "shared_gate_up", "shared_down", model.cfg.hybrid.swiglu_limit)
+        routed = SH.add_partials(rp, torch.bfloat16).float()
+    assert torch.equal(want, rwant + shared)  # _routed is emulate's routed half
     assert torch.equal(ids.long().sort(-1).values, topi.sort(-1).values)
     order = lambda i, v: torch.gather(v.float(), 1, i.long().argsort(-1))  # noqa: E731
     assert torch.allclose(order(ids, wts), order(topi, topv), rtol=1e-2, atol=1e-3)
     bound = 0.01 * want.float().abs().max()
     assert (got - want.float()).abs().max() <= bound, (got - want.float()).abs().max()
-    for wrong in (_Model(scale=2.0), _Model(limit=5.0)):
-        with torch.no_grad():
-            off = mh.emulate(wrong, layer, xn).float()
-        assert (got - off).abs().max() > bound
+    with torch.no_grad():
+        off = mh.emulate(_Model(limit=5.0), layer, xn).float()
+    assert (got - off).abs().max() > bound
+    # The routed scale is checked on the routed partials. The shared expert is about a thousand times larger here, so
+    # a wrong scale moves the whole output by less than its bound.
+    rbound = 0.01 * rwant.float().abs().max()
+    assert (routed - rwant.float()).abs().max() <= rbound, ((routed - rwant.float()).abs().max(), rbound)
+    with torch.no_grad():
+        off = _routed(_Model(scale=2.0), layer, xn).float()
+    assert (routed - off).abs().max() > rbound, ((routed - off).abs().max(), rbound)

@@ -71,7 +71,7 @@ def value_order(pools: torch.Tensor, cnt: torch.Tensor, vals: torch.Tensor):
     """A selection (pools ascending, count, scores; 0 / NEG_INF past the count) reordered to the kernel's vorder form:
     the selected pools by score descending, equal scores by pool ascending, then 0 / NEG_INF."""
     N, keep = pools.shape
-    k = torch.arange(keep).view(1, keep)
+    k = torch.arange(keep, device=pools.device).view(1, keep)
     live = k < cnt.view(N, 1)
     # a stable sort by score descending keeps equal scores in pool (ascending) order; the dead entries sort last
     key = torch.where(live, vals, torch.full_like(vals, -3.0e38))

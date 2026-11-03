@@ -352,3 +352,43 @@ def test_clamped_moe_reads_a_128_block_tile_blob_exactly():
     a = hybrid._moe_clamped(m, nat, x, 0.05)
     b = hybrid._moe_clamped(m, tiles, x, 0.05)
     assert torch.equal(a, b)
+
+
+@pytest.mark.parametrize("T,want", [(512, [("v10", 512)]), (320, [("v10", 320)]), (64, [("v8", 64)]),
+                                    (200, [("v8", 128), ("v8", 72)]), (300, [("v8", 128), ("v8", 128), ("v8", 44)])])
+def test_dispatch_v10_for_257_to_512_tokens(T, want, monkeypatch):
+    """moe_dedupe takes ONE moe_dedupe_v10 call for 257 to 512 tokens (a 512-row prefill chunk: GLM-5.3-Flash's 288
+    experts, top-8, 768 slots), v8's 128-token calls otherwise: below 257 tokens (the 129-256-token form is not carried)
+    and where v10 cannot plan (T not a multiple of 16). Stand-in kernels: which runs, on how many rows."""
+    import sys
+    import types
+
+    seen = []
+
+    class Wrapped:
+        def __init__(self, k):
+            self.k = k
+
+        def __getitem__(self, grid):
+            def call(**a):
+                seen.append(("v10" if self.k == "k10" else "v8", a["x"].shape[0]))
+                assert a["rev"] == (mdd.REV10 if self.k == "k10" else mdd.REV)
+                return a["x"]
+            return call
+
+    hop = types.ModuleType("libtorch_neuronx_lite.nki.nki_hop")
+    hop.wrap_nki = Wrapped
+    for name in ("libtorch_neuronx_lite", "libtorch_neuronx_lite.nki"):
+        monkeypatch.setitem(sys.modules, name, sys.modules.get(name) or types.ModuleType(name))
+    monkeypatch.setitem(sys.modules, "libtorch_neuronx_lite.nki.nki_hop", hop)
+    from trnrt import platform
+
+    monkeypatch.setattr(platform, "nki_grid", lambda: 2)
+    monkeypatch.setattr(mdd, "kernel", lambda: "k8")
+    monkeypatch.setattr(mdd, "kernel10", lambda: "k10")
+    x = torch.zeros(T, H, dtype=torch.bfloat16)
+    topv, topi = torch.ones(T, 8), torch.arange(T * 8).view(T, 8) % 288
+    blob = torch.zeros(288, 1, 1, dtype=torch.uint8)
+    mdd.moe_dedupe(x, topv, topi, blob)
+    assert seen == want
+    assert mdd.fits10(512, 8, 288) and not mdd.fits10(300, 8, 288)

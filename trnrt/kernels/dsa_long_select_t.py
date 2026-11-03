@@ -57,7 +57,7 @@ if nki is not None and dls.nki is not None:
                  npool=npool, pk=pk, out=out, outv=outv, scr=scr, scr2=scr, dbg=0, psum=None, lsub=lsub, dyn=0,
                  vorder=vorder, dscr=None)
         npg = nl.num_programs(axes=0) if nl.program_ndim() != 0 else 1  # lnc2
-        idle = npg == 2 and nl.program_id(axis=0) == 1  # lnc2: program 0 alone selects (dsa_long_select._lnc2_note)
+        idle = npg == 2 and nl.program_id(axis=0) == 1  # lnc2: program 0's selection is the output; 1 mirrors its loop
         IB = _sb((128, 128), BF16)
         nisa.dma_copy(dst=IB, src=identb)
         X["IB"] = IB
@@ -96,10 +96,19 @@ if nki is not None and dls.nki is not None:
         X["I"] = _sb((128, keep), U32)
         for name in ("roff", "hi", "lo", "oi"):
             X[name] = _sb((128, keep), I32)
+        if idle:  # lnc2: program 1 runs the SAME device loop, trip times, on the same tile, into buffers of its own
+            # lnc2: The two programs' device-loop trip counts must agree: a count that differs between them (here 1
+            # lnc2: against 0, at the first row whose certificate fails) hangs the call at LNC 2. Program 1's out / outv /
+            # lnc2: scr are internal shared_hbm allocated after scr, so they are per-program copies: the shared outputs
+            # lnc2: and the shared score scratch stay program 0's alone (dsa_long_select._lnc2_note: both programs
+            # lnc2: writing them broke the selection).
+            X["out"] = nl.ndarray((NT, 128, keep), dtype=I32, buffer=nl.shared_hbm)  # lnc2
+            X["outv"] = nl.ndarray((NT, 128, keep), dtype=F32, buffer=nl.shared_hbm)  # lnc2
+            scr1 = nl.ndarray((128 * NB, sub), dtype=F32, buffer=nl.shared_hbm)  # lnc2
+            X["scr"] = scr1  # lnc2
+            X["scr2"] = scr1  # lnc2
         cnt = _sb((1, 1), I32)
         nisa.dma_copy(dst=cnt, src=trip)
-        if idle:  # lnc2: program 1 runs the same device loop zero times (the two cores' code must have the same basic
-            nisa.iota(dst=cnt, pattern=[[0, 1]], offset=0, channel_multiplier=0)  # lnc2: blocks, NCC_IXGM002)
         rt = nisa.register_alloc()
         nisa.register_load(rt, cnt)
 

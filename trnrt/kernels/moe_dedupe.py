@@ -270,6 +270,10 @@ def default_lanes(T: int) -> int:
 SG = 4
 # Groups of expert buffers (loads run RING - 2 groups ahead).
 RING = 3
+# moe_dedupe_v10's groups of expert buffers, the head segments its device loops skip (static) and the head's share (%).
+RING9 = 3
+SKIP9 = 6
+HEAD9 = 75
 # Below this many tokens a call runs the per-pair kernel on the same layout (moe_tiles_pairs_v1):
 # pairs then seldom share an expert, and the plan, gather and route cost more than they save.
 PAIRS_BELOW = 16
@@ -353,9 +357,12 @@ def _lnc_split() -> bool:
 
 def kernel_inputs(x: torch.Tensor, topv: torch.Tensor, topi: torch.Tensor, blob: torch.Tensor,
                   lanes: int | None = None, act: int = 0, limit: float = 0.0, alpha: float = 1.702):
-    """moe_dedupe_v8's arguments for x [T, H] (T <= 128), routing [T, K] and one layer's blob: the routing as it comes
-    (the kernel plans the slots itself, as plan() does), and the static shape parameters."""
+    """The kernel's arguments for x [T, H] (T <= 128: moe_dedupe_v8; 256 < T <= 512: moe_dedupe_v10), routing [T, K]
+    and one layer's blob: the routing as it comes (the kernel plans the slots itself, as plan() does), and the static
+    shape parameters."""
     T, H = x.shape
+    if T > 2 * P:
+        return _kernel_inputs10(x, topv, topi, blob, lanes, act, limit, alpha)
     if not fits(T, topi.shape[1], blob.shape[0], lanes):
         raise ValueError(f"the dedupe kernel plans at most {4 * P} experts, {P} tokens and 1024 pairs per call")
     L = lanes or default_lanes(T)
@@ -366,6 +373,33 @@ def kernel_inputs(x: torch.Tensor, topv: torch.Tensor, topi: torch.Tensor, blob:
              blob=blob, lanes=L, group=q, ring=RING, slots=S, block=BL, keep=RING * q, act=act,
              limit=float(limit), alpha=float(alpha), debug=0)
     return dict(d, rev=REV, spl=int(_lnc_split()))
+
+
+# moe_dedupe_v10's: rows of 512 (T = 512 at lanes 8: 768 slots).
+SLOTS10 = 1024
+
+
+def fits10(T: int, K: int, E: int, lanes: int | None = None) -> bool:
+    """Whether one moe_dedupe_v10 call takes T tokens: up to 512 of them, top-8 (a pair tile of 128 is 16 tokens), T a
+    multiple of 16, at most 512 experts and SLOTS10 static slots."""
+    if T > 4 * P or K != 8 or T % 16 or E > 4 * P:
+        return False
+    return n_slots(T, K, E, lanes or default_lanes(T))[0] <= SLOTS10
+
+
+def _kernel_inputs10(x, topv, topi, blob, lanes, act, limit, alpha):
+    T, H = x.shape
+    K = topi.shape[1]
+    if not fits10(T, K, blob.shape[0], lanes):
+        raise ValueError(f"moe_dedupe_v10 takes up to {4 * P} tokens (a multiple of 16) x top-8 of at most {4 * P} "
+                         f"experts and {SLOTS10} slots per call, not T={T} K={K} E={blob.shape[0]}")
+    L = lanes or default_lanes(T)
+    S, BL = n_slots(T, K, blob.shape[0], L)
+    q = group_size(L)
+    return dict(x=x.contiguous(), topi=topi.to(torch.int32).contiguous(), topv=topv.to(torch.bfloat16).contiguous(),
+                blob=blob, lanes=L, group=q, ring=RING9, slots=S, block=BL, keep=RING9 * q, act=act,
+                limit=float(limit), alpha=float(alpha), debug=0, rev=REV10,
+                spl=int(_lnc_split()), skp=SKIP9, hdf=HEAD9)
 
 
 def fits(T: int, K: int, E: int, lanes: int | None = None) -> bool:
@@ -1012,6 +1046,598 @@ else:
     moe_tiles_pairs_v1 = None
 
 
+if nki is not None:  # moe_dedupe_v10 (its own block and revision, REV10)
+    @nki.jit
+    def moe_dedupe_v10(x, topi, topv, blob, lanes: int, group: int, ring: int, slots: int, block: int,
+                           keep: int, act: int = 0, limit: float = 0.0, alpha: float = 1.702, debug: int = 0,
+                           rev: int = 0, spl: int = 1, skp: int = 0, hdf: int = 0):
+        """The dedupe for up to 512 tokens in ONE call (a 512-row prefill chunk): each selected expert read once, where
+        calls of fewer tokens read every expert again per call. What would not fit SBUF at 4 token
+        tiles is made smaller: x stays in HBM and each block gathers its lanes' rows by one indirect DMA (row tok(l) of x
+        onto partition l, then the tensor engine's transposes into xg), the lane of every pair is kept as [pair p, tile
+        j] (128 pairs per tile) instead of on every partition, and a block's route matrix R [lanes, T] and its lanes'
+        tokens come from matmuls of the pairs' one-hot onto the block's lanes (OH [128 pairs, lanes]) with each pair
+        tile's 16-token window of weights (pair n = 8 t + k: tile j holds tokens 16 j .. 16 j + 15) and of token indices
+        (16 j + p // 8 as two bf16-exact columns). The slot table takes up to SLOTS10 slots in PSUM rows of 512. The rest
+        (slots, groups, segments, routes summed in pairs of blocks, the LNC split) is the 256-token form's.
+        x bf16 [T, H] (T <= 512), topi int32 [T, K] and topv bf16 [T, K] (the routing), blob
+        uint8 [E, 128, F] (tile layout, bf16 or fp32 tile scales by F); `act` / `limit` / `alpha`
+        the activation (ACTS); `lanes` pairs per slot, `slots`
+        slots in blocks of `block` lanes (n_slots), `group` slots per vector instruction, `ring`
+        groups of expert buffers (loads run ring - 2 groups ahead), padded slots below `keep` load
+        expert 0 (plan()); rev: this function's source revision (REV, see _kernel_rev). Returns bf16
+        [T, H]. Keep every helper inside it."""
+        T, H = x.shape
+        K = topi.shape[1]
+        N = T * K
+        TT = (T + 127) // 128  # token tiles on the partitions: token t = 128 tt + p at [p, tt]
+        E = blob.shape[0]
+        NE = (E + 127) // 128  # tiles of experts on the partitions (rows past E match no pair)
+        BL = block
+        S = slots
+        L = lanes
+        Q = group
+        NQ = S // Q  # groups
+        QB_ = BL // (L * Q)  # groups per block
+        F = blob.shape[2]
+        C = H // 128
+        DW = H // 2
+        C2 = DW // 128
+        G32 = H // 128  # output column groups of 128 (h // 128)
+        NH = G32 // 4  # 512-column chunks of the output
+        SB = (F - H - DW) // (2 * C)  # bytes per tile scale: 2 (bf16) or 4 (fp32)
+        o_dw, o_sg, o_sd = H, H + DW, H + DW + C * SB
+        f32, bf16, i32 = nl.float32, nl.bfloat16, nl.int32
+        sdt = nl.bfloat16 if SB == 2 else nl.float32
+        LOG2L = 1 if L == 2 else 2 if L == 4 else 3 if L == 8 else 4 if L == 16 else 0
+        out = nl.ndarray((T, H), dtype=bf16, buffer=nl.shared_hbm)
+        # LNC (trn2 at LNC=2, grid 2): the kernel is traced once per program, the two physical cores of the
+        # logical core (nki/_backends/mlir_tracer program_id: "kernel is traced LNC times with different
+        # program_id_value"), so npg / pid are Python ints. With two or more blocks of lanes each program
+        # runs a contiguous half of the blocks (their expert loads and matmuls), the fp32 partial sums are
+        # exchanged by halves of H (nisa.sendrecv between the two cores, nki/isa/_lnc.py) and each program
+        # writes its half of the output columns. Grid 1 (trn1), or one block: one program does everything.
+        # spl 0 (no LNC split): both programs do all of the work, as before the split.
+        npg, pid = (nl.num_programs(axes=0), nl.program_id(axis=0)) if spl and nl.program_ndim() != 0 else (1, 0)
+        NBK = S * L // BL  # blocks of lanes
+        split = npg == 2 and NBK >= 2
+        b_lo, b_hi = (0, NBK) if not split else ((0, (NBK + 1) // 2) if pid == 0 else ((NBK + 1) // 2, NBK))
+        g_lo, g_hi = b_lo * QB_, b_hi * QB_  # this program's groups
+        mine = split or pid == 0
+        if split:  # allocated first, the same in both programs' traces: the peer's sendrecv lands here
+            rcv = nl.ndarray((128, TT, H // 2), dtype=nl.float32, buffer=nl.sbuf)
+
+        NJ = N // 128  # pair tiles (pair n = 128 j + p at [p, j]); T is a multiple of 16 (fits10)
+
+        # --- constants (iota and compares; no inputs) ---
+        ipi = nl.ndarray((128, 1), dtype=i32, buffer=nl.sbuf)
+        nisa.iota(dst=ipi, pattern=[[0, 1]], offset=0, channel_multiplier=1)
+        ip = nl.ndarray((128, 1), dtype=f32, buffer=nl.sbuf)  # partition index
+        nisa.tensor_copy(dst=ip, src=ipi)
+        jfi = nl.ndarray((128, 128), dtype=i32, buffer=nl.sbuf)
+        nisa.iota(dst=jfi, pattern=[[1, 128]], offset=0, channel_multiplier=0)
+        dd = nl.ndarray((128, 128), dtype=f32, buffer=nl.sbuf)  # dd[p, j] = j - p
+        nisa.tensor_copy(dst=dd, src=jfi)
+        nisa.tensor_scalar(dst=dd, data=dd, op0=nl.subtract, operand0=ip)
+        idn = nl.ndarray((128, 128), dtype=bf16, buffer=nl.sbuf)  # identity
+        nisa.tensor_scalar(dst=idn, data=dd, op0=nl.equal, operand0=0.0)
+        up = nl.ndarray((128, 128), dtype=bf16, buffer=nl.sbuf)  # [p < j]: exclusive prefix sums
+        nisa.tensor_scalar(dst=up, data=dd, op0=nl.greater, operand0=0.0)
+        f1 = nl.ndarray((128, 128), dtype=bf16, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=f1, data=dd, op0=nl.equal, operand0=64.0)
+        f2 = nl.ndarray((128, 128), dtype=bf16, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=f2, data=dd, op0=nl.equal, operand0=-64.0)
+        fd = nl.ndarray((128, 128), dtype=bf16, buffer=nl.sbuf)  # fold[o, q] = [o % 64 == q % 64]
+        nisa.tensor_tensor(dst=fd, data1=idn, data2=f1, op=nl.add)
+        nisa.tensor_tensor(dst=fd, data1=fd, data2=f2, op=nl.add)
+        mh = nl.ndarray((128, 2), dtype=f32, buffer=nl.sbuf)  # [p < 64, p >= 64]
+        nisa.tensor_scalar(dst=mh[:, 0:1], data=ip, op0=nl.less, operand0=64.0)
+        nisa.tensor_scalar(dst=mh[:, 1:2], data=ip, op0=nl.greater_equal, operand0=64.0)
+        e_sb = nl.ndarray((1, S), dtype=i32, buffer=nl.sbuf)
+        one_r = nl.ndarray((1, 128), dtype=f32, buffer=nl.sbuf)
+        nisa.memset(dst=one_r, value=1.0)
+        ones_f = nl.ndarray((128, 128), dtype=f32, buffer=nl.sbuf)
+        nisa.memset(dst=ones_f, value=1.0)
+        ones_b = nl.ndarray((128, 128), dtype=bf16, buffer=nl.sbuf)
+        nisa.memset(dst=ones_b, value=1.0)
+        zero_n = nl.ndarray((128, N), dtype=f32, buffer=nl.sbuf)
+        nisa.memset(dst=zero_n, value=0.0)
+        isi = nl.ndarray((128, S), dtype=i32, buffer=nl.sbuf)
+        nisa.iota(dst=isi, pattern=[[1, S]], offset=0, channel_multiplier=0)
+        iota_s = nl.ndarray((128, S), dtype=f32, buffer=nl.sbuf)  # slot index on every partition
+        nisa.tensor_copy(dst=iota_s, src=isi)
+
+        # --- the routing plan (plan()'s arithmetic): every pair's lane, every slot's expert ---
+        ti = nl.ndarray((1, N), dtype=i32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=ti, src=topi.reshape((1, N)))
+        tb = nl.ndarray((1, N), dtype=f32, buffer=nl.sbuf)  # expert ids (fp32: bf16 rounds past 256)
+        nisa.tensor_copy(dst=tb, src=ti)
+        wv = nl.ndarray((1, N), dtype=f32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=wv, src=topv.reshape((1, N)))
+        eb = nl.ndarray((128, N), dtype=f32, buffer=nl.sbuf)  # e of pair n on every partition
+        for n0 in range(0, N, 512):
+            n1 = min(N, n0 + 512)
+            pb = nl.ndarray((128, n1 - n0), dtype=f32, buffer=nl.psum)
+            nisa.nc_matmul(dst=pb, stationary=one_r, moving=tb[:, n0:n1], accumulate=False)
+            nisa.tensor_copy(dst=eb[:, n0:n1], src=pb)
+        # pair-major: the weight of pair n = 128 j + p at [p, j] (a strided DMA of the [T K] routing), each pair tile's
+        # window of its 16 tokens W[p, j, t'] = w [t' == p // 8], and the tokens' bf16-exact parts [p // 8, j]
+        wJ = nl.ndarray((NJ, 128), dtype=bf16, buffer=nl.sbuf)  # [j, p] as stored, then transposed (exact)
+        nisa.dma_copy(dst=wJ, src=topv.reshape((NJ, 128)))
+        pwT = nl.ndarray((128, NJ), dtype=f32, buffer=nl.psum)
+        nisa.nc_matmul(dst=pwT, stationary=wJ, moving=idn[0:NJ, 0:NJ], accumulate=False)
+        wT = nl.ndarray((128, NJ), dtype=bf16, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=wT, src=pwT)
+        p8i = nl.ndarray((128, 1), dtype=i32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=p8i, data=ipi, op0=nl.right_shift, operand0=3)
+        p8 = nl.ndarray((128, 1), dtype=f32, buffer=nl.sbuf)  # p // 8
+        nisa.tensor_copy(dst=p8, src=p8i)
+        t16i = nl.ndarray((128, 16), dtype=i32, buffer=nl.sbuf)
+        nisa.iota(dst=t16i, pattern=[[1, 16]], offset=0, channel_multiplier=0)
+        t16 = nl.ndarray((128, 16), dtype=f32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=t16, src=t16i)
+        m16 = nl.ndarray((128, 16), dtype=bf16, buffer=nl.sbuf)  # [t' == p // 8]
+        nisa.tensor_scalar(dst=m16, data=t16, op0=nl.equal, operand0=p8)
+        Wp = nl.ndarray((128, NJ, 16), dtype=bf16, buffer=nl.sbuf)
+        nisa.tensor_tensor(dst=Wp, data1=m16.expand_dim(1).broadcast(1, NJ), data2=wT.expand_dim(2).broadcast(2, 16),
+                           op=nl.multiply)
+        tkp = nl.ndarray((128, NJ, 2), dtype=bf16, buffer=nl.sbuf)  # [p // 8, j]: token 16 j + p // 8, exact in bf16
+        jfj = nl.ndarray((128, NJ), dtype=i32, buffer=nl.sbuf)
+        nisa.iota(dst=jfj, pattern=[[1, NJ]], offset=0, channel_multiplier=0)
+        nisa.tensor_copy(dst=tkp[:, :, 1], src=jfj)
+        zj = nl.ndarray((128, NJ), dtype=f32, buffer=nl.sbuf)
+        nisa.memset(dst=zj, value=0.0)
+        nisa.tensor_scalar(dst=tkp[:, :, 0], data=zj, op0=nl.add, operand0=p8)  # p // 8 on every column
+        ilf = nl.ndarray((128, BL), dtype=f32, buffer=nl.sbuf)  # lane index within a block, on every partition
+        nisa.tensor_copy(dst=ilf, src=jfi[:, 0:BL])
+        # Per tile of 128 experts on the partitions (up to 4 tiles): counts first, then base, then a
+        # second pass that recomputes each tile's one-hot for the ranks, so that only one [128, N]
+        # one-hot is alive at a time.
+        ns_t = (nl.ndarray((128, 1), dtype=f32, buffer=nl.sbuf), nl.ndarray((128, 1), dtype=f32, buffer=nl.sbuf),
+                nl.ndarray((128, 1), dtype=f32, buffer=nl.sbuf), nl.ndarray((128, 1), dtype=f32, buffer=nl.sbuf))
+        nb_t = (nl.ndarray((128, 1), dtype=bf16, buffer=nl.sbuf), nl.ndarray((128, 1), dtype=bf16, buffer=nl.sbuf),
+                nl.ndarray((128, 1), dtype=bf16, buffer=nl.sbuf), nl.ndarray((128, 1), dtype=bf16, buffer=nl.sbuf))
+        pe_t = (nl.ndarray((128, 1), dtype=f32, buffer=nl.sbuf), nl.ndarray((128, 1), dtype=f32, buffer=nl.sbuf),
+                nl.ndarray((128, 1), dtype=f32, buffer=nl.sbuf), nl.ndarray((128, 1), dtype=f32, buffer=nl.sbuf))
+        bs_t = (nl.ndarray((128, 1), dtype=f32, buffer=nl.sbuf), nl.ndarray((128, 1), dtype=f32, buffer=nl.sbuf),
+                nl.ndarray((128, 1), dtype=f32, buffer=nl.sbuf), nl.ndarray((128, 1), dtype=f32, buffer=nl.sbuf))
+        lb_t = (nl.ndarray((128, 1), dtype=f32, buffer=nl.sbuf), nl.ndarray((128, 1), dtype=f32, buffer=nl.sbuf),
+                nl.ndarray((128, 1), dtype=f32, buffer=nl.sbuf), nl.ndarray((128, 1), dtype=f32, buffer=nl.sbuf))
+        for et in range(NE):
+            nisa.tensor_scalar(dst=pe_t[et], data=ip, op0=nl.add, operand0=128.0 * et)
+            cnt = nl.ndarray((128, 1), dtype=f32, buffer=nl.sbuf)
+            oh = nl.ndarray((128, N), dtype=f32, buffer=nl.sbuf)
+            nisa.tensor_scalar_reduce(dst=oh, data=eb, op0=nl.equal, operand0=pe_t[et], reduce_op=nl.add,
+                                      reduce_res=cnt)
+            if L == 1:
+                nisa.tensor_copy(dst=ns_t[et], src=cnt)
+            else:  # ceil(cnt / L) = (cnt + L - 1) >> log2 L, in int32
+                ci = nl.ndarray((128, 1), dtype=i32, buffer=nl.sbuf)
+                nisa.tensor_copy(dst=ci, src=cnt)
+                nisa.tensor_scalar(dst=ci, data=ci, op0=nl.add, operand0=L - 1)
+                nisa.tensor_scalar(dst=ci, data=ci, op0=nl.right_shift, operand0=LOG2L)
+                nisa.tensor_copy(dst=ns_t[et], src=ci)
+            nisa.tensor_copy(dst=nb_t[et], src=ns_t[et])
+        # base[e] = the slots of the experts before e (exclusive prefix sum over the partitions)
+        for et in range(NE):
+            pbs = nl.ndarray((128, 1), dtype=f32, buffer=nl.psum)
+            nisa.nc_matmul(dst=pbs, stationary=up, moving=nb_t[et], accumulate=False)
+            for t2 in range(et):
+                nisa.nc_matmul(dst=pbs, stationary=ones_b, moving=nb_t[t2], accumulate=True)
+            nisa.tensor_copy(dst=bs_t[et], src=pbs)
+            nisa.tensor_scalar(dst=lb_t[et], data=bs_t[et], op0=nl.multiply, operand0=1.0 * L)
+        # lane of pair n = L base[e_n] + its rank among the expert's pairs, summed over the experts (one nonzero
+        # term): the experts' partitions contracted against a ones column, pair-major ([p, j]). The lanes are the
+        # matmul's stationary operand here, whose values the tensor engine does not keep at fp32 for integers past
+        # bf16's 8 bits (measured: v10 read x out of bounds with the lanes as fp32 stationary), so they go as two
+        # bf16-exact parts, lane = 64 hi + lo.
+        vacc = nl.ndarray((128, N), dtype=f32, buffer=nl.sbuf)  # every expert tile's vv summed: one nonzero per column
+        for et in range(NE):
+            oh = nl.ndarray((128, N), dtype=f32, buffer=nl.sbuf)
+            nisa.tensor_scalar(dst=oh, data=eb, op0=nl.equal, operand0=pe_t[et])
+            cs = nl.ndarray((128, N), dtype=f32, buffer=nl.sbuf)
+            nisa.tensor_tensor_scan(dst=cs, data0=oh, data1=zero_n, initial=0.0, op0=nl.add, op1=nl.add)
+            rk = nl.ndarray((128, N), dtype=f32, buffer=nl.sbuf)
+            nisa.scalar_tensor_tensor(dst=rk, data=cs, op0=nl.subtract, operand0=1.0, op1=nl.multiply, operand1=oh)
+            vv = nl.ndarray((128, N), dtype=f32, buffer=nl.sbuf)
+            nisa.scalar_tensor_tensor(dst=vv, data=oh, op0=nl.multiply, operand0=lb_t[et], op1=nl.add, operand1=rk)
+            if et == 0:
+                nisa.tensor_copy(dst=vacc, src=vv)
+            else:
+                nisa.tensor_tensor(dst=vacc, data1=vacc, data2=vv, op=nl.add)
+        # the lanes as two bf16-exact parts (lane = 64 hi + lo), each pair tile's column transposed by one matmul (no PSUM
+        # accumulation across the expert tiles: interleaved accumulations into one PSUM tensor came out wrong on trn1)
+        vi = nl.ndarray((128, N), dtype=i32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=vi, src=vacc)
+        hi_i = nl.ndarray((128, N), dtype=i32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=hi_i, data=vi, op0=nl.right_shift, operand0=6)
+        vh = nl.ndarray((128, N), dtype=bf16, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=vh, src=hi_i)
+        lo_i = nl.ndarray((128, N), dtype=i32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=lo_i, data=vi, op0=nl.bitwise_and, operand0=63)
+        vl = nl.ndarray((128, N), dtype=bf16, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=vl, src=lo_i)
+        plh = nl.ndarray((128, NJ), dtype=f32, buffer=nl.psum)
+        pll = nl.ndarray((128, NJ), dtype=f32, buffer=nl.psum)
+        for j in range(NJ):
+            nisa.nc_matmul(dst=plh[:, j:j + 1], stationary=vh[:, j * 128:(j + 1) * 128], moving=ones_b[:, 0:1],
+                           accumulate=False)
+        for j in range(NJ):
+            nisa.nc_matmul(dst=pll[:, j:j + 1], stationary=vl[:, j * 128:(j + 1) * 128], moving=ones_b[:, 0:1],
+                           accumulate=False)
+        lam = nl.ndarray((128, NJ), dtype=f32, buffer=nl.sbuf)  # lane of pair 128 j + p = 64 hi + lo
+        lhs = nl.ndarray((128, NJ), dtype=f32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=lhs, src=plh)
+        nisa.scalar_tensor_tensor(dst=lam, data=lhs, op0=nl.multiply, operand0=64.0, op1=nl.add, operand1=pll)
+        # slot s holds expert e iff base[e] <= s < base[e] + nslots[e]; none: E (DMA skipped), or
+        # expert 0 below `keep` (a buffer's first use must be a real load)
+        SC = (S + 511) // 512  # PSUM rows of 512 slots
+        pse_c = []
+        psr_c = []
+        for _ in range(SC):
+            pse_c.append(nl.ndarray((1, 512), dtype=f32, buffer=nl.psum))
+            psr_c.append(nl.ndarray((1, 512), dtype=f32, buffer=nl.psum))
+        for et in range(NE):
+            m1 = nl.ndarray((128, S), dtype=f32, buffer=nl.sbuf)
+            nisa.tensor_scalar(dst=m1, data=iota_s, op0=nl.greater_equal, operand0=bs_t[et])
+            bn = nl.ndarray((128, 1), dtype=f32, buffer=nl.sbuf)
+            nisa.tensor_tensor(dst=bn, data1=bs_t[et], data2=ns_t[et], op=nl.add)
+            mm_ = nl.ndarray((128, S), dtype=f32, buffer=nl.sbuf)
+            nisa.scalar_tensor_tensor(dst=mm_, data=iota_s, op0=nl.less, operand0=bn, op1=nl.multiply, operand1=m1)
+            for sc in range(SC):
+                s0 = sc * 512
+                s1 = min(S, s0 + 512)
+                nisa.nc_matmul(dst=pse_c[sc][:, 0:s1 - s0], stationary=pe_t[et], moving=mm_[:, s0:s1],
+                               accumulate=et > 0)  # fp32: ids past 256
+                nisa.nc_matmul(dst=psr_c[sc][:, 0:s1 - s0], stationary=ones_f[:, 0:1], moving=mm_[:, s0:s1],
+                               accumulate=et > 0)
+        pse = nl.ndarray((1, S), dtype=f32, buffer=nl.sbuf)
+        psr = nl.ndarray((1, S), dtype=f32, buffer=nl.sbuf)
+        for sc in range(SC):
+            s0 = sc * 512
+            s1 = min(S, s0 + 512)
+            nisa.tensor_copy(dst=pse[:, s0:s1], src=pse_c[sc][:, 0:s1 - s0])
+            nisa.tensor_copy(dst=psr[:, s0:s1], src=psr_c[sc][:, 0:s1 - s0])
+        late = nl.ndarray((1, S), dtype=f32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=late, data=iota_s[0:1, :], op0=nl.greater_equal, operand0=1.0 * keep)
+        if split and g_lo > 0:  # this program's first `keep` slots are its buffers' first writes too
+            s0 = 1.0 * g_lo * Q
+            e2 = nl.ndarray((1, S), dtype=f32, buffer=nl.sbuf)  # [s0 <= s < s0 + keep]
+            nisa.tensor_scalar(dst=e2, data=iota_s[0:1, :], op0=nl.greater_equal, operand0=s0)
+            nisa.scalar_tensor_tensor(dst=e2, data=iota_s[0:1, :], op0=nl.less, operand0=s0 + keep,
+                                      op1=nl.multiply, operand1=e2)
+            nisa.tensor_scalar(dst=e2, data=e2, op0=nl.multiply, operand0=-1.0, op1=nl.add, operand1=1.0)
+            nisa.tensor_tensor(dst=late, data1=late, data2=e2, op=nl.multiply)
+        pad = nl.ndarray((1, S), dtype=f32, buffer=nl.sbuf)  # 1 - real
+        nisa.tensor_scalar(dst=pad, data=psr, op0=nl.multiply, operand0=-1.0, op1=nl.add, operand1=1.0)
+        nisa.scalar_tensor_tensor(dst=pad, data=pad, op0=nl.multiply, operand0=1.0 * E, op1=nl.multiply, operand1=late)
+        sef = nl.ndarray((1, S), dtype=f32, buffer=nl.sbuf)
+        nisa.tensor_tensor(dst=sef, data1=pse, data2=pad, op=nl.add)
+        nisa.tensor_copy(dst=e_sb, src=sef)
+
+        acc = nl.ndarray((128, TT, H), dtype=nl.float32, buffer=nl.sbuf)
+        # Rings, one tensor per entry (the compiler orders accesses per tensor): NR groups of expert
+        # buffers, two of each per-block tile (consecutive blocks overlap by the skew), three of
+        # each per-group tile.
+        NR = ring
+        PD = NR - 2  # a group's buffers are loaded PD steps ahead and read until the step after its own
+        bufs = (nl.ndarray((128, Q, F), dtype=nl.uint8, buffer=nl.sbuf), nl.ndarray((128, Q, F), dtype=nl.uint8, buffer=nl.sbuf),
+                nl.ndarray((128, Q, F), dtype=nl.uint8, buffer=nl.sbuf), nl.ndarray((128, Q, F), dtype=nl.uint8, buffer=nl.sbuf),
+                nl.ndarray((128, Q, F), dtype=nl.uint8, buffer=nl.sbuf))[:NR]
+        XL = nl.ndarray((BL, H), dtype=nl.bfloat16, buffer=nl.sbuf)  # a block's lanes' rows of x (one block at a time)
+        tkr = (nl.ndarray((BL, 1), dtype=nl.int32, buffer=nl.sbuf), nl.ndarray((BL, 1), dtype=nl.int32, buffer=nl.sbuf))
+        rs = (nl.ndarray((BL, T), dtype=nl.bfloat16, buffer=nl.sbuf), nl.ndarray((BL, T), dtype=nl.bfloat16, buffer=nl.sbuf),
+              nl.ndarray((BL, T), dtype=nl.bfloat16, buffer=nl.sbuf), nl.ndarray((BL, T), dtype=nl.bfloat16, buffer=nl.sbuf))
+        xg = (nl.ndarray((128, C, BL), dtype=nl.bfloat16, buffer=nl.sbuf),  # x[tok(lane), c * 128 + i]
+              nl.ndarray((128, C, BL), dtype=nl.bfloat16, buffer=nl.sbuf))
+        yb = (nl.ndarray((128, G32, BL), dtype=nl.bfloat16, buffer=nl.sbuf),  # [p, h // 128, lane]
+              nl.ndarray((128, G32, BL), dtype=nl.bfloat16, buffer=nl.sbuf))
+        mmb = (nl.ndarray((128, Q, L, 2), dtype=nl.bfloat16, buffer=nl.sbuf),  # [o, slot, lane, half] g masked
+               nl.ndarray((128, Q, L, 2), dtype=nl.bfloat16, buffer=nl.sbuf),
+               nl.ndarray((128, Q, L, 2), dtype=nl.bfloat16, buffer=nl.sbuf))
+        a2b = (nl.ndarray((128, Q, L, 2), dtype=nl.bfloat16, buffer=nl.sbuf),  # [q, slot, lane, half] a masked
+               nl.ndarray((128, Q, L, 2), dtype=nl.bfloat16, buffer=nl.sbuf),
+               nl.ndarray((128, Q, L, 2), dtype=nl.bfloat16, buffer=nl.sbuf))
+        # the groups' scales, copied out of the expert buffers in stage A (by the scalar engine), so
+        # that the buffers' last readers are the tensor engine's down matmuls and the next loads
+        # into them wait on nothing else
+        sg_r = (nl.ndarray((128, Q, C), dtype=nl.float32, buffer=nl.sbuf), nl.ndarray((128, Q, C), dtype=nl.float32, buffer=nl.sbuf),
+                nl.ndarray((128, Q, C), dtype=nl.float32, buffer=nl.sbuf))
+        sd_r = (nl.ndarray((128, Q, C), dtype=nl.float32, buffer=nl.sbuf), nl.ndarray((128, Q, C), dtype=nl.float32, buffer=nl.sbuf),
+                nl.ndarray((128, Q, C), dtype=nl.float32, buffer=nl.sbuf))
+        q_r = (nl.ndarray((128, Q, L, C), dtype=nl.float32, buffer=nl.sbuf),
+               nl.ndarray((128, Q, L, C), dtype=nl.float32, buffer=nl.sbuf),
+               nl.ndarray((128, Q, L, C), dtype=nl.float32, buffer=nl.sbuf))
+        g_r = (nl.ndarray((128, Q, L), dtype=nl.float32, buffer=nl.sbuf), nl.ndarray((128, Q, L), dtype=nl.float32, buffer=nl.sbuf),
+               nl.ndarray((128, Q, L), dtype=nl.float32, buffer=nl.sbuf))
+        sl_r = (nl.ndarray((128, Q, L), dtype=nl.float32, buffer=nl.sbuf), nl.ndarray((128, Q, L), dtype=nl.float32, buffer=nl.sbuf),
+                nl.ndarray((128, Q, L), dtype=nl.float32, buffer=nl.sbuf))
+        au_r = (nl.ndarray((128, Q, L), dtype=nl.float32, buffer=nl.sbuf), nl.ndarray((128, Q, L), dtype=nl.float32, buffer=nl.sbuf),
+                nl.ndarray((128, Q, L), dtype=nl.float32, buffer=nl.sbuf))
+        St = dict(T=T, TT=TT, K=K, BL=BL, L=L, Q=Q, QB_=QB_, C=C, C2=C2, G32=G32, NH=NH, H=H, F=F, S=S, NR=NR, PD=PD,
+                  o_dw=o_dw, o_sg=o_sg, o_sd=o_sd, sdt=sdt, act=act, limit=limit, alpha=alpha, debug=debug, blob=blob,
+                  e_sb=e_sb, x=x, lam=lam, Wp=Wp, tkp=tkp, ilf=ilf, XL=XL, tkr=tkr, NJ=NJ, ip=ip, idn=idn, fd=fd, mh=mh,
+                  acc=acc, bufs=bufs, rs=rs, xg=xg, yb=yb, mmb=mmb, a2b=a2b, sg_r=sg_r, sd_r=sd_r, q_r=q_r, g_r=g_r,
+                  sl_r=sl_r, au_r=au_r, b_first=b_lo)
+        SPB = BL // L  # slots per block
+        NHD = -(-(-(-N // L)) // SPB)  # blocks that hold one of the first ceil(N / L) slots: every routing fills them
+        NHD = max(NHD, -(-(S * hdf // 100) // SPB))  # hdf: a static head of hdf% of the slots (the routing's usual fill)
+        NHD = NHD + NHD % 2  # pairs of blocks share a route
+        SEG = skp + skp % 2
+        hd = min(b_hi, b_lo + NHD)
+        if mine and SEG > 0 and not split and npg == 1 and hd < b_hi:
+            KS = -(-(b_hi - hd) // SEG)
+            fkf = nl.ndarray((1, KS), dtype=f32, buffer=nl.sbuf)  # [segment k's first slot is real]
+            for k in range(KS):
+                s0 = (hd + k * SEG) * SPB
+                nisa.tensor_copy(dst=fkf[0:1, k:k + 1], src=psr[0:1, s0:s0 + 1])
+            fli = nl.ndarray((1, KS), dtype=i32, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=fli, src=fkf)
+            _dd10_region(St, b_lo, hd)
+            for k in range(KS):
+                b0 = hd + k * SEG
+                b1 = min(b_hi, b0 + SEG)
+                rk = nisa.register_alloc()
+                nisa.register_load(rk, fli.ap(pattern=[[KS, 1], [1, 1]], offset=k))
+
+                def seg(it, b0=b0, b1=b1):
+                    _dd10_region(St, b0, b1)
+
+                nl.fori_loop(0, rk, seg)
+        elif mine:
+            _dd10_region(St, b_lo, b_hi)
+        if split:  # the other program's partial for this program's columns, added in fp32, per token tile
+            hw = H // 2
+            oth = 1 - pid
+            for tt in range(TT):
+                tn = min(128, T - tt * 128)
+                nisa.sendrecv(src=acc[0:tn, tt, oth * hw:(oth + 1) * hw], dst=rcv[0:tn, tt, :], send_to_rank=oth,
+                              recv_from_rank=oth, pipe_id=0)
+            for tt in range(TT):
+                tn = min(128, T - tt * 128)
+                mine_acc = acc[0:tn, tt, pid * hw:(pid + 1) * hw]
+                nisa.tensor_tensor(dst=mine_acc, data1=mine_acc, data2=rcv[0:tn, tt, :], op=nl.add)
+                o_h = nl.ndarray((128, hw), dtype=nl.bfloat16, buffer=nl.sbuf)
+                nisa.tensor_copy(dst=o_h[0:tn, :], src=mine_acc)
+                nisa.dma_copy(dst=out[tt * 128:tt * 128 + tn, pid * hw:(pid + 1) * hw], src=o_h[0:tn, :])
+        elif pid == 0:
+            for tt in range(TT):
+                tn = min(128, T - tt * 128)
+                o_sb = nl.ndarray((128, H), dtype=nl.bfloat16, buffer=nl.sbuf)
+                nisa.tensor_copy(dst=o_sb[0:tn, :], src=acc[0:tn, tt, :])
+                nisa.dma_copy(dst=out[tt * 128:tt * 128 + tn, :], src=o_sb[0:tn, :])
+        if npg > 1:  # LNC: the whole output written (both column halves, or program 0's) before either ends
+            nisa.core_barrier(data=out, cores=(0, 1))
+        return out
+
+    def _dd10_region(St, b_lo, b_hi):
+        """moe_dedupe_v10's blocks b_lo .. b_hi - 1 as one software pipeline (loads, gathers, stages A / B / C,
+        routes), with PSUM rings of its own: the whole call, its static head, or the body of one of its device loops
+        (a PSUM tile referenced in two device-loop regions fails to compile: [NCC_IBIR092]). Blocks pair up for their routes from b_lo, so a region holds its pairs."""
+        T = St["T"]
+        TT = St["TT"]
+        K = St["K"]
+        BL = St["BL"]
+        L = St["L"]
+        Q = St["Q"]
+        QB_ = St["QB_"]
+        C = St["C"]
+        C2 = St["C2"]
+        G32 = St["G32"]
+        NH = St["NH"]
+        H = St["H"]
+        F = St["F"]
+        S = St["S"]
+        NR = St["NR"]
+        PD = St["PD"]
+        o_dw = St["o_dw"]
+        o_sg = St["o_sg"]
+        o_sd = St["o_sd"]
+        sdt = St["sdt"]
+        act = St["act"]
+        limit = St["limit"]
+        alpha = St["alpha"]
+        debug = St["debug"]
+        blob = St["blob"]
+        e_sb = St["e_sb"]
+        x = St["x"]
+        lam = St["lam"]
+        Wp = St["Wp"]
+        tkp = St["tkp"]
+        ilf = St["ilf"]
+        XL = St["XL"]
+        tkr = St["tkr"]
+        NJ = St["NJ"]
+        bf16 = nl.bfloat16
+        ip = St["ip"]
+        idn = St["idn"]
+        fd = St["fd"]
+        mh = St["mh"]
+        acc = St["acc"]
+        bufs = St["bufs"]
+        rs = St["rs"]
+        xg = St["xg"]
+        yb = St["yb"]
+        mmb = St["mmb"]
+        a2b = St["a2b"]
+        sg_r = St["sg_r"]
+        sd_r = St["sd_r"]
+        q_r = St["q_r"]
+        g_r = St["g_r"]
+        sl_r = St["sl_r"]
+        au_r = St["au_r"]
+        f32 = nl.float32
+        g_lo = b_lo * QB_
+        g_hi = b_hi * QB_
+        first = b_lo == St["b_first"]  # this program's first region: its first route writes the accumulator
+        pg_r = (nl.ndarray((128, Q, C, L), dtype=nl.float32, buffer=nl.psum),
+                nl.ndarray((128, Q, C, L), dtype=nl.float32, buffer=nl.psum),
+                nl.ndarray((128, Q, C, L), dtype=nl.float32, buffer=nl.psum))
+        pf_r = (nl.ndarray((128, Q, L, 2), dtype=nl.float32, buffer=nl.psum),
+                nl.ndarray((128, Q, L, 2), dtype=nl.float32, buffer=nl.psum),
+                nl.ndarray((128, Q, L, 2), dtype=nl.float32, buffer=nl.psum))
+        pd_r = (nl.ndarray((128, Q, C2, L, 2), dtype=nl.float32, buffer=nl.psum),
+                nl.ndarray((128, Q, C2, L, 2), dtype=nl.float32, buffer=nl.psum),
+                nl.ndarray((128, Q, C2, L, 2), dtype=nl.float32, buffer=nl.psum))
+
+        # Step i: the loads of group i + PD, stage A (gate_up, scales) of group i, then stage B
+        # (fold, SiLU) and stage C (down, output) of group i - 1. The expert DMAs are the long
+        # pole, so they run ahead; a group's buffers are free after its stage C.
+        DG = QB_ // 2 if QB_ > 1 else 0  # steps from a gather's vector half to its tensor-engine half
+        DR = 2  # steps from a route's transposes to its matmuls
+        it0 = g_lo - PD
+        pend = []  # the pending route: [step, blocks, their transposed outputs, rel]
+        for it in range(it0, g_hi + 1 + DR + 1):
+            gl = it + PD
+            if g_lo <= gl < g_hi and debug % 2 == 0:  # loads of group gl (debug bit 1: none, to time the rest)
+                bq = bufs[gl % NR]
+                for s in range(Q):
+                    e = e_sb.ap(pattern=[[S, 1], [1, 1]], offset=gl * Q + s)
+                    nisa.dma_copy(dst=bq[:, s, :], src=blob.select(0, e), oob_mode=nisa.oob_mode.skip)
+            # the gather of block bk (xg[i, c, l] = x[tok(l), c * 128 + i]), one block ahead: the first block's in
+            # the first step; block bk's vector half in the step after block bk - 1's first group, its tensor-engine
+            # half DG steps later (still before block bk's first stage A)
+            bk = b_lo if it == it0 else ((it - 1) // QB_ + 1 if (it - 1) % QB_ == 0 else -1)
+            if b_lo <= bk < b_hi and (bk == b_lo) == (it == it0):
+                # the pairs' one-hot onto the block's lanes, per pair tile: OH[p, l] = [lane(128 j + p) == bk BL + l];
+                # R[l, t] = sum over pairs of OH x the tile's 16-token window of weights (each window written once),
+                # the lanes' tokens 16 j + p // 8 from the bf16-exact parts [p // 8, j] (a padded lane: token 0, weight 0)
+                pr = nl.ndarray((128, 512), dtype=f32, buffer=nl.psum)
+                ptk = nl.ndarray((128, 2), dtype=f32, buffer=nl.psum)
+                lamk = nl.ndarray((128, NJ), dtype=f32, buffer=nl.sbuf)  # the pairs' lanes relative to this block
+                nisa.tensor_scalar(dst=lamk, data=lam, op0=nl.subtract, operand0=1.0 * bk * BL)
+                ohs = []
+                for j in range(NJ):
+                    oh = nl.ndarray((128, BL), dtype=bf16, buffer=nl.sbuf)
+                    nisa.tensor_scalar(dst=oh, data=ilf, op0=nl.equal, operand0=lamk[:, j:j + 1])
+                    nisa.nc_matmul(dst=pr[0:BL, j * 16:(j + 1) * 16], stationary=oh, moving=Wp[:, j, :], accumulate=False)
+                    ohs.append(oh)
+                for j in range(NJ):  # the tokens' accumulation on its own, uninterleaved
+                    nisa.nc_matmul(dst=ptk[0:BL, :], stationary=ohs[j], moving=tkp[:, j, :], accumulate=j > 0)
+                nisa.activation(dst=rs[bk % 4], op=nl.copy, data=pr[0:BL, 0:T])
+                tk2 = nl.ndarray((128, 2), dtype=f32, buffer=nl.sbuf)  # out of PSUM first: the vector engine reads one
+                nisa.tensor_copy(dst=tk2[0:BL, :], src=ptk[0:BL, :])  # PSUM operand per instruction
+                tkf = nl.ndarray((128, 1), dtype=f32, buffer=nl.sbuf)
+                nisa.scalar_tensor_tensor(dst=tkf[0:BL, :], data=tk2[0:BL, 1:2], op0=nl.multiply, operand0=16.0,
+                                          op1=nl.add, operand1=tk2[0:BL, 0:1])
+                nisa.tensor_scalar(dst=tkf[0:BL, :], data=tkf[0:BL, :], op0=nl.maximum, operand0=0.0, op1=nl.minimum,
+                                   operand1=1.0 * (T - 1))  # the gather never leaves x
+                nisa.tensor_copy(dst=tkr[bk % 2], src=tkf[0:BL, :])
+            jp = it - 1 - DG
+            bk = b_lo if it == it0 else (jp // QB_ + 1 if jp % QB_ == 0 else -1)
+            if b_lo <= bk < b_hi and (bk == b_lo) == (it == it0):
+                pa = bk % 2
+                # the lanes' rows of x by one indirect DMA (row tok(l) onto partition l), transposed into xg
+                nisa.dma_copy(dst=XL, src=x.ap(pattern=[[H, BL], [1, H]], offset=0,
+                                               vector_offset=tkr[pa].ap(pattern=[[1, BL], [1, 1]], offset=0),
+                                               indirect_dim=0))
+                for c in range(C):
+                    px = nl.ndarray((128, BL), dtype=nl.float32, buffer=nl.psum)
+                    nisa.nc_matmul(dst=px, stationary=XL[:, c * 128:(c + 1) * 128], moving=idn[0:BL, 0:BL], accumulate=False)
+                    nisa.activation(dst=xg[pa][:, c, :], op=nl.copy, data=px)
+            if g_lo <= it < g_hi:  # stage A of group it
+                gq = it
+                pa = (gq // QB_) % 2
+                l0 = (gq % QB_) * Q * L
+                bq = bufs[gq % NR]
+                pg = pg_r[gq % 3]
+                for s in range(Q):
+                    wg = bq[:, s, 0:H].view(nl.float8_e4m3)
+                    for c in range(C):
+                        nisa.nc_matmul(dst=pg[:, s, c, :], stationary=wg[:, c * 128:(c + 1) * 128],
+                                       moving=xg[pa][:, c, l0 + s * L:l0 + (s + 1) * L], accumulate=False)
+                nisa.activation(dst=sg_r[gq % 3], op=nl.copy, data=bq[:, :, o_sg:o_sd].view(sdt))
+                nisa.activation(dst=sd_r[gq % 3], op=nl.copy, data=bq[:, :, o_sd:F].view(sdt))
+                # g[o, s, l] = sum over tiles c of pg[o, s, c, l] * s_gu[o, c] of the slot's expert
+                sg = sg_r[gq % 3].expand_dim(3).broadcast(3, L)  # [o, s, c, l]
+                q = q_r[gq % 3]
+                nisa.tensor_tensor(dst=q.permute((0, 1, 3, 2)), data1=pg, data2=sg, op=nl.multiply)
+                g = g_r[gq % 3]
+                nisa.tensor_reduce(dst=g, op=nl.add, data=q, axis=3)
+                nisa.tensor_tensor(dst=mmb[gq % 3], data1=g.expand_dim(3).broadcast(3, 2),
+                                   data2=mh.expand_dim(1).expand_dim(1).broadcast(1, Q).broadcast(2, L), op=nl.multiply)
+            if g_lo + 1 <= it <= g_hi:  # stages B and C of group it - 1
+                gq = it - 1
+                bk = (gq * Q * L) // BL
+                pa = bk % 2
+                l0 = (gq % QB_) * Q * L
+                # B: fold the up rows onto the gate rows, SiLU
+                pf = pf_r[gq % 3]
+                nisa.nc_matmul(dst=pf.flatten_dims(1, 3), stationary=fd, moving=mmb[gq % 3].flatten_dims(1, 3),
+                               accumulate=False)
+                sl = sl_r[gq % 3]
+                au = au_r[gq % 3]
+                if act == 0:  # silu(gate) * up
+                    nisa.activation(dst=sl, op=nl.silu, data=pf[:, :, :, 0])
+                    nisa.tensor_tensor(dst=au, data1=sl, data2=pf[:, :, :, 1], op=nl.multiply)
+                else:  # gate clamped from above, up into [-limit, limit] (ACTS)
+                    gc = nl.ndarray((128, Q, L), dtype=f32, buffer=nl.sbuf)
+                    nisa.tensor_scalar(dst=gc, data=pf[:, :, :, 0], op0=nl.minimum, operand0=limit)
+                    uc = nl.ndarray((128, Q, L), dtype=f32, buffer=nl.sbuf)
+                    nisa.tensor_scalar(dst=uc, data=pf[:, :, :, 1], op0=nl.maximum, operand0=-limit, op1=nl.minimum,
+                                       operand1=limit)
+                    if act == 1:  # silu(gc) * uc
+                        nisa.activation(dst=sl, op=nl.silu, data=gc)
+                        nisa.tensor_tensor(dst=au, data1=sl, data2=uc, op=nl.multiply)
+                    else:  # (uc + 1) * gc * sigmoid(alpha gc)
+                        nisa.activation(dst=sl, op=nl.sigmoid, data=gc, scale=alpha)
+                        nisa.tensor_tensor(dst=sl, data1=sl, data2=gc, op=nl.multiply)
+                        nisa.scalar_tensor_tensor(dst=au, data=uc, op0=nl.add, operand0=1.0, op1=nl.multiply, operand1=sl)
+                # a2[q, s, l, half] = a[q % 64, s, l] * [q // 64 == half]: the two H halves of
+                # w_down are stacked on the partitions
+                nisa.tensor_tensor(dst=a2b[gq % 3], data1=au.expand_dim(3).broadcast(3, 2),
+                                   data2=mh.expand_dim(1).expand_dim(1).broadcast(1, Q).broadcast(2, L), op=nl.multiply)
+                # C: down, scales, into the block's output columns
+                bq = bufs[gq % NR]
+                pd = pd_r[gq % 3]
+                for s in range(Q):
+                    wd = bq[:, s, o_dw:o_sg].view(nl.float8_e4m3)
+                    for c in range(C2):
+                        nisa.nc_matmul(dst=pd[:, s, c, :, :].flatten_dims(1, 2), stationary=wd[:, c * 128:(c + 1) * 128],
+                                       moving=a2b[gq % 3][:, s, :, :].flatten_dims(1, 2), accumulate=False)
+                # y[h], h = half * H/2 + c' * 128 + p: pd[p, s, c', l, half] * s_down[p, 2 c' + half],
+                # into yb[p, half * C2 + c', lane]; one instruction per slot (each its own expert)
+                for s in range(Q):
+                    sd = sd_r[gq % 3][:, s, :].reshape_dim(1, (C2, 1, 2)).broadcast(2, L)
+                    ybv = yb[pa][:, :, l0 + s * L:l0 + (s + 1) * L].reshape_dim(1, (2, C2)).permute((0, 2, 3, 1))
+                    nisa.tensor_tensor(dst=ybv, data1=pd[:, s], data2=sd, op=nl.multiply)
+                rel = bk - b_lo
+                if gq % QB_ == QB_ - 1 and (rel % 2 == 1 or bk == b_hi - 1):  # this block and the one before: transposed
+                    blks = []
+                    if rel % 2 == 1:
+                        blks.append(bk - 1)
+                    blks.append(bk)
+                    yts = []
+                    for b in blks:
+                        yt = nl.ndarray((BL, G32, 128), dtype=nl.bfloat16, buffer=nl.sbuf)  # [lane, h // 128, p]
+                        for g4 in range(NH):
+                            pt = nl.ndarray((BL, 4, 128), dtype=nl.float32, buffer=nl.psum)
+                            for k in range(4):
+                                nisa.nc_matmul(dst=pt[:, k, :], stationary=yb[b % 2][:, g4 * 4 + k, :], moving=idn,
+                                               accumulate=False)
+                            nisa.activation(dst=yt[:, g4 * 4:(g4 + 1) * 4, :], op=nl.copy, data=pt)
+                        yts.append(yt)
+                    pend = [it + DR, blks, yts, rel]
+            if len(pend) > 0 and pend[0] == it:  # the pending route: its lanes' outputs into their tokens
+                blks = pend[1]
+                yts = pend[2]
+                for hc in range(NH):
+                    for tt in range(TT):  # one token tile at a time
+                        tn = min(128, T - tt * 128)
+                        po = nl.ndarray((128, 512), dtype=nl.float32, buffer=nl.psum)
+                        for j in range(len(blks)):
+                            nisa.nc_matmul(dst=po[0:tn, :], stationary=rs[blks[j] % 4][:, tt * 128:tt * 128 + tn],
+                                           moving=yts[j][:, hc * 4:(hc + 1) * 4, :].flatten_dims(1, 2), accumulate=j > 0)
+                        av = acc[0:tn, tt, hc * 512:(hc + 1) * 512]
+                        if first and pend[3] <= 1:  # this program's first route
+                            nisa.activation(dst=av, op=nl.copy, data=po[0:tn, :])
+                        else:
+                            nisa.tensor_tensor(dst=av, data1=av, data2=po[0:tn, :], op=nl.add)
+                pend = []
+else:
+    moe_dedupe_v10 = None
+
+
 def _kernel_rev() -> int:
     """CRC-32 of moe_dedupe_v8's source text, passed to it as the static argument `rev`: LNL's graph
     cache key (libtorch_neuronx_lite/compile/cache.py create_cache_hash, SDK 2.32) hashes each NKI call's
@@ -1042,11 +1668,31 @@ def _kernel_rev_pairs() -> int:
 REV_PAIRS = _kernel_rev_pairs()
 
 
+def _kernel_rev10() -> int:
+    """moe_dedupe_v10's source revision (its block)."""
+    import zlib
+
+    src = open(__file__).read()
+    a = src.index("if nki is not None:  # moe_dedupe_v10")
+    b = src.index("    moe_dedupe_v10 = None", a)
+    return zlib.crc32(src[a:b].encode())
+
+
+REV10 = _kernel_rev10()
+
+
 def kernel():
     """The NKI kernel (raises where the NKI package is missing)."""
     if moe_dedupe_v8 is None:
         raise RuntimeError("the NKI MoE kernel needs the nki package (the Neuron venv)")
     return moe_dedupe_v8
+
+
+def kernel10():
+    """The 256 < T <= 512 dedupe kernel (raises where NKI is missing)."""
+    if moe_dedupe_v10 is None:
+        raise RuntimeError("the NKI MoE kernel needs the nki package (the Neuron venv)")
+    return moe_dedupe_v10
 
 
 def pairs_kernel():
@@ -1077,18 +1723,21 @@ def emulate_pairs(x, topv, topi, blob, act: int = 0, limit: float = 0.0, alpha: 
     return emulate(x, topv, topi, blob, act, limit, alpha, pair_bf16=False)
 
 
-# Tokens per dedupe kernel call: 128, moe_dedupe_v8's bound.
-MAX_TOKENS = P
+# Tokens per dedupe kernel call: 512 puts a call of 257 to 512 tokens (a multiple of 16) on moe_dedupe_v10, ONE call
+# that reads each selected expert once (a 512-row prefill chunk, below models/decoder.MOE_PREFILL_MIN_TOKENS); calls of
+# up to 128 tokens run moe_dedupe_v8.
+MAX_TOKENS = 4 * P
 
 
 def moe_dedupe(x: torch.Tensor, topv: torch.Tensor, topi: torch.Tensor, blob: torch.Tensor,
                max_tokens: int | None = None, lanes: int | None = None, act: int = 0, limit: float = 0.0,
                alpha: float = 1.702) -> torch.Tensor:
     """sum_k topv[t, k] * expert_{topi[t, k]}(x[t]) on the device, inside the caller's graph: one
-    kernel call per chunk of at most max_tokens tokens (default MAX_TOKENS; the kernel holds a chunk's
-    tokens on the partitions, up to 128 of them), each selected expert of a chunk read once; calls below
-    PAIRS_BELOW tokens run the per-pair kernel on the same layout instead. act / limit / alpha: the
-    activation (ACTS)."""
+    kernel call per chunk of at most max_tokens tokens (default MAX_TOKENS; the kernels hold a chunk's
+    tokens on the partitions, v8 up to 128 of them and v10 257 to 512), each selected expert of a chunk
+    read once; calls below PAIRS_BELOW tokens run the per-pair kernel on the same layout instead. A call
+    with a chunk of 129 to 256 tokens, or one v10 cannot plan, runs v8's 128-token chunks. act / limit /
+    alpha: the activation (ACTS)."""
     from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
     from .. import platform
@@ -1098,11 +1747,16 @@ def moe_dedupe(x: torch.Tensor, topv: torch.Tensor, topi: torch.Tensor, blob: to
         return from_pairs(wrap_nki(pairs_kernel())[platform.nki_grid()](**pairs_inputs(x, topv, topi, blob, act, limit, alpha)),
                           x.dtype)
     mt = max_tokens or MAX_TOKENS
+    if mt > P and T > P and (any(P < min(mt, T - s) <= 2 * P for s in range(0, T, mt))
+                             or not fits10(min(T, mt), topi.shape[1], blob.shape[0], lanes)):
+        mt = P
     outs = []
     for s in range(0, T, mt):
-        # each call slices x[s:s + max_tokens]: the slice's end is part of the traced graph
-        e = s + mt
-        call = wrap_nki(kernel())[platform.nki_grid()]
+        n = min(mt, T - s)
+        v10 = n > 2 * P
+        # v8's calls slice x[s:s + max_tokens]: the slice's end is part of the traced graph
+        e = s + n if v10 else s + mt
+        call = wrap_nki(kernel10() if v10 else kernel())[platform.nki_grid()]
         outs.append(call(**kernel_inputs(x[s:e], topv[s:e], topi[s:e], blob, lanes, act, limit, alpha)))
     out = outs[0] if len(outs) == 1 else torch.cat(outs)
     return out.to(x.dtype)

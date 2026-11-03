@@ -5,7 +5,8 @@ call of the FFN half's body with the glue after it, _b5), on the host, by its so
 - decode_layer_split builds the FFN half's arguments with the very keywords ffn_half.decode passes its run(), and calls
   the KDA shell as hybrid.layer does (the previous layer's pend in the shell's slot form);
 - hybrid hands decode_layer_split the previous layer's raw (post, comb, y);
-- layer_takes: the rows split evenly over the programs and each program's rows x H / 128 chunks fit _b5's 128;
+- layer_takes: the rows split evenly over the programs and H / 128 chunks fit 128 partitions (a program's rows past one
+  chunk run the chunked glue, tests/test_mk_b5c.py);
 - its REV is one CRC of its source, ffn_half_pb's REV and shell's.
 Each pin is shown to fail on a planted source."""
 
@@ -93,12 +94,19 @@ def test_hybrid_hands_the_split_layer_its_raw_pend():
     assert {k.arg: ast.unparse(k.value) for k in c.keywords} == {"pend": "pend"}
 
 
-def test_layer_takes_needs_whole_rows_per_program_and_fits_the_glue(monkeypatch):
-    from trnrt import platform
-
-    monkeypatch.setattr(platform, "nki_grid", lambda: 2)
+def test_layer_takes_needs_whole_rows_per_program_and_fits_the_glue():
+    """The programs come from the layer's packing (ks_dims[3], decode_layer_split's npg), not the runtime: no runtime
+    is configured here. Two packings with different answers, so the rule can't be reading a constant. Rows past one
+    chunk of the glue (T > 8 at grid 2) take the split layer too, through the chunked glue; a hidden size of more than
+    128 chunks fits no glue."""
     model = types.SimpleNamespace(cfg=types.SimpleNamespace(hidden_size=4096))
-    assert [MK.layer_takes(model, T) for T in (1, 2, 4, 6, 8, 10)] == [False, True, True, True, True, False]
+    Ts = (1, 2, 4, 6, 8, 10, 12, 16)
+    two = types.SimpleNamespace(ks_dims=(4096, 64, 4, 2, 4))
+    one = types.SimpleNamespace(ks_dims=(4096, 64, 4, 1, 4))
+    assert [MK.layer_takes(model, two, T) for T in Ts] == [False, True, True, True, True, True, True, True]
+    assert [MK.layer_takes(model, one, T) for T in Ts] == [True] * len(Ts)
+    wide = types.SimpleNamespace(cfg=types.SimpleNamespace(hidden_size=129 * 128))
+    assert [MK.layer_takes(wide, two, T) for T in (2, 8)] == [False, False]
 
 
 def test_rev_is_one_crc_of_its_parts():
