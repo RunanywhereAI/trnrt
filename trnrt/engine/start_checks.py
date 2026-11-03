@@ -98,7 +98,7 @@ def engine_devices(core_base: int, tp: int, devices: list[dict], lnc: int | None
     return sorted(mine)
 
 
-def device_users(devices: list[dict], wanted) -> list[tuple[int, int, str]]:
+def device_users(devices: list[dict], wanted) -> list[tuple[int, object, str]]:
     """(device, pid, command) of every process with a Neuron runtime on a device in `wanted`."""
     out = []
     for d in devices:
@@ -106,7 +106,7 @@ def device_users(devices: list[dict], wanted) -> list[tuple[int, int, str]]:
         if dev in wanted:
             for p in d.get("neuron_processes") or []:
                 if p.get("neuron_runtime_version"):
-                    out.append((dev, int(p["pid"]), str(p.get("command") or "?")))
+                    out.append((dev, p.get("pid", "?"), str(p.get("command") or "?")))
     return out
 
 
@@ -123,15 +123,20 @@ def device_refusal(core_base: int, tp: int, lnc: int | None = None, devices: lis
             print(f"trnrt: neuron-ls not found: not checking that the Neuron devices of cores {core_base}-"
                   f"{core_base + tp - 1} are free", file=sys.stderr, flush=True)
             return None
-    mine = engine_devices(core_base, tp, devices, lnc)
-    users = device_users(devices, set(mine))
+    try:
+        mine = engine_devices(core_base, tp, devices, lnc)
+        users = device_users(devices, set(mine))
+    except (KeyError, TypeError, ValueError, ZeroDivisionError) as e:
+        return (f"could not read neuron-ls's device listing ({type(e).__name__}: {e}), and a failed read is never "
+                f"taken as free devices. Set {SKIP_DEVICE}=1 to start without this check.")
     if not users:
         return None
     named = "; ".join(f"pid {pid} on device {dev} ({cmd})" for dev, pid, cmd in users[:16])
     more = f"; and {len(users) - 16} more" if len(users) > 16 else ""
     return (f"the Neuron devices of this engine's cores {core_base}-{core_base + tp - 1} (devices "
             f"{', '.join(map(str, mine))}) are in use by another process: {named}{more}. Stop them (an engine of an "
-            f"earlier run that did not exit, a neuron-monitor) and start again, or set {SKIP_DEVICE}=1 to start anyway.")
+            f"earlier run that did not exit, a neuron-monitor) and start again, or set {SKIP_DEVICE}=1 to start "
+            "anyway.")
 
 
 def refusal(device: str, core_base: int, tp: int) -> str | None:
