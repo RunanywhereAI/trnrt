@@ -6,7 +6,7 @@ steps it under its own collective waits.
 
 The kernel is mhc_split.front_body's k-layout form (front_body_k: an attention-side fn, which the j-major copy never
 re-lays), with the Sinkhorn's input c = softmax(logits) + eps written where mhc_pre writes comb. front_body is
-pre_body's instructions (tests/test_mhc_split.py), so x and post are mhc_pre's to the bit, and
+pre_body's instructions (tests/test_mhc.py), so x and post are mhc_pre's to the bit, and
 mhc_split.sinkhorn_body on c's tile (dsa_satwfc) is mhc_pre's comb. c is wrapped in PendingComb so no consumer can
 read it as comb: the fused call unwraps it; models/hybrid.py's fallback recomputes mhc_pre's comb."""
 
