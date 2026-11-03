@@ -80,6 +80,9 @@ _LOOPS: weakref.WeakSet = weakref.WeakSet()
 
 @atexit.register
 def _stop_loops() -> None:
+    if DETOK_CHECK["checked"]:  # the streaming self-check's total (_Detok._check), for the engine log
+        print(f"trnrt: detok self-check at exit: {DETOK_CHECK['checked']} streams checked, {DETOK_CHECK['mismatch']} "
+              "mismatches", flush=True)
     for lp in list(_LOOPS):
         lp.stop()
         lp.engine.close()
@@ -202,16 +205,13 @@ class EngineLoop:
 
     def _watch_ranks(self) -> None:
         """A rank that dies while the loop waits in a step leaves no thread to notice it: a collective with a dead peer
-        can block instead of raising (gloo on macOS does until its timeout; a device collective too). The loop's own
-        check between steps gets the first second."""
-        seen = None
-        while not self._stopping.wait(0.5) and self.failed is None:
+        can block instead of raising (gloo on macOS does until its timeout; a device collective too). This thread is the
+        only check: the loop does not poll its workers between steps (each poll's waitpid calls release the GIL early in
+        the step's gap, and the engine thread then waits behind the streams' detokenize). So it polls every 0.25 s and
+        fails at first sight: a dead rank does not come back."""
+        while not self._stopping.wait(0.25) and self.failed is None:
             dead = self.engine.dead_ranks()
-            if not dead:
-                seen = None
-            elif seen is None:
-                seen = time.monotonic()
-            elif time.monotonic() - seen > 1.0:
+            if dead:
                 self._fail(f"tensor-parallel rank(s) {dead} exited")
                 return
 
@@ -243,10 +243,6 @@ class EngineLoop:
 
     def _loop(self) -> None:
         while not self._stopping.is_set() and self.failed is None:
-            dead = self.engine.dead_ranks()
-            if dead:
-                self._fail(f"tensor-parallel rank(s) {dead} exited")
-                return
             self._drain(block=not self.engine.has_work())
             if not self.engine.has_work():
                 continue
@@ -265,6 +261,7 @@ class EngineLoop:
                         self.engine.abort(st.req)
                 self.streams.clear()
                 continue
+            batch: dict = {}  # one cross-thread call per event loop and step, not one per stream
             for rid, st in list(self.streams.items()):
                 req = st.req
                 out = req.output_ids
@@ -276,11 +273,23 @@ class EngineLoop:
                     new = out[st.sent:ready]
                     lps = req.logprobs[st.sent:ready] if with_lp else None
                     st.sent = ready
-                    st.loop.call_soon_threadsafe(st.out.put_nowait,
-                                                 ("tokens", new, req.finish_reason if finished else None, lps))
+                    batch.setdefault(st.loop, []).append((st.out, ("tokens", new, req.finish_reason if finished else None,
+                                                                   lps)))
                 if finished:
                     del self.streams[rid]
                     self.metrics.on_finish(req)
+            for loop, items in batch.items():
+                loop.call_soon_threadsafe(_deliver, items)
+
+
+def _deliver(items) -> None:
+    for q, item in items:
+        q.put_nowait(item)
+
+
+# The streaming self-check: every stream checks, when it ends, that what it streamed is a prefix of the full decode of its
+# ids, and all of it when no stop string cut it. Counted here, one line printed per mismatch, the total at exit.
+DETOK_CHECK = {"checked": 0, "mismatch": 0}
 
 
 class _Detok:
@@ -292,19 +301,61 @@ class _Detok:
     the OpenAI API specifies.
     """
 
-    def __init__(self, tokenizer, stops: tuple[str, ...] = ()):
+    def __init__(self, tokenizer, stops: tuple[str, ...] = (), incremental: bool = False, rid: str = ""):
         self.tok = tokenizer
+        self.rid = rid
         self.stops = stops
         self.hold = max((len(x) for x in stops), default=1) - 1
         self.ids: list[int] = []
         self.emitted = 0
         self.stopped = False
+        # incremental (the server's streams): the text so far is kept and extended by decoding a window of the newest ids
+        # (from the last point where the text was complete, TGI's prefix / read offsets), instead of decoding every id on
+        # every push, which is O(n^2) per stream and holds the GIL while the engine thread waits. The final push decodes
+        # the whole output once, so the complete text is the full decode. incremental=False (decode it all, every push) is
+        # the reference the tests compare against.
+        self.incremental = incremental
+        self._text = ""
+        self._po = self._ro = 0
+        self._streamed: list[str] | None = [] if incremental else None  # the self-check's record (DETOK_CHECK)
+
+    def _check(self, full: str | None) -> None:
+        """DETOK_CHECK: everything this stream emitted is a prefix of the full decode of its ids, and all of it if the
+        stream ended without a stop string. `full`: that decode when the caller has it (the final push), else decoded
+        here."""
+        if full is None:
+            full = self.tok.decode(self.ids, skip_special_tokens=True)
+        got = "".join(self._streamed)
+        DETOK_CHECK["checked"] += 1
+        if full.startswith(got) and (self.stopped or got == full):
+            return
+        DETOK_CHECK["mismatch"] += 1
+        i = next((k for k, (a, b) in enumerate(zip(got, full)) if a != b), min(len(got), len(full)))
+        print(f"trnrt: detok self-check mismatch {DETOK_CHECK['mismatch']} of {DETOK_CHECK['checked']}: rid {self.rid}, "
+              f"streamed {len(got)} chars, the full decode {len(full)}, first difference at offset {i}", flush=True)
+
+    def _decoded(self, final: bool) -> str:
+        if final or not self.incremental:
+            return self.tok.decode(self.ids, skip_special_tokens=True)
+        prefix = self.tok.decode(self.ids[self._po : self._ro], skip_special_tokens=True)
+        new = self.tok.decode(self.ids[self._po :], skip_special_tokens=True)
+        if len(new) > len(prefix) and not new.endswith("\ufffd"):
+            self._text += new[len(prefix):]
+            self._po, self._ro = self._ro, len(self.ids)
+            return self._text
+        # Not committed (the newest character is incomplete, or the window added no text): the text as the full decode
+        # reads it now, the incomplete character's U+FFFD included, so a stop string before that character is found at
+        # this push, as the full decode finds it (returning only the committed text + U+FFFD finds it one push late).
+        # The offsets stay, so the next push re-decodes the window from the same complete point.
+        if new.startswith(prefix):
+            return self._text + new[len(prefix):]
+        return self._text + "\ufffd"  # an incomplete character: held back below, as the full decode's would be
 
     def push(self, ids: list[int], final: bool) -> str:
         if self.stopped:
             return ""
         self.ids.extend(ids)
-        text = self.tok.decode(self.ids, skip_special_tokens=True)
+        text = self._decoded(final)
         cut = min((i for i in (text.find(x) for x in self.stops) if i >= 0), default=-1)
         if cut >= 0:
             self.stopped = True
@@ -317,6 +368,10 @@ class _Detok:
             end = max(self.emitted, len(text) - self.hold)
         delta = text[self.emitted:end]
         self.emitted = end
+        if self._streamed is not None:
+            self._streamed.append(delta)
+            if final or self.stopped:
+                self._check(text if final else None)  # the final push's text is already the full decode
         return delta
 
 
@@ -642,7 +697,7 @@ def build_app(engine: LLMEngine, model_name: str) -> FastAPI:
         created = int(time.time())
         oid = ("chatcmpl-" if chat else "cmpl-") + sub.rid
         obj = "chat.completion" if chat else "text_completion"
-        detok = _Detok(tok, params.stop)
+        detok = _Detok(tok, params.stop, incremental=True, rid=sub.rid)
 
         def usage_of(n_out: int) -> dict:
             """OpenAI usage, with prompt_tokens_details.cached_tokens: the prompt tokens this request resumed from the
