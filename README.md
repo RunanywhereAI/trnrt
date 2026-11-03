@@ -21,7 +21,7 @@ More: [how the decode kernels work](docs/MEGAKERNELS.md), [all results and metho
 SemiAnalysis's AgentX benchmark replays the request patterns of real Claude Code sessions. At a 1M-token context and 32
 concurrent agents, one hour per point, one trn2.48xlarge serves:
 
-| Decode batch per engine | Requests / min | Tokens / min (box) | Decode tokens/s per user (p50 / p90) | First token, cached prompt (p50 / p90) | $ per M tokens at $35.76/h / $8.60/h |
+| Decode batch per engine | Requests / min | Tokens / min (box) | Decode tokens/s per user (p50 / p90) | First token, cached prompt (p50 / p90) | $ per M tokens, capacity block / spot |
 |---|---|---|---|---|---|
 | 4 | 19.3 | 2.36M | 46.6 / 34.7 | 76.73 s / 141.47 s | $0.253 / $0.061 |
 | 8 | 25.2 | 3.02M | 29.4 / 20.0 | 28.82 s / 77.29 s | $0.197 / $0.047 |
@@ -39,9 +39,9 @@ full tables, including first-token times for uncached prompts and lower loads.
 |---|---|
 | Serving host | one trn2.48xlarge: 16 Trainium2 chips with 96 GiB of HBM each (64 logical NeuronCores at LNC 2), 192 vCPUs, 2 TB of memory (AWS's published specification) |
 | Compile host | any x86_64 host with Docker; no NeuronCore needed. `compile` runs as many neuronx-cc processes at once as host memory admits, 30 GB of available memory each by default (`--mem-per-compile-gb`), so its memory and cores set the compile time |
-| Software | Docker, and the image built from `docker/`: Neuron SDK 2.32 (neuronx-cc 2.27), Python 3.13, its base image pinned by digest. The base image is about an 8 GB download, and the built image takes about 27 GB of disk |
-| Model | `zai-org/GLM-5.3-Flash` at revision `eb9eb208eb0d988989d07a6a12d0fdeb5f52574a`, FP8 weights as released, about 330 GB: the same revision for compiling and serving |
-| Disk | the image on both hosts; the compile output under `$OUT` on the compile host; the checkpoint and the compile cache on the serving host |
+| Software | Docker, and the image built from `docker/`: Neuron SDK 2.32 (neuronx-cc 2.27), Python 3.13, its base image pinned by digest. The base image is about an 8 GB download |
+| Model | `zai-org/GLM-5.3-Flash` at revision `eb9eb208eb0d988989d07a6a12d0fdeb5f52574a`, FP8 weights as released, 328 GB: the same revision for compiling and serving |
+| Disk | on each host, the built image (26.7 GB); on the compile host, the compile output under `$OUT`; on the serving host, the checkpoint (328 GB) and the compile cache |
 | Time | building the compile cache takes hours. Start-up loads the weights and warms every compiled graph, one engine at a time, and each engine has `--startup-timeout` (default 3600 s) to come up |
 | Cost | one trn2.48xlarge for as long as it serves; [docs/RESULTS.md](docs/RESULTS.md) gives the cost per million tokens and per request at the two prices above |
 
@@ -65,7 +65,8 @@ docker build -f docker/Dockerfile \
 ```
 
 The build checks every Neuron piece trnRT imports and its version, and that the image's transformers has `glm5_next`
-(`docker/check_image.py`). Build the image on the compile host and on the serving host.
+(`docker/check_image.py`). Build the image on the compile host and on the serving host: the base image is about an
+8 GB download, and the built image takes 26.7 GB of disk.
 
 ### 3. Build the compile cache (CPU host)
 
@@ -74,7 +75,7 @@ config and safetensors headers (a few MB, read without downloading the weights) 
 
 ```bash
 OUT=/data/trnrt                               # everything goes under one directory
-REV=eb9eb208eb0d988989d07a6a12d0fdeb5f52574a  # the checkpoint revision (step 4)
+REV=eb9eb208eb0d988989d07a6a12d0fdeb5f52574a  # the revision the published numbers were measured on (step 4)
 mkdir -p $OUT/nki $OUT/work                   # the NKI kernel binaries, shared by every step; neuronx-cc's scratch
 # each step: `python -m trnrt` in a new container of the image, with $OUT at the same path and $OUT/nki mounted
 trnrt() { docker run --rm -e HF_TOKEN -v $OUT:$OUT -v $OUT/nki:/var/tmp/nki-intermediate-cache trnrt "$@"; }
@@ -238,7 +239,7 @@ BATCH8=(--max-num-seqs 8 --decode-buckets 1,2,4,6,8 --max-running 8 --kda-shell-
 trnrt compile capture --out $OUT -- --model $OUT/shapes "${BATCH8[@]}"
 trnrt compile compile --out $OUT --work-root $OUT/work
 trnrt compile strip --out $OUT
-docker run ... trnrt serve --model /model --port 8000 "${BATCH8[@]}"   # the mounts and variables of step 4
+docker run ... trnrt serve --model /model --port 8000 "${BATCH8[@]}"   # step 4's mounts and variables; BATCH8 as above
 ```
 
 An argument given explicitly wins over a default; the last of a repeated argument wins.
@@ -250,13 +251,13 @@ arrival order. It changes no graph, so it runs on the compile cache of the confi
 batch-8 configuration with `--max-running 4`, on batch 8's compile cache:
 
 ```bash
-docker run ... trnrt serve --model /model --port 8000 "${BATCH8[@]}" --max-running 4   # the mounts and variables of step 4
+docker run ... trnrt serve --model /model --port 8000 "${BATCH8[@]}" --max-running 4   # BATCH8 and step 4 as above
 ```
 
 ### Supported scope
 
-Supported scope is these configurations: the default (batch 12), batch 8, and either of them with a lower
-`--max-running` (batch 4: batch 8 with `--max-running 4`). Larger decode batches, and values of `--kda-shell-max-rows`,
+The supported configurations are the default (batch 12), batch 8, and either of them with a lower `--max-running`
+(batch 4: batch 8 with `--max-running 4`). Larger decode batches, and values of `--kda-shell-max-rows`,
 `--dsa-layer-max-rows`, `--ffn-half-below` and `--dsa-index-rows` other than those of these two configurations, are not
 supported.
 
@@ -282,8 +283,8 @@ Engine tests use a tiny random model of GLM-5.3-Flash's architecture and need a 
 - `TRNRT_TEST_MODEL`: a GLM-5.3-Flash checkpoint directory, for the API tests over the real model;
 - `TRNRT_TEST_GLM_CKPT`: a local GLM-5.3-Flash checkpoint directory, for the KDA shell's test on the checkpoint's own
   hyper-connection weights;
-- `TRNRT_TEST_NETWORK=1`: lets tests fetch the model's small files (config, tokenizer, chat template) from the Hugging
-  Face Hub; without it they skip unless those files are cached;
+- `TRNRT_TEST_NETWORK=1`: lets tests read the model's small files (config, tokenizer, chat template, safetensors
+  headers) from the Hugging Face Hub; without it they skip, or use those files if they are already cached;
 - `HLO_PB2_PATH`: a directory holding `hlo_pb2.py`, for the graph-equivalence tests where `libtorch_neuronx_lite` is not
   installed (they also need zstd).
 
