@@ -28,6 +28,10 @@ from the exact selection.
   1.2% of selections that kept the merged shortlist, an exact re-selection would have added an estimated 0.4 to 0.7%
   to total prompt-processing time, and up to 29 to 50% on the worst-affected prompt chunks. Per-request impact was not
   measured, so on requests built from such chunks the first-token and end-to-end times may be optimistic.
+- **Watching it.** Each engine counts these rows on rank 0's row group, warmup included: `/metrics` reports
+  `trnrt:dsa_local_k_rows_total`, `trnrt:dsa_local_k_failed_rows_total` (rows that failed the certificate) and
+  `trnrt:dsa_local_k_inexact_rows_total` (rows past the limit, which kept the merged shortlist), and the engine prints
+  the same counts when it closes, EXACT only if no row went past the limit.
 
 ## Batch 12 beyond 32 agents: the host-side prompt cache fills
 
