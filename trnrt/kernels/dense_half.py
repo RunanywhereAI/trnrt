@@ -4,7 +4,7 @@ kernels/ffn_half_pb.py's FFN half with a dense SwiGLU body in place of the MoE b
 In XLA a dense layer's FFN block was two NKI calls (mhc_mix, mhc_pre) around the attention output's slot sum, rms_norm,
 the in-graph dequant of 4.7 M FP8 weights, two dots and their layout transposes: 188-191 us of XLA glue a step in
 L0-L2. Here:
-- the front is ffn_half_pb's kernel's, statement for statement (tests/test_dense_half.py pins it): shell.mix_in_h,
+- the front is ffn_half_pb's kernel's, statement for statement (tests/test_ffn_half.py pins it): shell.mix_in_h,
   mhc_split.front_body (the j-major fn through mhc_split.fn_arg), ffn_half_pb._norm_xc, the served objects imported,
   not copied, so ffn_half_pb's forms act here as there;
 - the body is moe_half's shared-expert section (half_body_pb's lines: bf16 where torch rounds, the clamped SwiGLU) at
