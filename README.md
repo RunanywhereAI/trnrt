@@ -107,8 +107,8 @@ directory too, so `serve` below mounts the compile host's copy.
 
 The arguments after `capture --` must be the engine arguments the server runs with, spelled out in full. Capture refuses
 any other; the server's own, such as `--engines` and `--port`, do not change the graphs. The defaults are the default
-configuration (batch 12), so `--model` alone is enough. For batch 8 ([Batch 8](#batch-8)), pass its arguments to both
-`capture` and `serve`.
+configuration (batch 12), so `--model` alone is enough. For batch 8 ([Batch 8](#batch-8)), pass `--preset batch8` to
+both `capture` and `serve`.
 
 ### 4. Download the checkpoint and serve (trn2.48xlarge)
 
@@ -120,8 +120,9 @@ hf download zai-org/GLM-5.3-Flash --revision eb9eb208eb0d988989d07a6a12d0fdeb5f5
 ```
 
 That is the revision the published numbers were measured on; later revisions change the chat template. Give `serve`
-the downloaded directory: `--model` also takes a Hugging Face repo id, but then downloads the repo's default branch,
-not a pinned revision. Then start the server:
+the downloaded directory. Alternatively, `--model` takes the Hugging Face repo id and `serve` downloads the checkpoint
+itself: then pass `--revision eb9eb208eb0d988989d07a6a12d0fdeb5f52574a` too, since without it the download is the
+repo's default branch (`--revision` with a local directory is refused). Then start the server:
 
 ```bash
 docker run --rm --privileged --network host --ipc=host \
@@ -142,9 +143,17 @@ Then the router answers on `--port`.
   (0: none).
 - **`--startup-timeout`** (default 3600 s): how long each engine has, from its start, to answer `/health`. Past it,
   `serve` stops every engine and exits nonzero.
-- Start-up needs free contiguous host memory, which a full page cache can withhold: drop the page cache before starting
-  (`sync; echo 3 | sudo tee /proc/sys/vm/drop_caches`).
-- `--ipc=host` gives the engines' processes the host's shared memory instead of Docker's 64 MB default (or pass
+- **Each engine checks its host before it starts**, and refuses to start, with exit status 4 and a message saying what
+  it found and how to fix it (`serve` then stops every engine and exits nonzero), when:
+  - another process's Neuron runtime holds one of the engine's devices, as `neuron-ls` lists them (without `neuron-ls`
+    this check is skipped with a warning; a listing it cannot read refuses the start). Stop that process, or set
+    `TRNRT_SKIP_DEVICE_CHECK=1`;
+  - the host has too little free contiguous memory for the Neuron runtime's DMA rings: fewer than 1,024 free order-10
+    (4 MiB) blocks over all zones, or fewer than 256 in any NUMA node's Normal zone (`/proc/buddyinfo`). Clean page
+    cache, such as a checkpoint just downloaded, is the usual cause: drop it on the host
+    (`sync; echo 1 | sudo tee /proc/sys/vm/drop_caches`) and start again, or set `TRNRT_SKIP_HOST_MEM_CHECK=1`.
+- `--ipc=host`: each engine's rank 0 hands its calls to the engine's other ranks through a 64 MiB segment in /dev/shm
+  (`TRNRT_TP_SHM_BYTES`), one per engine, and Docker's default /dev/shm is 64 MB. Keep it in the command (or pass
   `--shm-size=1g`).
 - The router's `/health` answers 200 while both engines are up, 200 with `"status": "degraded"` while one is (its
   requests and sessions go to the other), and 503 while neither is. The body names the engines that are down.
@@ -176,7 +185,8 @@ curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -
 - A client that disconnects aborts its request, streamed or not.
 - Endpoints on `--port` (the router): `/v1/chat/completions`, `/v1/completions`, `/v1/models` and `/health`. Each
   engine also serves Prometheus metrics at `/metrics` on its own port (8001 and 8002 with the default `--port`), on
-  127.0.0.1 only.
+  127.0.0.1 only, among them the sparse-attention selection's counters (`trnrt:dsa_local_k_*`,
+  [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md)).
 - The router listens on every interface (`--host 0.0.0.0`) and has no authentication: put it behind your own proxy, or
   pass `--host 127.0.0.1`.
 - Not supported, answered with 400: repetition, frequency and presence penalties, guided decoding (`response_format`
@@ -204,62 +214,75 @@ requests per engine.
 | `--kv-cache-gb`, `--kv-cache-dtype` | 4.0, fp8 | KV pool per rank |
 | `--state-checkpoints` | 16 | linear-attention state rows kept for the prefix cache |
 | `--host-cache-gb` | 4.0 | host memory per rank under the prefix cache (half for state checkpoints) |
+| `--revision` | the repo's default branch | with a Hugging Face repo id as `--model`, the commit (or branch, tag) to download; refused with a local directory; host only |
+| `--moe-kernel` | nki on Neuron, xla with `--device cpu` | the routed experts: the NKI kernels (the served path) or XLA's gather |
 | `--kda-shell-max-rows` | 12 | KDA layers' decode attention as one fused kernel up to this many rows |
 | `--dsa-layer-max-rows` | 16 | DSA layers' decode attention and FFN as one fused kernel up to this many rows |
 | `--ffn-half-below` | 17 | decode FFN blocks as one fused kernel below this many rows |
 | `--dsa-index-rows` | 8 | the DSA indexer's decode scores in kernel calls of at most this many rows (0: one call) |
 
 The seats, the bucket ladders, the pool sizes, the page size and the decode kernel routes are graph shapes: changing
-any of them needs a new capture. `--preset batch12` names this configuration explicitly and sets the same values.
+any of them needs a new capture. `--preset batch12` names this configuration: it is accepted, and changes nothing.
 `python -m trnrt engine` runs one engine without the router.
 
 ### Batch 8
 
-Decode batches of up to 8 requests per engine: the configuration of the batch-8 numbers, and the one the batch-4
-numbers ran on. It differs from the default in these engine arguments; everything else stays as above:
+`--preset batch8`: decode batches of up to 8 requests per engine, the configuration of the batch-8 numbers and the one
+the batch-4 numbers ran on. The preset sets these engine arguments; everything else stays at the defaults above:
 
-| Argument | Default (batch 12) | Batch 8 | |
+| Argument | Default (batch 12) | `--preset batch8` | |
 |---|---|---|---|
 | `--max-num-seqs` | 16 | 8 | request seats per engine (the state pool's rows) |
 | `--decode-buckets` | 1,2,4,6,8,12 | 1,2,4,6,8 | compiled decode batch sizes |
-| `--max-running` | 12 | 8 | requests running at once per engine |
+| `--max-running` | 12 | unset: all 8 seats run | requests running at once per engine |
 | `--kda-shell-max-rows` | 12 | 8 | KDA layers' decode attention as one fused kernel up to this many rows |
 | `--dsa-layer-max-rows` | 16 | 8 | DSA layers' decode attention and FFN as one fused kernel up to this many rows |
 | `--ffn-half-below` | 17 | 16 | decode FFN blocks as one fused kernel below this many rows |
 | `--dsa-index-rows` | 8 | 0 | the DSA indexer's decode scores in calls of at most this many rows (0: one call) |
 
-Batch 8 has its own graphs: 8 seats change every graph that carries the linear-attention state, prefill graphs
-included. Capture and serve it with the same arguments (step 3's shape directory and `trnrt` function; its entries sit
-beside the default configuration's in the cache, under their own keys, and `$OUT/capture` then holds this capture's
-records):
+The preset has its own graphs: 8 seats change every graph that carries the linear-attention state, prefill graphs
+included. Capture and serve with the same preset (step 3's shape directory and `trnrt` function; its entries sit beside
+the default configuration's in the cache, under their own keys, and `$OUT/capture` then holds this capture's records):
 
 ```bash
-BATCH8=(--max-num-seqs 8 --decode-buckets 1,2,4,6,8 --max-running 8 --kda-shell-max-rows 8 --dsa-layer-max-rows 8
-        --ffn-half-below 16 --dsa-index-rows 0)
-trnrt compile capture --out $OUT -- --model $OUT/shapes "${BATCH8[@]}"
+trnrt compile capture --out $OUT -- --model $OUT/shapes --preset batch8
 trnrt compile compile --out $OUT --work-root $OUT/work
 trnrt compile strip --out $OUT
-docker run ... trnrt serve --model /model --port 8000 "${BATCH8[@]}"   # step 4's mounts and variables; BATCH8 as above
+docker run ... trnrt serve --model /model --port 8000 --preset batch8   # the mounts and variables of step 4
 ```
 
-An argument given explicitly wins over a default; the last of a repeated argument wins.
+An argument given explicitly overrides the preset's value. `--max-running` is host only; any other override changes
+the graphs and needs its own capture.
 
 ### Batch 4: `--max-running 4`
 
 `--max-running N` admits at most N requests at once per engine (never more than `--max-num-seqs`); the rest wait in
-arrival order. It changes no graph, so it runs on the compile cache of the configuration it is added to. Batch 4 is the
-batch-8 configuration with `--max-running 4`, on batch 8's compile cache:
+arrival order. It changes no graph, so it runs on the compile cache of the configuration it is added to. Batch 4 is
+`--preset batch8` with `--max-running 4`, on batch 8's compile cache:
 
 ```bash
-docker run ... trnrt serve --model /model --port 8000 "${BATCH8[@]}" --max-running 4   # BATCH8 and step 4 as above
+docker run ... trnrt serve --model /model --port 8000 --preset batch8 --max-running 4   # the mounts and variables of step 4
 ```
 
 ### Supported scope
 
-The supported configurations are the default (batch 12), batch 8, and either of them with a lower `--max-running`
-(batch 4: batch 8 with `--max-running 4`). Larger decode batches, and values of `--kda-shell-max-rows`,
-`--dsa-layer-max-rows`, `--ffn-half-below` and `--dsa-index-rows` other than those of these two configurations, are not
-supported.
+The supported configurations are the default (batch 12), `--preset batch8`, and either of them with a lower
+`--max-running` (batch 4: `--preset batch8 --max-running 4`). Larger decode batches, and values of
+`--kda-shell-max-rows`, `--dsa-layer-max-rows`, `--ffn-half-below` and `--dsa-index-rows` other than those of these two
+configurations, are not supported.
+
+### Environment variables
+
+Set them on the server's container (`docker run -e NAME=value ...`); its engines inherit them.
+
+| Variable | Default | |
+|---|---|---|
+| `TRNRT_TP_SHM` | on | each engine's rank 0 hands every graph call to its other ranks through a shared-memory segment; `0` sends them over gloo (TCP) instead, as happens anyway, with a warning, when /dev/shm is unusable |
+| `TRNRT_TP_SHM_BYTES` | 67108864 (64 MiB) | that segment's size, one segment per engine in /dev/shm; a larger call goes over gloo |
+| `TRNRT_SKIP_DEVICE_CHECK` | unset | `1`: start without checking that the engine's Neuron devices are free |
+| `TRNRT_SKIP_HOST_MEM_CHECK` | unset | `1`: start without checking the host's free contiguous memory |
+| `TRNRT_ROUTER_LOG_SESSIONS` | unset | `1`, for debugging: the router's log names session ids: a line per new pin and per side request, and the id in its failover and return-home lines; unset, it logs no session id |
+| `NEURON_LIBTORCH_CACHE_ROOT` | `~/.cache/neuron_libtorch` | the compile cache's root (step 4) |
 
 ## Tests
 
