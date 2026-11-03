@@ -27,13 +27,22 @@ def names(cfg: ModelConfig) -> dict:
     return dict(NAMES)
 
 
-def resolve_model_path(model: str) -> str:
-    """A local directory, or a Hugging Face repo id downloaded to the local cache."""
+# What a Hugging Face repo id's download takes: the configs, the weights, the tokenizer's files, and the chat template,
+# which GLM-5.3-Flash ships as chat_template.jinja alone (its tokenizer_config.json carries none).
+DOWNLOAD_PATTERNS = ("*.json", "*.safetensors", "tokenizer*", "*.txt", "*.model", "*.jinja")
+
+
+def resolve_model_path(model: str, revision: str | None = None) -> str:
+    """A local directory, or a Hugging Face repo id downloaded to the local cache at `revision` (a commit, a branch or a
+    tag; None: the repo's default branch). A revision pins a download only: with a local directory it is refused."""
     if os.path.isdir(model):
+        if revision is not None:
+            raise ValueError(f"revision {revision!r} given with a local checkpoint directory ({model}): a revision "
+                             "only selects what a Hugging Face repo id downloads")
         return model
     from huggingface_hub import snapshot_download
 
-    return snapshot_download(model, allow_patterns=["*.json", "*.safetensors", "tokenizer*", "*.txt", "*.model"])
+    return snapshot_download(model, revision=revision, allow_patterns=list(DOWNLOAD_PATTERNS))
 
 
 class _Alias:
