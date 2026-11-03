@@ -308,7 +308,7 @@ class EngineLoop:
 class _Detok:
     """A streamed request's text, pushed a few tokens at a time. Not an incremental detokenizer: each push decodes
     every token id received so far, from the first, and returns the text past what it returned before, so the decoding
-    work of a request grows with the square of its length (the served engine's server does the same).
+    work of a request grows with the square of its length.
 
     Never emits half of a multi-byte character, and with stop strings it holds back the
     last `max(len(stop)) - 1` characters until they cannot start a stop string, so a stop
