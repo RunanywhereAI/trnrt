@@ -1,6 +1,7 @@
-"""Greedy text through the served engine, for the bytes gate (A0) and decode parity: the same engine `trnrt engine`
-builds from the same arguments (so the same graphs from the same compile cache), fed natural-text prompts of different
-lengths, `--concurrency` in flight, greedy, --new-tokens each, every output and its top-2 logprobs written to --out.
+"""Greedy text through the served engine, for a byte-for-byte output comparison and decode parity: the same engine
+`trnrt engine` builds from the same arguments (so the same graphs from the same compile cache), fed natural-text prompts
+of different lengths, `--concurrency` in flight, greedy, --new-tokens each, every output and its top-2 logprobs written
+to --out.
 
     python tools/check_mixed.py --model DIR --core-base 0 --concurrency 8 --requests 384 --new-tokens 64 \
         --lengths 3840,1500,3000,700,2048,2500,1024,3200,128,192,256,384,128,192,256,384 --turns --out a.json
@@ -94,7 +95,7 @@ def compare(a_path: str, b_path: str, ulp: float | None = None, out: dict | None
     (2) the teacher-forced |dlogprob| before each first difference never exceeds 2 q;
     (3) its mean <= DP_MEAN and its p99 <= DP_P99.
     A run without logprobs FAILS. Exit status 1 on FAIL. Two runs of the same engine on the same arguments read
-    equal=N/N: that is the bytes gate (A0), and the parity figures are then all zero."""
+    equal=N/N: that is the byte-for-byte output comparison, and the parity figures are then all zero."""
     with open(a_path) as f:
         a = json.load(f)
     with open(b_path) as f:
