@@ -140,7 +140,9 @@ def final(model, h: torch.Tensor) -> torch.Tensor:
 # at C=512, 8 heads per rank: 10.7 ms, about 80 ms once any NKI call sits in the mixer, against 3.8 ms).
 
 # The KDA shell takes decode steps of at most this many rows; the XLA half runs above. Its per-row recurrence costs
-# ~8.5-10.5 us per row x 34 layers, which a batched recurrence could lift.
+# ~8.5-10.5 us per row x 34 layers, which a batched recurrence could lift. The engine's --kda-shell-max-rows
+# (EngineConfig.kda_shell_max_rows, set on every rank by engine.build_shard before it builds the shard; 8 served, 12
+# under the batch-12 preset, so every decode step up to 12 rows takes the shell and the split layer).
 KDA_SHELL_MAXB = 8
 
 
@@ -181,7 +183,9 @@ def defers(model, layer, nxt, h, positions, table, bias, state_slot) -> bool:
     return kda_shell_takes(model, nxt, h, state_slot, dec, sp)
 
 
-# Decode calls of fewer rows than this take the FFN half (kernels/ffn_half.py): moe_dedupe's pairs kernel's bound.
+# Decode calls of fewer rows than this take the FFN half (kernels/ffn_half.py): moe_dedupe's pairs kernel's bound. The
+# engine's --ffn-half-below (EngineConfig.ffn_half_below, set by engine.build_shard; 16 served, 17 under the batch-12
+# preset).
 MOE_HALF_BELOW = 16
 
 
@@ -383,7 +387,7 @@ def _moe_clamped(model, layer, x: torch.Tensor, limit: float, route=None) -> tor
 
     On the device a packed layer always runs an NKI kernel: the XLA paths cannot read the blob there (LNL rejects the
     in-graph uint8 -> float8 view the unpack needs), so they serve packed layers on the CPU only. From
-    MOE_PREFILL_MIN_TOKENS tokens on that is kernels/moe_prefill.py (a grouped GEMM over the whole chunk), below it
+    MOE_PREFILL_MIN_TOKENS tokens on that is kernels/moe_prefill_tsb.py (a grouped GEMM over the whole chunk), below it
     kernels/moe_dedupe.py."""
     cfg = model.cfg
     topv, topi = model._route(layer, x) if route is None else route
@@ -394,11 +398,11 @@ def _moe_clamped(model, layer, x: torch.Tensor, limit: float, route=None) -> tor
         from ..kernels.moe_dedupe import ACTS, moe_dedupe
         from .decoder import MOE_PREFILL_MIN_TOKENS, moe_prefill_down
 
-        if T >= MOE_PREFILL_MIN_TOKENS:
-            from ..kernels.moe_prefill import moe_prefill
+        if T >= MOE_PREFILL_MIN_TOKENS:  # the fused stage-C drain with the token scatter built in SBUF
+            from ..kernels.moe_prefill_tsb import moe_prefill_tsb
 
-            return moe_prefill(x, topv, topi, layer.w_blob, act=ACTS["silu_clamp"], limit=limit,
-                               dq=layer.moe_prefill_dq, down=moe_prefill_down(layer))
+            return moe_prefill_tsb(x, topv, topi, layer.w_blob, act=ACTS["silu_clamp"], limit=limit,
+                                   down=moe_prefill_down(layer))
         return moe_dedupe(x, topv, topi, layer.w_blob, act=ACTS["silu_clamp"], limit=limit)
 
     def act(gu):

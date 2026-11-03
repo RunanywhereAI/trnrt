@@ -88,6 +88,9 @@ class RadixCache:
         # set, evict_checkpoints may also take a checkpoint on a running request's path.
         self.free_ckpt = None
         self.offload_ckpt = None
+        # offload_ckpt_hash(h, row) (the host cache's, wired beside offload_ckpt): the same by the path's last page hash,
+        # which path_hash keeps per node, so a checkpoint eviction needn't rebuild and rehash the path.
+        self.offload_ckpt_hash = None
         self.num_ckpts = 0
         self.num_dominated_freed = 0
         self.num_running_offloaded = 0
@@ -418,8 +421,30 @@ class RadixCache:
             freed += 1
         return freed
 
+    def path_hash(self, node: RadixNode) -> int | None:
+        """The host cache's page-hash chain at the end of node's root-to-node path (host_cache.HostTier.hashes(path)[-1]),
+        cached on each node of the path as it is computed: a node's path end never moves (_split keeps the node as the
+        deeper half and creates the upper one), so each key is hashed once. None if a key is not whole pages."""
+        ps, todo, n = self.page_size, [], node
+        while n is not None and n is not self.root and n.__dict__.get("_hend") is None:
+            todo.append(n)
+            n = n.parent
+        h = 0 if n is None or n is self.root else n.__dict__["_hend"]
+        for m in reversed(todo):
+            k = m.key
+            if len(k) % ps:
+                return None
+            for j in range(0, len(k), ps):
+                h = hash((h, tuple(k[j:j + ps])))
+            m.__dict__["_hend"] = h
+        return h
+
     def _drop_ckpt(self, node: RadixNode, offload: bool) -> None:
-        if offload and self.offload_ckpt is not None:
+        h = self.path_hash(node) if offload and self.offload_ckpt is not None and self.offload_ckpt_hash is not None \
+            else None
+        if h is not None:
+            self.offload_ckpt_hash(h, node.ckpt)
+        elif offload and self.offload_ckpt is not None:
             keys, n = [], node
             while n is not None and n is not self.root:
                 keys.append(n.key)

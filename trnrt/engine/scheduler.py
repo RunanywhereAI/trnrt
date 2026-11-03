@@ -69,6 +69,8 @@ class SchedulerConfig:
     # every preemption recomputes from the request's last state checkpoint. (vLLM's v1 scheduler admits
     # whenever the first chunk fits.)
     admission_decode_tokens: int = 256
+    # EngineConfig.max_running: running requests at most (None: max_num_seqs). Admission only, never the graphs' seats.
+    max_running: int | None = None
 
 
 def shared_pages(a: list[int], b: list[int], ps: int, limit: int) -> int:
@@ -86,6 +88,63 @@ def shared_pages(a: list[int], b: list[int], ps: int, limit: int) -> int:
         else:
             hi = mid
     return lo
+
+
+def page_chain(req: Request, ps: int) -> list[int]:
+    """req's prompt-so-far as chained page hashes, h[k] = hash((h[k-1], page k)) (the host cache's own formula), over its
+    leading full pages that hold no in-flight placeholder (-1: replaced in place once its step lands, so never cached).
+    Built once and extended as tokens append (the request's token list only grows; a new list object or a shorter one
+    rebuilds it), so shared_pages_req compares two prefixes by a binary search over two int lists instead of copying
+    slices: at ~150K tokens a slice compare costs ~1 ms, and an admission makes one per running request."""
+    tok = req.token_ids
+    st = req.__dict__.get("_page_chain")
+    if st is None or st[0] is not tok or st[1] > len(tok) or st[3] != ps:
+        st = [tok, 0, [], ps, False]  # token list, tokens hashed, chain, page size, stopped at a placeholder page
+        req.__dict__["_page_chain"] = st
+    if not st[4]:
+        chain, n, h = st[2], st[1], st[2][-1] if st[2] else 0
+        while n + ps <= len(tok):
+            page = tuple(tok[n:n + ps])
+            if -1 in page:  # a placeholder: the chain stops here until the next rebuild
+                st[4] = True
+                break
+            h = hash((h, page))
+            chain.append(h)
+            n += ps
+        st[1] = n
+    return st[2]
+
+
+def shared_pages_req(a: Request, b: Request, ps: int, limit: int) -> int:
+    """shared_pages(a.token_ids, b.token_ids, ps, limit) from the requests' page chains: equal entries at page k mean
+    equal pages 0..k (up to a 64-bit hash collision), and prefix equality is monotone in k, so the longest shared prefix
+    within both chains is a binary search. Past either chain's end (a placeholder page) it compares the rest by slices,
+    as shared_pages does."""
+    ta, tb = a.token_ids, b.token_ids
+    n = min(limit, len(ta) // ps, len(tb) // ps)
+    if n <= 0:
+        return 0
+    ca, cb = page_chain(a, ps), page_chain(b, ps)
+    m = min(n, len(ca), len(cb))
+    if m == 0:
+        return shared_pages(ta, tb, ps, n)
+    if ca[0] != cb[0]:
+        return 0
+    if ca[m - 1] != cb[m - 1]:
+        lo, hi = 1, m  # pages [0, lo) shared, [0, hi) not
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            if ca[mid - 1] == cb[mid - 1]:
+                lo = mid
+            else:
+                hi = mid
+        return lo
+    if m == n:
+        return n
+    k = m  # the first m pages are shared; the rest by slices
+    while k < n and ta[k * ps:(k + 1) * ps] == tb[k * ps:(k + 1) * ps]:
+        k += 1
+    return k
 
 
 @dataclass
@@ -275,6 +334,11 @@ class Scheduler:
 
     # -- planning -----------------------------------------------------------------
 
+    def _seats(self) -> int:
+        """Requests that may run at once: the compiled seats (max_num_seqs), or fewer under max_running."""
+        cap = self.cfg.max_running
+        return self.cfg.max_num_seqs if cap is None else min(self.cfg.max_num_seqs, cap)
+
     def _schedule(self) -> StepPlan:
         plan = StepPlan()
         ps = self.cfg.page_size
@@ -312,7 +376,7 @@ class Scheduler:
         # 3. Admit waiting requests, first come first served, while budget and capacity remain.
         owed = sum(self._still_needs(r) for r in self.running)
         deferred = []  # waiting for a running request to checkpoint the prefix they share
-        while self.waiting and budget > 0 and len(self.running) < self.cfg.max_num_seqs:
+        while self.waiting and budget > 0 and len(self.running) < self._seats():
             req = self.waiting[0]
             if self._prefix_in_progress(req):
                 deferred.append(self.waiting.popleft())
@@ -418,8 +482,7 @@ class Scheduler:
     def _shared_with(self, req: Request, other: Request) -> int:
         """Page-aligned prompt tokens req and other share (checkpointable: before either's newest)."""
         ps = self.cfg.page_size
-        return shared_pages(req.token_ids, other.token_ids, ps,
-                            min(self._prompt_pages(req, ps), self._prompt_pages(other, ps))) * ps
+        return shared_pages_req(req, other, ps, min(self._prompt_pages(req, ps), self._prompt_pages(other, ps))) * ps
 
     def _mark_running_junctions(self, req: Request) -> None:
         """A request arriving while another is still prefilling a prefix they share: make the end of the
@@ -507,8 +570,9 @@ class Scheduler:
         checkpoint into a fresh row of the state pool. Returns the new match."""
         ids, ps = req.token_ids, self.cfg.page_size
         full = self.radix.match_prefix(ids, max_pages=kv_pages)
-        slots = self.host.lookup(ids, kv_pages, limit)
-        ck = self.host.find_ckpt(ids, match.num_pages + 1, kv_pages + len(slots))
+        chain = page_chain(req, ps) if getattr(self.host, "ps", None) == ps else None  # the host cache's own hashes
+        slots = self.host.lookup(ids, kv_pages, limit, chain=chain)
+        ck = self.host.find_ckpt(ids, match.num_pages + 1, kv_pages + len(slots), chain=chain)
         keep = max(0, ck[0] - kv_pages) if ck is not None else 0
         self.host.unpin(slots[keep:])
         slots = slots[:keep]

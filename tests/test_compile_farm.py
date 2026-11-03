@@ -550,8 +550,41 @@ def checkpoint_experts(E=6, H=1024, Im=64, seed=0):
 
 # -- the header checkpoint and the load-time decisions (need the model loader) ------------------------
 
+@pytest.fixture
+def restore_capture_env():
+    """capture.configure_env (farm's capture command runs it in the calling process, before it spawns the ranks) sets
+    the target environment for the rest of the process. A test that runs it puts the variables back as they were,
+    absent included (monkeypatch.delenv of an absent variable records nothing to restore). Left set, every later
+    engine in the session lays out its KDA shell for the target's LNC (kda_half.half_programs): at LNC 2 the test
+    model's KDA layers register no shell, and test_decode_composition saw no FFN hand-off."""
+    keys = ("NEURON_PLATFORM_TARGET_OVERRIDE", "NEURON_LIBTORCH_CPU_COMPILE", "NEURON_LIBTORCH_CACHE_ROOT")
+    kept = {k: os.environ.get(k) for k in keys}
+    yield
+    for k, v in kept.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
+
+
+@pytest.fixture
+def restore_capture(monkeypatch):
+    """capture.install_header_checkpoint patches the loader, DecoderLayer.pack_experts and moe_prefill's check_blob /
+    down_factors for the rest of the process (a capture runs in a process of its own). A test that installs them puts
+    them back after it; otherwise every later engine in the session loads through them (test_decode_composition's
+    KDA shells then received no FFN hand-off when this file ran before it)."""
+    from trnrt.kernels import moe_prefill as mp
+    from trnrt.models import decoder, loader
+
+    for obj, name in ((loader._Checkpoint, "__init__"), (loader, "_load_experts"),
+                      (decoder.DecoderLayer, "pack_experts"), (mp, "check_blob"), (mp, "down_factors")):
+        monkeypatch.setattr(obj, name, getattr(obj, name))
+    for obj in (loader._Checkpoint, mp):  # the install guards: absent again afterwards
+        monkeypatch.setattr(obj, "_trnrt_capture", False, raising=False)
+
+
 @MODELS
-def test_a_shape_dir_reads_like_the_checkpoint(tmp_path):
+def test_a_shape_dir_reads_like_the_checkpoint(tmp_path, restore_capture):
     """The loader's checkpoint over a shape directory answers every question about names, shapes and dtypes
     as it does over the checkpoint, slices included, under both namings of GLM-5.3-Flash's text model."""
     from trnrt.compile import capture
@@ -641,7 +674,7 @@ def test_compute_decisions_writes_every_layer_and_rank(tmp_path):
 
 
 @MODELS
-def test_capture_replays_the_decisions_and_refuses_without_them(tmp_path, monkeypatch):
+def test_capture_replays_the_decisions_and_refuses_without_them(tmp_path, monkeypatch, restore_capture):
     """A layer packed from a shape directory (zeros) gets the recorded answers, and the tensors the real
     values give it (moe_prefill_dsc / moe_prefill_dfr: their presence, shapes and dtypes enter the graphs);
     an answer the record lacks raises."""
@@ -676,7 +709,7 @@ def test_capture_replays_the_decisions_and_refuses_without_them(tmp_path, monkey
 
 # -- the capture ------------------------------------------------------------------------------------
 
-def test_capture_refuses_arguments_the_engine_does_not_take(tmp_path, monkeypatch):
+def test_capture_refuses_arguments_the_engine_does_not_take(tmp_path, monkeypatch, restore_capture_env):
     """engine_config drops an argument it does not know (the server hands it its own too), so capture refuses one,
     and an abbreviation, before it builds anything; the engine's own arguments pass."""
     import re
@@ -687,7 +720,7 @@ def test_capture_refuses_arguments_the_engine_does_not_take(tmp_path, monkeypatc
     (out / "shapes").mkdir(parents=True)
     (out / "shapes" / capture.HEADERS).write_text("{}")
     for k in ("NEURON_PLATFORM_TARGET_OVERRIDE", "NEURON_LIBTORCH_CPU_COMPILE"):
-        monkeypatch.delenv(k, raising=False)  # put back afterwards: capture.configure_env sets them
+        monkeypatch.delenv(k, raising=False)  # unset during the test; restore_capture_env puts them back afterwards
 
     def engine_config(argv):
         raise AssertionError(f"engine_config({argv}) ran")
@@ -748,7 +781,7 @@ def tiny_engine_config(argv):
 
 
 @needs("libtorch_neuronx_lite", "transformers.models.glm5_next", "trnrt.engine.model_runner", "trnrt.models.loader")
-def test_capture_tp2_writes_one_entry_per_graph(tmp_path):
+def test_capture_tp2_writes_one_entry_per_graph(tmp_path, restore_capture_env):
     """`compile capture` of a tiny GLM-5.3-Flash at tp=2 (fake process group, meta device): both ranks trace
     the same graphs, every entry carries what the compile step needs and none is compiled, and each rank's
     record lists its keys in the order its warmup met them."""

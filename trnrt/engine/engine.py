@@ -83,8 +83,22 @@ def pool_pages(cfg: EngineConfig, mcfg: ModelConfig) -> int:
                              else cfg.max_num_seqs * cfg.max_pages_per_seq + 1)
 
 
+def set_decode_routes(cfg: EngineConfig) -> None:
+    """The decode kernel routes' row caps of `cfg` (EngineConfig.kda_shell_max_rows, dsa_layer_max_rows, ffn_half_below,
+    dsa_index_rows) into the model modules that read them when a graph is traced. Every rank's build_shard calls it
+    before building its shard (an engine's ranks and a capture's alike: each rank is its own process, given the
+    EngineConfig), so they all trace the same routes; it sets every cap, so an engine never inherits another's."""
+    from ..models import hybrid, mla
+
+    hybrid.KDA_SHELL_MAXB = int(cfg.kda_shell_max_rows)
+    hybrid.MOE_HALF_BELOW = int(cfg.ffn_half_below)
+    mla.LAYER_MK_MAXB = int(cfg.dsa_layer_max_rows)
+    mla.CP_INDEX_ROWS = int(cfg.dsa_index_rows)
+
+
 def build_shard(cfg: EngineConfig, path: str, num_pages: int, rank: int = 0):
     """Device, model shard and runner for one tensor-parallel rank (the whole model at tp=1)."""
+    set_decode_routes(cfg)
     mcfg = ModelConfig.from_pretrained(path)
     if cfg.num_layers is not None:
         mcfg = mcfg.truncated(cfg.num_layers)
@@ -200,6 +214,7 @@ class LLMEngine:
             max_model_len=cfg.max_model_len,
             eos_token_ids=self.mcfg.eos_token_ids,
             admission_decode_tokens=cfg.admission_decode_tokens,
+            max_running=cfg.max_running,
         )
         # The scheduler (engine/scheduler.py) runs the served prefix-cache rules for a recurrent model: a hit resumes from
         # the deepest state checkpoint at or below it, checkpoints are written inside prefill chunks and at every page
@@ -223,6 +238,7 @@ class LLMEngine:
             pages = int(budget // page_bytes) if page_bytes else cfg.max_num_seqs * cfg.max_pages_per_seq
             self.host_tier = HostTier(self.runner, cfg.page_size, max(1, pages), ckpts)
             self.radix.offload, self.radix.offload_ckpt = self.host_tier.offload, self.host_tier.offload_ckpt
+            self.radix.offload_ckpt_hash = self.host_tier.offload_ckpt_hash
             self.scheduler.host = self.host_tier
         self._ids = itertools.count()
         self.last_step = StepStats()

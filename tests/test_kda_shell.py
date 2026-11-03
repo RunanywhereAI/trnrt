@@ -40,6 +40,18 @@ NKI = importlib.util.find_spec("nki") is not None
 bf = torch.bfloat16
 
 
+@pytest.fixture(autouse=True, scope="module")
+def _torch_threads():
+    """torch pinned at 4 threads for the whole file. The CPU emulations' bf16 reductions round by thread count, and these
+    tests hold kernels to them: on an x86 host twelve_steps[2] fails at 16 threads (step 6's state error 3.2e-3, the
+    projection's rounding: with q, k, v pinned the chain stays at 1e-7) and passes at 1, 2, 4 and 8. 4 is a pin, not a
+    fit."""
+    n = torch.get_num_threads()
+    torch.set_num_threads(4)
+    yield
+    torch.set_num_threads(n)
+
+
 def stand_in(seed: int, R: int = 9):
     """A KDA layer at GLM-5.3-Flash's per-rank shapes (tp 32: 2 heads of 128), with state pools of R rows."""
     g = torch.Generator().manual_seed(seed)

@@ -6,10 +6,13 @@
 
 Every default is the served configuration of GLM-5.3-Flash on one trn2.48xlarge: two engines of 32 tensor-parallel
 ranks each (logical NeuronCores 0-31 and 32-63 at LNC 2), 1M-token context, FP8 KV cache, 256-token pages, decode
-batches of up to 8, 4,096-token prefill chunks, and 4 GiB per rank of host memory under the prefix cache. The bucket
-ladders are graph shapes: a server finds its graphs in the compile cache only if `compile capture` ran with the same
-arguments. An engine compiles nothing on the serving host: a graph missing from the cache ends its start-up with the
-likely cause (NEURON_LIBTORCH_ASSERT_CACHE_HIT=1; --allow-compile compiles it there instead, minutes to hours a graph).
+batches of up to 8, 4,096-token prefill chunks, and 4 GiB per rank of host memory under the prefix cache. `--preset
+batch12` is the other supported configuration: decode batches of up to 12 per engine (PRESETS below). The bucket
+ladders and the decode kernel routes are graph structure: a server finds its graphs in the compile cache only if
+`compile capture` ran with the same arguments (the same --preset included). --max-running (fewer requests running
+than the compiled seats) is host only. An engine compiles nothing on the serving host: a graph missing from the cache
+ends its start-up with the likely cause (NEURON_LIBTORCH_ASSERT_CACHE_HIT=1; --allow-compile compiles it there instead,
+minutes to hours a graph).
 """
 
 from __future__ import annotations
@@ -33,19 +36,49 @@ def _ints(s: str) -> tuple[int, ...]:
     return tuple(int(x) for x in s.split(",") if x)
 
 
+def _at_least(lo: int):
+    def parse(s: str) -> int:
+        v = int(s)
+        if v < lo:
+            raise argparse.ArgumentTypeError(f"{v}: at least {lo}")
+        return v
+    return parse
+
+
+# Named configurations: each sets the engine arguments below (argparse dests) as defaults, and an argument given
+# explicitly still wins. A preset's graphs are its own, so `compile capture -- --preset NAME ...` must run with the
+# preset the server runs with.
+# - batch12: decode batches of up to 12 requests per engine. 16 seats (the state pool's rows: every graph that carries
+#   the linear-attention state is re-keyed against the served configuration), decode buckets 1, 2, 4, 6, 8 and 12, at
+#   most 12 requests running, and every decode step of up to 12 rows on the fused decode kernels: the KDA shell and the
+#   split KDA layer, the fused DSA layer and the FFN half.
+PRESETS: dict[str, dict] = {
+    "batch12": dict(max_num_seqs=16, decode_buckets=(1, 2, 4, 6, 8, 12), max_running=12, kda_shell_max_rows=12,
+                    dsa_layer_max_rows=16, ffn_half_below=17, dsa_index_rows=8),
+}
+
+
 def add_engine_args(ap: argparse.ArgumentParser) -> None:
     """The engine's arguments, with the served values as defaults."""
     g = ap.add_argument_group("engine")
+    g.add_argument("--preset", default=None, choices=sorted(PRESETS),
+                   help="a named configuration (README, Configuration): its values become the defaults of the "
+                        "arguments it sets; an argument given explicitly still wins")
     g.add_argument("--model", required=True, help="the checkpoint directory (or a Hugging Face repo id)")
     g.add_argument("--device", default="neuron", choices=["neuron", "cpu"])
     g.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float32"])
     g.add_argument("--tp", type=int, default=32, help="tensor-parallel ranks per engine, one logical NeuronCore each")
     g.add_argument("--max-model-len", type=int, default=1_048_576)
     g.add_argument("--page-size", type=int, default=256)
-    g.add_argument("--max-num-seqs", type=int, default=8, help="requests decoding at once per engine")
+    g.add_argument("--max-num-seqs", type=int, default=8,
+                   help="request seats per engine: the state pool's rows, a graph shape (--max-running caps how many "
+                        "run at once)")
+    g.add_argument("--max-running", type=_at_least(1), default=None,
+                   help="at most this many requests running at once per engine, the rest waiting in arrival order "
+                        "(default: --max-num-seqs). Host only: no graph changes")
     g.add_argument("--max-prefill-tokens", type=int, default=4096, help="prefill tokens per step (the chunk size)")
     g.add_argument("--decode-buckets", type=_ints, default=(1, 2, 4, 6, 8))
-    g.add_argument("--prefill-buckets", type=_ints, default=(1024, 2048, 4096))
+    g.add_argument("--prefill-buckets", type=_ints, default=(512, 1024, 2048, 4096))
     g.add_argument("--page-buckets", type=_ints, default=(512, 1024, 4096))
     g.add_argument("--prefill-page-buckets", type=_ints, default=(1024, 4096))
     g.add_argument("--prefill-page-min-rows", type=int, default=2048)
@@ -56,6 +89,32 @@ def add_engine_args(ap: argparse.ArgumentParser) -> None:
                    help="host memory under the prefix cache per rank, GiB (0: off)")
     g.add_argument("--moe-kernel", default="nki", choices=["nki", "xla"])
     g.add_argument("--num-layers", type=int, default=None, help="debugging: the first n layers only")
+    k = ap.add_argument_group("decode kernel routes", "the row counts at which a decode step takes each fused kernel. "
+                              "Graph structure: a change needs a new capture. Supported: the defaults (the served "
+                              "configuration) and --preset batch12's values")
+    k.add_argument("--kda-shell-max-rows", type=_at_least(1), default=8,
+                   help="KDA layers' decode attention as the KDA shell's kernel up to this many rows")
+    k.add_argument("--dsa-layer-max-rows", type=_at_least(1), default=8,
+                   help="DSA layers' decode attention and FFN as the fused layer's one call up to this many rows")
+    k.add_argument("--ffn-half-below", type=_at_least(1), default=16,
+                   help="decode FFN blocks as the FFN half's one call below this many rows")
+    k.add_argument("--dsa-index-rows", type=_at_least(0), default=0,
+                   help="the context-parallel DSA indexer's decode scores in kernel calls of at most this many rows "
+                        "(0: one call)")
+
+
+def parse_engine_args(argv: list[str]) -> argparse.Namespace:
+    """The engine arguments of `argv` (serve's, engine's, or capture's after its `--`), its --preset applied: the
+    preset's values are the defaults, arguments given explicitly win."""
+    # No abbreviations: the server's own arguments pass through here unparsed, and one that is a prefix of an engine
+    # argument would be read as it (serve's `--host 127.0.0.1` for each engine as --host-cache-gb).
+    ap = argparse.ArgumentParser(prog="trnrt", allow_abbrev=False)
+    add_engine_args(ap)
+    a, _ = ap.parse_known_args(argv)  # the server's own arguments (--port, --engines, ...) are not the engine's
+    if a.preset is not None:
+        ap.set_defaults(**PRESETS[a.preset])
+        a, _ = ap.parse_known_args(argv)
+    return a
 
 
 def engine_config(argv: list[str], core_base: int = 0):
@@ -64,11 +123,7 @@ def engine_config(argv: list[str], core_base: int = 0):
 
     from .config import EngineConfig
 
-    # No abbreviations: the server's own arguments pass through here unparsed, and one that is a prefix of an engine
-    # argument would be read as it (serve's `--host 127.0.0.1` for each engine as --host-cache-gb).
-    ap = argparse.ArgumentParser(prog="trnrt", allow_abbrev=False)
-    add_engine_args(ap)
-    a, _ = ap.parse_known_args(argv)  # the server's own arguments (--port, --engines, ...) are not the engine's
+    a = parse_engine_args(argv)
     return EngineConfig(
         model_path=a.model, device=a.device, dtype=getattr(torch, a.dtype), kv_cache_dtype=a.kv_cache_dtype,
         page_size=a.page_size, kv_cache_gb=a.kv_cache_gb, max_num_seqs=a.max_num_seqs, max_model_len=a.max_model_len,
@@ -76,7 +131,9 @@ def engine_config(argv: list[str], core_base: int = 0):
         prefill_token_buckets=a.prefill_buckets, page_buckets=a.page_buckets,
         prefill_page_buckets=a.prefill_page_buckets, prefill_page_min_rows=a.prefill_page_min_rows,
         host_cache_gb=a.host_cache_gb, state_checkpoints=a.state_checkpoints, tp=a.tp, tp_core_base=core_base,
-        moe_kernel=a.moe_kernel, num_layers=a.num_layers)
+        moe_kernel=a.moe_kernel, num_layers=a.num_layers, max_running=a.max_running,
+        kda_shell_max_rows=a.kda_shell_max_rows, dsa_layer_max_rows=a.dsa_layer_max_rows,
+        ffn_half_below=a.ffn_half_below, dsa_index_rows=a.dsa_index_rows)
 
 
 def add_compile_arg(ap: argparse.ArgumentParser) -> None:

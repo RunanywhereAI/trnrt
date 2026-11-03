@@ -96,9 +96,10 @@ def state_bytes_per_token_rank(cfg: ModelConfig, atp: int, dtype: torch.dtype, k
     return sum(_mla.pool_key_width(s, kv_fp8) for s in layer_specs(cfg)) * b
 
 
-# Prefill chunks of a packed MoE layer from this many tokens on run kernels/moe_prefill.py (a grouped GEMM
-# over the whole chunk) instead of kernels/moe_dedupe.py's 128-token calls (models/hybrid.py _moe_clamped).
-MOE_PREFILL_MIN_TOKENS = 512
+# Prefill chunks of a packed MoE layer from this many tokens on run kernels/moe_prefill_tsb.py (a grouped GEMM
+# over the whole chunk) instead of kernels/moe_dedupe.py's calls (models/hybrid.py _moe_clamped): a 512-row chunk
+# takes one moe_dedupe_v10 call.
+MOE_PREFILL_MIN_TOKENS = 600
 
 
 # Sequence-parallel residual streams for prefill: between the layers of a prefill chunk every
@@ -241,6 +242,10 @@ class DecoderLayer(nn.Module):
         # for a layout the kernel cannot take.
         self.moe_prefill_dq = check_blob(self.w_blob.data, H)
         down = down_factors(self.w_blob.data, H)
+        from ..kernels import moe_prefill_mdr as MDR
+
+        if down is not None:  # the fused stage-C drain's table: T = s f as three bf16 pieces [E, 3 H], in f's place
+            down = (down[0], MDR.fused_drain_table(down[0], down[1], H))
         self.moe_prefill_dsc, self.moe_prefill_dfr = (
             (None, None) if down is None else (nn.Parameter(t, requires_grad=False) for t in down))
 

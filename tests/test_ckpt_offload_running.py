@@ -90,8 +90,8 @@ def test_restoring_the_wrong_offloaded_slot_is_caught(glm, monkeypatch):
     path, _, vocab = glm
     real = HostTier.find_ckpt
 
-    def wrong(self, ids, lo, hi):
-        got = real(self, ids, lo, hi)
+    def wrong(self, ids, lo, hi, **kw):  # (kw: the scheduler's page chain)
+        got = real(self, ids, lo, hi, **kw)
         others = [s for s in self.ckpts.values() if got is not None and s != got[1]]
         return got if got is None or not others else (got[0], others[-1])
 
