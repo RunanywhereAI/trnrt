@@ -96,6 +96,33 @@ def set_decode_routes(cfg: EngineConfig) -> None:
     mla.CP_INDEX_ROWS = int(cfg.dsa_index_rows)
 
 
+def local_k_counts(model) -> list[float] | None:
+    """The counters of the context-parallel prefill's local-K selection (models/mla.py CP_LOCAL_K: each DSA layer's
+    cp_localk buffer, which the graphs add to) on this rank's row group, summed over the layers: [rows, rows that failed
+    the certificate and were selected again from the whole lists, failed rows past CP_LOCAL_F (not exact)]. None when
+    the model has no such counters (no context-parallel row groups). A device read: it waits for the graphs in flight
+    that write the counters."""
+    tot = None
+    for layer in model.kv_layers():
+        b = getattr(layer, "cp_localk", None)
+        if b is not None:
+            v = b.detach().cpu().double()
+            tot = v if tot is None else tot + v
+    return None if tot is None else tot.tolist()
+
+
+def local_k_report(before: list[float] | None, after: list[float] | None, what: str) -> str | None:
+    """One line on the local-K counters' change over `what` (local_k_counts before and after; before None: from 0).
+    None when the counters are off. The run's selection was exact only if no row went past CP_LOCAL_F."""
+    if after is None:
+        return None
+    from ..models import mla
+
+    rows, failed, past = (a - b for a, b in zip(after, before or [0.0, 0.0, 0.0]))
+    return (f"local-K {what}: {failed:.0f} of {rows:.0f} rows failed the certificate ({failed / max(rows, 1):.2e}), "
+            f"{past:.0f} past CP_LOCAL_F = {mla.CP_LOCAL_F} ({'EXACT' if past == 0 else 'NOT EXACT'})")
+
+
 def build_shard(cfg: EngineConfig, path: str, num_pages: int, rank: int = 0):
     """Device, model shard and runner for one tensor-parallel rank (the whole model at tp=1)."""
     set_decode_routes(cfg)
@@ -281,10 +308,26 @@ class LLMEngine:
             self.runner.tp_send = None
         self._stop_workers(0.0)
 
+    def local_k_counts(self) -> list[float] | None:
+        """The local-K selection's counters over this engine's run so far, its warmup included (local_k_counts); None
+        when its model has none. Call it from the thread that steps the engine."""
+        model = getattr(self, "model", None)
+        return None if model is None else local_k_counts(model)
+
     def close(self) -> None:
         """Stop tensor-parallel workers (rank 0 tells them to exit), destroy the process group and
         give this process back the state init_rank changed. Idempotent."""
         runner = getattr(self, "runner", None)
+        if self in _OPEN and runner is not None and runner.tp_send is not None and not self.dead_ranks():
+            # The local-K selection's exactness over the engine's whole run (rank 0's row group), for every engine,
+            # served or driven by a tool: "past CP_LOCAL_F" must be 0. Not after a failure (close_failed, a dead rank):
+            # a step still in flight on a collective with the dead rank would never let the counters be read.
+            try:
+                line = local_k_report(None, self.local_k_counts(), "this engine's run")
+                if line:
+                    print(line, flush=True)
+            except Exception as e:  # noqa: BLE001 - a report, never a reason not to close
+                print(f"local-K report failed: {e!r}", flush=True)
         _OPEN.discard(self)
         if runner is not None and getattr(runner, "watchdog", None) is not None:
             runner.watchdog.close()
