@@ -305,10 +305,11 @@ class LLMEngine:
 
         self._stop_workers(wait)
         if self._tp_saved is not None:
-            if dist.is_initialized():
-                dist.destroy_process_group()
             from . import tp
 
+            tp.drop_channel()  # the calls' shared-memory channel, when the shutdown call did not close it
+            if dist.is_initialized():
+                dist.destroy_process_group()
             tp.restore_process_state(self._tp_saved)
             self._tp_saved = None
 
