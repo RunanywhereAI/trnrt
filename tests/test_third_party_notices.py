@@ -53,14 +53,20 @@ def marked_files(root, paths):
 
 
 def covered(path, listed):
-    return any(path == l or path.startswith(l + "/") for l in listed)
+    return any(path == item or path.startswith(item + "/") for item in listed)
 
 
 def check(root, paths):
-    text = open(os.path.join(root, NOTICES)).read() if os.path.exists(os.path.join(root, NOTICES)) else ""
+    notices = os.path.join(root, NOTICES)
+    text = ""
+    if os.path.exists(notices):
+        with open(notices) as f:
+            text = f.read()
     listed = listed_paths(text)
     problems = [
-        f"{NOTICES} lists {l}, which does not exist" for l in listed if not os.path.exists(os.path.join(root, l))
+        f"{NOTICES} lists {item}, which does not exist"
+        for item in listed
+        if not os.path.exists(os.path.join(root, item))
     ]
     problems += [
         f"{p} carries a third-party marker but {NOTICES} does not list it"

@@ -78,8 +78,8 @@ def scan(root):
             with open(full, "rb") as f:
                 hits += _hits(f.read(), p, EXEMPT.get(p, ()))
     log = _git(root, "log", "--all", "--format=%H%x00%an <%ae>%x00%cn <%ce>%x00%B%x01")
-    for rec in log.split(b"\x01"):
-        rec = rec.strip(b"\n")
+    for raw in log.split(b"\x01"):
+        rec = raw.strip(b"\n")
         if rec:
             sha, rest = rec.split(b"\x00", 1)
             if sha.decode() in EXEMPT_COMMITS:

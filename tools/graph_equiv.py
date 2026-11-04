@@ -38,6 +38,9 @@ import re
 import shlex
 import subprocess
 import sys
+from contextlib import suppress
+from itertools import pairwise
+from typing import Any
 
 NKI_TARGET = "AwsNeuronCustomNativeKernel"
 _B64 = re.compile(rb"eyJ[A-Za-z0-9+/=]+")
@@ -88,7 +91,9 @@ def load_capture(root, cache_subdir):
 
 def pair(ref_ranks, new_ranks):
     """[(rank, index, ref_key, new_key)], plus problems (rank sets, lengths, one key paired two ways)."""
-    pairs, problems, seen_r, seen_n = [], [], {}, {}
+    pairs, problems = [], []
+    seen_r: dict[str, str] = {}
+    seen_n: dict[str, str] = {}
     if set(ref_ranks) != set(new_ranks):
         problems.append(f"rank sets differ: {sorted(ref_ranks)} vs {sorted(new_ranks)}")
     for r in sorted(set(ref_ranks) & set(new_ranks)):
@@ -106,11 +111,13 @@ def pair_by_signature(ref_ranks, new_ranks, sig_ref, sig_new):
     """As pair(), but each rank's graphs match by input signature (example_inputs.txt) rather than by visit order, with
     visit order breaking ties between graphs that share a signature. For a new tree whose warmup visits buckets in
     another order."""
-    pairs, problems, seen_r, seen_n = [], [], {}, {}
+    pairs, problems = [], []
+    seen_r: dict[str, str] = {}
+    seen_n: dict[str, str] = {}
     if set(ref_ranks) != set(new_ranks):
         problems.append(f"rank sets differ: {sorted(ref_ranks)} vs {sorted(new_ranks)}")
     for r in sorted(set(ref_ranks) & set(new_ranks)):
-        pool = {}
+        pool: dict[Any, list[str]] = {}
         for kb in new_ranks[r]:
             pool.setdefault(sig_new(kb), []).append(kb)
         for i, ka in enumerate(ref_ranks[r]):
@@ -180,10 +187,8 @@ def normalize_hlo(path, names, pb2):
     kernels = []
     entry = m.entry_computation_id
     for fld in ("name", "id", "entry_computation_name", "stack_frame_index", "schedule", "profile_info"):
-        try:
+        with suppress(ValueError):  # a field this proto version does not have
             m.ClearField(fld)
-        except ValueError:  # a field this proto version does not have
-            pass
     m.entry_computation_id = cid.get(entry, -1)
     for i, c in enumerate(m.computations):
         c.name = f"c{i}"
@@ -222,7 +227,7 @@ def hlo_diff(a, b, pb2, limit=12):
     la, lb = text_format.MessageToString(ma).splitlines(), text_format.MessageToString(mb).splitlines()
     import difflib
 
-    return [l for l in difflib.unified_diff(la, lb, "ref", "new", n=1, lineterm="")][:limit]
+    return list(difflib.unified_diff(la, lb, "ref", "new", n=1, lineterm=""))[:limit]
 
 
 # ---- kernels (.colz) ----
@@ -233,7 +238,7 @@ def _frame_decoder():
     try:
         from compression import zstd
 
-        return lambda: zstd.ZstdDecompressor()
+        return zstd.ZstdDecompressor
     except ImportError:
         pass
     try:
@@ -259,8 +264,8 @@ def _zstd_frames(payload):
     # zstd CLI fallback: decode each span between magic numbers; the CLI writes the frame, then rejects the container's
     # trailing bytes ("unsupported format"), which is expected here. A magic number inside compressed data is not handled.
     starts = [m.start() for m in re.finditer(re.escape(_ZSTD_MAGIC), payload)] + [len(payload)]
-    for s, e in zip(starts, starts[1:]):
-        p = subprocess.run(["zstd", "-d", "-c", "-q"], input=payload[s:e], capture_output=True)
+    for s, e in pairwise(starts):
+        p = subprocess.run(["zstd", "-d", "-c", "-q"], input=payload[s:e], capture_output=True, check=False)
         if p.returncode != 0 and b"unsupported format" not in p.stderr:
             raise ValueError(f"zstd: {p.stderr[:200]!r}")
         out.append(p.stdout)
@@ -286,7 +291,7 @@ def _json_records(data):
         yield obj
 
 
-_KCACHE = {}
+_KCACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
 
 
 def kernel_digest(path, names):
@@ -378,7 +383,7 @@ def compare_pair(ref_dir, new_dir, names_ref, names_new, pb2, kernels=True):
         diffs.append("metadata")
     kernel_diffs = []
     if kernels and len(ka) == len(kb):
-        for (na, pa), (nb, pb) in zip(ka, kb):
+        for (na, pa), (_nb, pb) in zip(ka, kb):
             if not pa or not pb:
                 kernel_diffs.append(f"{na}: binary path missing")
                 continue
@@ -416,16 +421,22 @@ def main(argv=None):
     ap.add_argument("--json", help="write per-pair records and the summary here")
     a = ap.parse_args(argv)
     pb2 = hlo_pb2(a.hlo_proto_path)
-    nmap = json.load(open(a.name_map)) if a.name_map else {}
+    nmap = {}
+    if a.name_map:
+        with open(a.name_map) as f:
+            nmap = json.load(f)
     names_ref, names_new = Names([a.ref_package], nmap), Names([a.new_package])
     ref_ranks, ref_cache = load_capture(a.ref_root, a.cache_subdir)
     new_ranks, new_cache = load_capture(a.new_root, a.cache_subdir)
     if a.pair_by == "signature":
-        sig = lambda cache: lambda k: _read(os.path.join(cache, k, "example_inputs.txt"))
+
+        def sig(cache):
+            return lambda k: _read(os.path.join(cache, k, "example_inputs.txt"))
+
         pairs, problems = pair_by_signature(ref_ranks, new_ranks, sig(ref_cache), sig(new_cache))
     else:
         pairs, problems = pair(ref_ranks, new_ranks)
-    done, records, bad = {}, [], 0
+    done, records = {}, []
     for r, i, ka, kb in pairs:
         if (ka, kb) not in done:
             done[(ka, kb)] = compare_pair(
@@ -440,8 +451,8 @@ def main(argv=None):
     for ka, kb in differ:
         d, notes, _ = done[(ka, kb)]
         print(f"DIFFER {ka} / {kb}: {', '.join(d)}")
-        for l in notes[:8]:
-            print(f"    {l}")
+        for note in notes[:8]:
+            print(f"    {note}")
     for p in problems:
         print(f"PROBLEM {p}")
     ok = not differ and not problems

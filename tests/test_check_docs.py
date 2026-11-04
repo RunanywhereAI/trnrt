@@ -13,7 +13,9 @@ _spec.loader.exec_module(cd)
 
 
 def _is_git(root):
-    return subprocess.run(["git", "-C", root, "rev-parse", "--git-dir"], capture_output=True).returncode == 0
+    return (
+        subprocess.run(["git", "-C", root, "rev-parse", "--git-dir"], capture_output=True, check=False).returncode == 0
+    )
 
 
 @pytest.mark.skipif(not _is_git(ROOT), reason="needs the git checkout (lists the tracked Markdown); the image has none")

@@ -50,6 +50,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from contextlib import suppress
 from dataclasses import asdict, dataclass, field
 
 from . import cache
@@ -176,10 +177,8 @@ def _tree_rss(pid: int) -> int:
         return 0
     total = 0
     for q in procs:
-        try:
+        with suppress(psutil.NoSuchProcess):
             total += q.memory_info().rss
-        except psutil.NoSuchProcess:
-            pass
     return total
 
 
@@ -250,8 +249,8 @@ def run_compile(
     done.set()
     th.join()
     proc.returncode = os.waitstatus_to_exitcode(status)
-    with open(err_path, "rb") as f:
-        err = f.read().decode(errors="replace")[-2000:]
+    with open(err_path, "rb") as err_in:
+        stderr_tail = err_in.read().decode(errors="replace")[-2000:]
     ok = proc.returncode == 0 and os.path.exists(neff)
     res = Result(
         key,
@@ -262,7 +261,7 @@ def run_compile(
         max_rss_gb=ru.ru_maxrss / 2**20,
         peak_tree_rss_gb=peak[0] / 2**30,
         args=args,
-        error="" if ok else (err or f"exit {proc.returncode}, no NEFF written"),
+        error="" if ok else (stderr_tail or f"exit {proc.returncode}, no NEFF written"),
     )
     if res.ok:
         res.neff_bytes = os.path.getsize(neff)
@@ -334,7 +333,7 @@ def compile_entries(
     def attempt(d: str, n: int, rss: list[int]) -> None:
         try:
             r = run_compile(d, work_root=work_root, neuronx_cc=neuronx_cc, rss=rss)
-        except Exception as err:  # that entry's failure: the others go on
+        except Exception as err:  # noqa: BLE001  # that entry's failure, whatever it is: the others go on
             r = Result(cache.key_of(d), False, 0.0, -1, error=f"{type(err).__name__}: {err}")
         r.attempt = n
         done.put((d, r))

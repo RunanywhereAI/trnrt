@@ -78,7 +78,7 @@ def cli(*argv: str) -> str:
     exe = shutil.which(argv[0])
     if exe is None:
         raise FileNotFoundError(f"{argv[0]} is not on PATH")
-    p = subprocess.run([exe, *argv[1:]], capture_output=True, text=True, timeout=120)
+    p = subprocess.run([exe, *argv[1:]], capture_output=True, text=True, timeout=120, check=False)
     if p.returncode != 0:
         raise RuntimeError(f"{' '.join(argv)} exited {p.returncode}: {(p.stderr or p.stdout).strip()[-300:]}")
     return " ".join((p.stdout or p.stderr).split())[:160]

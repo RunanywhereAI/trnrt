@@ -31,25 +31,25 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # The served configuration's (batch 12's) values of everything the presets and --max-running touch, in EngineConfig's
 # names, as the README documents them.
-SERVED = dict(
-    max_num_seqs=16,
-    decode_batch_buckets=(1, 2, 4, 6, 8, 12),
-    max_running=12,
-    kda_shell_max_rows=12,
-    dsa_layer_max_rows=16,
-    ffn_half_below=17,
-    dsa_index_rows=8,
-)
+SERVED = {
+    "max_num_seqs": 16,
+    "decode_batch_buckets": (1, 2, 4, 6, 8, 12),
+    "max_running": 12,
+    "kda_shell_max_rows": 12,
+    "dsa_layer_max_rows": 16,
+    "ffn_half_below": 17,
+    "dsa_index_rows": 8,
+}
 # batch8's: EngineConfig's own defaults and the model modules' import-time row caps.
-BATCH8 = dict(
-    max_num_seqs=8,
-    decode_batch_buckets=(1, 2, 4, 6, 8),
-    max_running=None,
-    kda_shell_max_rows=8,
-    dsa_layer_max_rows=8,
-    ffn_half_below=16,
-    dsa_index_rows=0,
-)
+BATCH8 = {
+    "max_num_seqs": 8,
+    "decode_batch_buckets": (1, 2, 4, 6, 8),
+    "max_running": None,
+    "kda_shell_max_rows": 8,
+    "dsa_layer_max_rows": 8,
+    "ffn_half_below": 16,
+    "dsa_index_rows": 0,
+}
 
 
 def _diff(a: EngineConfig, b: EngineConfig) -> dict:
@@ -110,7 +110,7 @@ def test_batch4_is_a_running_cap_on_compiled_graphs():
         "max_running": 4
     }
     b8 = ["--model", "m", "--preset", "batch8"]
-    assert _diff(cli.engine_config(b8), cli.engine_config(b8 + ["--max-running", "4"])) == {"max_running": 4}
+    assert _diff(cli.engine_config(b8), cli.engine_config([*b8, "--max-running", "4"])) == {"max_running": 4}
 
 
 def test_capture_takes_the_preset_and_the_settings():
@@ -165,17 +165,17 @@ def test_the_command_line_refuses_out_of_range_values(argv):
 
 
 @pytest.mark.parametrize(
-    "kw",
+    ("kw", "message"),
     [
-        dict(max_running=0),
-        dict(kda_shell_max_rows=0),
-        dict(dsa_layer_max_rows=0),
-        dict(ffn_half_below=0),
-        dict(dsa_index_rows=-1),
+        ({"max_running": 0}, "max_running=0: at least 1"),
+        ({"kda_shell_max_rows": 0}, "kda_shell_max_rows=0: at least 1"),
+        ({"dsa_layer_max_rows": 0}, "dsa_layer_max_rows=0: at least 1"),
+        ({"ffn_half_below": 0}, "ffn_half_below=0: at least 1"),
+        ({"dsa_index_rows": -1}, r"dsa_index_rows=-1: 0 \(one call\) or more"),
     ],
 )
-def test_engine_config_refuses_out_of_range_values(kw):
-    with pytest.raises(ValueError):
+def test_engine_config_refuses_out_of_range_values(kw, message):
+    with pytest.raises(ValueError, match=message):
         EngineConfig(model_path="m", **kw)
 
 

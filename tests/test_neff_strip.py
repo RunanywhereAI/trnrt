@@ -35,7 +35,7 @@ def neff(seed: int = 1, size_fmt: str = "<Q", size_twice: bool = False, members=
     head += struct.pack(size_fmt, len(data))
     if size_twice:
         head += struct.pack(size_fmt, len(data))
-    md5 = hashlib.md5(data).digest()
+    md5 = hashlib.md5(data, usedforsecurity=False).digest()
     head += md5 + b"\x00" * 7 + md5  # the data's md5, twice
     head += hashlib.sha256(data).hexdigest().encode()  # and its sha256 as hex
     return bytes(head.ljust(strip.HEADER, b"\x00")) + data
@@ -56,10 +56,10 @@ def test_strip_drops_the_debug_members_and_rewrites_the_header_fields():
     head = new[: strip.HEADER]
     at = rep["fields"]["data_size"][0]
     assert struct.unpack_from("<Q", head, at)[0] == len(data) and rep["bytes"] == (len(old), len(new))
-    md5 = hashlib.md5(data).digest()
+    md5 = hashlib.md5(data, usedforsecurity=False).digest()
     assert head.count(md5) == 2 and rep["fields"]["md5"] == [at + 8, at + 8 + 16 + 7]
     assert hashlib.sha256(data).hexdigest().encode() in head
-    assert hashlib.md5(old[strip.HEADER :]).digest() not in head
+    assert hashlib.md5(old[strip.HEADER :], usedforsecurity=False).digest() not in head
     # every other header byte as it was
     changed = [i for i in range(strip.HEADER) if head[i] != old[i]]
     fields = (
@@ -125,13 +125,13 @@ def test_strip_cache_strips_in_place_and_keeps_every_entry_a_cache_hit(tmp_path)
         assert cache.is_complete(str(d))
         assert cache.read_marker(str(d))["neff_size"] == str(len(blob))
         assert struct.unpack_from("<Q", blob, 63)[0] == len(blob) - strip.HEADER
-        assert blob[: strip.HEADER].count(hashlib.md5(blob[strip.HEADER :]).digest()) == 2
+        assert blob[: strip.HEADER].count(hashlib.md5(blob[strip.HEADER :], usedforsecurity=False).digest()) == 2
     assert (bad / cache.neff_name(bad.name)).read_bytes() == bad_blob  # refused: untouched
     assert cache.read_marker(str(bad))["neff_size"] == str(len(bad_blob))
     assert (raw / cache.neff_name(raw.name)).read_bytes() == before[raw.name]
     assert not (raw / cache.MARKER).exists()
     assert {r["key"]: r["status"] for r in seen}["c" * 32] == "refused"
-    assert not [p for p in root.rglob("*.strip-*")]  # no temporary file left
+    assert not list(root.rglob("*.strip-*"))  # no temporary file left
 
     again = strip.strip_cache(str(root))
     assert (again["stripped"], again["already"], again["refused"]) == (0, 2, 1)

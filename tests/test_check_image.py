@@ -20,7 +20,8 @@ def ci():
 
 
 def test_the_required_compiler_is_the_one_the_readme_states(ci):
-    readme = open(os.path.join(ROOT, "README.md")).read()
+    with open(os.path.join(ROOT, "README.md")) as f:
+        readme = f.read()
     stated = re.search(r"neuronx-cc (\d+\.\d+)\)", readme)
     assert stated and ci.WANT_VERSION["neuronx-cc"] == stated.group(1) + ".", (stated, ci.WANT_VERSION)
     assert "Neuron SDK 2.32" in readme and ci.WANT_VERSION["libtorch-neuronx-lite"] == "2.11."  # SDK 2.32's
@@ -44,7 +45,8 @@ def test_glm5_next_is_required(ci, monkeypatch):
 
 
 def test_the_image_pins_a_transformers_with_glm5_next():
-    df = open(os.path.join(ROOT, "docker", "Dockerfile")).read()
+    with open(os.path.join(ROOT, "docker", "Dockerfile")) as f:
+        df = f.read()
     pins = dict(re.findall(r"\b(transformers|tokenizers)==(\d+\.\d+\.\d+)\b", df))
     assert set(pins) == {"transformers", "tokenizers"}, pins
     # 5.17.0 has glm5_next; the base image's 5.15.0 does not

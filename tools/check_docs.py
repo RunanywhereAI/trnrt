@@ -31,7 +31,9 @@ def anchor(heading: str) -> str:
 
 
 def anchors(path: str) -> set[str]:
-    out, seen, fenced = set(), {}, False
+    out: set[str] = set()
+    seen: dict[str, int] = {}
+    fenced = False
     with open(path, encoding="utf-8") as f:
         for line in f:
             if _FENCE.match(line):

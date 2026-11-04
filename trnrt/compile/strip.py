@@ -31,6 +31,7 @@ import io
 import os
 import struct
 import tarfile
+from typing import Any
 
 from . import cache
 
@@ -51,10 +52,9 @@ def strip(neff: bytes, drop: str = DROP) -> tuple[bytes, dict]:
     back unchanged. Raises ValueError when the data size is not in the header exactly once, and
     tarfile.TarError when the data is not a gzip-compressed tar."""
     head, data = bytearray(neff[:HEADER]), neff[HEADER:]
-    src = tarfile.open(fileobj=io.BytesIO(data), mode="r:gz")
     out = io.BytesIO()
     removed = []
-    with tarfile.open(fileobj=out, mode="w:gz") as dst:
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as src, tarfile.open(fileobj=out, mode="w:gz") as dst:
         for m in src.getmembers():
             if m.isfile() and fnmatch.fnmatch(os.path.basename(m.name), drop):
                 removed.append((m.name, m.size))
@@ -63,7 +63,7 @@ def strip(neff: bytes, drop: str = DROP) -> tuple[bytes, dict]:
     if not removed:
         return neff, {"removed": [], "removed_bytes": 0, "fields": {}, "bytes": (len(neff), len(neff))}
     new = out.getvalue()
-    fields = {}
+    fields: dict[str, Any] = {}
     for fmt in ("<Q", "<I"):  # the data size, 8 or 4 bytes
         if len(data) >= 2 ** (8 * struct.calcsize(fmt)):
             continue

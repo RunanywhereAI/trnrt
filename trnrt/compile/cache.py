@@ -46,7 +46,7 @@ LOG = "log-neuron-cc.txt"
 METADATA = ".artifact_metadata_v0.json"  # compile/cache.py _get_artifact_metadata_filename(0)
 NKI_SUBDIR = "nki"  # LNL nki/nki_cache.py _NKI_CACHE_SUBDIR: its NKI compile results, under the cache
 # Where the NKI compiler leaves kernel binaries (the path neuronx-cc names in NCC_EVRF059).
-NKI_KERNEL_DIR = "/var/tmp/nki-intermediate-cache"
+NKI_KERNEL_DIR = "/var/tmp/nki-intermediate-cache"  # noqa: S108  # the compiler's fixed location, not ours
 DEFAULT_ROOT = "~/.cache/neuron_libtorch"  # LNL's default NEURON_LIBTORCH_CACHE_ROOT
 DEFAULT_OUT = "~/.cache/trnrt"  # the compile pipeline's work directory (farm.py --out)
 
