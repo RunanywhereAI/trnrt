@@ -16,6 +16,7 @@ TRNRT_TEST_NETWORK=1; skipped unless the tokenizer files and chat_template.jinja
 from __future__ import annotations
 
 import json
+from typing import ClassVar
 
 import pytest
 
@@ -57,7 +58,7 @@ TOOLS = [
         },
     },
 ]
-KW = dict(tools=True, tool_defs=TOOLS)
+KW = {"tools": True, "tool_defs": TOOLS}
 
 
 NEEDS = ("tokenizer.json", "tokenizer_config.json", "chat_template.jinja")  # the tokenizer and the chat template
@@ -266,7 +267,10 @@ def test_a_template_that_knows_developer_keeps_it():
         )
 
     class Named:
-        chat_template = {"default": "{{ messages }}", "tool_use": "{% if m.role == 'developer' %}{% endif %}"}
+        chat_template: ClassVar[dict[str, str]] = {
+            "default": "{{ messages }}",
+            "tool_use": "{% if m.role == 'developer' %}{% endif %}",
+        }
 
     class Prose:  # mentions the word, has no branch for the role: its developer turn would vanish
         chat_template = (

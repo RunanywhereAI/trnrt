@@ -12,6 +12,7 @@ import socket
 import threading
 import time
 import types
+from itertools import pairwise
 
 import pytest
 
@@ -28,9 +29,9 @@ def _save_tokenizer(path, vocab: int) -> None:
     from tokenizers import Tokenizer, models, pre_tokenizers
     from transformers import PreTrainedTokenizerFast
 
-    tk = Tokenizer(models.WordLevel({f"t{i}": i for i in range(vocab)}, unk_token="t0"))
+    tk = Tokenizer(models.WordLevel({f"t{i}": i for i in range(vocab)}, unk_token="t0"))  # noqa: S106  the tokenizer's unknown-token string, not a secret
     tk.pre_tokenizer = pre_tokenizers.Whitespace()
-    t = PreTrainedTokenizerFast(tokenizer_object=tk, unk_token="t0")
+    t = PreTrainedTokenizerFast(tokenizer_object=tk, unk_token="t0")  # noqa: S106  the tokenizer's unknown-token string, not a secret
     t.chat_template = TEMPLATE
     t.save_pretrained(str(path))
 
@@ -114,9 +115,9 @@ def test_another_stream_flows_while_a_prompt_renders(server, monkeypatch):
     def stream():
         body = {"prompt": [5, 17, 42, 99], "max_tokens": 450, "temperature": 0, "ignore_eos": True, "stream": True}
         with httpx.stream("POST", server.url + "/v1/completions", json=body, timeout=120) as r:
-            for line in r.iter_lines():
-                if line.startswith("data: ") and line != "data: [DONE]":
-                    times.append(time.perf_counter())
+            times.extend(
+                time.perf_counter() for line in r.iter_lines() if line.startswith("data: ") and line != "data: [DONE]"
+            )
 
     th = threading.Thread(target=stream)
     th.start()
@@ -131,5 +132,5 @@ def test_another_stream_flows_while_a_prompt_renders(server, monkeypatch):
     during = [t for t in times if t0 + 0.2 < t < t0 + 1.8]
     assert times[-1] > t0 + 1.8, (len(times), times[-1] - times[0], times[-1] - t0)
     assert len(during) >= 20, f"{len(during)} stream events while another prompt rendered for 2 s"
-    gap = max(b - a for a, b in zip(times, times[1:]) if t0 < b < t1)
+    gap = max(b - a for a, b in pairwise(times) if t0 < b < t1)
     assert gap < 0.5, gap

@@ -35,7 +35,7 @@ TOOLS = [
         },
     },
 ]
-KW = dict(tools=True, tool_defs=TOOLS)
+KW = {"tools": True, "tool_defs": TOOLS}
 
 
 def test_thinking_on_prompt_opened_the_block():

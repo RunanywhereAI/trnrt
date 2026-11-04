@@ -26,6 +26,8 @@ import subprocess
 import sys
 import time
 
+from . import log
+
 GiB = 2**30
 # libtorch-neuronx-lite raises on a graph missing from the compile cache instead of compiling it (neuronx-cc on the
 # serving host: minutes to hours per graph, while the engine is not serving).
@@ -61,24 +63,24 @@ def _at_least(lo: int):
 #   the fused decode kernels' row caps of steps of up to 8 rows: the model modules' own (hybrid.KDA_SHELL_MAXB,
 #   mla.LAYER_MK_MAXB, ...) and EngineConfig's.
 PRESETS: dict[str, dict] = {
-    "batch12": dict(
-        max_num_seqs=16,
-        decode_buckets=(1, 2, 4, 6, 8, 12),
-        max_running=12,
-        kda_shell_max_rows=12,
-        dsa_layer_max_rows=16,
-        ffn_half_below=17,
-        dsa_index_rows=8,
-    ),
-    "batch8": dict(
-        max_num_seqs=8,
-        decode_buckets=(1, 2, 4, 6, 8),
-        max_running=None,
-        kda_shell_max_rows=8,
-        dsa_layer_max_rows=8,
-        ffn_half_below=16,
-        dsa_index_rows=0,
-    ),
+    "batch12": {
+        "max_num_seqs": 16,
+        "decode_buckets": (1, 2, 4, 6, 8, 12),
+        "max_running": 12,
+        "kda_shell_max_rows": 12,
+        "dsa_layer_max_rows": 16,
+        "ffn_half_below": 17,
+        "dsa_index_rows": 8,
+    },
+    "batch8": {
+        "max_num_seqs": 8,
+        "decode_buckets": (1, 2, 4, 6, 8),
+        "max_running": None,
+        "kda_shell_max_rows": 8,
+        "dsa_layer_max_rows": 8,
+        "ffn_half_below": 16,
+        "dsa_index_rows": 0,
+    },
 }
 
 
@@ -269,7 +271,7 @@ def cmd_engine(argv: list[str]) -> int:
     )
     add_engine_args(ap)
     ap.add_argument("--core-base", type=int, default=0, help="the engine's first logical NeuronCore")
-    ap.add_argument("--host", default="0.0.0.0")
+    ap.add_argument("--host", default="0.0.0.0")  # noqa: S104  an API server: reachable by design
     ap.add_argument("--port", type=int, default=8001)
     ap.add_argument("--served-model-name", default="glm")
     add_compile_arg(ap)
@@ -373,7 +375,7 @@ def cmd_serve(argv: list[str]) -> int:
     )
     add_engine_args(ap)
     ap.add_argument("--engines", type=int, default=2, help="engines of --tp ranks each, on consecutive cores")
-    ap.add_argument("--host", default="0.0.0.0")
+    ap.add_argument("--host", default="0.0.0.0")  # noqa: S104  an API server: reachable by design
     ap.add_argument("--port", type=int, default=8000, help="the router's port; engine i listens on port + 1 + i")
     ap.add_argument("--served-model-name", default="glm")
     ap.add_argument(
@@ -397,7 +399,8 @@ def cmd_serve(argv: list[str]) -> int:
     # host-wide start lock stays on too (engine/start_lock.py: each graph's first call holds it): two engines whose
     # ranks load collective graphs at the same moment collide in the runtime's collectives bootstrap.
     env = dict(os.environ, **compile_env(a.allow_compile))
-    env.setdefault("TRNRT_START_LOCK", os.path.join("/tmp", f"trnrt-start-lock-{a.port}"))
+    # A fixed path: the engines' processes coordinate through it, so it cannot be a private temp file.
+    env.setdefault("TRNRT_START_LOCK", os.path.join("/tmp", f"trnrt-start-lock-{a.port}"))  # noqa: S108
     # --engines, --startup-timeout and --timeout-keep-alive are serve's own; --allow-compile goes on: engine takes it
     engine_argv = _without(_without(_without(argv, "--engines"), "--startup-timeout"), "--timeout-keep-alive")
     procs: list[subprocess.Popen] = []
@@ -420,7 +423,11 @@ def cmd_serve(argv: list[str]) -> int:
                 "127.0.0.1",
             ]
             procs.append(
-                subprocess.Popen(cmd, env=dict(env, TRNRT_START_LOCK_OWNER=f"engine{i}"), preexec_fn=_dies_with_parent)
+                subprocess.Popen(
+                    cmd,
+                    env=dict(env, TRNRT_START_LOCK_OWNER=f"engine{i}"),
+                    preexec_fn=_dies_with_parent,  # noqa: PLW1509  PR_SET_PDEATHSIG has no subprocess option; no thread runs here
+                )
             )
             urls.append(f"http://127.0.0.1:{port}")
             s = _wait_healthy(urls[-1], procs, a.startup_timeout, HEALTH_POLL_S)
@@ -449,6 +456,7 @@ def cmd_compile(argv: list[str]) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    log.configure()  # once per process: `serve` starts each engine as a process of its own, which runs this main too
     argv = sys.argv[1:] if argv is None else argv
     cmds = {"serve": cmd_serve, "engine": cmd_engine, "compile": cmd_compile}
     if not argv or argv[0] not in cmds:

@@ -3,10 +3,12 @@ assertion unless --allow-compile, a cache miss ends start-up with its likely cau
 time and stops them all past --startup-timeout, and the argv serve hands each engine parses there. Fake engine
 processes and a fake /health: nothing is loaded or served."""
 
+import logging
 import os
 import signal
 import sys
 import time
+from typing import ClassVar
 
 import pytest
 
@@ -14,6 +16,18 @@ httpx = pytest.importorskip("httpx")
 pytest.importorskip("uvicorn")
 
 import trnrt.__main__ as cli  # noqa: E402
+from trnrt import log  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _undo_logging_setup():
+    """main() configures trnrt's logger for its process; here several run in the test's own, so put it back."""
+    root = logging.getLogger(log.ROOT)
+    handlers, level = list(root.handlers), root.level
+    yield
+    root.handlers[:] = handlers
+    root.setLevel(level)
+
 
 MISS = (
     "NEURON_LIBTORCH_ASSERT_CACHE_HIT: compile cache miss for key 0123abcd. All graphs must be pre-compiled when "
@@ -213,8 +227,8 @@ def test_an_engine_that_dies_while_the_next_starts_ends_serve(host, monkeypatch)
 
 
 class _FakeLLMEngine:
-    seen_env: list = []
-    cfgs: list = []
+    seen_env: ClassVar[list] = []
+    cfgs: ClassVar[list] = []
     fail = None
 
     def __init__(self, cfg):
@@ -272,7 +286,7 @@ def test_engine_passes_other_failures_through_and_allow_compile_turns_the_assert
         cli.cmd_engine(ENGINE_ARGV)
     engine.fail = None
     assert cli.cmd_engine(ENGINE_ARGV) == 0
-    assert cli.cmd_engine(ENGINE_ARGV + ["--allow-compile"]) == 0
+    assert cli.cmd_engine([*ENGINE_ARGV, "--allow-compile"]) == 0
     assert engine.seen_env == ["1", "1", "0"]
 
 
@@ -334,7 +348,7 @@ def test_serve_hands_each_engine_an_argv_it_parses(stand_in):
     assert cli.cmd_serve(["--model", "m", "--device", "cpu", "--port", "9000"]) == 0
     assert [(c.host_cache_gb, c.tp_core_base) for c in stand_in.cfgs] == [(4.0, 0), (4.0, 32)]
     stand_in.cfgs.clear()
-    assert cli.cmd_serve(["--model", "m", "--device", "cpu", "--host-cache-gb", "2", "--host", "0.0.0.0"]) == 0
+    assert cli.cmd_serve(["--model", "m", "--device", "cpu", "--host-cache-gb", "2", "--host", "0.0.0.0"]) == 0  # noqa: S104  an argv; the stand-in binds nothing
     assert [c.host_cache_gb for c in stand_in.cfgs] == [2.0, 2.0]  # a full name still reaches the engines
 
 

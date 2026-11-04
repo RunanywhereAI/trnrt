@@ -69,7 +69,7 @@ def test_bad_values_are_400_and_a_running_request_is_untouched(client):
         ("top_k", 2**63),
         ("top_k", -5),
         ("prompt", [c.vocab]),
-        ("prompt", PROMPT + [-1]),
+        ("prompt", [*PROMPT, -1]),
         ("top_p", 0),
     ):
         r = c.post("/v1/completions", json={**sampled, field: value})

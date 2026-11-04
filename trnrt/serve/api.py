@@ -25,6 +25,7 @@ import contextlib
 import copy
 import functools
 import json
+import logging
 import math
 import queue
 import re
@@ -37,7 +38,7 @@ import uuid
 import weakref
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from fastapi import FastAPI, HTTPException
 from fastapi import Request as HTTPRequest
@@ -49,6 +50,8 @@ from .parsers import THINK_OPEN, StreamParser, chat_finish_reason, parse_full, t
 
 if TYPE_CHECKING:  # only annotations: importing this module does not load the engine and its model code
     from ..engine.engine import LLMEngine
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -133,9 +136,7 @@ class EngineLoop:
         if self.failed is None and self.thread.is_alive() and self.thread is not threading.current_thread():
             self.thread.join(wait)
             if self.thread.is_alive():
-                print(
-                    f"trnrt: the engine thread did not stop within {wait:.0f} s; closing the engine anyway", flush=True
-                )
+                logger.warning("trnrt: the engine thread did not stop within %.0f s; closing the engine anyway", wait)
 
     def health_error(self) -> str | None:
         """Why the engine cannot serve, or None. A worker that died while this loop waits in a step (a device collective
@@ -206,7 +207,7 @@ class EngineLoop:
     def _run(self) -> None:
         try:
             self._loop()
-        except BaseException as e:  # outside a step (a step's own failure is _loop's): nothing would serve requests
+        except BaseException as e:  # noqa: BLE001  outside a step (a step's own failure is _loop's): nothing would serve requests
             traceback.print_exc()
             self._fail(f"the engine loop failed: {e!r}")
 
@@ -251,7 +252,7 @@ class EngineLoop:
             if self.failed is not None:
                 return
             self.failed = reason
-        print(f"trnrt: {reason}; /health answers 503 and the engine shuts down", flush=True)
+        logger.error("trnrt: %s; /health answers 503 and the engine shuts down", reason)
         streams, self.streams = self.streams, {}
         for st in streams.values():
             st.loop.call_soon_threadsafe(st.out.put_nowait, ("error", f"engine failed: {reason}", 503))
@@ -280,7 +281,7 @@ class EngineLoop:
             self._local_k_stale = True
             try:
                 self.engine.step()
-            except Exception as e:  # never let the engine thread die silently
+            except Exception as e:  # noqa: BLE001  never let the engine thread die silently
                 traceback.print_exc()
                 if self.engine.cfg.tp > 1:  # rank 0 left a step its workers ran or wait in: the ranks are out of step
                     dead = self.engine.dead_ranks()
@@ -356,7 +357,7 @@ class _Detok:
 # its neutral values, absent or listed here, which OpenAI SDKs and agent harnesses send by default. A plain-text
 # response_format is neutral too; penalties and a thinking budget are the engine's to refuse (engine.unsupported),
 # also only when they would change the output.
-_NEUTRAL = {
+_NEUTRAL: dict[str, tuple[object, ...]] = {
     "prompt_logprobs": (None,),
     "guided_json": (None,),
     "guided_regex": (None,),
@@ -619,12 +620,12 @@ def chat_prompt(tok, body: dict) -> tuple[list[int], dict]:
         )
     # parallel_tool_calls=False keeps only the first call (vLLM maybe_filter_parallel_tool_calls,
     # entrypoints/serve/utils/tool_calls_utils.py).
-    parse = dict(
-        tools=bool(tools),
-        thinking_open=tail.endswith(THINK_OPEN),
-        tool_defs=tools,
-        parallel_tool_calls=body.get("parallel_tool_calls") is not False,
-    )
+    parse = {
+        "tools": bool(tools),
+        "thinking_open": tail.endswith(THINK_OPEN),
+        "tool_defs": tools,
+        "parallel_tool_calls": body.get("parallel_tool_calls") is not False,
+    }
     return ids, parse
 
 
@@ -704,6 +705,7 @@ def build_app(engine: LLMEngine, model_name: str) -> FastAPI:
         chat: bool,
         parse: dict | None = None,
     ):
+        parse_args = parse or {}
         stream = _flag(body, "stream")
         opts = body.get("stream_options") or {}
         include_usage = isinstance(opts, dict) and _flag(opts, "include_usage")
@@ -736,7 +738,7 @@ def build_app(engine: LLMEngine, model_name: str) -> FastAPI:
             if chat:
 
                 def entry(t, lp):
-                    s = tok.decode([t])
+                    s = cast("str", tok.decode([t]))  # one id decodes to one string; the stubs also allow a list
                     return {"token": s, "logprob": lp, "bytes": list(s.encode())}
 
                 return {
@@ -766,9 +768,11 @@ def build_app(engine: LLMEngine, model_name: str) -> FastAPI:
                 "choices": [choice],
             }
 
-        sparser = StreamParser(**parse) if chat else None
+        sparser = StreamParser(**parse_args) if chat else None
 
         def chat_chunks(text: str, finish: str | None, pairs):
+            if sparser is None:  # only a chat request builds chunks through the parser
+                raise ValueError("no stream parser for a completions request")
             deltas = sparser.push(text, finish is not None)
             finish = chat_finish_reason(finish, sparser.saw_tool)
             if not deltas:
@@ -830,7 +834,8 @@ def build_app(engine: LLMEngine, model_name: str) -> FastAPI:
             return StreamingResponse(events(), media_type="text/event-stream")
 
         async def collect():
-            text, finish, n_out, all_lps = "", None, 0, []
+            text, finish, n_out = "", None, 0
+            all_lps: list[tuple[int, tuple[float, list[int], list[float]]]] = []
             while finish is None:
                 kind, *rest = await sub.out.get()
                 if kind == "error":
@@ -854,7 +859,7 @@ def build_app(engine: LLMEngine, model_name: str) -> FastAPI:
             return Response(status_code=499)  # nginx's "client closed request"; nobody reads it
         text, finish, n_out, all_lps = done
         if chat:
-            msg = parse_full(text, **parse)
+            msg = parse_full(text, **parse_args)
             finish = chat_finish_reason(finish, bool(msg.get("tool_calls")))
             choice = {"index": 0, "message": msg, "finish_reason": finish}
         else:

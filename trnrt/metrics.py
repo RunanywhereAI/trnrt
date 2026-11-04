@@ -56,7 +56,7 @@ class Metrics:
         self.finished: dict[str, int] = {}
         self.ttft = Histogram()
         self.tpot = Histogram()
-        self.e2e = Histogram(LATENCY_BUCKETS + (81.92, 163.84))
+        self.e2e = Histogram((*LATENCY_BUCKETS, 81.92, 163.84))
         # The local-K selection's counters (LLMEngine.local_k_counts) as the engine thread last read them, and whether
         # a render asked for them since. They are device buffers the graphs write, so only the engine thread reads
         # them, and only while it is idle (serve/api.py EngineLoop): a scrape shows the counts of the last idle moment

@@ -14,6 +14,7 @@ end-of-sequence token, so the served engines write the call as text and stop aft
 alone: no token the prompts contain is renamed.
 """
 
+import contextlib
 import json
 import os
 import signal
@@ -111,7 +112,7 @@ def _scripted_prompt(engine_args: list[str]) -> tuple[list[int], list[int]]:
         eng.warmup()
         for seed in range(40):
             user = torch.randint(4, VOCAB, (23,), generator=torch.Generator().manual_seed(seed)).tolist()
-            out = eng.generate([user + [GEN]], SamplingParams(max_new_tokens=10, ignore_eos=True))[0].output_ids
+            out = eng.generate([[*user, GEN]], SamplingParams(max_new_tokens=10, ignore_eos=True))[0].output_ids
             if len(set(out)) == 10 and not set(out) & (set(user) | {GEN, 0}):
                 return user, out
     finally:
@@ -126,10 +127,10 @@ def _save_tokenizer(path: str, gen: list[int]) -> None:
 
     names = {i: f"t{i}" for i in range(VOCAB)}
     names.update(zip(gen, CALL))
-    tk = Tokenizer(models.WordLevel({w: i for i, w in names.items()}, unk_token="t0"))
+    tk = Tokenizer(models.WordLevel({w: i for i, w in names.items()}, unk_token="t0"))  # noqa: S106  the tokenizer's unknown-token string, not a secret
     tk.pre_tokenizer = pre_tokenizers.Whitespace()
     tk.decoder = decoders.Fuse()
-    tok = PreTrainedTokenizerFast(tokenizer_object=tk, unk_token="t0", eos_token=names[gen[9]])
+    tok = PreTrainedTokenizerFast(tokenizer_object=tk, unk_token="t0", eos_token=names[gen[9]])  # noqa: S106  the tokenizer's unknown-token string, not a secret
     tok.chat_template = TEMPLATE
     tok.save_pretrained(path)
     with open(os.path.join(path, "generation_config.json")) as f:
@@ -268,7 +269,8 @@ def test_serve_end_to_end_on_cpu(tmp_path):
         assert content.strip() == "" and finish == "tool_calls", (content, finish)
         assert chunks[-1].usage is not None and chunks[-1].usage.prompt_tokens == len(user) + 1, chunks[-1].usage
 
-        second = first + [
+        second = [
+            *first,
             {
                 "role": "assistant",
                 "content": None,
@@ -300,8 +302,6 @@ def test_serve_end_to_end_on_cpu(tmp_path):
             time.sleep(0.1)
         assert [p for p in kids if _alive(p)] == [], tail()
     finally:  # whatever failed, nothing it started outlives the test (serve and its engines share its process group)
-        try:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
             os.killpg(proc.pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
         proc.wait(10)

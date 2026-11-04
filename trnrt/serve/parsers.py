@@ -250,7 +250,8 @@ def template_messages(messages: list, developer_to_system: bool = False) -> list
     developer turn would vanish from the prompt while the request is still answered 200, and an agent harness that
     probes the role would then trust it. api.chat_prompt sets it when the template never tests for "developer"."""
     out = []
-    for m in messages:
+    for msg in messages:
+        m = msg
         if developer_to_system and isinstance(m, dict) and m.get("role") == "developer":
             m = dict(m, role="system")
         if not (isinstance(m, dict) and m.get("role") == "assistant" and isinstance(m.get("tool_calls"), list)):
@@ -316,10 +317,11 @@ def chat_finish_reason(finish: str | None, called: bool) -> str | None:
 
 def _find(text: str, tags) -> tuple[int, str | None]:
     """The earliest tag in text (the longest one on a tie)."""
-    best, found = -1, None
+    best = -1
+    found: str | None = None
     for tag in tags:
         i = text.find(tag)
-        if i >= 0 and (best < 0 or i < best or (i == best and len(tag) > len(found))):
+        if i >= 0 and (best < 0 or i < best or (i == best and len(tag) > len(found or ""))):
             best, found = i, tag
     return best, found
 
@@ -448,7 +450,7 @@ class StreamParser:
                 if tag == THINK_OPEN:
                     self._enter_think()
                 continue
-            # st == "block"
+            # otherwise the state is "block"
             j = self._buf.find(TOOL_CLOSE)
             if j >= 0 or final:
                 body = self._buf[:j] if j >= 0 else self._buf
@@ -479,7 +481,8 @@ class StreamParser:
     def _block(self, body: str, done: bool, closer: str) -> list[dict]:
         """The deltas of the current tool block so far. body: its text after `<tool_call>`; done: the block ended
         (closer: its `</tool_call>`, or "" when the output ended inside it)."""
-        slot, out = self._slot, []
+        slot = self._slot
+        out: list[dict] = []
         name, args = _scan(body, done)
         announce = False
         if not slot.skip and slot.index is None and name is not None:
@@ -496,7 +499,7 @@ class StreamParser:
             if text.startswith(slot.sent):  # never retract what was streamed
                 diff, slot.sent = text[len(slot.sent) :], text
             if not slot.muted and (announce or diff):
-                call = {"index": slot.index, "function": {"arguments": diff}}
+                call: dict[str, object] = {"index": slot.index, "function": {"arguments": diff}}
                 if announce:
                     call = {
                         "index": slot.index,

@@ -13,6 +13,7 @@ No model is built: the layers, the engine and its loop are stand-ins.
 
 from __future__ import annotations
 
+import logging
 import time
 import types
 
@@ -61,19 +62,33 @@ def _engine(model):
     return eng
 
 
-def test_close_prints_the_report_once(capsys):
+@pytest.fixture
+def written(capsys, caplog):
+    """What close wrote so far, one entry per line: its log records and anything it printed."""
+    caplog.set_level(logging.INFO, logger="trnrt")
+
+    def lines() -> list[str]:
+        out = capsys.readouterr().out.splitlines() + caplog.messages
+        caplog.clear()
+        return out
+
+    return lines
+
+
+def test_close_prints_the_report_once(written):
     eng = _engine(_Model([100, 3, 0], [50, 1, 0]))
     eng.close()
-    out = capsys.readouterr().out.splitlines()
-    assert out == [
-        f"local-K this engine's run: 4 of 150 rows failed the certificate (2.67e-02), 0 past CP_LOCAL_F = "
-        f"{mla.CP_LOCAL_F} (EXACT)"
+    assert written() == [
+        (
+            f"local-K this engine's run: 4 of 150 rows failed the certificate (2.67e-02), 0 past CP_LOCAL_F = "
+            f"{mla.CP_LOCAL_F} (EXACT)"
+        )
     ]
     eng.close()  # idempotent: no second report
-    assert capsys.readouterr().out == ""
+    assert written() == []
 
 
-def test_close_reports_nothing_after_a_failure_or_without_counters(capsys):
+def test_close_reports_nothing_after_a_failure_or_without_counters(written):
     failed = _engine(_Model([100, 3, 1]))
     failed.close_failed()  # a rank failed: nothing more goes to the workers, and no device read either
     failed.close()
@@ -81,10 +96,10 @@ def test_close_reports_nothing_after_a_failure_or_without_counters(capsys):
     dead._workers = [types.SimpleNamespace(exitcode=-9, pid=None)]
     dead.close()
     _engine(_Model()).close()
-    assert capsys.readouterr().out == ""
+    assert written() == []
     control = _engine(_Model([100, 3, 1]))  # the same engine, healthy: the report, NOT EXACT
     control.close()
-    assert "NOT EXACT" in capsys.readouterr().out
+    assert "NOT EXACT" in "\n".join(written())
 
 
 def _stub():

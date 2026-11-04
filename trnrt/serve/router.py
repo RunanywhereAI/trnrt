@@ -74,6 +74,10 @@ import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+from .. import log
+
+logger = log.get("router")
+
 SESSION_FIELD = "session_id"  # the request body field naming the session (serve/api.py takes it too)
 # TRNRT_ROUTER_LOG_SESSIONS=1, for debugging: a line per new pin and per side request, and the failover and return-home
 # lines, each with the session's id, so a log reader can attribute requests to engines. Off (the default) the router
@@ -158,8 +162,11 @@ class PrefixTree:
             self.size = 0
             return
         victim = min(leaves, key=lambda n: n.last)
+        parent = victim.parent
+        if parent is None:  # only the root has none, and the leaves exclude it
+            raise RuntimeError("the prefix tree's root was picked for eviction")
         self.size -= len(victim.text)
-        del victim.parent.children[victim.text[0]]
+        del parent.children[victim.text[0]]
 
 
 class Router:
@@ -210,7 +217,9 @@ class Router:
         self.up = [True] * len(workers)  # False once down (see note_failure) until /health answers again
         self.fails = [0] * len(workers)  # consecutive soft failures (a slow or failed /health)
         self.down_after = down_after
-        self.kv_used = [None] * len(workers)  # KV pages in use / total, from the worker's /v1/stats; None unknown
+        self.kv_used: list[float | None] = [None] * len(
+            workers
+        )  # KV pages in use / total, from the worker's /v1/stats; None unknown
 
     @staticmethod
     def session_of(body: dict) -> str | None:
@@ -244,24 +253,27 @@ class Router:
             w = mv[0]
             del self.moved[sid]
             self.routed["home"] += 1
-            print(f"trnrt.router: {self._session(sid)} back to worker {w} ({self.workers[w]}), up again", flush=True)
+            logger.info("trnrt.router: %s back to worker %s (%s), up again", self._session(sid), w, self.workers[w])
         elif w is not None and self.up[w]:
             self.routed["session"] += 1
         elif w is not None:
             old, w = w, self.least_loaded()
             self.routed["failover"] += 1
             self.moved[sid] = [mv[0] if mv is not None else old, 0]
-            print(
-                f"trnrt.router: {self._session(sid)} failed over from worker {old} ({self.workers[old]}, down) to "
-                f"worker {w} ({self.workers[w]})",
-                flush=True,
+            logger.warning(
+                "trnrt.router: %s failed over from worker %s (%s, down) to worker %s (%s)",
+                self._session(sid),
+                old,
+                self.workers[old],
+                w,
+                self.workers[w],
             )
         else:
             self.prune()  # a new pin: bound the map first (and on every poll), not on every request
             w = self.least_loaded()
             self.routed["new_session"] += 1
             if self.log_sessions:  # one line per pin, the last per session naming its worker
-                print(f"trnrt.router: session {sid!r} pinned to worker {w} ({self.workers[w]})", flush=True)
+                logger.info("trnrt.router: session %r pinned to worker %s (%s)", sid, w, self.workers[w])
         self.sessions.pop(sid, None)
         self.sessions[sid] = w  # re-inserted: the map's order is least recently used first
         self.seen[sid] = self.clock()
@@ -293,7 +305,7 @@ class Router:
         self.routed["side"] += 1
         w = self.least_loaded()
         if self.log_sessions:
-            print(f"trnrt.router: side request of session {sid!r} to worker {w} ({self.workers[w]})", flush=True)
+            logger.info("trnrt.router: side request of session %r to worker %s (%s)", sid, w, self.workers[w])
         return w
 
     def _session(self, sid: str) -> str:
@@ -303,7 +315,9 @@ class Router:
     def turn_done(self, sid: str | None, w: int) -> None:
         """A request of session `sid` completed on worker w: once a failed-over session has a turn on its new worker,
         its context lives there and it stays."""
-        mv = self.moved.get(sid) if sid is not None else None
+        if sid is None:
+            return
+        mv = self.moved.get(sid)
         if mv is not None and self.sessions.get(sid) == w:
             mv[1] += 1
             if mv[0] != w:
@@ -326,7 +340,7 @@ class Router:
 
     def note_ok(self, w: int) -> None:
         if not self.up[w]:
-            print(f"trnrt.router: worker {w} ({self.workers[w]}) is up", flush=True)
+            logger.info("trnrt.router: worker %s (%s) is up", w, self.workers[w])
         self.up[w], self.fails[w] = True, 0
 
     def note_failure(self, w: int, hard: bool) -> None:
@@ -339,7 +353,7 @@ class Router:
 
     def mark_down(self, w: int) -> None:
         if self.up[w]:
-            print(f"trnrt.router: worker {w} ({self.workers[w]}) is down", flush=True)
+            logger.warning("trnrt.router: worker %s (%s) is down", w, self.workers[w])
         self.up[w] = False
 
     def pick(
@@ -424,7 +438,7 @@ def _session_key(path: str, body: dict) -> tuple[str, str]:
     characters). Stable while an agent's conversation grows (both parts are the conversation's start); sys_hash differs
     under another system prompt (a title or summary request), first_hash under another conversation start (a
     compaction). No dump of the whole request (~1 MB at 200K tokens)."""
-    h = lambda b: hashlib.sha1(b.encode("utf-8", "replace")).hexdigest()  # noqa: E731
+    h = lambda b: hashlib.sha1(b.encode("utf-8", "replace"), usedforsecurity=False).hexdigest()  # noqa: E731
     if not path.endswith("chat/completions"):
         p = body.get("prompt", "")
         return h(""), h((p if isinstance(p, str) else json.dumps(p))[:SESSION_KEY_CHARS])
@@ -461,7 +475,8 @@ def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: floa
     # held a whole host at 100 requests in flight: the rest waited inside client.send() here, which clients measured as
     # time to first token. So no cap, and a keep-alive expiry that closes idle connections here before an engine does.
     client = httpx.AsyncClient(
-        timeout=None, limits=httpx.Limits(max_connections=None, max_keepalive_connections=512, keepalive_expiry=30.0)
+        timeout=None,  # noqa: S113  a stream lives until its last token; the polls and /v1/models set their own timeout
+        limits=httpx.Limits(max_connections=None, max_keepalive_connections=512, keepalive_expiry=30.0),
     )
 
     async def poll() -> None:
@@ -558,7 +573,7 @@ def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: floa
                 router.load[w] -= 1
                 router.note_failure(w, hard=isinstance(e, httpx.ConnectError))  # refused: a dead port
                 if attempt == 1 or all(not ok for ok in router.up):
-                    raise HTTPException(status_code=503, detail=f"worker {w} unreachable")
+                    raise HTTPException(status_code=503, detail=f"worker {w} unreachable") from e
                 w = router.pick(
                     _request_text(path, body) if sid is None else "",
                     session=sid,
@@ -625,7 +640,7 @@ def main() -> None:
         required=True,
         help="comma list of the engines' base URLs, e.g. http://127.0.0.1:8111,http://127.0.0.1:8112",
     )
-    ap.add_argument("--host", default="0.0.0.0")
+    ap.add_argument("--host", default="0.0.0.0")  # noqa: S104  a server in front of the engines: reachable by design
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument(
         "--timeout-keep-alive",
@@ -634,6 +649,7 @@ def main() -> None:
         help="seconds an idle client connection stays open (above aiohttp's 15 s pool keep-alive)",
     )
     args = ap.parse_args()
+    log.configure()
     import uvicorn
 
     router = Router([u.rstrip("/") for u in args.worker_urls.split(",") if u])

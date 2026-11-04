@@ -191,7 +191,7 @@ def _stub_worker(i: int, chat_status: int = 200):
         if body.get("stream"):
 
             async def stream():
-                yield ('data: {"choices": [{"delta": {"content": "w%d"}}]}\n\n' % i).encode()
+                yield ('data: {"choices": [{"delta": {"content": "w' + str(i) + '"}}]}\n\n').encode()
                 yield b"data: [DONE]\n\n"
 
             return StreamingResponse(stream(), media_type="text/event-stream")

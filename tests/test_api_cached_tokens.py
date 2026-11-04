@@ -25,9 +25,9 @@ def _save_tokenizer(path, vocab: int) -> None:
     from tokenizers import Tokenizer, models, pre_tokenizers
     from transformers import PreTrainedTokenizerFast
 
-    tk = Tokenizer(models.WordLevel({f"t{i}": i for i in range(vocab)}, unk_token="t0"))
+    tk = Tokenizer(models.WordLevel({f"t{i}": i for i in range(vocab)}, unk_token="t0"))  # noqa: S106  the tokenizer's unknown-token string, not a secret
     tk.pre_tokenizer = pre_tokenizers.Whitespace()
-    PreTrainedTokenizerFast(tokenizer_object=tk, unk_token="t0").save_pretrained(str(path))
+    PreTrainedTokenizerFast(tokenizer_object=tk, unk_token="t0").save_pretrained(str(path))  # noqa: S106  the tokenizer's unknown-token string, not a secret
 
 
 @pytest.fixture(scope="module")
@@ -109,5 +109,5 @@ def test_streaming_usage_chunk_only_when_asked(client):
     assert tail["choices"] == [] and tail["usage"]["completion_tokens"] == 3
     assert tail["usage"]["prompt_tokens_details"]["cached_tokens"] == h2 - h1 > 0
     assert all("usage" not in e for e in evs[:-1])
-    evs, _ = stream({"prompt": second + [5], "max_tokens": 3, "temperature": 0, "stream": True})
+    evs, _ = stream({"prompt": [*second, 5], "max_tokens": 3, "temperature": 0, "stream": True})
     assert all("usage" not in e for e in evs)
