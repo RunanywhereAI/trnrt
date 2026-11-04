@@ -404,6 +404,18 @@ def _request_text(path: str, body: dict) -> str:
     return p if isinstance(p, str) else json.dumps(p)
 
 
+async def _json_object(http: Request) -> dict:
+    """The request's JSON object; 400 for anything else, as each engine answers (serve/api.py, _body). Without this, a
+    malformed body or a JSON array raised inside the proxy and the router answered 500."""
+    try:
+        body = await http.json()
+    except ValueError:  # json.JSONDecodeError and UnicodeDecodeError
+        raise HTTPException(status_code=400, detail="the request body must be a JSON object") from None
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="the request body must be a JSON object")
+    return body
+
+
 def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: float = 5.0) -> FastAPI:
     # A streaming request holds its connection to the worker until the last token, so the pool's connection cap is a cap
     # on requests in flight at every worker together. httpx's default (Limits(max_connections=100), shared by all hosts)
@@ -474,7 +486,7 @@ def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: floa
         raise HTTPException(status_code=503, detail="no engine answered /v1/models")
 
     async def proxy(path: str, http: Request):
-        body = await http.json()
+        body = await _json_object(http)
         sid = router.session_of(body)
         key = _session_key(path, body) if sid is not None else None
         tools = bool(body.get("tools"))

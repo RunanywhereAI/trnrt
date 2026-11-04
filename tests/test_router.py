@@ -248,6 +248,33 @@ def test_router_health_and_models_follow_the_workers():
     asyncio.run(main())
 
 
+@pytest.mark.parametrize("body", [b"{not json", b"[1, 2]", b'"text"', b"\xff\xfe"])
+def test_a_body_that_is_not_a_json_object_is_answered_400_and_reaches_no_worker(body):
+    """The router refuses a malformed body, or JSON that is not an object, with 400, as each engine does, instead of
+    raising inside the proxy (500). No worker sees the request."""
+    import asyncio
+
+    import httpx
+
+    from trnrt.serve.router import build_router_app
+
+    async def main() -> None:
+        ports = [_free_port() for _ in range(2)]
+        router, worker = Router([f"http://127.0.0.1:{ports[0]}"]), _stub_worker(0)
+        servers, tasks = await _start([(worker, ports[0]), (build_router_app(router, poll_s=0), ports[1])])
+        try:
+            async with httpx.AsyncClient(timeout=30) as c:
+                r = await c.post(f"http://127.0.0.1:{ports[1]}/v1/chat/completions", content=body,
+                                 headers={"Content-Type": "application/json"})
+                assert r.status_code == 400, r.text
+                assert r.json()["detail"] == "the request body must be a JSON object"
+                assert router.load == [0] and worker.state.chats == 0
+        finally:
+            await _stop(servers, tasks)
+
+    asyncio.run(main())
+
+
 @pytest.mark.parametrize("stream", [False, True])
 def test_a_503_from_a_request_marks_its_worker_down_and_the_request_goes_to_another(stream):
     """A failed engine answers every request 503 (its /health too, but the poller is off here): the router marks it down
