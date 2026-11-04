@@ -45,7 +45,7 @@ def test_page_groups_layout():
     ppg = dsa_index.page_groups(table)
     assert ppg.shape == (128, 2, 2) and ppg.dtype == torch.int32
     assert torch.equal(ppg[5, 1], table[1, 10:12]) and torch.equal(ppg.permute(1, 0, 2).reshape(2, -1), table)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="needs a multiple of 128"):
         dsa_index.page_groups(table[:, :200])
 
 

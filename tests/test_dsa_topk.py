@@ -246,7 +246,7 @@ def _simulate(grid: int, monkeypatch):
 @needs_nki
 @pytest.mark.parametrize("grid", [1, 2], ids=["grid1", "grid2"])
 @pytest.mark.parametrize(
-    "rows,n,keep,kind",
+    ("rows", "n", "keep", "kind"),
     [
         (8, 2112, 512, "pooled"),
         (8, 2112, 512, "integers"),

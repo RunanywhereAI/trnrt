@@ -221,7 +221,7 @@ def _pinned(src: str) -> bool:
         for field in ("body", "orelse"):
             stmts = getattr(n, field, [])
             block = [ast.unparse(x) for x in stmts if isinstance(x, ast.stmt)] if isinstance(stmts, list) else []
-            pairs += list(zip(block, block[1:] + [""]))
+            pairs += list(zip(block, [*block[1:], ""]))
     for a, b in pairs:
         if a.startswith(("model._store(layer.k_cache", "model._store(layer.v_cache", "layer.pool_key.index_put_")):
             writes.append((a, b))

@@ -29,7 +29,7 @@ needs_nki = pytest.mark.skipif(importlib.util.find_spec("nki") is None, reason="
 D, PPP = dsh.D, dsh.PPP
 # attend's served form: the merge's rows interleaved and stacked, the selection in SBUF, the slot table in SBUF, the
 # tail block for every row at once, the over fallback folded in
-SERVED_ATTEND = dict(il=1, sb=1, st=1, ss=1, tl=1, fo=1)
+SERVED_ATTEND = {"il": 1, "sb": 1, "st": 1, "ss": 1, "tl": 1, "fo": 1}
 
 
 def case(B: int, NPg: int, Hi: int, nloc, seed: int = 0, repeat: bool = False, pages: int | None = None):
@@ -50,7 +50,7 @@ def test_rows_address_the_cp_pool_rows():
     """emulate's rows are cp_pool_rows' pool rows of the selected local pools, an independent derivation of the page
     layout (page_size 256, kpool 4, A 8: 8 local pools per page)."""
     q, w, pkc, table, nloc = case(2, 256, 4, [2048, 1500])
-    lval, cpool, rows, sc = dsh.emulate(q, w, pkc, table, nloc, 128, 8, 3)
+    _lval, cpool, rows, _sc = dsh.emulate(q, w, pkc, table, nloc, 128, 8, 3)
     prow = dsa_long.cp_pool_rows(table, 256, 4, 8)  # [B, Pl]
     lp = ((cpool - 3) / 8).long()
     assert torch.equal(rows.long(), prow.gather(1, lp))
@@ -74,7 +74,7 @@ def test_list_is_the_top_keep_in_pool_order(nl0):
     pool; NEG_INF and pool 0 past the count."""
     keep = 128
     q, w, pkc, table, nloc = case(1, 256, 4, [nl0], seed=2, repeat=True)
-    lval, cpool, rows, sc = dsh.emulate(q, w, pkc, table, nloc, keep, 8, 5)
+    lval, cpool, _rows, sc = dsh.emulate(q, w, pkc, table, nloc, keep, 8, 5)
     s = sc[0]
     vis = torch.nonzero(s > dsa_long.VISIBLE).view(-1)
     order = sorted(vis.tolist(), key=lambda m: (-s[m].item(), m))[:keep]
@@ -146,7 +146,7 @@ def test_merge_tail_slot():
     """The tail slot: the incomplete pool's row (pool_row of npool // A), visible on its owner (npool % A) at the tokens
     npool 4 + t <= pos and masked on every other rank; the slots past it are row 0, masked."""
     T, A, keep, NPg = 4, 8, 128, 32
-    ev, ec, sc, rows_sel, table, pos = merge_case(T, A, keep, NPg, [2000, 2001, 600, 7], seed=4)
+    ev, ec, _sc, rows_sel, table, pos = merge_case(T, A, keep, NPg, [2000, 2001, 600, 7], seed=4)
     npool = dsa_long.npools(pos, 4)
     for a in range(A):
         srows, sbias = dsh.emulate_merge(ev, ec, rows_sel, table, pos, keep, A, a)
@@ -210,7 +210,7 @@ def _bits(a, b):
 @needs_nki
 @pytest.mark.parametrize("grid", [1, 2])
 @pytest.mark.parametrize(
-    "B,NPg,nloc,keep,repeat",
+    ("B", "NPg", "nloc", "keep", "repeat"),
     [
         (1, 256, [2048 - 5], 128, False),  # one chunk of 16 columns
         (2, 1024, [8191, 90], 128, True),  # a row under keep, ties
@@ -263,9 +263,7 @@ def _c2s_case(B: int, NPg: int, keep: int, ties: bool, seed: int):
     visible pools than keep, empty, exactly keep); with ties, every row's table two pages repeated (16 distinct scores:
     the keep-th score tied far past room)."""
     P = NPg * PPP
-    nloc = []
-    for b in range(B):
-        nloc.append((P - 5, P // 3 + 7 * b, keep - 9, 0, keep)[b % 5])
+    nloc = [(P - 5, P // 3 + 7 * b, keep - 9, 0, keep)[b % 5] for b in range(B)]
     q, w, pkc, table, nl_ = case(B, NPg, 8, nloc, seed=seed)
     if ties:
         table = table[:, :2].repeat(1, NPg // 2)
@@ -329,7 +327,7 @@ def attend_case(T: int, keep: int, NPg: int, npool, seed: int = 0, hot_rank: int
     exceed 128: the over path)."""
     A = 8
     g = torch.Generator().manual_seed(seed + 100)
-    ev, ec, sc, rows_sel, table, pos = merge_case(T, A, keep, NPg, npool, seed=seed, levels=levels)
+    ev, ec, _sc, rows_sel, table, pos = merge_case(T, A, keep, NPg, npool, seed=seed, levels=levels)
     if hot_rank is not None:  # rank hot_rank's entries outrank every other rank's
         ev[hot_rank] = torch.where(ev[hot_rank] > dsa_long.VISIBLE, ev[hot_rank] + 10.0, ev[hot_rank])
     rows_sel = torch.randint(0, 4096, (T, keep), generator=g, dtype=torch.int32)
@@ -394,7 +392,7 @@ def _fallback_sim(q, kc, srows, sbias, grid):
 @needs_nki
 @pytest.mark.parametrize("grid", [1, 2])
 @pytest.mark.parametrize(
-    "T,npool,levels,hot",
+    ("T", "npool", "levels", "hot"),
     [
         (1, [2000], 16, None),
         (2, [2047, 600], 16, None),
@@ -454,7 +452,7 @@ def test_attend_served_form_is_the_served_chain(monkeypatch, grid, T, npool, lev
 @needs_nki
 @pytest.mark.parametrize("grid", [1, 2])
 @pytest.mark.parametrize(
-    "T,npool,hot,hot_rows,seed",
+    ("T", "npool", "hot", "hot_rows", "seed"),
     [(1, [1805], 5, None, 306), (2, [1805, 1797], 5, None, 7), (4, [1805, 2000, 1797, 600], 5, (2, 4), 309)],
 )
 def test_attend_fold_control(monkeypatch, grid, T, npool, hot, hot_rows, seed):
@@ -520,7 +518,7 @@ def test_attend_fold_control(monkeypatch, grid, T, npool, hot, hot_rows, seed):
 
 @needs_nki
 @pytest.mark.parametrize(
-    "NPg,T,npool",
+    ("NPg", "T", "npool"),
     [
         (1024, 6, [60000, 9000, 33000, 1205, 64001, 48000]),
         (4096, 8, [250000, 9000, 131000, 1205, 64001, 48000, 262143, 77777]),

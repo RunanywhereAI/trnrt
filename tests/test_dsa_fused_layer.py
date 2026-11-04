@@ -251,7 +251,7 @@ def _sk_piece():
         calls.append((lo, hi))
 
     g = {"MS": type("MS", (), {"sinkhorn_body": staticmethod(body)})}
-    exec(compile(ast.Module(body=[f], type_ignores=[]), "dsa_satwfc", "exec"), g)
+    exec(compile(ast.Module(body=[f], type_ignores=[]), "dsa_satwfc", "exec"), g)  # noqa: S102  # runs one extracted kernel function against a stub
     return g["_sk_piece"], calls
 
 
@@ -287,7 +287,7 @@ def test_front_then_sinkhorn_is_mhc_pre_on_the_host():
 def test_front_wraps_c():
     S = torch.randn(2, 4, 128).bfloat16()
     fn = (0.05 * torch.randn(24, 512)).bfloat16()
-    x, post, c = MF.front(S, fn, torch.zeros(24), torch.ones(3), 20, 1e-6, 1e-6)
+    _x, _post, c = MF.front(S, fn, torch.zeros(24), torch.ones(3), 20, 1e-6, 1e-6)
     assert isinstance(c, MF.PendingComb) and tuple(c.c.shape) == (2, 4, 4)
     with pytest.raises(TypeError):
         c.c + c  # a PendingComb is no tensor
@@ -363,14 +363,14 @@ def _bits(a, b) -> bool:
 
 @needs_nki
 @pytest.mark.parametrize("T", [4, 8, 16])
-@pytest.mark.parametrize("so,wu", [(1, 1), (1, 0), (0, 0)])
+@pytest.mark.parametrize(("so", "wu"), [(1, 1), (1, 0), (0, 0)])
 def test_heads_stacked_bitwise(monkeypatch, T, so, wu):
     """_tail_heads_hs (the served form) == the per-head form on uvT, rowok and o_out, bit for bit (A 8 sources, 2 heads,
     r 512, dv 256)."""
     monkeypatch.setenv("NEURON_PLATFORM_TARGET_OVERRIDE", "trn2")
     A, nh, r, dv = 8, 2, 512, 256
     rs, w, ident = _tail_case(T, A, nh, r, dv, seed=31 + T)
-    kw = dict(T=T, A=A, nh=nh, r=r, dv=dv, so=so, wu=wu, nf=1)
+    kw = {"T": T, "A": A, "nh": nh, "r": r, "dv": dv, "so": so, "wu": wu, "nf": 1}
     monkeypatch.setattr(CT, "HS", 0)
     a = nki.simulate(_heads_kernel)(rs, w, ident, hs=0, **kw)
     monkeypatch.setattr(CT, "HS", 1)
@@ -392,7 +392,7 @@ def test_heads_stacked_dispatch_control(monkeypatch):
     monkeypatch.setenv("NEURON_PLATFORM_TARGET_OVERRIDE", "trn2")
     T, A, nh, r, dv = 8, 8, 2, 512, 256
     rs, w, ident = _tail_case(T, A, nh, r, dv, seed=5)
-    kw = dict(T=T, A=A, nh=nh, r=r, dv=dv, so=1, wu=1, nf=1)
+    kw = {"T": T, "A": A, "nh": nh, "r": r, "dv": dv, "so": 1, "wu": 1, "nf": 1}
     monkeypatch.setattr(CT, "HS", 0)
     a = nki.simulate(_heads_kernel)(rs, w, ident, hs=0, **kw)
     monkeypatch.setattr(CT, "HS", 1)

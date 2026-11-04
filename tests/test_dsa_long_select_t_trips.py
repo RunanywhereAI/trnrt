@@ -96,6 +96,11 @@ class FakeISA(types.ModuleType):
         return Any(name)
 
 
+def _read(path: str) -> str:
+    with open(path) as f:
+        return f.read()
+
+
 def _load(monkeypatch, src: str):
     """dsa_long_select (fresh) and the given dsa_long_select_t source, both against the stand-in NKI."""
     import trnrt.kernels as pkg
@@ -114,7 +119,7 @@ def _load(monkeypatch, src: str):
     spec.loader.exec_module(dls)
     mod = types.ModuleType("trnrt.kernels._dsa_long_select_t_trips")
     mod.__package__, mod.__file__ = "trnrt.kernels", SEL_T
-    exec(compile(src, SEL_T, "exec"), mod.__dict__)
+    exec(compile(src, SEL_T, "exec"), mod.__dict__)  # noqa: S102  # the kernel source is the subject: run against the stand-in NKI
     assert mod.dsa_long_select_t_kernel is not None, "the kernel was not defined against the stand-in NKI"
     return mod, nl
 
@@ -146,14 +151,14 @@ COUNT_LINE = "        nisa.dma_copy(dst=cnt, src=trip)\n"
 
 @pytest.mark.parametrize("trip", [1, 0])
 def test_both_programs_run_the_same_trip(monkeypatch, trip):
-    mod, nl = _load(monkeypatch, open(SEL_T).read())
+    mod, nl = _load(monkeypatch, _read(SEL_T))
     got = _trips(mod, nl, trip)
     assert got == {0: trip, 1: trip}, got
 
 
 def test_the_old_override_is_caught(monkeypatch):
     """Positive control: program 1's count overwritten with 0 (the form that hung) must make the trips disagree at 1."""
-    src = open(SEL_T).read()
+    src = _read(SEL_T)
     assert src.count(COUNT_LINE) == 1
     old = src.replace(COUNT_LINE, COUNT_LINE + OLD_OVERRIDE)
     mod, nl = _load(monkeypatch, old)

@@ -60,7 +60,7 @@ def _layer(pkc):
     )
 
 
-@pytest.mark.parametrize("rows,T,pieces", [(0, 12, []), (8, 8, []), (8, 12, [12]), (8, 16, [16])])
+@pytest.mark.parametrize(("rows", "T", "pieces"), [(0, 12, []), (8, 8, []), (8, 12, [12]), (8, 16, [16])])
 def test_cp_scores_takes_the_pieces_only_past_the_setting(monkeypatch, rows, T, pieces):
     q, w, pkc, table, _, nloc = inputs(T, seed=T)
     pk = torch.zeros(T, NPG * PPK, D, dtype=torch.bfloat16)  # its shape only: the kernel path reads the page rows

@@ -224,12 +224,12 @@ def test_cp_merge_wide(A):
     cand = torch.arange(P).view(1, P) < npool.view(N, 1)
     plateau = torch.full((N, P), 1.0)
     plateau[:, P // 2 :] = 2.0
-    for name, sc in (
+    for name, raw in (
         ("int", torch.randint(0, 7, (N, P), generator=g).float()),
         ("randn", torch.randn(N, P, generator=g)),
         ("plateau", plateau),
     ):
-        sc = torch.where(cand, sc, torch.tensor(NEG))
+        sc = torch.where(cand, raw, torch.tensor(NEG))
         vals, cps = _local_lists(sc, keep, A)
         sel = dsa_long.cp_merge(vals, cps, keep)
         assert torch.equal(_merged_mask(sel, cps, N, P), _ref_mask(sc, keep)), f"{name} A={A}"
@@ -290,7 +290,7 @@ def test_two_selection_merge_sees_the_tie_rule():
 
 
 @pytest.mark.parametrize(
-    "N,KL", [(64, 120), (512, 120), (16, 512)]
+    ("N", "KL"), [(64, 120), (512, 120), (16, 512)]
 )  # local-K lists (K 120) and the failed rows' (keep)
 @pytest.mark.parametrize("kind", ["randn", "ties", "zeros", "empty"])
 def test_prefill_local_k_merge_two_selection_is_bit_equal(N, KL, kind):
@@ -414,7 +414,7 @@ def _close(a, b, atol=2e-5):
         )
 
 
-@pytest.mark.parametrize("page_size,chunk", [(4, 16), (8, 6)])
+@pytest.mark.parametrize(("page_size", "chunk"), [(4, 16), (8, 6)])
 def test_long_path_matches_transformers(sparse, page_size, chunk, monkeypatch):
     """Every bucket past 16 keys on the long path (scores, two-level selection, slots, absorbed attention), through
     chunked prefill with chunks that cut pools, a radix-cache hit and batched decode, against transformers' greedy
@@ -422,7 +422,7 @@ def test_long_path_matches_transformers(sparse, page_size, chunk, monkeypatch):
     path, hf = sparse
     ps = glm.prompts(2, (37, 70, 9))
     ps.append(ps[1][:48] + ps[0][:20])  # shares 48 tokens with prompt 1: a prefix hit
-    kw = dict(page_size=page_size, max_prefill_tokens=chunk)
+    kw = {"page_size": page_size, "max_prefill_tokens": chunk}
     eng_l, got = _generate(path, ps, 12, 16, monkeypatch, **kw)
     assert eng_l.model.long_ctx(32) and not eng_l.model.long_ctx(16)
     _, want = _generate(path, ps, 12, 1 << 30, monkeypatch, **kw)
@@ -448,7 +448,7 @@ def test_long_context_against_transformers(sparse, sub, monkeypatch):
     monkeypatch.setattr(dsa_long, "SUB", sub)
     path, hf = sparse
     ps = glm.prompts(9, (1500,), 384)
-    kw = dict(max_model_len=2048, num_pages=600, max_prefill_tokens=64, max_num_seqs=1)
+    kw = {"max_model_len": 2048, "num_pages": 600, "max_prefill_tokens": 64, "max_num_seqs": 1}
     _, got = _generate(path, ps, 6, 64, monkeypatch, **kw)
     _, want = _generate(path, ps, 6, 1 << 30, monkeypatch, **kw)
     assert [r.output_ids for r in got] == [r.output_ids for r in want] == [glm.hf_greedy(hf, ps[0], 6)]
@@ -462,9 +462,9 @@ def test_long_scratch_is_capped(sparse, monkeypatch):
     path, _ = sparse
     eng = glm.engine(path, max_model_len=4096, num_pages=64)
     try:
-        for l in eng.model.kv_layers():
-            if getattr(l, "dsa_mask", None) is not None:
-                assert l.dsa_mask.shape[1] == 64
+        for layer in eng.model.kv_layers():
+            if getattr(layer, "dsa_mask", None) is not None:
+                assert layer.dsa_mask.shape[1] == 64
     finally:
         eng.close()
 
@@ -487,7 +487,7 @@ def _cp_engine(path, ps, n, tp, **kw):
     reason="docs/KNOWN_ISSUES.md: logprobs 1.3-2.2e-3 apart under the FP8 KV cache (atol "
     "1e-4), tokens equal; not isolated from FP8 summation-order noise",
 )
-@pytest.mark.parametrize("tp,page_size", [(2, 8), (4, 16)])
+@pytest.mark.parametrize(("tp", "page_size"), [(2, 8), (4, 16)])
 def test_cp_engine_matches_replicated(sparse_cp, tp, page_size, monkeypatch):
     """Context parallelism at tp 2 and 4 (attention TP = tp = CP, each rank holding 1 / tp of the DSA caches): the same
     greedy tokens, and logprobs within fp32 summation order, as the replicated long path at tp 1, through chunked
@@ -495,7 +495,7 @@ def test_cp_engine_matches_replicated(sparse_cp, tp, page_size, monkeypatch):
     path, _ = sparse_cp
     ps = glm.prompts(4, (37, 70, 9))
     ps.append(ps[1][:48] + ps[0][:20])
-    kw = dict(page_size=page_size, max_prefill_tokens=16, max_num_seqs=4)
+    kw = {"page_size": page_size, "max_prefill_tokens": 16, "max_num_seqs": 4}
     _, want = _generate(path, ps, 10, 16, monkeypatch, kv_cache_dtype="fp8", **kw)
     (cp, rows, lps), got = _cp_engine(path, ps, 10, tp, **kw)
     assert (cp, rows, lps) == (tp, 1, page_size // tp)
@@ -510,7 +510,7 @@ def test_cp_engine_fewer_local_pools_than_keep(tmp_path, monkeypatch):
     path = str(tmp_path)
     glm.build(path, seed=2, index_topk=64, max_position_embeddings=4096, hidden_size=512)
     ps = glm.prompts(3, (41, 9, 66))
-    kw = dict(page_size=8, max_prefill_tokens=16, max_num_seqs=4)
+    kw = {"page_size": 8, "max_prefill_tokens": 16, "max_num_seqs": 4}
     _, want = _generate(path, ps, 8, 16, monkeypatch, kv_cache_dtype="fp8", **kw)
     _, got = _cp_engine(path, ps, 8, 2, **kw)
     assert [r.output_ids for r in got] == [r.output_ids for r in want]
@@ -540,7 +540,7 @@ def test_cp_row_groups_match_replicated(tmp_path, monkeypatch):
         vocab_size=1024,
     )
     ps = glm.prompts(6, (1400, 301, 9))
-    kw = dict(page_size=32, max_prefill_tokens=64, max_num_seqs=4, max_model_len=2048, num_pages=200)
+    kw = {"page_size": 32, "max_prefill_tokens": 64, "max_num_seqs": 4, "max_model_len": 2048, "num_pages": 200}
     assert mla.CP_LOCAL_K == 120 and mla._local_k(256, 8) == 120
     _, want = _generate(path, ps, 6, 16, monkeypatch, kv_cache_dtype="fp8", **kw)
     (cp, rows, lps), got = _cp_engine(path, ps, 6, 16, **kw)
@@ -568,11 +568,11 @@ def test_cp_engine_dump_slot_stays_zero(sparse_cp, monkeypatch):
                 for r in eng.generate(glm.prompts(4, (37, 70, 9)), SamplingParams(max_new_tokens=10, ignore_eos=True))
             ]
             d = dsa_long.cp_dump_slot(8, 2)
-            layers = [l for l in eng.model.kv_layers() if getattr(l, "pool_key", None) is not None]
+            layers = [layer for layer in eng.model.kv_layers() if getattr(layer, "pool_key", None) is not None]
             assert layers, "no DSA layer with a pool-key cache"
             rows = [
-                (l.k_cache[d].float().clone(), l.v_cache[d].float().clone(), l.pool_key[d].float().clone())
-                for l in layers
+                (layer.k_cache[d].float().clone(), layer.v_cache[d].float().clone(), layer.pool_key[d].float().clone())
+                for layer in layers
             ]
         finally:
             eng.close()
