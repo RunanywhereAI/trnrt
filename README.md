@@ -189,6 +189,9 @@ curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -
   [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md)).
 - The router listens on every interface (`--host 0.0.0.0`) and has no authentication: put it behind your own proxy, or
   pass `--host 127.0.0.1`.
+- The router keeps an idle client connection open for 75 s (`--timeout-keep-alive`). A proxy or client connection pool
+  in front of it should drop idle connections sooner than that; otherwise a request can go out on a connection the
+  router is closing.
 - Not supported, answered with 400: repetition, frequency and presence penalties, guided decoding (`response_format`
   other than text, `tool_choice` `"required"` or a named tool), prompt logprobs and thinking budgets. Every graph
   samples on the device, and these need host inputs no served graph takes.
