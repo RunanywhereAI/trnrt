@@ -14,6 +14,8 @@ permissions:
 jobs:
   analyze:
     name: Analyze (Python)
+    # Code scanning is free on public repositories; a private or internal one needs GitHub Advanced Security.
+    if: github.event.repository.visibility == 'public'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
