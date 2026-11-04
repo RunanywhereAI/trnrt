@@ -40,11 +40,11 @@ lint = ["ruff==0.17.3", "pre-commit>=4", "mypy==2.4.1"]
 dev = ["trnrt[test,lint]"]
 
 [project.urls]
-Homepage = "https://github.com/RunanywhereAI/trnrt"
-Repository = "https://github.com/RunanywhereAI/trnrt"
-Documentation = "https://github.com/RunanywhereAI/trnrt/tree/main/docs"
-Issues = "https://github.com/RunanywhereAI/trnrt/issues"
-Changelog = "https://github.com/RunanywhereAI/trnrt/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/RunanywhereAI/trnrt-glm"
+Repository = "https://github.com/RunanywhereAI/trnrt-glm"
+Documentation = "https://github.com/RunanywhereAI/trnrt-glm/tree/main/docs"
+Issues = "https://github.com/RunanywhereAI/trnrt-glm/issues"
+Changelog = "https://github.com/RunanywhereAI/trnrt-glm/blob/main/CHANGELOG.md"
 
 [project.scripts]
 trnrt = "trnrt.__main__:main"
