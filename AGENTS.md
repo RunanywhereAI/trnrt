@@ -3,7 +3,7 @@
 Guidance for coding agents and people working in this repository. `AGENTS.md` is the canonical file. `CLAUDE.md` is a
 symlink to it, which `tools/check_docs.py` enforces, so edit this file and never the link.
 
-trnrt serves LLMs on AWS Trainium2. The first model is GLM-5.3-Flash on one `trn2.48xlarge`: two engines of 32
+TrnRT serves LLMs on AWS Trainium2. The first model is GLM-5.3-Flash on one `trn2.48xlarge`: two engines of 32
 tensor-parallel ranks behind a session-affine router, with NKI decode megakernels. The map of the code is in
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 

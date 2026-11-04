@@ -33,7 +33,7 @@ docker build -f docker/Dockerfile \
   --build-arg TRNRT_REVISION=$(git rev-parse HEAD) -t trnrt .
 ```
 
-The build checks every Neuron piece trnRT imports and its version, and that the image's transformers has `glm5_next`
+The build checks every Neuron piece TrnRT imports and its version, and that the image's transformers has `glm5_next`
 (`docker/check_image.py`). Build the image on the compile host and on the serving host: the base image is about an
 8 GB download, and the built image takes 26.7 GB of disk.
 
@@ -108,7 +108,7 @@ Then the router answers on `--port`.
 - **A graph missing from the cache fails start-up.** The engines run with `NEURON_LIBTORCH_ASSERT_CACHE_HIT=1`: instead
   of compiling on the serving host (neuronx-cc, minutes to hours per graph), the engine stops and names the missing
   key, and `serve` stops every engine and exits nonzero. The cache was built for other arguments, another checkpoint
-  revision, another trnRT version or another Neuron SDK, or `NEURON_LIBTORCH_CACHE_ROOT` does not point at it.
+  revision, another TrnRT version or another Neuron SDK, or `NEURON_LIBTORCH_CACHE_ROOT` does not point at it.
   `--allow-compile` compiles the missing graphs on the spot instead; give it a `--startup-timeout` that allows for that
   (0: none).
 - **`--startup-timeout`** (default 3600 s): how long each engine has, from its start, to answer `/health`. Past it,

@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to trnrt are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/),
+All notable changes to TrnRT are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/),
 and versions follow [Semantic Versioning](https://semver.org/). Rebuild the compile cache for each release.
 
 ## [Unreleased]

@@ -59,12 +59,12 @@ safetensors headers and those decisions, without downloading the weights:
 | `strip` | Drops the NEFFs' debug info, which two engines need to fit in host memory. |
 
 At start-up an engine loads each graph from the cache. A missing graph fails the start rather than compiling on the
-serving host. A cache built for other engine arguments, another checkpoint revision, another trnrt release or another
+serving host. A cache built for other engine arguments, another checkpoint revision, another TrnRT release or another
 Neuron SDK misses.
 
 ## Adding a model family
 
-trnrt serves one model family today. The model-facing contract a second family must meet:
+TrnRT serves one model family today. The model-facing contract a second family must meet:
 
 | Layer | Today | What a new family provides |
 |---|---|---|

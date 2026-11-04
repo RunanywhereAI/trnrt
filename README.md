@@ -2,7 +2,7 @@
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/assets/banner-dark.svg">
     <source media="(prefers-color-scheme: light)" srcset="docs/assets/banner-light.svg">
-    <img alt="trnrt: the open LLM inference engine for AWS Trainium, by RunAnywhere" src="docs/assets/banner-dark.svg" width="100%">
+    <img alt="TrnRT: the open LLM inference engine for AWS Trainium, by RunAnywhere" src="docs/assets/banner-dark.svg" width="100%">
   </picture>
 </p>
 
@@ -23,15 +23,15 @@
   <a href="https://runanywhere.ai"><b>runanywhere.ai</b></a>
 </p>
 
-**trnrt** serves large language models on AWS Trainium2. It has an OpenAI-compatible API, a 1M-token context, and a
-prefix cache that spans device and host memory. Decode runs as NKI megakernels, about one kernel per layer half. The
-first supported model is **GLM-5.3-Flash** on one `trn2.48xlarge`.
+**TrnRT** is an open inference engine for large language models on AWS Trainium. It serves an OpenAI-compatible API
+from one `trn2.48xlarge`, runs decode as NKI megakernels (about one kernel per layer half), and keeps a prefix cache
+across device and host memory. **GLM-5.3-Flash is the first supported model; more open models are on the way.**
 
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/assets/cards-dark.svg">
     <source media="(prefers-color-scheme: light)" srcset="docs/assets/cards-light.svg">
-    <img alt="3.57M tokens per minute on one trn2.48xlarge (AgentX, batch 12). 24 ms decode step at 8 users, down from 34 ms. 1M-token context: first token in 190.8 s, a cached follow-up in 1.84 s. $0.040 per million tokens at the spot price." src="docs/assets/cards-dark.svg" width="100%">
+    <img alt="3.57M tokens per minute on one trn2.48xlarge (AgentX, batch 12). 24 ms decode step at 8 concurrent users, down from 34 ms. $0.040 per million tokens at the spot price, $0.167 on a capacity block." src="docs/assets/cards-dark.svg" width="100%">
   </picture>
 </p>
 
@@ -104,13 +104,24 @@ print(reply.choices[0].message.content)
 The full guide covers what each step needs, start-up checks, the batch 4, 8 and 12 configurations and every flag:
 [deploy](docs/DEPLOY.md) · [API](docs/API.md) · [configuration](docs/CONFIGURATION.md).
 
-## Supported models and hardware
+## Supported hardware and models
 
-| Model | Weights | Instance | Layout | Context | Status |
-|---|---|---|---|---|---|
-| [GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) (320B, 18B active) | FP8, as released | `trn2.48xlarge` (16 Trainium2 chips) | 2 engines × TP 32, LNC 2 | 1,048,576 | Device check in progress |
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/support-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="docs/assets/support-light.svg">
+    <img alt="Hardware: AWS Trainium2 (trn2.48xlarge, 16 chips, 96 GiB HBM each, Neuron SDK 2.32), supported. Models: GLM-5.3-Flash (320B MoE, 18B active, FP8, 1M-token context), supported. More open models: coming soon." src="docs/assets/support-dark.svg" width="100%">
+  </picture>
+</p>
 
-Adding a model family is described in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#adding-a-model-family).
+| Target | Status |
+|---|---|
+| **AWS Trainium2**, `trn2.48xlarge` (16 chips, 2 engines × TP 32, LNC 2) | ✅ Supported |
+| **[GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash)** (320B MoE, 18B active, FP8, 1M-token context) | ✅ Supported, device check of this repository in progress |
+| More open models | 🔜 Coming soon. [Request a model](https://github.com/RunanywhereAI/trnrt/issues/new?template=30-model-request.yml) |
+
+GLM-5.3-Flash is where TrnRT starts. The engine, router, caches and compile pipeline are built to carry more model
+families, and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#adding-a-model-family) describes what a new one needs.
 
 ## Benchmarks
 
@@ -186,7 +197,7 @@ change, and [SECURITY.md](SECURITY.md) to report a vulnerability.
 ## Acknowledgments
 
 Thanks to the AWS Neuron team for NKI and its documentation, to Z.ai for releasing GLM-5.3-Flash, and to SemiAnalysis
-for AgentX and its public traces. trnrt includes code derived from other Apache-2.0 projects: see [NOTICE](NOTICE)
+for AgentX and its public traces. TrnRT includes code derived from other Apache-2.0 projects: see [NOTICE](NOTICE)
 and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## License
@@ -205,3 +216,7 @@ and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
   <br>
   <sub>Built by <a href="https://runanywhere.ai">RunAnywhere</a>.</sub>
 </p>
+
+<sub>AWS, Amazon Web Services, Trainium, Inferentia and Neuron are trademarks of Amazon.com, Inc. or its affiliates. The
+AWS logo appears here as published in AWS's Architecture Icons. TrnRT is an independent open-source project, not
+affiliated with or endorsed by Amazon Web Services.</sub>

@@ -2,7 +2,7 @@
 
 ## Verification status
 
-The published numbers were measured with an earlier build of trnrt, and a graph-equivalence check
+The published numbers were measured with an earlier build of TrnRT, and a graph-equivalence check
 (`tools/graph_equiv.py`) holds this repository to compiling the same graphs as that build. A full run of that check over
 all 32 ranks and a check of this repository on a device are in progress ([RESULTS.md](RESULTS.md)).
 

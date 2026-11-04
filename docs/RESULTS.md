@@ -1,6 +1,6 @@
 # Results
 
-GLM-5.3-Flash on one AWS trn2.48xlarge, measured with an earlier build of trnrt, in the configurations this repository
+GLM-5.3-Flash on one AWS trn2.48xlarge, measured with an earlier build of TrnRT, in the configurations this repository
 reproduces ([CONFIGURATION.md](CONFIGURATION.md)). The graph-equivalence check (`tools/graph_equiv.py`) holds this
 repository to compiling the same graphs as that build. On 2 Nov 2026 it read
 EQUAL for 144 graphs on 4 of 32 ranks, before a later selection-kernel fix, and its positive control (one constant

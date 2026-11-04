@@ -23,7 +23,7 @@ Security fixes go to the latest release and to `main`.
 
 ## Deployment notes
 
-trnrt is a model server with **no authentication**:
+TrnRT is a model server with **no authentication**:
 
 - The router listens on every interface by default (`--host 0.0.0.0`). Put it behind your own proxy or gateway, or
   pass `--host 127.0.0.1`.

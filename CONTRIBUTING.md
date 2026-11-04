@@ -1,4 +1,4 @@
-# Contributing to trnrt
+# Contributing to TrnRT
 
 Thanks for helping. Bug reports, performance work, kernel fixes, docs and new model families are all welcome.
 

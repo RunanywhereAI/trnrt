@@ -1,4 +1,4 @@
-# trnrt documentation
+# TrnRT documentation
 
 | Guide | |
 |---|---|
