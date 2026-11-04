@@ -37,7 +37,7 @@ first supported model is **GLM-5.3-Flash** on one `trn2.48xlarge`.
 
 ## Highlights
 
-| | |
+| Feature | What it does |
 |---|---|
 | **NKI megakernels** | One fused kernel per layer half for decode: KDA attention, the fused DSA layer, mHC and the MoE FFN. |
 | **1M-token context** | Sparse attention (top 2,048) and linear attention, with fixed-size state. |
@@ -65,7 +65,8 @@ docker build -f docker/Dockerfile \
 ```bash
 OUT=/data/trnrt REV=eb9eb208eb0d988989d07a6a12d0fdeb5f52574a
 mkdir -p $OUT/nki $OUT/work
-trnrt() { docker run --rm -e HF_TOKEN -v $OUT:$OUT -v $OUT/nki:/var/tmp/nki-intermediate-cache trnrt "$@"; }
+trnrt() { docker run --rm -e HF_TOKEN -v $OUT:$OUT \
+  -v $OUT/nki:/var/tmp/nki-intermediate-cache trnrt "$@"; }
 trnrt compile shapes zai-org/GLM-5.3-Flash --revision $REV --out $OUT
 trnrt compile decisions --model zai-org/GLM-5.3-Flash --revision $REV --out $OUT
 trnrt compile capture --out $OUT -- --model $OUT/shapes
@@ -76,9 +77,12 @@ trnrt compile strip --out $OUT
 **3. Serve** (on the `trn2.48xlarge`, with `$OUT/cache` and `$OUT/nki` copied over)
 
 ```bash
-hf download zai-org/GLM-5.3-Flash --revision eb9eb208eb0d988989d07a6a12d0fdeb5f52574a --local-dir /models/GLM-5.3-Flash
+hf download zai-org/GLM-5.3-Flash --revision eb9eb208eb0d988989d07a6a12d0fdeb5f52574a \
+  --local-dir /models/GLM-5.3-Flash
 docker run --rm --privileged --network host --ipc=host \
-  -v /data/trnrt/cache:/cache -v /data/trnrt/nki:/var/tmp/nki-intermediate-cache -v /models/GLM-5.3-Flash:/model \
+  -v /data/trnrt/cache:/cache \
+  -v /data/trnrt/nki:/var/tmp/nki-intermediate-cache \
+  -v /models/GLM-5.3-Flash:/model \
   -e NEURON_LIBTORCH_CACHE_ROOT=/cache \
   trnrt serve --model /model --port 8000
 ```
@@ -104,7 +108,7 @@ The full guide covers what each step needs, start-up checks, the batch 4, 8 and 
 
 | Model | Weights | Instance | Layout | Context | Status |
 |---|---|---|---|---|---|
-| [GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) (320B, 18B active) | FP8, as released | `trn2.48xlarge` (16 Trainium2 chips) | 2 engines × TP 32, LNC 2 | 1,048,576 | Verification of this repository on a device is in progress |
+| [GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) (320B, 18B active) | FP8, as released | `trn2.48xlarge` (16 Trainium2 chips) | 2 engines × TP 32, LNC 2 | 1,048,576 | Device check in progress |
 
 Adding a model family is described in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#adding-a-model-family).
 
@@ -145,16 +149,16 @@ the collectives into the kernel. [docs/MEGAKERNELS.md](docs/MEGAKERNELS.md) walk
 
 ```text
 trnrt/
-├── __main__.py      CLI: serve, engine, compile
-├── serve/           OpenAI-compatible API, session-affine router, tool-call and reasoning parsers
-├── engine/          engine loop, scheduler, radix and host caches, tensor parallelism, start-up checks
-├── models/          GLM-5.3-Flash: KDA and DSA attention, mHC, MoE, FP8 loading
-├── kernels/         NKI kernels: decode megakernels, prefill kernels, in-kernel collectives
-└── compile/         offline compile pipeline: shapes, capture, neuronx-cc farm, NEFF strip
-docker/              the serving and compile image, and its build-time checks
-tools/               graph-equivalence gate and on-device output checks
-tests/               CPU test suite (no NeuronCore needed)
-docs/                guides, results, kernel notes
+├── __main__.py   CLI: serve, engine, compile
+├── serve/        OpenAI API, session-affine router, output parsers
+├── engine/       scheduler, prefix caches, tensor parallelism
+├── models/       GLM-5.3-Flash: KDA, DSA, mHC, MoE, FP8 loading
+├── kernels/      NKI decode megakernels and prefill kernels
+└── compile/      offline compile: shapes, capture, neuronx-cc, strip
+docker/           the serving and compile image
+tools/            graph-equivalence gate, device checks, doc checks
+tests/            CPU test suite (no NeuronCore needed)
+docs/             guides, results, kernel notes
 ```
 
 More in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
@@ -171,7 +175,7 @@ change, and [SECURITY.md](SECURITY.md) to report a vulnerability.
 
 ## AWS resources
 
-| | |
+| Resource | Link |
 |---|---|
 | Trainium2 and `trn2` instances | [aws.amazon.com/ec2/instance-types/trn2](https://aws.amazon.com/ec2/instance-types/trn2/) |
 | AWS Neuron SDK documentation | [awsdocs-neuron.readthedocs-hosted.com](https://awsdocs-neuron.readthedocs-hosted.com/) |
