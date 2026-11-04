@@ -291,6 +291,10 @@ def cmd_serve(argv: list[str]) -> int:
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8000, help="the router's port; engine i listens on port + 1 + i")
     ap.add_argument("--served-model-name", default="glm")
+    ap.add_argument("--timeout-keep-alive", type=int, default=75,
+                    help="seconds the router keeps an idle client connection open. Above common client pools' "
+                         "keep-alive (aiohttp: 15 s): at uvicorn's default 5 s a client could send on a connection the "
+                         "router was closing")
     ap.add_argument("--startup-timeout", type=float, default=3600.0,
                     help="seconds each engine has, from its start, to load and warm every graph and answer /health "
                          "(0: no limit); past it every engine is stopped and serve exits 1")
@@ -301,7 +305,8 @@ def cmd_serve(argv: list[str]) -> int:
     # ranks load collective graphs at the same moment collide in the runtime's collectives bootstrap.
     env = dict(os.environ, **compile_env(a.allow_compile))
     env.setdefault("TRNRT_START_LOCK", os.path.join("/tmp", f"trnrt-start-lock-{a.port}"))
-    engine_argv = _without(_without(argv, "--engines"), "--startup-timeout")  # --allow-compile goes on: engine takes it
+    # --engines, --startup-timeout and --timeout-keep-alive are serve's own; --allow-compile goes on: engine takes it
+    engine_argv = _without(_without(_without(argv, "--engines"), "--startup-timeout"), "--timeout-keep-alive")
     procs: list[subprocess.Popen] = []
     urls = []
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(128 + signal.SIGTERM))  # unwind through the finally below
@@ -319,7 +324,7 @@ def cmd_serve(argv: list[str]) -> int:
 
         from .serve.router import Router, build_router_app
 
-        uvicorn.run(build_router_app(Router(urls)), host=a.host, port=a.port)
+        uvicorn.run(build_router_app(Router(urls)), host=a.host, port=a.port, timeout_keep_alive=a.timeout_keep_alive)
     finally:
         for p in procs:
             if p.poll() is None:

@@ -555,11 +555,13 @@ def main() -> None:
                     help="comma list of the engines' base URLs, e.g. http://127.0.0.1:8111,http://127.0.0.1:8112")
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8000)
+    ap.add_argument("--timeout-keep-alive", type=int, default=75,
+                    help="seconds an idle client connection stays open (above aiohttp's 15 s pool keep-alive)")
     args = ap.parse_args()
     import uvicorn
 
     router = Router([u.rstrip("/") for u in args.worker_urls.split(",") if u])
-    uvicorn.run(build_router_app(router), host=args.host, port=args.port)
+    uvicorn.run(build_router_app(router), host=args.host, port=args.port, timeout_keep_alive=args.timeout_keep_alive)
 
 
 if __name__ == "__main__":
