@@ -27,6 +27,7 @@ docker run --rm --entrypoint python trnrt -m pytest
 | NKI simulator | Kernels against their reference in the NKI simulator | The Neuron venv's `nki` package; skipped otherwise |
 | Checkpoint | API tests over the real model; the KDA shell on the checkpoint's own weights | `TRNRT_TEST_MODEL` / `TRNRT_TEST_GLM_CKPT` = a local GLM-5.3-Flash directory |
 | Hub | Tests that read the model's small files (config, tokenizer, chat template, safetensors headers) from the Hub | `TRNRT_TEST_NETWORK=1` |
+| Private trace scan | `tests/test_no_trace.py`'s scan for the maintainers' private patterns, and its positive control | `TRNRT_TRACE_PATTERNS` = the maintainers' patterns file, kept outside the repository |
 | Graph equivalence | `tools/graph_equiv.py` over captured graphs | `libtorch_neuronx_lite`, or `HLO_PB2_PATH` = a directory holding `hlo_pb2.py`, plus `zstd` |
 | Device | `docker/check_image.py --device`, `tools/check_mixed.py`, serving | A Trainium2 host |
 
