@@ -5,6 +5,7 @@ processes and a fake /health: nothing is loaded or served."""
 
 import os
 import signal
+import sys
 import time
 
 import pytest
@@ -59,7 +60,7 @@ class FakeEngine:
 
 class FakeHost:
     def __init__(self):
-        self.events, self.engines, self.plan, self.router = [], [], [], None
+        self.events, self.engines, self.plan, self.router, self.router_kw = [], [], [], None, None
 
 
 def _unset(monkeypatch, name):
@@ -87,8 +88,8 @@ def host(monkeypatch):
                 return httpx.Response(e.health())
         raise httpx.ConnectError("connection refused")
 
-    def run(app, host=None, port=None):
-        h.router = app
+    def run(app, host=None, port=None, **kw):
+        h.router, h.router_kw = app, kw
         h.events.append(("router", port))
 
     monkeypatch.setattr(cli.subprocess, "Popen", popen)
@@ -110,6 +111,29 @@ def test_serve_starts_one_engine_at_a_time_with_the_cache_hit_assertion(host):
         assert _last(e.cmd, "--core-base") == str(32 * i) and _last(e.cmd, "--host") == "127.0.0.1"
         assert "--engines" not in e.cmd and "--startup-timeout" not in e.cmd and "--allow-compile" not in e.cmd
         assert e.signals == [signal.SIGTERM]  # the router returned: serve stops its engines
+
+
+def test_serve_gives_the_router_its_keep_alive_and_not_the_engines(host):
+    """uvicorn's default keep-alive (5 s) is under a client pool's (aiohttp: 15 s): the router keeps 75 s by default."""
+    assert cli.cmd_serve(["--model", "m"]) == 0
+    assert host.router_kw["timeout_keep_alive"] == 75
+    host.engines.clear()
+    assert cli.cmd_serve(["--model", "m", "--timeout-keep-alive", "120"]) == 0
+    assert host.router_kw["timeout_keep_alive"] == 120
+    assert all("--timeout-keep-alive" not in e.cmd for e in host.engines)  # serve's own flag: an engine would refuse it
+
+
+def test_router_main_passes_its_keep_alive(monkeypatch):
+    import uvicorn
+
+    from trnrt.serve import router
+
+    got = {}
+    monkeypatch.setattr(uvicorn, "run", lambda app, **kw: got.update(kw))
+    for extra, want in (([], 75), (["--timeout-keep-alive", "5"], 5)):
+        monkeypatch.setattr(sys, "argv", ["router", "--worker-urls", "http://127.0.0.1:9", *extra])
+        router.main()
+        assert got["timeout_keep_alive"] == want
 
 
 def test_allow_compile_turns_the_assertion_off_in_the_engines(host, monkeypatch):
