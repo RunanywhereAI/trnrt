@@ -39,8 +39,9 @@ The build checks every Neuron piece trnRT imports and its version, and that the 
 
 ### 3. Build the compile cache (CPU host)
 
-A graph depends on the weights' shapes and dtypes, never their values. So the cache is built from the checkpoint's
-config and safetensors headers (a few MB, read without downloading the weights) on a host without NeuronCores:
+A graph depends on the weights' shapes and dtypes, and on MoE packing decisions read from a few weight values per
+layer (`decisions`), never on the rest of the values. So the cache is built from the checkpoint's config and safetensors
+headers (a few MB) plus those reads, without downloading the weights, on a host without NeuronCores:
 
 ```bash
 OUT=/data/trnrt                               # everything goes under one directory

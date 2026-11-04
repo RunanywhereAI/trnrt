@@ -28,7 +28,8 @@ Nothing here needs a Trainium device. Device-only work (`docker/check_image.py -
    ladders, the pool sizes, the page size or a decode kernel route (`trnrt/config.py`, `trnrt/__main__.py` defaults).
    Make such a change only on purpose, prove it with `tools/graph_equiv.py`, and say so in the PR. Never run a
    formatter over these paths. The repository has no formatter configured for this reason.
-2. **`trnrt.__version__` is part of every cache key.** Bump it only for a release ([docs/DEVELOPMENT.md](docs/DEVELOPMENT.md#releasing)).
+2. **Bump `trnrt.__version__` only for a release** ([docs/DEVELOPMENT.md](docs/DEVELOPMENT.md#releasing)). Captures
+   record it, and each release gets its own compile cache.
 3. **Every argparse parser passes `allow_abbrev=False`** (`tests/test_no_abbrev.py`): one parser's argv is handed to
    another, and an abbreviation silently became a different flag once.
 4. **The published tree names nothing it must not.** `tests/test_no_trace.py` scans every tracked file, path and

@@ -46,8 +46,9 @@
 
 ## Compile pipeline
 
-A graph depends on the weights' shapes and dtypes, never their values. So `trnrt compile` builds every graph on a
-CPU host, from the checkpoint's config and safetensors headers:
+A graph depends on the weights' shapes and dtypes, plus the MoE packing decisions that `decisions` reads from a few
+weight values per layer. So `trnrt compile` builds every graph on a CPU host, from the checkpoint's config,
+safetensors headers and those decisions, without downloading the weights:
 
 | Step | Does |
 |---|---|
@@ -58,8 +59,8 @@ CPU host, from the checkpoint's config and safetensors headers:
 | `strip` | Drops the NEFFs' debug info, which two engines need to fit in host memory. |
 
 At start-up an engine loads each graph from the cache. A missing graph fails the start rather than compiling on the
-serving host. The cache key covers the graph code, the engine arguments, the checkpoint revision, the trnrt version and the Neuron
-SDK.
+serving host. A cache built for other engine arguments, another checkpoint revision, another trnrt release or another
+Neuron SDK misses.
 
 ## Adding a model family
 
@@ -69,10 +70,12 @@ trnrt serves one model family today. The model-facing contract a second family m
 |---|---|---|
 | Config | `ModelConfig.from_config_dict` dispatches on `architectures` to `glm5_next.config_from_hf` | A `config_from_hf` for its architecture names |
 | Weights | `loader.ARCHITECTURES` maps the architecture to `DecoderForCausalLM`, and the loader knows GLM's tensor names | Its tensor-name map and any packing |
-| Model | `ModelRunner` calls `kv_shapes`, `bind_kv_cache`, `state_shapes`, `token_state_shapes`, `forward_decode`, `forward_prefill`, `layer_kind` and `group_fn` | The same methods on its model class |
+| Model | `ModelRunner` calls `kv_shapes`, `bind_kv_cache`, `aux_kv_shapes`, `bind_aux_kv`, `state_shapes`, `token_state_shapes`, `forward_decode`, `forward_prefill`, `layer_kind` and `group_fn` | The same methods on its model class |
 | Engine | `engine.py` sets the KDA and DSA decode routes and requires recurrent state | Its own routes, or none |
 | Chat | `serve/parsers.py` parses GLM's reasoning and tool-call format | A parser for its output format |
 
-The engine, scheduler, caches, router, compile pipeline and tensor parallelism are already model-independent. Open a
+The router, the page pool, the sampler, tensor parallelism and the compile cache layout do not depend on the model.
+The engine, scheduler and prefix caches still assume a hybrid model with recurrent state (the engine refuses a model
+without it), and the compile steps know GLM's tensor names. A second family starts by lifting those assumptions. Open a
 [model request](https://github.com/RunanywhereAI/trnrt/issues/new?template=30-model-request.yml) to discuss a family
 before starting on one.

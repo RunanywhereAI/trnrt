@@ -2,6 +2,9 @@
 
 import importlib.util
 import os
+import subprocess
+
+import pytest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _spec = importlib.util.spec_from_file_location("check_docs", os.path.join(ROOT, "tools", "check_docs.py"))
@@ -9,6 +12,11 @@ cd = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(cd)
 
 
+def _is_git(root):
+    return subprocess.run(["git", "-C", root, "rev-parse", "--git-dir"], capture_output=True).returncode == 0
+
+
+@pytest.mark.skipif(not _is_git(ROOT), reason="needs the git checkout (lists the tracked Markdown); the image has none")
 def test_the_repository_docs_have_no_broken_links():
     assert cd.main([]) == 0
 

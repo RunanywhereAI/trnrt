@@ -1,8 +1,7 @@
 # Changelog
 
 All notable changes to trnrt are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/),
-and versions follow [Semantic Versioning](https://semver.org/). A version change also changes the compile cache's
-keys, so a cache is rebuilt for each release.
+and versions follow [Semantic Versioning](https://semver.org/). Rebuild the compile cache for each release.
 
 ## [Unreleased]
 

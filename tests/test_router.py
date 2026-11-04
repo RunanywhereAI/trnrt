@@ -248,8 +248,9 @@ def test_router_health_and_models_follow_the_workers():
     asyncio.run(main())
 
 
-@pytest.mark.parametrize("body", [b"{not json", b"[1, 2]", b'"text"', b"\xff\xfe"])
-def test_a_body_that_is_not_a_json_object_is_answered_400_and_reaches_no_worker(body):
+@pytest.mark.parametrize("path", ["/v1/chat/completions", "/v1/completions"])
+@pytest.mark.parametrize("body", [b"{not json", b"[1, 2]", b'"text"', b"null", b"true", b"3", b"", b"\xff\xfe"])
+def test_a_body_that_is_not_a_json_object_is_answered_400_and_reaches_no_worker(path, body):
     """The router refuses a malformed body, or JSON that is not an object, with 400, as each engine does, instead of
     raising inside the proxy (500). No worker sees the request."""
     import asyncio
@@ -264,7 +265,7 @@ def test_a_body_that_is_not_a_json_object_is_answered_400_and_reaches_no_worker(
         servers, tasks = await _start([(worker, ports[0]), (build_router_app(router, poll_s=0), ports[1])])
         try:
             async with httpx.AsyncClient(timeout=30) as c:
-                r = await c.post(f"http://127.0.0.1:{ports[1]}/v1/chat/completions", content=body,
+                r = await c.post(f"http://127.0.0.1:{ports[1]}{path}", content=body,
                                  headers={"Content-Type": "application/json"})
                 assert r.status_code == 400, r.text
                 assert r.json()["detail"] == "the request body must be a JSON object"

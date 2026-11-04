@@ -52,8 +52,8 @@ Dependabot keeps the pinned actions current. Every third-party action is pinned 
 
 ## Releasing
 
-1. Bump `__version__` in `trnrt/__init__.py`. The version is part of every compile-cache key, so caches built for the
-   old version stop matching. Move `CHANGELOG.md`'s Unreleased entries under the new version.
+1. Bump `__version__` in `trnrt/__init__.py` and move `CHANGELOG.md`'s Unreleased entries under the new version.
+   Rebuild the compile cache for every release: a release can change graphs, and a mismatched cache fails start-up.
 2. Merge to `main`, then tag: `git tag v0.2.0 && git push origin v0.2.0`.
 3. To publish to PyPI as well, configure a trusted publisher for the `pypi` environment, and set the repository
    variable `PUBLISH_PYPI` to `true`.
