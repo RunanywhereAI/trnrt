@@ -19,13 +19,15 @@
   <a href="docs/RESULTS.md"><b>Benchmarks</b></a> ·
   <a href="docs/README.md"><b>Docs</b></a> ·
   <a href="docs/MEGAKERNELS.md"><b>Kernels</b></a> ·
-  <a href="https://runanywhere.ai/blog"><b>Blog</b></a> ·
+  <a href="https://runanywhere.ai/blog/glm-5-3-flash-trainium2-nki-megakernels"><b>Blog post</b></a> ·
   <a href="https://runanywhere.ai"><b>runanywhere.ai</b></a>
 </p>
 
 **TrnRT** is an open inference engine for large language models on AWS Trainium. It serves an OpenAI-compatible API
 from one `trn2.48xlarge`, runs decode as NKI megakernels (about one kernel per layer half), and keeps a prefix cache
 across device and host memory. **GLM-5.3-Flash is the first supported model; more open models are on the way.**
+
+How we built it, with the AgentX results: [Serving GLM-5.3-Flash on one Trainium2 box with NKI layer megakernels](https://runanywhere.ai/blog/glm-5-3-flash-trainium2-nki-megakernels).
 
 <p align="center">
   <picture>
