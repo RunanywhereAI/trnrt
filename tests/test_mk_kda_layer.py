@@ -41,10 +41,10 @@ def _params(f: ast.FunctionDef) -> list[str]:
 def split_kernel_errors(fbsrc: str, msrc: str) -> list[str]:
     f = _params(_fn(fbsrc, "ffn_half_kernel"))
     k = _fn(msrc, "mk_ffn_b5_kernel")
-    bad = [] if _params(k) == f + ["frev"] else [f"parameters {_params(k)}, want the FFN half kernel's + frev"]
+    bad = [] if _params(k) == [*f, "frev"] else [f"parameters {_params(k)}, want the FFN half kernel's + frev"]
     calls = [c for c in ast.walk(k) if isinstance(c, ast.Call) and ast.unparse(c.func) == "_ffn_body"]
     if len(calls) != 1:
-        return bad + [f"{len(calls)} _ffn_body calls, want 1"]
+        return [*bad, f"{len(calls)} _ffn_body calls, want 1"]
     got = [ast.unparse(a) for a in calls[0].args]
     want = [{"dbg": "0", "rev": "frev"}.get(p, p) for p in f]
     if got != want or calls[0].keywords:

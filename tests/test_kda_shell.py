@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import pathlib
 from types import SimpleNamespace
 
 import pytest
@@ -35,7 +36,7 @@ from trnrt.models.decoder import rms_norm
 H, NV, D, K, LB, EPS = 4096, 2, 128, 4, -5.0, 1e-5
 CD = 3 * NV * D
 HC, ITERS, HC_EPS = 4, 20, 1e-6
-O = 2 * HC + HC * HC
+n_mix = 2 * HC + HC * HC
 NKI = importlib.util.find_spec("nki") is not None
 bf = torch.bfloat16
 
@@ -83,7 +84,7 @@ def stand_in(seed: int, R: int = 9):
         cfg=SimpleNamespace(rms_norm_eps=EPS, hybrid=None),
         dtype=bf,
         page_size=256,
-        _w=lambda layer, name: getattr(layer, name),
+        _w=getattr,
     )
     return m, L, g
 
@@ -149,10 +150,10 @@ def test_a_wrong_gate_is_caught():
 
 def case(T: int, seed: int, npg: int):
     """The stand-in layer plus a hyper-connection, T rows."""
-    m, L, g = stand_in(seed, R=2 * T + 1)
+    _m, L, g = stand_in(seed, R=2 * T + 1)
     R = L.rec_state.shape[0]
-    fn = (torch.randn(O, HC * H, generator=g) * 0.02).to(bf)
-    base = torch.randn(O, generator=g) * 0.5
+    fn = (torch.randn(n_mix, HC * H, generator=g) * 0.02).to(bf)
+    base = torch.randn(n_mix, generator=g) * 0.5
     scale = torch.rand(3, generator=g) + 0.5
     S = (torch.randn(T, HC, H, generator=g) * 0.5).to(bf)
     positions = torch.arange(T) + 7
@@ -163,7 +164,16 @@ def case(T: int, seed: int, npg: int):
     post_p = torch.rand(T, HC, generator=g) * 2
     comb_p = torch.softmax(torch.randn(T, HC, HC, generator=g), -1)
     Yp = (torch.randn(npg, T, H, generator=g) * 0.3).to(bf)
-    return dict(L=L, fn=fn, base=base, scale=scale, S=S, slots=slots, wcat=wcat, pend=(post_p, comb_p, Yp))
+    return {
+        "L": L,
+        "fn": fn,
+        "base": base,
+        "scale": scale,
+        "S": S,
+        "slots": slots,
+        "wcat": wcat,
+        "pend": (post_p, comb_p, Yp),
+    }
 
 
 def emulated(c, npg: int, mix: bool, lb: float = LB):
@@ -196,10 +206,10 @@ def emulated(c, npg: int, mix: bool, lb: float = LB):
 
 
 def test_arrange_fn_is_h_layout_per_stream():
-    fn = torch.randn(O, HC * H)
+    fn = torch.randn(n_mix, HC * H)
     f = SH.arrange_fn(fn, HC)
     W = H // 128
-    assert f.shape == (128, HC, W, O)
+    assert f.shape == (128, HC, W, n_mix)
     for p, n, j, o in ((0, 0, 0, 0), (5, 2, 31, 17), (127, 3, 7, 23)):
         assert f[p, n, j, o] == fn[o, n * H + p * W + j]
 
@@ -356,7 +366,7 @@ def _rec_rel(want, got):
 
 @pytest.mark.skipif(not NKI, reason="needs the NKI package (Neuron venv)")
 @pytest.mark.parametrize(
-    "T,grid,mix",
+    ("T", "grid", "mix"),
     [
         (1, 1, False),
         (2, 1, True),
@@ -507,14 +517,14 @@ def _pinned(c, x, grid: int, conv, rec, qkv=None):
 
 
 @pytest.mark.skipif(not NKI, reason="needs the NKI package (Neuron venv)")
-@pytest.mark.parametrize("T,grid,mix", [(8, 2, False), (8, 1, False), (8, 2, True), (5, 2, True)])
+@pytest.mark.parametrize(("T", "grid", "mix"), [(8, 2, False), (8, 1, False), (8, 2, True), (5, 2, True)])
 def test_with_x_pinned_the_state_is_tight(T, grid, mix, monkeypatch):
     """The emulation's KDA half on the kernel's own x: the partials and the states then meet the half's tight bounds
     (rec rtol 1e-3 / atol 1e-4, as the emulation check above with x shared). That the prologue here is the shell's: its
     post and comb equal the shell's bit for bit."""
     monkeypatch.setenv("NEURON_PLATFORM_TARGET_OVERRIDE", "trn2")
     seed = 30 + 4 * T + grid
-    want, got = _simulated(T, grid, mix, seed=seed)
+    _want, got = _simulated(T, grid, mix, seed=seed)
     c = case(T, seed, grid)
     x, post, comb = _kernel_x(c, grid, mix)
     assert torch.equal(post, got[1]) and torch.equal(comb, got[2])
@@ -592,7 +602,7 @@ def _seam(grid: int, steps: int = 12, skip_write_at: int | None = None, pin_qkv:
         _, pconv, prec = _pinned(c, x, grid, pconv, prec, qkv=qkv)
         u = _bf16_ulps(kconv[rows], pconv[rows])
         rec = (krec[rows] - prec[rows]).abs().flatten(2).amax(-1)  # [seq, head]
-        out.append(dict(pin=torch.equal(xpost, post), ulps=int(u.max()), ndiff=int((u > 0).sum()), rec=rec))
+        out.append({"pin": torch.equal(xpost, post), "ulps": int(u.max()), "ndiff": int((u > 0).sum()), "rec": rec})
     return out
 
 
@@ -659,7 +669,7 @@ def _released_hc(layer: int = 0) -> dict:
 
     from safetensors import safe_open
 
-    idx = json.load(open(os.path.join(CKPT, "model.safetensors.index.json")))["weight_map"]
+    idx = json.loads(pathlib.Path(CKPT, "model.safetensors.index.json").read_text())["weight_map"]
     out = {}
     for n in ("fn", "base", "scale"):
         k = f"model.language_model.layers.{layer}.hc_attn_{n}"
@@ -694,7 +704,7 @@ def test_the_prologue_under_the_released_prior(monkeypatch):
 
 
 @pytest.mark.skipif(not NKI, reason="needs the NKI package (Neuron venv)")
-@pytest.mark.parametrize("T,grid,mix", [(1, 2, False), (5, 2, True), (8, 2, False), (8, 1, True)])
+@pytest.mark.parametrize(("T", "grid", "mix"), [(1, 2, False), (5, 2, True), (8, 2, False), (8, 1, True)])
 def test_the_row_batched_recurrence_is_the_pair_pipeline_bit_for_bit(T, grid, mix, monkeypatch):
     """recb 1 (rows batched, stage-major: served from BATCH_MIN_T rows) against recb 0 (the pair pipeline, served below)
     on the same inputs: the
@@ -748,7 +758,9 @@ def test_the_row_batched_recurrence_is_the_pair_pipeline_bit_for_bit(T, grid, mi
 
 
 @pytest.mark.skipif(not NKI, reason="needs the NKI package (Neuron venv)")
-@pytest.mark.parametrize("T,grid,mix", [(1, 2, False), (5, 2, True), (8, 2, False), (8, 1, True), (16, 2, False)])
+@pytest.mark.parametrize(
+    ("T", "grid", "mix"), [(1, 2, False), (5, 2, True), (8, 2, False), (8, 1, True), (16, 2, False)]
+)
 def test_the_batched_xn_is_the_per_row_xn_bit_for_bit(T, grid, mix, monkeypatch):
     """The batched xn (two vector ops over [128, W, B], rx broadcast along W and in_norm along B; served at every T but
     XNB_SKIP_T) against the per-row loop (two ops a row; served at XNB_SKIP_T, where it is faster) on the same inputs:
@@ -803,7 +815,7 @@ def test_the_batched_xn_is_the_per_row_xn_bit_for_bit(T, grid, mix, monkeypatch)
 
 @pytest.mark.skipif(not NKI, reason="needs the NKI package (Neuron venv)")
 @pytest.mark.parametrize(
-    "T,grid,mix,pad",
+    ("T", "grid", "mix", "pad"),
     [(1, 2, False, False), (4, 2, True, False), (6, 2, False, True), (8, 2, False, False), (8, 1, True, True)],
 )
 def test_the_batched_conv_is_the_row_at_a_time_conv_bit_for_bit(T, grid, mix, pad, monkeypatch):
@@ -894,9 +906,9 @@ def test_the_batched_conv_traces_fewer_transposes(monkeypatch):
         calls = []
         real = nki.isa.nc_matmul
 
-        def spy(*a, **kw):
-            calls.append(1)
-            return real(*a, **kw)
+        def spy(*a, _calls=calls, _real=real, **kw):
+            _calls.append(1)
+            return _real(*a, **kw)
 
         monkeypatch.setattr(nki.isa, "nc_matmul", spy)
         KS.run(
@@ -935,7 +947,7 @@ def test_the_per_row_xn_is_kept_at_the_skip_row_count():
     """The batched xn costs more than the per-row form at XNB_SKIP_T rows: the kernel's guards keep the per-row loop
     there, in the hashed source (so a NEFF of one form is never served for the other)."""
     assert KS.XNB is True and KS.XNB_SKIP_T == 6
-    src = open(KS.__file__).read()
+    src = pathlib.Path(KS.__file__).read_text()
     span = src[src.index("try:  # the Neuron venv") : src.index("    kda_shell_kernel = None")]
     assert span.count("if XNB and B != XNB_SKIP_T:") == 1
     assert span.count("for b in range(0 if XNB and B != XNB_SKIP_T else B):") == 1
@@ -1087,7 +1099,7 @@ def test_decode_passes_the_layer_through(monkeypatch):
     reduced = []
     model = SimpleNamespace(cfg=_cfg(), _attn_all_reduce=lambda x: reduced.append(x) or x * 2)
     S = torch.zeros(2, HC, H, dtype=bf)
-    out, (post, comb, Y) = KS.decode(model, layer, S, torch.tensor([0, 5]), torch.tensor([2, 4]))
+    out, (_post, _comb, Y) = KS.decode(model, layer, S, torch.tensor([0, 5]), torch.tensor([2, 4]))
     R = layer.rec_state.shape[0]
     assert out is S and seen["slots"].tolist() == [[R - 1, 4], [2, 4]]
     assert seen["grid"] == 2 and seen["iters"] == ITERS and seen["hc_eps"] == HC_EPS and seen["lb"] == LB

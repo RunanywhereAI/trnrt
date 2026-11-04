@@ -102,9 +102,12 @@ def test_moe_pairs_halves_sum_to_the_whole_kernel(monkeypatch):
         topv = (torch.rand(T, 8, generator=g) + 0.1).bfloat16()
         args = mdd.pairs_inputs(x, topv, topi, blob, act=1, limit=10.0)
         assert args["spl"] == 1
-        run = lambda grid, **kw: mdd.from_pairs(
-            torch.as_tensor(_sim(mdd.pairs_kernel(), grid, **dict(args, **kw))), torch.float32
-        )
+
+        def run(grid, *, base_args=args, **kw):
+            return mdd.from_pairs(
+                torch.as_tensor(_sim(mdd.pairs_kernel(), grid, **dict(base_args, **kw))), torch.float32
+            )
+
         one, two, again = run(1), run(2), run(2)
         want = mdd.emulate_pairs(x, topv, topi, blob, 1, 10.0).float()
         assert torch.equal(two, again), T

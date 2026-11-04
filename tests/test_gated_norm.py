@@ -5,6 +5,7 @@ venv only)."""
 from __future__ import annotations
 
 import importlib.util
+import pathlib
 
 import pytest
 import torch
@@ -49,7 +50,7 @@ def test_rev_is_the_kernel_span_and_p():
     """REV is a CRC of the span holding the kernel (its def inside it) and of P, the constant it reads."""
     import zlib
 
-    src = open(gn.__file__).read()
+    src = pathlib.Path(gn.__file__).read_text()
     a = src.index("# -- the kernel (its span is what REV hashes)")
     b = src.index("    gated_norm2_kernel = None", a)
     assert "def gated_norm2_kernel(" in src[a:b] and "nisa.activation_reduce" in src[a:b]

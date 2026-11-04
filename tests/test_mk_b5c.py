@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import pathlib
 import zlib
 
 import pytest
@@ -85,7 +86,7 @@ def test_the_reference_layout_is_the_docstrings():
     assert y[1, 389] == 1 and y.float().abs().sum() == 1
 
 
-SRC = open(MK.__file__).read()
+SRC = pathlib.Path(MK.__file__).read_text()
 
 
 def test_the_served_rev_span_holds_none_of_the_chunked_code_and_revc_is_its_own():
@@ -114,7 +115,7 @@ def test_the_chunked_kernel_is_the_served_one_but_for_its_glue():
     ]
 
 
-@pytest.mark.parametrize("T,chunked", [(2, False), (4, False), (6, False), (8, False), (12, True), (16, True)])
+@pytest.mark.parametrize(("T", "chunked"), [(2, False), (4, False), (6, False), (8, False), (12, True), (16, True)])
 def test_decode_layer_split_picks_the_served_kernel_at_eight_rows_or_fewer(T, chunked):
     """The dispatch rule as decode_layer_split computes it, at H 4096 and grid 2: a program's rows x H / 128 > 128
     takes the chunked kernel and REVC; T <= 8 keeps the served kernel and REV (no graph of 8 rows or fewer moves)."""

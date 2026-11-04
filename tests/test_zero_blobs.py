@@ -98,7 +98,7 @@ def test_ffn_half_pack_pads_with_zeros(monkeypatch):
     _nan_empty(monkeypatch)
     E, H, Is, hc = 8, 256, 8, 4
     L = fp8_layer(E, H, Is)
-    O = 2 * hc + hc * hc
+    n_mix = 2 * hc + hc * hc
     b = FH.pack(
         L.router,
         L.router_bias,
@@ -106,9 +106,9 @@ def test_ffn_half_pack_pads_with_zeros(monkeypatch):
         L.shared_gate_up_scale,
         L.shared_down,
         L.shared_down_scale,
-        torch.zeros(O, hc * H),
+        torch.zeros(n_mix, hc * H),
         torch.ones(H),
-        torch.zeros(O),
+        torch.zeros(n_mix),
         torch.ones(3),
         npg=2,
     )

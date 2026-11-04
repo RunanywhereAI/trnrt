@@ -106,7 +106,7 @@ FORMS = [(1, 0, 0), (2, 0, 0), (4, 1, 1), (6, 1, 1), (8, 1, 1), (4, 0, 1), (4, 1
 
 @pytest.mark.skipif(not NKI, reason="needs the NKI package (Neuron venv)")
 @pytest.mark.parametrize("regime", ["warmup", "real", "pad"])
-@pytest.mark.parametrize("T,recb,cbat", FORMS)
+@pytest.mark.parametrize(("T", "recb", "cbat"), FORMS)
 def test_the_zero_row_is_the_skip_bit_for_bit(T, recb, cbat, regime, monkeypatch):
     """post, comb, P and the pools' first R rows equal the skip's bit for bit, and the zero row is still zero."""
     off, on, R = _pair(T, recb, cbat, regime, monkeypatch)
@@ -120,7 +120,7 @@ def test_the_zero_row_is_the_skip_bit_for_bit(T, recb, cbat, regime, monkeypatch
 
 
 @pytest.mark.skipif(not NKI, reason="needs the NKI package (Neuron venv)")
-@pytest.mark.parametrize("T,recb,cbat", [(2, 0, 0), (4, 1, 1), (4, 0, 1), (4, 1, 0)])
+@pytest.mark.parametrize(("T", "recb", "cbat"), [(2, 0, 0), (4, 1, 1), (4, 0, 1), (4, 1, 0)])
 def test_a_planted_zero_row_shows(T, recb, cbat, monkeypatch):
     """The positive control: the zero row planted nonzero, warmup's rows (every one reads it) change: P and both written
     pools differ from the skip's. Had the reads missed row R, they would not."""

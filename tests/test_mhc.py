@@ -79,7 +79,7 @@ def test_mix_takes_on_a_device_within_its_shapes():
 
 
 @needs_nki
-@pytest.mark.parametrize("T,H", [(1, 256), (4, 256), (4, 4096), (8, 4096)])
+@pytest.mark.parametrize(("T", "H"), [(1, 256), (4, 256), (4, 4096), (8, 4096)])
 def test_mix_simulator_equals_emulation(T, H, monkeypatch):
     import nki
 
@@ -181,7 +181,7 @@ def test_pre_takes_on_a_device_within_its_shapes():
 def _sim_pre(T: int, H: int, seed: int, sig: int = mp.SIGMOID, skf: int = mp.SK):
     import nki
 
-    model, layer, S = stand_in(T, H, seed)
+    _model, layer, S = stand_in(T, H, seed)
     x, post, comb = nki.simulate(mp.mhc_pre_kernel)(
         S=_bf(S.reshape(T, HC * H)),
         fn=_bf(layer.hc_attn_fn),
@@ -204,13 +204,13 @@ def _sim_pre(T: int, H: int, seed: int, sig: int = mp.SIGMOID, skf: int = mp.SK)
 
 
 @needs_nki
-@pytest.mark.parametrize("T,H", [(1, 256), (4, 256), (4, 4096), (8, 4096)])
+@pytest.mark.parametrize(("T", "H"), [(1, 256), (4, 256), (4, 4096), (8, 4096)])
 def test_pre_simulator_matches_emulation(T, H, monkeypatch):
     """x: the kernel differs from the host's in its last fp32 bits (summation order, the scalar engine's functions),
     so an x differs where the hc-term sum cancels (|x| far below the terms) or sits at a bf16 rounding boundary: within
     one bf16 ulp of x plus 1e-6 of the terms' magnitude. comb: well inside the gap one Sinkhorn round makes."""
     monkeypatch.setenv("NEURON_PLATFORM_TARGET_OVERRIDE", "trn2")
-    model, layer, S = stand_in(T, H, T + H)
+    _model, layer, S = stand_in(T, H, T + H)
     (x, post, comb), (wx, wpost, wcomb) = _sim_pre(T, H, seed=T + H)
     ulp = (x.bfloat16().view(torch.int16).int() - wx.view(torch.int16).int()).abs()
     terms = S.float().abs().sum(1)
@@ -219,7 +219,7 @@ def test_pre_simulator_matches_emulation(T, H, monkeypatch):
     assert (post - wpost).abs().max() <= 1e-6
     err = (comb - wcomb).abs().max().item()
     a = list(pre_args(layer, S))
-    gap = min((mp.emulate(*(a[:4] + [n] + a[5:]))[2] - wcomb).abs().max().item() for n in (ITERS - 1, ITERS + 1))
+    gap = min((mp.emulate(*([*a[:4], n, *a[5:]]))[2] - wcomb).abs().max().item() for n in (ITERS - 1, ITERS + 1))
     assert err <= 1e-5 and err < gap / 100, (err, gap)
 
 
@@ -236,15 +236,15 @@ def test_sinkhorn_eps_in_the_reduce(T, monkeypatch):
     (x0, p0, c0), _ = _sim_pre(T, 256, seed=T + 7, skf=0)
     (x1, p1, c1), _ = _sim_pre(T, 256, seed=T + 7, skf=1)
     assert torch.equal(c1, c0) and torch.equal(x1, x0) and torch.equal(p1, p0)
-    O, z = HC * (2 + HC), np.zeros
+    n_mix, z = HC * (2 + HC), np.zeros
 
     def adds(skf, frontend):
         m = str(
             source_to_mlir(
                 mp.mhc_pre_kernel,
                 S=z((T, HC * 4096), ml_dtypes.bfloat16),
-                fn=z((O, HC * 4096), ml_dtypes.bfloat16),
-                base=z((O,), np.float32),
+                fn=z((n_mix, HC * 4096), ml_dtypes.bfloat16),
+                base=z((n_mix,), np.float32),
                 scale=z((3,), np.float32),
                 hc=HC,
                 iters=ITERS,
@@ -269,13 +269,13 @@ def test_pre_parser_takes_the_kernel(T):
     import ml_dtypes
     from nki.compiler.frontend import FrontendKind, source_to_mlir
 
-    H, z, O = 4096, np.zeros, HC * (2 + HC)
+    H, z, n_mix = 4096, np.zeros, HC * (2 + HC)
     assert str(
         source_to_mlir(
             mp.mhc_pre_kernel,
             S=z((T, HC * H), ml_dtypes.bfloat16),
-            fn=z((O, HC * H), ml_dtypes.bfloat16),
-            base=z((O,), np.float32),
+            fn=z((n_mix, HC * H), ml_dtypes.bfloat16),
+            base=z((n_mix,), np.float32),
             scale=z((3,), np.float32),
             hc=HC,
             iters=ITERS,
@@ -293,8 +293,10 @@ def test_pre_parser_takes_the_kernel(T):
 # -- the pre broadcast on chip (pre_body, front_body) --------------------------------------------------------------
 
 SHELL_BC = [  # shell.mhc_pre_h's broadcast, as it reads there
-    "nisa.affine_select(dst=D, pattern=[[1, T], [0, hc]], channel_multiplier=-1, offset=0, on_true_tile=pre.ap(pattern="
-    "[[hc, T], [0, T], [1, hc]], offset=0), on_false_value=0.0, cmp_op=nl.equal)",
+    (
+        "nisa.affine_select(dst=D, pattern=[[1, T], [0, hc]], channel_multiplier=-1, offset=0, on_true_tile=pre.ap(pattern="
+        "[[hc, T], [0, T], [1, hc]], offset=0), on_false_value=0.0, cmp_op=nl.equal)"
+    ),
     "nisa.nc_matmul(dst=pbp, stationary=ones_t, moving=D, accumulate=False)",
     "nisa.tensor_copy(dst=pb, src=pbp, engine=nisa.vector_engine)",
 ]
@@ -365,7 +367,7 @@ def test_the_broadcast_pins_fail_on_planted_sources():
 
 @needs_nki
 @pytest.mark.parametrize("kernel", ["pre", "split"])
-@pytest.mark.parametrize("T,nan", [(1, False), (4, False), (4, True), (8, True)])
+@pytest.mark.parametrize(("T", "nan"), [(1, False), (4, False), (4, True), (8, True)])
 def test_the_broadcast_is_bit_equal_to_the_round_trip_in_the_simulator(kernel, T, nan, monkeypatch):
     """x, post and comb with the on-chip broadcast against the HBM round trip it replaced, bit for bit (NaN bits
     included) at H 256. A NaN element stands for a stream a warmup's zero inputs make NaN."""
@@ -378,18 +380,18 @@ def test_the_broadcast_is_bit_equal_to_the_round_trip_in_the_simulator(kernel, T
         if nan:
             S = S.clone()
             S[min(1, T - 1), 1, 5] = float("nan")
-        kw = dict(
-            S=_bf(S.reshape(T, HC * 256)),
-            fn=_bf(layer.hc_attn_fn),
-            base=layer.hc_attn_base.numpy().astype(np.float32),
-            scale=layer.hc_attn_scale.numpy().astype(np.float32),
-            hc=HC,
-            iters=ITERS,
-            eps=EPS,
-            rms_eps=RMS_EPS,
-            sig=mp.SIGMOID,
-            skf=mp.SK,
-        )
+        kw = {
+            "S": _bf(S.reshape(T, HC * 256)),
+            "fn": _bf(layer.hc_attn_fn),
+            "base": layer.hc_attn_base.numpy().astype(np.float32),
+            "scale": layer.hc_attn_scale.numpy().astype(np.float32),
+            "hc": HC,
+            "iters": ITERS,
+            "eps": EPS,
+            "rms_eps": RMS_EPS,
+            "sig": mp.SIGMOID,
+            "skf": mp.SK,
+        }
         if kernel == "pre":
             out = nki.simulate(mp.mhc_pre_kernel)(rev=mp.REV, **kw)
         else:
@@ -447,7 +449,7 @@ def test_split_chunks_partition_the_half_rounds(chunks):
 
 @pytest.mark.parametrize("chunks", [0, 40])
 def test_split_chunks_out_of_range_refused(chunks):
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=rf"chunks {chunks} not in \[1, 39\]"):
         MS.chunk_bounds(20, chunks)
 
 
@@ -504,7 +506,7 @@ def _fnj_pin_errors(split: str, fnj: str) -> list:
 
 
 def _ap(pattern, offset, env, counts):
-    pat, base = eval(pattern, {}, env), eval(offset, {}, env)
+    pat, base = eval(pattern, {}, env), eval(offset, {}, env)  # noqa: S307  # the kernel source's own pattern text over a fixed numeric env, no untrusted input
     assert [c for _, c in pat] == counts
     idx = torch.tensor(base)
     for k, (stride, n) in enumerate(pat):
@@ -526,11 +528,11 @@ def _fnj_layout_errors(split: str) -> list:
     src_ap = lambda c: next(k.value for k in c.keywords if k.arg == "src")  # noqa: E731
     ld, cp = src_ap(calls["nisa.dma_copy:wk"]), src_ap(calls["nisa.tensor_copy:wkj"])
     kw = lambda a: {k.arg: ast.unparse(k.value) for k in a.keywords}  # noqa: E731
-    O, NJ = 24, 128
-    env = dict(P=P, O=O, NJ=NJ, F=P * NJ)
-    fn = torch.arange(O * P * NJ, dtype=torch.int64).view(O, P * NJ)
-    wk = fn.reshape(-1)[_ap(kw(ld)["pattern"], kw(ld)["offset"], env, [P, O, NJ]).reshape(-1)].view(P, O, NJ)
-    wkj = wk.reshape(-1)[_ap(kw(cp)["pattern"], kw(cp)["offset"], env, [P, NJ, O]).reshape(-1)].view(P, NJ, O)
+    n_mix, NJ = 24, 128
+    env = {"P": P, "O": n_mix, "NJ": NJ, "F": P * NJ}
+    fn = torch.arange(n_mix * P * NJ, dtype=torch.int64).view(n_mix, P * NJ)
+    wk = fn.reshape(-1)[_ap(kw(ld)["pattern"], kw(ld)["offset"], env, [P, n_mix, NJ]).reshape(-1)].view(P, n_mix, NJ)
+    wkj = wk.reshape(-1)[_ap(kw(cp)["pattern"], kw(cp)["offset"], env, [P, NJ, n_mix]).reshape(-1)].view(P, NJ, n_mix)
     return [] if torch.equal(MF.fn_j(fn), wkj) else ["fn_j is not front_body's j-major operand"]
 
 

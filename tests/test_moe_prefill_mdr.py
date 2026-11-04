@@ -84,9 +84,9 @@ def test_inputs_guard_the_table():
     down = mp.down_factors(blob, 1024)
     fused = (down[0], md.fused_drain_table(*down, 1024))
     x, topv, topi = routing(256, skew=True)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="the fused drain needs the per-column path"):
         md.kernel_inputs(x, topv, topi, blob, 1, 0.05, B=64, down=None)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="build it with fused_drain_table at load"):
         md.kernel_inputs(x, topv, topi, blob, 1, 0.05, B=64, down=down)
     a = md.kernel_inputs(x, topv, topi, blob, 1, 0.05, B=64, down=fused)
     b = mp.kernel_inputs(x, topv, topi, blob, 1, 0.05, B=64, down=down)

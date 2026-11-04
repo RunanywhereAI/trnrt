@@ -68,7 +68,7 @@ def test_uncapped_the_burst_fills_the_seats():
     assert all(r.status is Status.FINISHED for r in reqs)
 
 
-@pytest.mark.parametrize("seats,cap,want", [(4, 1, 1), (4, 4, 4), (4, 9, 4), (16, 12, 12)])
+@pytest.mark.parametrize(("seats", "cap", "want"), [(4, 1, 1), (4, 4, 4), (4, 9, 4), (16, 12, 12)])
 def test_the_cap_is_the_lesser_of_the_cap_and_the_seats(seats, cap, want):
     """A burst of more requests than seats, with a prefill budget that admits them all in one step."""
     _, most, _, _ = burst(make(seats, cap, budget=1024), n=seats + 2)

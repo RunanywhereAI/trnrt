@@ -136,9 +136,9 @@ def check_plan(topv, topi, E, L):
     return real
 
 
-@pytest.mark.parametrize("T,L", [(1, 1), (3, 1), (4, 2), (16, 2), (32, 4), (64, 4), (128, 8)])
+@pytest.mark.parametrize(("T", "L"), [(1, 1), (3, 1), (4, 2), (16, 2), (32, 4), (64, 4), (128, 8)])
 def test_plan_assigns_every_pair_one_lane(T, L):
-    x, topv, topi = routing(T)
+    _x, topv, topi = routing(T)
     real = check_plan(topv, topi, 256, L)
     assert real >= len(set(topi.reshape(-1).tolist()))
 
@@ -178,7 +178,7 @@ def test_emulated_kernel_matches_fp32(T):
 
 
 @pytest.mark.skipif(importlib.util.find_spec("nki") is None, reason="needs the NKI package (Neuron venv)")
-@pytest.mark.parametrize("T,L", [(2, 1), (7, 2), (5, 4)])
+@pytest.mark.parametrize(("T", "L"), [(2, 1), (7, 2), (5, 4)])
 def test_nki_simulator_matches_emulation(T, L, monkeypatch):
     import nki
 
@@ -283,7 +283,7 @@ def reference_act(x, topv, topi, w_gu, s_gu, w_down, s_down, act, limit):
     return out
 
 
-@pytest.mark.parametrize("act,limit", [(1, 10.0), (1, 0.05), (2, 7.0), (2, 0.05)])
+@pytest.mark.parametrize(("act", "limit"), [(1, 10.0), (1, 0.05), (2, 7.0), (2, 0.05)])
 @pytest.mark.parametrize("which", [experts, experts128])
 def test_emulated_activations_match_fp32(act, limit, which):
     ws = which()
@@ -309,13 +309,13 @@ def test_glu_forms():
 
 
 def test_plan_over_288_experts():
-    x, topv, topi = routing(32, E=288, seed=5)
+    _x, topv, topi = routing(32, E=288, seed=5)
     topi[0, :2] = torch.tensor([287, 257])  # ids past 256
     check_plan(topv, topi, 288, 4)
 
 
 @pytest.mark.skipif(importlib.util.find_spec("nki") is None, reason="needs the NKI package (Neuron venv)")
-@pytest.mark.parametrize("act,limit", [(1, 0.02), (2, 0.02)])
+@pytest.mark.parametrize(("act", "limit"), [(1, 0.02), (2, 0.02)])
 def test_nki_simulator_activations_128_blocks_and_160_experts(act, limit, monkeypatch):
     """The dedupe kernel (16 tokens, lanes 2) and the per-pair kernel (3 tokens) on fp32 128-block
     scales, clamped activations whose limit bites, 160 experts (a partial tile of 128)."""
@@ -379,7 +379,7 @@ def test_clamped_moe_reads_a_128_block_tile_blob_exactly():
 
 
 @pytest.mark.parametrize(
-    "T,want",
+    ("T", "want"),
     [
         (512, [("v10", 512)]),
         (320, [("v10", 320)]),

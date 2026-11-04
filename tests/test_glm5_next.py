@@ -25,23 +25,28 @@ CONFIG = os.path.join(os.path.dirname(__file__), "fixtures", "GLM-5.3-Flash-conf
 # The indexer keeps its 32 heads: with few heads a pool's score is exactly 0 (every head's ReLU zero) often
 # enough to tie at the top-k boundary, where any tie-break is a valid top-k but transformers' and ours differ
 # (measured with 4 heads: 1 query in 70 at layer 3).
-SMALL = dict(
-    hidden_size=128,
-    intermediate_size=256,
-    moe_intermediate_size=128,
-    num_attention_heads=4,
-    num_key_value_heads=4,
-    vocab_size=384,
-    n_routed_experts=8,
-    num_experts_per_tok=2,
-    max_position_embeddings=1024,
-    pad_token_id=None,
-    eos_token_id=1,
-    num_nextn_predict_layers=0,
-)
-VISION = dict(
-    depth=1, hidden_size=32, intermediate_size=64, num_heads=2, out_hidden_size=128, projection_intermediate_size=64
-)
+SMALL = {
+    "hidden_size": 128,
+    "intermediate_size": 256,
+    "moe_intermediate_size": 128,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 4,
+    "vocab_size": 384,
+    "n_routed_experts": 8,
+    "num_experts_per_tok": 2,
+    "max_position_embeddings": 1024,
+    "pad_token_id": None,
+    "eos_token_id": 1,
+    "num_nextn_predict_layers": 0,
+}
+VISION = {
+    "depth": 1,
+    "hidden_size": 32,
+    "intermediate_size": 64,
+    "num_heads": 2,
+    "out_hidden_size": 128,
+    "projection_intermediate_size": 64,
+}
 
 
 def text_config(layers=8, linear_heads=4, **extra):
@@ -71,14 +76,9 @@ def randomize(model, seed=0):
                 p.copy_(torch.empty(p.shape).uniform_(-4.0, 1.0, generator=g))
             elif n.endswith("dt_bias"):
                 p.copy_(r)
-            elif (
-                ("norm" in n and n.endswith("weight"))
-                or n.endswith("hc_attn.scale")
-                or n.endswith("hc_ffn.scale")
-                or n.endswith("_hc.scale")
-            ):
+            elif ("norm" in n and n.endswith("weight")) or n.endswith(("hc_attn.scale", "hc_ffn.scale", "_hc.scale")):
                 p.copy_(1 + 0.1 * r)
-            elif n.endswith("bias") or n.endswith(".base"):
+            elif n.endswith(("bias", ".base")):
                 p.copy_((0.5 if "correction" in n else 0.1) * r)
             elif "embed_tokens" in n:
                 p.copy_(r)
@@ -99,7 +99,7 @@ def build(path, seed=0, layers=8, linear_heads=4, **extra):
     """A random GLM-5.3-Flash-architecture model saved to `path` by transformers; returns the HF model."""
     import transformers as tf
 
-    c, t = text_config(layers, linear_heads, **extra)
+    _c, t = text_config(layers, linear_heads, **extra)
     cfg = tf.Glm5NextConfig(text_config=t, vision_config=VISION)
     cfg._attn_implementation = "eager"
     cfg.text_config._attn_implementation = "eager"
@@ -123,16 +123,16 @@ def engine(path, **kw):
     from trnrt.config import EngineConfig
     from trnrt.engine.engine import LLMEngine
 
-    base = dict(
-        model_path=path,
-        device="cpu",
-        dtype=torch.float32,
-        page_size=4,
-        num_pages=256,
-        max_num_seqs=3,
-        max_model_len=256,
-        max_prefill_tokens=8,
-    )
+    base = {
+        "model_path": path,
+        "device": "cpu",
+        "dtype": torch.float32,
+        "page_size": 4,
+        "num_pages": 256,
+        "max_num_seqs": 3,
+        "max_model_len": 256,
+        "max_prefill_tokens": 8,
+    }
     base.update(kw)
     return LLMEngine(EngineConfig(**base))
 
@@ -165,7 +165,7 @@ def test_config_is_parsed(dense):
     kinds = ["kda" if isinstance(s, LinearSpec) else "dsa" for s in cfg.attn_layers]
     assert kinds == ["kda", "kda", "kda", "dsa", "kda", "kda", "kda", "dsa"]
     assert list(cfg.moe_layers) == [
-        i for i, l in enumerate(hf.model.language_model.layers) if hasattr(l.mlp, "experts")
+        i for i, layer in enumerate(hf.model.language_model.layers) if hasattr(layer.mlp, "experts")
     ]
     kda = cfg.attn_layers[0]
     assert (kda.num_k_heads, kda.head_k_dim, kda.lower_bound, kda.gate_rank) == (4, 128, -5.0, 128)
@@ -244,10 +244,10 @@ def test_fp8_kv_keeps_a_separate_pool_key_cache(sparse):
     round the key), bound by the engine for every DSA layer."""
     from trnrt.engine.request import SamplingParams
 
-    path, hf = sparse
+    path, _hf = sparse
     eng = engine(path, kv_cache_dtype="fp8")
     layers = eng.model.kv_layers()
-    assert layers and all(getattr(l, "pool_key", None) is not None for l in layers)
+    assert layers and all(getattr(layer, "pool_key", None) is not None for layer in layers)
     (got,) = eng.generate(prompts(7, (41,)), SamplingParams(max_new_tokens=6, ignore_eos=True))
     assert len(got.output_ids) == 6
 
@@ -264,7 +264,7 @@ def test_tp2_matches_tp1(tmp_path):
     build(path, seed=1, index_topk=16, hidden_size=512)
     ps = prompts(3, (11, 41))
     sp = SamplingParams(max_new_tokens=10, ignore_eos=True)
-    kw = dict(max_num_seqs=2, page_size=8, kv_cache_dtype="fp8")
+    kw = {"max_num_seqs": 2, "page_size": 8, "kv_cache_dtype": "fp8"}
     want = [r.output_ids for r in engine(path, **kw).generate(ps, sp)]
     two = engine(path, tp=2, **kw)
     try:

@@ -43,7 +43,6 @@ def checkpoint_experts(E=6, H=1024, Im=64, seed=0):
     from trnrt.models.quant import fit_e4m3_max
 
     g = torch.Generator().manual_seed(seed)
-    C = H // 128
 
     def blocks(rows, cols, shard_rows, shard_cols):
         """A [rows, cols] checkpoint weight quantized per 128 x 128 block, its shard and row scales."""
@@ -58,7 +57,7 @@ def checkpoint_experts(E=6, H=1024, Im=64, seed=0):
         return fit_e4m3_max(cw, rs, 240.0), true
 
     gus, gss, ds, dss, tgu, td = [], [], [], [], [], []
-    for e in range(E):
+    for _e in range(E):
         (wg, sg), tg = blocks(128, H, slice(0, Im), slice(0, H))  # the rank's gate rows of a 2 x Im block
         (wu, su), tu = blocks(128, H, slice(Im, 2 * Im), slice(0, H))
         (wd, sd), tdd = blocks(H, 128, slice(0, H), slice(0, Im))  # down [H, I]: the rank's Im columns
@@ -100,7 +99,9 @@ def reference(x, topv, topi, w_gu, s_gu, w_down, s_down, lim=None):
     return out
 
 
-@pytest.mark.parametrize("T,E,K,B", [(128, 6, 4, 64), (256, 6, 4, 128), (256, 288, 8, 64), (512, 16, 8, 128)])
+@pytest.mark.parametrize(
+    ("T", "E", "K", "B"), [(128, 6, 4, 64), (256, 6, 4, 128), (256, 288, 8, 64), (512, 16, 8, 128)]
+)
 @pytest.mark.parametrize("skew", [False, True])
 def test_plan_matches_the_reference(T, E, K, B, skew):
     g = torch.Generator().manual_seed(T + E)
@@ -147,7 +148,7 @@ def test_plan_fits_the_worst_routing():
     assert torch.equal(bexp[0][(slot // B).long()], topi.to(torch.int32))
 
 
-@pytest.mark.parametrize("act,lim", [(0, None), (1, 10.0), (1, 0.05)])
+@pytest.mark.parametrize(("act", "lim"), [(0, None), (1, 10.0), (1, 0.05)])
 @pytest.mark.parametrize("dq", [False, True])
 def test_emulation_matches_fp32(act, lim, dq):
     ws = experts()
@@ -158,7 +159,7 @@ def test_emulation_matches_fp32(act, lim, dq):
     assert (got - ref).abs().max() <= 0.01 * ref.abs().max()
 
 
-@pytest.mark.parametrize("act,lim", [(0, 0.0), (1, 0.05)])
+@pytest.mark.parametrize(("act", "lim"), [(0, 0.0), (1, 0.05)])
 def test_emulation_is_the_dedupe_arithmetic(act, lim):
     """emulate (one expert at a time) equals moe_dedupe.emulate(pair_bf16=True) (every pair at once)
     up to fp32 summation order."""
@@ -243,7 +244,7 @@ def test_pack_experts_records_the_prefill_path(fmt):
 
 @pytest.mark.skipif(importlib.util.find_spec("nki") is None, reason="needs the NKI package (Neuron venv)")
 @pytest.mark.parametrize(
-    "act,lim,skew,B,fmt",
+    ("act", "lim", "skew", "B", "fmt"),
     [
         (0, 0.0, False, 64, "dq"),
         (1, 0.05, True, 64, "dq"),
@@ -283,7 +284,7 @@ def test_nki_simulator_matches_emulation(act, lim, skew, B, fmt, monkeypatch):
 
 @pytest.mark.skipif(importlib.util.find_spec("nki") is None, reason="needs the NKI package (Neuron venv)")
 @pytest.mark.parametrize(
-    "B,fmt,order,nyb",
+    ("B", "fmt", "order", "nyb"),
     [(128, "loaded", 1, 3), (64, "loaded", 1, 3), (128, "loaded", 1, 0), (128, "dq", 1, 2), (64, "rows", 0, 2)],
 )
 def test_nki_simulator_round_order_and_output_ring(B, fmt, order, nyb, monkeypatch):

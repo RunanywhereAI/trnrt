@@ -138,7 +138,7 @@ def test_the_loop_hook_is_guarded_by_n_inside_stage_c():
     assert len(guard) == 1 and all(_is_piece(b) for b in guard[0].body)
 
 
-@pytest.mark.parametrize("T,pieces,step", [(1, 4, 10), (2, 5, 8), (4, 7, 6), (6, 8, 5), (8, 10, 4)])
+@pytest.mark.parametrize(("T", "pieces", "step"), [(1, 4, 10), (2, 5, 8), (4, 7, 6), (6, 8, 5), (8, 10, 4)])
 def test_schedule_is_the_preregistered_table(T, pieces, step):
     K, Q = 8, 4  # num_experts_per_tok, moe_dedupe.group_size(1)
     NQ = -(-T * K // Q)
@@ -430,17 +430,17 @@ def test_emulate_is_hybrids_swiglu():
     Ir, H, hc, T = 384, 256, 4, 4
     gu8, gus, dn8, dns = _layer_weights(Ir, H)
     g = torch.Generator().manual_seed(7)
-    O = 2 * hc + hc * hc
+    n_mix = 2 * hc + hc * hc
     S = torch.randn(T, hc, H, generator=g).bfloat16()
     pend = (
         torch.rand(T, hc, generator=g) * 2,
         torch.full((T, hc, hc), 1 / hc),
         (0.5 * torch.randn(2, T, H)).bfloat16(),
     )
-    fn = (0.05 * torch.randn(O, hc * H, generator=g)).bfloat16()
-    base, scale = 0.1 * torch.randn(O, generator=g), 1 + 0.1 * torch.randn(3, generator=g)
+    fn = (0.05 * torch.randn(n_mix, hc * H, generator=g)).bfloat16()
+    base, scale = 0.1 * torch.randn(n_mix, generator=g), 1 + 0.1 * torch.randn(3, generator=g)
     pn = (1 + 0.1 * torch.randn(H, generator=g)).bfloat16()
-    Sn, post, comb, xn, y = DH.emulate(S, pend, fn, base, scale, pn, gu8, gus, dn8, dns, 20, 1e-6, 1e-5, 10.0)
+    _Sn, _post, _comb, xn, y = DH.emulate(S, pend, fn, base, scale, pn, gu8, gus, dn8, dns, 20, 1e-6, 1e-5, 10.0)
     layer = SimpleNamespace(gate_up=gu8, gate_up_scale=gus, down=dn8, down_scale=dns)
     model = SimpleNamespace(_w=lambda lyr, n: dequant(getattr(lyr, n), getattr(lyr, n + "_scale"), torch.bfloat16))
     want = hybrid._swiglu(model, layer, xn, "gate_up", "down", 10.0)
@@ -506,9 +506,9 @@ def test_pack_returns_fn_in_the_kernels_layout():
     from trnrt.kernels import mhc_fnj as MF
 
     E, H, Is, hc = 8, 256, 8, 4
-    O, F = 2 * hc + hc * hc, hc * H
+    n_mix, F = 2 * hc + hc * hc, hc * H
     L = fp8_layer(E, H, Is)
-    fn = torch.zeros(O, F, dtype=torch.bfloat16)
+    fn = torch.zeros(n_mix, F, dtype=torch.bfloat16)
     fn[5, 3 * (F // P) + 2] = 1.0  # o 5, p 3, j 2 -> [p, j, o] = [3, 2, 5]
     b = FH.pack(
         L.router,
@@ -519,11 +519,11 @@ def test_pack_returns_fn_in_the_kernels_layout():
         L.shared_down_scale,
         fn,
         torch.ones(H),
-        torch.zeros(O),
+        torch.zeros(n_mix),
         torch.ones(3),
         npg=2,
     )
-    assert b["fn"].shape == (P, F // P, O) and b["fn"].dtype == torch.bfloat16
+    assert b["fn"].shape == (P, F // P, n_mix) and b["fn"].dtype == torch.bfloat16
     assert b["fn"][3, 2, 5] == 1 and b["fn"].float().abs().sum() == 1
     assert torch.equal(b["fn"], MF.fn_j(fn))
     assert b["fn"].shape != fn.shape  # the raw layout is [O, hc H]
@@ -613,13 +613,13 @@ def test_decode_dispatches_by_layer_kind(monkeypatch):
 
 
 def _takes_layer(**kw):
-    a = dict(moe=False, gate_up_scale=torch.ones(1), down_scale=torch.ones(1))
+    a = {"moe": False, "gate_up_scale": torch.ones(1), "down_scale": torch.ones(1)}
     a.update(kw)
     return types.SimpleNamespace(**a)
 
 
 @pytest.mark.parametrize(
-    "layer,fam,lim,want",
+    ("layer", "fam", "lim", "want"),
     [
         ({}, "glm5_next", 10.0, True),
         ({"moe": True}, "glm5_next", 10.0, False),
@@ -709,9 +709,9 @@ def _ffn_case(T: int, npg: int, seed: int = 5):
     layer.router.data = (torch.randn(E, H, generator=g) * H**-0.5).bfloat16()
     layer.w_blob = mdd.pack(*experts128(seed=seed, e=E, h=H))
     layer.moe, layer.moe_blob, layer.moe_tiles, layer.down_t = True, True, True, True
-    O = 2 * HC + HC * HC
-    layer.hc_ffn_fn = (torch.randn(O, HC * H, generator=g) * 0.02).bfloat16()
-    layer.hc_ffn_base = torch.randn(O, generator=g) * 0.5
+    n_mix = 2 * HC + HC * HC
+    layer.hc_ffn_fn = (torch.randn(n_mix, HC * H, generator=g) * 0.02).bfloat16()
+    layer.hc_ffn_base = torch.randn(n_mix, generator=g) * 0.5
     layer.hc_ffn_scale = torch.rand(3, generator=g) + 0.5
     layer.post_norm = (1 + 0.1 * torch.randn(H, generator=g)).bfloat16()
     blobs = FH.pack(
@@ -785,7 +785,7 @@ def _routed(model, layer, xn):
 
 
 @needs_nki
-@pytest.mark.parametrize("T,npg", [(1, 2), (4, 2), (8, 2), (4, 1)])
+@pytest.mark.parametrize(("T", "npg"), [(1, 2), (4, 2), (8, 2), (4, 1)])
 def test_the_ffn_half_in_the_simulator_is_its_emulation(T, npg, monkeypatch):
     """The kernel against its host form, step by step:
     - the mixed streams bit for bit mhc_mix's emulation, post and comb within fp32 summation order of _mhc's;

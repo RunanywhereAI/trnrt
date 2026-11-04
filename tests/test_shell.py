@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import pathlib
 import tempfile
 
 import numpy as np
@@ -17,7 +18,7 @@ from trnrt.kernels import shell as SH
 def test_program_units_split_evenly_or_refuse():
     assert [SH.program_units(2, 2, p) for p in (0, 1)] == [(0, 1), (1, 1)]
     assert SH.program_units(8, 1, 0) == (0, 8)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="3 units do not split evenly over 2 programs"):
         SH.program_units(3, 2, 0)
 
 
@@ -62,9 +63,9 @@ def test_kernel_rev_follows_the_source_between_its_markers():
         f.write("head\n# BEGIN\nbody 1\n# END\ntail\n")
     try:
         r1 = SH.kernel_rev(f.name, "# BEGIN", "# END")
-        open(f.name, "w").write("head 2\n# BEGIN\nbody 1\n# END\ntail 2\n")
+        pathlib.Path(f.name).write_text("head 2\n# BEGIN\nbody 1\n# END\ntail 2\n")
         assert SH.kernel_rev(f.name, "# BEGIN", "# END") == r1  # outside the markers: the same rev
-        open(f.name, "w").write("head\n# BEGIN\nbody 2\n# END\ntail\n")
+        pathlib.Path(f.name).write_text("head\n# BEGIN\nbody 2\n# END\ntail\n")
         assert SH.kernel_rev(f.name, "# BEGIN", "# END") != r1
     finally:
         os.unlink(f.name)

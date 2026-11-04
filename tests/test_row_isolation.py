@@ -121,7 +121,7 @@ def test_kda_shell_keeps_a_bad_row_in_its_row(what, cbat, fin, monkeypatch):
 
 
 @needs_nki
-@pytest.mark.parametrize("what,cbat", [("conv_nan", 1)])
+@pytest.mark.parametrize(("what", "cbat"), [("conv_nan", 1)])
 def test_kda_shell_served_form_spreads(what, cbat):
     """The positive control: fin=0 (no isolation) lets the conv path's transposes carry the bad row into the others. The
     projection is weights-stationary, so only the conv path's transposes contract over the rows: the control is a bad
@@ -133,7 +133,7 @@ def test_kda_shell_served_form_spreads(what, cbat):
 
 
 @needs_nki
-@pytest.mark.parametrize("what,cbat", [("S_nan", 1), ("S_inf", 0)])
+@pytest.mark.parametrize(("what", "cbat"), [("S_nan", 1), ("S_inf", 0)])
 def test_kda_shell_served_form_keeps_a_bad_S_row(what, cbat):
     """The weights-stationary projection puts the features on the partitions straight from the PE, so it has no PE
     transposes over the rows for a bad S row's NaN or inf to cross, even without isolation (fin 0). Not a relaxed test:

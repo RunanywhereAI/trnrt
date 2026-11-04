@@ -57,7 +57,7 @@ def recurrence(q, k, v, g, beta, S0):
     return torch.cat(outs), S[0]
 
 
-@pytest.mark.parametrize("H,T", [(2, 300), (1, 128), (2, 4096)])
+@pytest.mark.parametrize(("H", "T"), [(2, 300), (1, 128), (2, 4096)])
 @pytest.mark.parametrize("correlated", [False, True])
 def test_emulation_matches_the_recurrence(H, T, correlated):
     """The kernel's factorisation (16-row reference sub-chunks, the transposed blocked inverse, the chunk as an affine
@@ -71,7 +71,7 @@ def test_emulation_matches_the_recurrence(H, T, correlated):
     scale = want.abs().max().item()
     assert (got.double() - want).abs().max().item() < 2e-5 * max(1.0, scale)
     assert (S_got.double() - S_want).abs().max().item() < 2e-5 * max(1.0, S_want.abs().max().item())
-    ref, S_ref = chunk_scan(q, k, v, gate, beta, S0, 64)
+    ref, _S_ref = chunk_scan(q, k, v, gate, beta, S0, 64)
     assert (got - ref).abs().max().item() < 2e-5 * max(1.0, scale)
 
 
@@ -80,7 +80,7 @@ def test_strong_decay_stays_finite():
     finite, the result is the recurrence's."""
     q, k, v, gate, beta, S0 = inputs(256, 1, seed=4)
     gate = torch.full_like(gate, -4.999)
-    want, S_want = recurrence(q, k, v, gate, beta, S0)
+    want, _S_want = recurrence(q, k, v, gate, beta, S0)
     got, S_got = dr.emulate(q, k, v, gate, beta, S0)
     assert torch.isfinite(got).all() and torch.isfinite(S_got).all()
     assert (got.double() - want).abs().max().item() < 2e-5 * max(1.0, want.abs().max().item())
@@ -88,8 +88,8 @@ def test_strong_decay_stays_finite():
 
 def test_constants():
     c = dr.consts_np()
-    I, U, BL, BU = (torch.tensor(c[:, i]) for i in (dr.C_I, dr.C_U, dr.C_BL, dr.C_BU))
-    assert torch.equal(I, torch.eye(128)) and torch.equal(BU, BL.T)
+    eye, U, BL, BU = (torch.tensor(c[:, i]) for i in (dr.C_I, dr.C_U, dr.C_BL, dr.C_BU))
+    assert torch.equal(eye, torch.eye(128)) and torch.equal(BU, BL.T)
     assert torch.equal(U, torch.triu(torch.ones(128, 128)))
     for i, s in enumerate(dr.LEVELS):
         lo = torch.tensor(c[:, dr.C_LO + i])
@@ -97,7 +97,7 @@ def test_constants():
 
 
 @needs_nki
-@pytest.mark.parametrize("H,T,ug", [(2, 256, 6), (2, 256, None), (3, 128, 6), (2, 512, 6)])
+@pytest.mark.parametrize(("H", "T", "ug"), [(2, 256, 6), (2, 256, None), (3, 128, 6), (2, 512, 6)])
 def test_nki_simulator_matches_emulation(H, T, ug, monkeypatch):
     """The kernel at the model's unit group (6: linear_attn's prefill call) and at the module default."""
     import nki
@@ -177,7 +177,7 @@ def test_the_short_conv_kernel_is_never_taken_on_the_host():
 
 
 @needs_nki
-@pytest.mark.parametrize("T,C", [(1024, 256), (300, 384), (128, 128), (4096, 768)])
+@pytest.mark.parametrize(("T", "C"), [(1024, 256), (300, 384), (128, 128), (4096, 768)])
 def test_short_conv_kernel_equals_causal_conv(monkeypatch, T, C):
     """y = sum_j xe[j : j + T] w[:, j] in fp32: the kernel's grid 1 and grid 2 outputs equal _causal_conv's bits
     (768: a rank's q, k and v channels at tp 32)."""
@@ -189,7 +189,7 @@ def test_short_conv_kernel_equals_causal_conv(monkeypatch, T, C):
     monkeypatch.setenv("NEURON_PLATFORM_TARGET_OVERRIDE", "trn2")
     xe, w = _conv_inputs(T, C)
     want = _causal_conv(xe, w, T)
-    args = dict(xe=xe, w=w, ib=torch.eye(128).to(torch.bfloat16), i32=torch.eye(128), rev=sc.REV)
+    args = {"xe": xe, "w": w, "ib": torch.eye(128).to(torch.bfloat16), "i32": torch.eye(128), "rev": sc.REV}
     one = torch.as_tensor(nki.simulate(sc.short_conv_kernel)(**args))
     two = torch.as_tensor(nki.simulate(sc.short_conv_kernel[2])(**args))
     assert one.shape == (T, C) and one.dtype == torch.float32
@@ -233,7 +233,7 @@ def test_rows_sharing_the_scratch_slot_change_only_it():
 def _index_form(mp):
     """The index form of the window's read and write (conv_state[slot] and _write_rows), patched in."""
     mp.setattr(LA, "_conv_read", lambda cs, slot: cs[slot])
-    mp.setattr(LA, "_conv_write", lambda cs, slot, win: LA._write_rows(cs, slot, win))
+    mp.setattr(LA, "_conv_write", LA._write_rows)
 
 
 @pytest.fixture(scope="module")

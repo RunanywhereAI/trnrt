@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ast
 import os
+import pathlib
 import re
 import subprocess
 import sys
@@ -45,11 +46,12 @@ def sets_host_sim(src: str, path: str) -> list[int]:
             if isinstance(n, (ast.AugAssign, ast.AnnAssign))
             else []
         )
-        for t in targets:
-            if (isinstance(t, ast.Attribute) and t.attr == "HOST_SIM") or (
-                isinstance(t, ast.Name) and t.id == "HOST_SIM" and path != SHELL
-            ):
-                out.append(n.lineno)
+        out.extend(
+            n.lineno
+            for t in targets
+            if (isinstance(t, ast.Attribute) and t.attr == "HOST_SIM")
+            or (isinstance(t, ast.Name) and t.id == "HOST_SIM" and path != SHELL)
+        )
         if (
             isinstance(n, ast.Call)
             and isinstance(n.func, ast.Name)
@@ -63,7 +65,7 @@ def sets_host_sim(src: str, path: str) -> list[int]:
 
 
 def test_shell_defines_it_once_false():
-    tree = ast.parse(open(os.path.join(ROOT, SHELL)).read())
+    tree = ast.parse(pathlib.Path(ROOT, SHELL).read_text())
     defs = [
         n
         for n in tree.body
@@ -81,7 +83,7 @@ def test_no_source_outside_tests_sets_it():
                     p = os.path.join(d, f)
                     rel = os.path.relpath(p, ROOT)
                     try:
-                        src = open(p).read()
+                        src = pathlib.Path(p).read_text()
                         lines = sets_host_sim(src, rel)
                     except (SyntaxError, UnicodeDecodeError):
                         continue
@@ -118,7 +120,9 @@ def test_serving_import_path_leaves_it_off():
         "from trnrt.kernels import shell\n"
         "print(json.dumps({'host_sim': shell.HOST_SIM, 'ok': ok, 'skipped': skipped}))\n"
     )
-    p = subprocess.run([sys.executable, "-c", code], cwd=ROOT, env=env, capture_output=True, text=True, timeout=600)
+    p = subprocess.run(
+        [sys.executable, "-c", code], cwd=ROOT, env=env, capture_output=True, text=True, timeout=600, check=False
+    )
     assert p.returncode == 0, p.stderr[-2000:]
     import json
 
@@ -180,17 +184,17 @@ def test_mhc_pre_follows_it(monkeypatch, fake_launch):
 
     monkeypatch.setattr(mhc_pre, "mhc_pre_kernel", "the mhc_pre kernel")
     T, hc, H = 2, 4, 256
-    O = 2 * hc + hc * hc
+    n_mix = 2 * hc + hc * hc
     g = torch.Generator().manual_seed(1)
-    S, fn = torch.randn(T, hc, H, generator=g).bfloat16(), (0.02 * torch.randn(O, hc * H, generator=g)).bfloat16()
-    base, scale = 0.1 * torch.randn(O, generator=g), 1 + 0.1 * torch.randn(3, generator=g)
+    S, fn = torch.randn(T, hc, H, generator=g).bfloat16(), (0.02 * torch.randn(n_mix, hc * H, generator=g)).bfloat16()
+    base, scale = 0.1 * torch.randn(n_mix, generator=g), 1 + 0.1 * torch.randn(3, generator=g)
     assert not mhc_pre.takes(S.device, T, H, hc, fn.dtype)
     x = mhc_pre.pre(S, fn, base, scale, 20, 1e-6, 1e-5)
     assert len(x) == 3 and fake_launch == []  # the emulation
     monkeypatch.setattr(SH, "HOST_SIM", True)
     assert mhc_pre.takes(S.device, T, H, hc, fn.dtype)
     assert not mhc_pre.takes(S.device, T, H, hc, torch.float32)  # its other conditions still decide
-    x, post, comb = mhc_pre.pre(S, fn, base, scale, 20, 1e-6, 1e-5)
+    x, _post, comb = mhc_pre.pre(S, fn, base, scale, 20, 1e-6, 1e-5)
     assert x.shape == (T, H) and comb.shape == (T, hc, hc)  # the stand-in launch's outputs, not the emulation's
     assert [(k, g, kw["rev"], kw["skf"]) for k, g, kw in fake_launch] == [
         ("the mhc_pre kernel", 2, mhc_pre.REV, mhc_pre.SK)
@@ -265,7 +269,7 @@ def test_every_guard_is_classified():
     files = sorted({r for r, _ in SITES} | set(glob.glob("trnrt/kernels/dsa_*.py", root_dir=ROOT)))
     bad = []
     for rel in files:
-        bad += classify_errors(rel, open(os.path.join(ROOT, rel)).read(), SITES)
+        bad += classify_errors(rel, pathlib.Path(ROOT, rel).read_text(), SITES)
     assert bad == [], bad
 
 
