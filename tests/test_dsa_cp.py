@@ -39,8 +39,15 @@ def _bits(t: torch.Tensor) -> torch.Tensor:
 def _model(a: int, A: int, reduce, index_of=lambda a: a, dtype=torch.bfloat16):
     oh = torch.zeros(A)
     oh[index_of(a)] = 1
-    return types.SimpleNamespace(cp=A, dtype=dtype, long_grp_index=torch.tensor([index_of(a)]), long_grp_onehot=oh,
-                                 cp_group=None, attn_group=None, _all_reduce=reduce)
+    return types.SimpleNamespace(
+        cp=A,
+        dtype=dtype,
+        long_grp_index=torch.tensor([index_of(a)]),
+        long_grp_onehot=oh,
+        cp_group=None,
+        attn_group=None,
+        _all_reduce=reduce,
+    )
 
 
 def _emulate(fn, A: int, index_of=lambda a: a):
@@ -63,7 +70,7 @@ def _lists(A: int, T: int, keep: int, seed: int = 3):
     lval, cpool = [], []
     for a in range(A):
         v = torch.randn(T, keep, generator=g)
-        v[:, keep - 5 * (a + 1):] = NEG_INF  # padding past a short list
+        v[:, keep - 5 * (a + 1) :] = NEG_INF  # padding past a short list
         v[0, 0], v[0, 1] = 0.0, -0.0
         c = torch.randint(0, 1 << 24, (T, keep), generator=g).float()
         c[1, 0] = (1 << 24) - 1
@@ -147,7 +154,7 @@ def test_every_rank_gets_the_replicated_query_and_its_own_latent_gather(fp8):
         assert qi.shape == ref.shape and torch.equal(qi, ref), (fp8, a)
         assert torch.equal(_bits(q_all), _bits(lat[a])), a
         for b in range(A):  # head b NH + j of q_all is rank b's head j
-            assert torch.equal(q_all[:, b * NH:(b + 1) * NH], ql[b]), (a, b)
+            assert torch.equal(q_all[:, b * NH : (b + 1) * NH], ql[b]), (a, b)
 
 
 def test_a_dtype_mismatch_is_refused_not_cast():
@@ -193,10 +200,16 @@ def test_dump_row_zeroed_and_the_rest_kept_bit_for_bit(form):
     assert torch.isnan(cache[4, 0, 2].float())
 
 
-SERVED = ("model._store(layer.k_cache, ls, c.unsqueeze(1))", "model._store(layer.v_cache, ls, ki.unsqueeze(1))",
-          "layer.pool_key.index_put_((slots4,), keys.reshape(T * kp, Di // kp).to(layer.pool_key.dtype))")
-ZEROS = ("_cp_zero_dump(model, layer.k_cache, dump, c)", "_cp_zero_dump(model, layer.v_cache, dump, ki)",
-         "_cp_zero_dump(None, layer.pool_key, dump, keys)")
+SERVED = (
+    "model._store(layer.k_cache, ls, c.unsqueeze(1))",
+    "model._store(layer.v_cache, ls, ki.unsqueeze(1))",
+    "layer.pool_key.index_put_((slots4,), keys.reshape(T * kp, Di // kp).to(layer.pool_key.dtype))",
+)
+ZEROS = (
+    "_cp_zero_dump(model, layer.k_cache, dump, c)",
+    "_cp_zero_dump(model, layer.v_cache, dump, ki)",
+    "_cp_zero_dump(None, layer.pool_key, dump, keys)",
+)
 
 
 def _pinned(src: str) -> bool:
@@ -231,13 +244,17 @@ def test_a_planted_change_breaks_the_pin(site, plant):
     if plant == "drop the zero":
         bad = src.replace("    " + zero + "\n", "", 1)
     elif plant == "select in the store":
-        bad = src.replace(store, store.replace("c.unsqueeze(1)", "torch.where(real.view(-1, 1), c, 0).unsqueeze(1)")
-                          .replace("ki.unsqueeze(1)", "torch.where(real.view(-1, 1), ki, 0).unsqueeze(1)")
-                          .replace("keys.reshape(", "torch.where(real4, keys, 0).reshape("), 1)
+        bad = src.replace(
+            store,
+            store.replace("c.unsqueeze(1)", "torch.where(real.view(-1, 1), c, 0).unsqueeze(1)")
+            .replace("ki.unsqueeze(1)", "torch.where(real.view(-1, 1), ki, 0).unsqueeze(1)")
+            .replace("keys.reshape(", "torch.where(real4, keys, 0).reshape("),
+            1,
+        )
     else:
         i, j = src.index(store), src.index(zero)
-        line_s = src[src.rindex("\n", 0, i) + 1:src.index("\n", i) + 1]
-        line_z = src[src.rindex("\n", 0, j) + 1:src.index("\n", j) + 1]
+        line_s = src[src.rindex("\n", 0, i) + 1 : src.index("\n", i) + 1]
+        line_z = src[src.rindex("\n", 0, j) + 1 : src.index("\n", j) + 1]
         bad = src.replace(line_s + line_z, line_z + line_s, 1)
     assert bad != src and not _pinned(bad)
 
@@ -257,7 +274,9 @@ def test_padded_and_unowned_writes_both_land_zero():
     owned = (positions // kp) % A == 1
     assert owned.tolist() == [False, True, True, False, False, False] and not real[-1]
     assert bool((ls[~owned] == dump).all()) and bool((ls[owned] != dump).all())
-    x = torch.full((6, 8), float("nan"))  # every row NaN: the padded row (5), unowned real tokens (0, 3, 4), owned (1, 2)
+    x = torch.full(
+        (6, 8), float("nan")
+    )  # every row NaN: the padded row (5), unowned real tokens (0, 3, 4), owned (1, 2)
     cache = torch.randn(10 * ps // A, 8)
     before = cache.clone()
     cache.index_put_((ls,), x)
@@ -268,8 +287,9 @@ def test_padded_and_unowned_writes_both_land_zero():
     assert torch.equal(cache[other], before[other])
     first = positions - positions % kp
     pos4 = (first.unsqueeze(-1) + torch.arange(kp)).reshape(-1)
-    slots4 = torch.where(real.repeat_interleave(kp), dsa_long.cp_local_slots(pos4, table, ps, kp, A, rank),
-                         torch.full_like(pos4, dump))
+    slots4 = torch.where(
+        real.repeat_interleave(kp), dsa_long.cp_local_slots(pos4, table, ps, kp, A, rank), torch.full_like(pos4, dump)
+    )
     own4 = owned.repeat_interleave(kp)
     assert bool((slots4[~own4] == dump).all())
     pk = torch.randn(10 * ps // A, 2)
@@ -346,8 +366,9 @@ def test_the_copies_stay_out_of_the_piecewise_graphs_tensors():
     split = DecoderForCausalLM._layer_split
     assert list(split(with_, 0)[1]) == list(split(without, 0)[1]) == ["w_a", "w_a_scale"]
     kind = DecoderForCausalLM.layer_kind
-    assert kind(types.SimpleNamespace(layers=with_.layers, _layer_split=lambda i: split(with_, i)), 0) \
-        == kind(types.SimpleNamespace(layers=without.layers, _layer_split=lambda i: split(without, i)), 0)
+    assert kind(types.SimpleNamespace(layers=with_.layers, _layer_split=lambda i: split(with_, i)), 0) == kind(
+        types.SimpleNamespace(layers=without.layers, _layer_split=lambda i: split(without, i)), 0
+    )
 
 
 def test_row_caps():
@@ -378,8 +399,9 @@ def _scores_case(seed: int = 0):
     w = torch.randn(CT_, HI_, generator=g)
     nloc = torch.tensor([PAGES * PPK - 37, 300])
     dsa = types.SimpleNamespace(head_dim=DI_)
-    layer = types.SimpleNamespace(spec=types.SimpleNamespace(mla=types.SimpleNamespace(dsa=dsa)), pool_key=pool_key,
-                                  v_cache=None)
+    layer = types.SimpleNamespace(
+        spec=types.SimpleNamespace(mla=types.SimpleNamespace(dsa=dsa)), pool_key=pool_key, v_cache=None
+    )
     return layer, q, w, pk, table, nloc
 
 
@@ -387,7 +409,7 @@ def test_kernel_scores_equal_the_xla_scores():
     """_cp_scores of a decode call of whole 128-page groups (dsa_index's emulation on the host) gives dsa_long.scores over
     the gathered pool keys up to fp32 rounding, NEG_INF past each row's local count."""
     layer, q, w, pk, table, nloc = _scores_case()
-    scale = DI_ ** -0.5
+    scale = DI_**-0.5
     want = dsa_long.scores(q, w, pk, nloc, scale)
     got = mla._cp_scores(None, layer, q, w, pk, table, nloc, scale)
     live = want > -1e29
@@ -398,7 +420,7 @@ def test_kernel_scores_equal_the_xla_scores():
 
 def test_a_shuffled_pool_order_is_caught():
     layer, q, w, pk, table, nloc = _scores_case(1)
-    scale = DI_ ** -0.5
+    scale = DI_**-0.5
     want = dsa_long.scores(q, w, pk.view(CT_, PAGES, PPK, DI_).flip(2).reshape(CT_, -1, DI_), nloc, scale)
     got = mla._cp_scores(None, layer, q, w, pk, table, nloc, scale)
     live = got > -1e29

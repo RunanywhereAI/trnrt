@@ -15,8 +15,17 @@ import pytest
 from trnrt import __main__ as cli
 from trnrt.models import loader
 
-GLM_FILES = ["config.json", "generation_config.json", "model.safetensors.index.json", "model-00001-of-00093.safetensors",
-             "tokenizer.json", "tokenizer_config.json", "chat_template.jinja", "README.md", "assets/figure.png"]
+GLM_FILES = [
+    "config.json",
+    "generation_config.json",
+    "model.safetensors.index.json",
+    "model-00001-of-00093.safetensors",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "chat_template.jinja",
+    "README.md",
+    "assets/figure.png",
+]
 
 
 @pytest.fixture
@@ -36,9 +45,15 @@ def test_a_repo_id_downloads_the_chat_template_at_the_revision(hub):
     assert loader.resolve_model_path("zai-org/GLM-5.3-Flash") == "/cache/zai-org/GLM-5.3-Flash/main"
     assert [c["revision"] for c in hub] == ["eb9eb208", None]
     taken = [f for f in GLM_FILES if any(fnmatch.fnmatch(f, p) for p in hub[0]["patterns"])]
-    assert taken == ["config.json", "generation_config.json", "model.safetensors.index.json",
-                     "model-00001-of-00093.safetensors", "tokenizer.json", "tokenizer_config.json",
-                     "chat_template.jinja"]
+    assert taken == [
+        "config.json",
+        "generation_config.json",
+        "model.safetensors.index.json",
+        "model-00001-of-00093.safetensors",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "chat_template.jinja",
+    ]
 
 
 def test_a_local_directory_is_used_as_it_is_and_refuses_a_revision(hub, tmp_path):
@@ -53,8 +68,9 @@ def test_the_command_line_sets_only_the_revision():
 
     plain, pinned = cli.engine_config(["--model", "m"]), cli.engine_config(["--model", "m", "--revision", "eb9eb208"])
     assert plain.model_revision is None and pinned.model_revision == "eb9eb208"
-    assert {f.name for f in dataclasses.fields(plain) if getattr(plain, f.name) != getattr(pinned, f.name)} == \
-        {"model_revision"}
+    assert {f.name for f in dataclasses.fields(plain) if getattr(plain, f.name) != getattr(pinned, f.name)} == {
+        "model_revision"
+    }
 
 
 def test_the_engine_resolves_its_configured_revision(monkeypatch):

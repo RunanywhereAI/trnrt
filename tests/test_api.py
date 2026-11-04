@@ -24,21 +24,39 @@ def client():
     from trnrt.engine.engine import LLMEngine
     from trnrt.serve.api import build_app
 
-    eng = LLMEngine(EngineConfig(model_path=MODEL, device="cpu", dtype=torch.float32, page_size=8,
-                                 num_pages=512, max_num_seqs=4, max_model_len=1024, max_prefill_tokens=128))
+    eng = LLMEngine(
+        EngineConfig(
+            model_path=MODEL,
+            device="cpu",
+            dtype=torch.float32,
+            page_size=8,
+            num_pages=512,
+            max_num_seqs=4,
+            max_model_len=1024,
+            max_prefill_tokens=128,
+        )
+    )
     with TestClient(build_app(eng, "test-model")) as c:
         c.engine = eng
         yield c
 
 
-TOOLS = [{"type": "function", "function": {
-    "name": "get_weather", "description": "Current weather for a city",
-    "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}]
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Current weather for a city",
+            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]},
+        },
+    }
+]
 
 
 def test_completion_greedy_with_logprobs(client):
-    r = client.post("/v1/completions", json={"prompt": "The capital of France is", "max_tokens": 4,
-                                             "temperature": 0, "logprobs": 3})
+    r = client.post(
+        "/v1/completions", json={"prompt": "The capital of France is", "max_tokens": 4, "temperature": 0, "logprobs": 3}
+    )
     assert r.status_code == 200, r.text
     choice = r.json()["choices"][0]
     assert "Paris" in choice["text"]
@@ -51,16 +69,22 @@ def test_completion_greedy_with_logprobs(client):
 
 
 def test_stop_string_is_cut(client):
-    r = client.post("/v1/completions", json={"prompt": "1, 2, 3, 4,", "max_tokens": 30,
-                                             "temperature": 0, "stop": [" 7"]})
+    r = client.post(
+        "/v1/completions", json={"prompt": "1, 2, 3, 4,", "max_tokens": 30, "temperature": 0, "stop": [" 7"]}
+    )
     choice = r.json()["choices"][0]
     assert choice["finish_reason"] == "stop"
     assert "7" not in choice["text"] and choice["text"].strip().endswith("6,")
 
 
 def test_streaming_chat(client):
-    body = {"messages": [{"role": "user", "content": "Say hello."}], "max_tokens": 12,
-            "temperature": 0, "stream": True, "chat_template_kwargs": {"enable_thinking": False}}
+    body = {
+        "messages": [{"role": "user", "content": "Say hello."}],
+        "max_tokens": 12,
+        "temperature": 0,
+        "stream": True,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
     chunks, done = [], False
     with client.stream("POST", "/v1/chat/completions", json=body) as r:
         for line in r.iter_lines():
@@ -77,9 +101,13 @@ def test_streaming_chat(client):
 
 
 def test_tool_call_is_parsed(client):
-    body = {"messages": [{"role": "user", "content": "What is the weather in Paris right now?"}],
-            "tools": TOOLS, "max_tokens": 200, "temperature": 0,
-            "chat_template_kwargs": {"enable_thinking": False}}
+    body = {
+        "messages": [{"role": "user", "content": "What is the weather in Paris right now?"}],
+        "tools": TOOLS,
+        "max_tokens": 200,
+        "temperature": 0,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
     r = client.post("/v1/chat/completions", json=body)
     choice = r.json()["choices"][0]
     assert choice["finish_reason"] == "tool_calls", choice
@@ -88,16 +116,18 @@ def test_tool_call_is_parsed(client):
 
 
 def test_reasoning_is_separated(client):
-    body = {"messages": [{"role": "user", "content": "What is 2+3? Reply with the number."}],
-            "max_tokens": 300, "temperature": 0}
+    body = {
+        "messages": [{"role": "user", "content": "What is 2+3? Reply with the number."}],
+        "max_tokens": 300,
+        "temperature": 0,
+    }
     msg = client.post("/v1/chat/completions", json=body).json()["choices"][0]["message"]
     assert msg.get("reasoning_content"), msg
     assert "<think>" not in (msg["content"] or "") and "</think>" not in (msg["content"] or "")
 
 
 def test_metrics_count_the_served_tokens(client):
-    r = client.post("/v1/completions", json={"prompt": "The capital of France is", "max_tokens": 4,
-                                             "temperature": 0})
+    r = client.post("/v1/completions", json={"prompt": "The capital of France is", "max_tokens": 4, "temperature": 0})
     assert r.status_code == 200, r.text
     m = client.get("/metrics").text
     assert "trnrt:generation_tokens_total" in m and "trnrt:time_to_first_token_seconds_count" in m
@@ -111,8 +141,12 @@ def test_metrics_count_the_served_tokens(client):
 
 
 def test_session_id(client):
-    body = {"prompt": "A long agent conversation about capitals: France, Spain, Italy and Japan.",
-            "session_id": "agent-7", "max_tokens": 2, "temperature": 0}
+    body = {
+        "prompt": "A long agent conversation about capitals: France, Spain, Italy and Japan.",
+        "session_id": "agent-7",
+        "max_tokens": 2,
+        "temperature": 0,
+    }
     assert client.post("/v1/completions", json=body).status_code == 200
     r = client.post("/v1/completions", json={"prompt": "hello", "max_tokens": 1, "session_id": "agent-7"})
     assert r.status_code == 200

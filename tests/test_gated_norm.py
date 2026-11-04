@@ -53,8 +53,8 @@ def test_rev_is_the_kernel_span_and_p():
     a = src.index("# -- the kernel (its span is what REV hashes)")
     b = src.index("    gated_norm2_kernel = None", a)
     assert "def gated_norm2_kernel(" in src[a:b] and "nisa.activation_reduce" in src[a:b]
-    assert gn.REV == zlib.crc32(repr((gn.P,)).encode(), zlib.crc32(src[a:b].encode()))
-    assert gn.REV != zlib.crc32(repr((gn.P * 2,)).encode(), zlib.crc32(src[a:b].encode()))  # P re-keys it
+    assert zlib.crc32(repr((gn.P,)).encode(), zlib.crc32(src[a:b].encode())) == gn.REV
+    assert zlib.crc32(repr((gn.P * 2,)).encode(), zlib.crc32(src[a:b].encode())) != gn.REV  # P re-keys it
 
 
 @pytest.mark.skipif(importlib.util.find_spec("nki") is None, reason="needs the NKI package (Neuron venv)")

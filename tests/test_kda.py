@@ -29,6 +29,7 @@ needs_nki = pytest.mark.skipif(importlib.util.find_spec("nki") is None, reason="
 
 # -- the delta rule --------------------------------------------------------------------------------------------------
 
+
 def inputs(T, H, seed=0, lower_bound=-5.0, correlated=False, D=128):
     """Torch-path inputs as linear_attn builds them for KDA: l2-normalised q (scaled) and k, per-channel gates in
     [lower_bound, 0) (the safe gate, lower_bound * sigmoid)."""
@@ -40,7 +41,7 @@ def inputs(T, H, seed=0, lower_bound=-5.0, correlated=False, D=128):
     else:
         k = torch.nn.functional.normalize(torch.randn(T, H, D, generator=g), dim=-1)
         beta = torch.rand(T, H, generator=g)
-    q = torch.nn.functional.normalize(torch.randn(T, H, D, generator=g), dim=-1) * D ** -0.5
+    q = torch.nn.functional.normalize(torch.randn(T, H, D, generator=g), dim=-1) * D**-0.5
     v = torch.randn(T, H, D, generator=g)
     gate = lower_bound * torch.sigmoid(torch.randn(T, H, D, generator=g) * 2 - (4 if correlated else 0))
     S0 = torch.randn(H, D, D, generator=g) * 0.1
@@ -113,13 +114,14 @@ def test_nki_simulator_matches_emulation(H, T, ug, monkeypatch):
 
 # -- chunk_scan -------------------------------------------------------------------------------------------------------
 
+
 @pytest.mark.parametrize("chunk", [4, 16, 32, 64])
 def test_chunk_scan_matches_the_recurrence(chunk):
     """chunk_scan (sub-chunks, (I - N)^-1, padding) equals the delta rule token by token, from a non-zero state, with
     per-channel decay."""
     g = torch.Generator().manual_seed(3)
     T, H, Dk, Dv = 37, 3, 8, 5
-    q = torch.nn.functional.normalize(torch.randn(T, H, Dk, generator=g), dim=-1) * Dk ** -0.5
+    q = torch.nn.functional.normalize(torch.randn(T, H, Dk, generator=g), dim=-1) * Dk**-0.5
     k = torch.nn.functional.normalize(torch.randn(T, H, Dk, generator=g), dim=-1)
     v = torch.randn(T, H, Dv, generator=g)
     gate = -torch.rand(T, H, Dk, generator=g) * 3
@@ -143,7 +145,7 @@ def test_chunk_scan_is_stable_on_correlated_keys(chunk):
     T, H, Dk, Dv = 128, 2, 32, 16
     base = torch.randn(H, Dk, generator=g)
     k = torch.nn.functional.normalize(base + 0.05 * torch.randn(T, H, Dk, generator=g), dim=-1)
-    q = torch.nn.functional.normalize(torch.randn(T, H, Dk, generator=g), dim=-1) * Dk ** -0.5
+    q = torch.nn.functional.normalize(torch.randn(T, H, Dk, generator=g), dim=-1) * Dk**-0.5
     v = torch.randn(T, H, Dv, generator=g)
     gate = -0.01 * torch.rand(T, H, Dk, generator=g)
     beta = 0.9 + 0.1 * torch.rand(T, H, generator=g)
@@ -157,6 +159,7 @@ def test_chunk_scan_is_stable_on_correlated_keys(chunk):
 
 
 # -- the short conv of a prefill chunk ------------------------------------------------------------------------------
+
 
 def _conv_inputs(T: int, C: int, K: int = 4, seed: int = 0):
     g = torch.Generator().manual_seed(seed)
@@ -195,6 +198,7 @@ def test_short_conv_kernel_equals_causal_conv(monkeypatch, T, C):
 
 
 # -- the decode form's conv window ------------------------------------------------------------------------------------
+
 
 def pool(seed=0, S=25, K=4, D=768, dtype=torch.bfloat16):
     g = torch.Generator().manual_seed(seed)
@@ -284,6 +288,7 @@ def test_the_decode_form_is_the_index_form(flash, monkeypatch, B):
 def test_one_row_keeps_the_index_form(flash, monkeypatch):
     """One row compiles to a direct copy already, so a one-row decode never calls _conv_read / _conv_write; two rows do
     (the positive control)."""
+
     def boom(*a):
         raise AssertionError("the one-hot path")
 
@@ -303,8 +308,8 @@ def test_one_row_keeps_the_index_form(flash, monkeypatch):
 
 
 def serve(path, monkeypatch, form: str, budget: int = 64, reverse: bool = False):
-    from trnrt.engine.request import SamplingParams
     from tests.test_glm5_next import prompts
+    from trnrt.engine.request import SamplingParams
 
     with monkeypatch.context() as mp:
         if form == "index":

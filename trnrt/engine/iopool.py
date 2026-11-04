@@ -48,7 +48,7 @@ _CTX = None
 
 
 class _Ctx:
-    __slots__ = ("pool", "key", "j", "occ", "args")
+    __slots__ = ("args", "j", "key", "occ", "pool")
 
     def __init__(self, pool, key, j):
         self.pool, self.key, self.j = pool, key, j
@@ -136,10 +136,18 @@ class Pool:
             self.last[(key, j)] = bound.n - 1
 
     def stats(self) -> dict:
-        return {"k": self.k, "names": sorted(self.names), "rank": self.rank, "calls": self.calls, "waits": self.waits,
-                "wait_s": round(self.wait_s, 4), "wait_max_ms": round(1000 * self.wait_max, 3),
-                "reallocs": self.reallocs, "fallback": dict(self.fallback),
-                "slots": {str(k): min(n, self.k) for k, n in list(self.count.items())}}
+        return {
+            "k": self.k,
+            "names": sorted(self.names),
+            "rank": self.rank,
+            "calls": self.calls,
+            "waits": self.waits,
+            "wait_s": round(self.wait_s, 4),
+            "wait_max_ms": round(1000 * self.wait_max, 3),
+            "reallocs": self.reallocs,
+            "fallback": dict(self.fallback),
+            "slots": {str(k): min(n, self.k) for k, n in list(self.count.items())},
+        }
 
 
 class PooledExecutor:

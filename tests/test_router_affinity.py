@@ -179,8 +179,10 @@ def test_end_to_end_affinity_and_failover_through_the_router():
         ports = [_free_port() for _ in range(3)]
         router = Router([f"http://127.0.0.1:{p}" for p in ports[:2]])
         apps = [worker(0), worker(1), build_router_app(router, poll_s=0)]
-        servers = [uvicorn.Server(uvicorn.Config(a, host="127.0.0.1", port=p, log_level="warning"))
-                   for a, p in zip(apps, ports)]
+        servers = [
+            uvicorn.Server(uvicorn.Config(a, host="127.0.0.1", port=p, log_level="warning"))
+            for a, p in zip(apps, ports)
+        ]
         tasks = [asyncio.create_task(s.serve()) for s in servers]
         try:
             while not all(s.started for s in servers):
@@ -189,8 +191,12 @@ def test_end_to_end_affinity_and_failover_through_the_router():
             async with httpx.AsyncClient(timeout=30) as c:
 
                 async def turn(sid: str) -> str:
-                    body = {"model": "glm", "stream": True, "session_id": sid,
-                            "messages": [{"role": "user", "content": f"{sid} " + "context " * 2000}]}
+                    body = {
+                        "model": "glm",
+                        "stream": True,
+                        "session_id": sid,
+                        "messages": [{"role": "user", "content": f"{sid} " + "context " * 2000}],
+                    }
                     async with c.stream("POST", base + "/v1/chat/completions", json=body) as r:
                         assert r.status_code == 200
                         lines = [x async for x in r.aiter_lines() if x.startswith("data: ") and x != "data: [DONE]"]
@@ -259,8 +265,10 @@ def test_a_health_poll_that_times_out_once_moves_no_session_but_a_refused_port_d
         ports = [_free_port() for _ in range(3)]
         router = Router([f"http://127.0.0.1:{p}" for p in ports[:2]], down_after=3)
         apps = [worker(0), worker(1), build_router_app(router, poll_s=0.2, health_timeout_s=0.3)]
-        servers = [uvicorn.Server(uvicorn.Config(a, host="127.0.0.1", port=p, log_level="warning"))
-                   for a, p in zip(apps, ports)]
+        servers = [
+            uvicorn.Server(uvicorn.Config(a, host="127.0.0.1", port=p, log_level="warning"))
+            for a, p in zip(apps, ports)
+        ]
         tasks = [asyncio.create_task(s.serve()) for s in servers]
         try:
             while not all(s.started for s in servers):
@@ -269,8 +277,12 @@ def test_a_health_poll_that_times_out_once_moves_no_session_but_a_refused_port_d
             async with httpx.AsyncClient(timeout=30) as c:
 
                 async def turn(sid: str) -> str:
-                    body = {"model": "glm", "stream": True, "session_id": sid,
-                            "messages": [{"role": "user", "content": sid}]}
+                    body = {
+                        "model": "glm",
+                        "stream": True,
+                        "session_id": sid,
+                        "messages": [{"role": "user", "content": sid}],
+                    }
                     async with c.stream("POST", base + "/v1/chat/completions", json=body) as r:
                         lines = [x async for x in r.aiter_lines() if x.startswith("data: ") and x != "data: [DONE]"]
                     return json.loads(lines[0][6:])["choices"][0]["delta"]["content"]
@@ -316,7 +328,10 @@ def test_a_long_shared_system_prompt_does_not_pin_new_sessions():
     from trnrt.serve.router import _request_head, _request_text
 
     path = "/v1/chat/completions"
-    system = {"role": "system", "content": "You are a coding agent. Environment and file tree follow. " + "src/x.py " * 4500}
+    system = {
+        "role": "system",
+        "content": "You are a coding agent. Environment and file tree follow. " + "src/x.py " * 4500,
+    }
     r = Router(["a", "b"], balance_abs=1, balance_rel=1.0, sticky_chars=32_768)
     picks = []
     for i in range(8):
@@ -329,7 +344,10 @@ def test_a_long_shared_system_prompt_does_not_pin_new_sessions():
     assert set(picks) == {0, 1} and r.routed["sticky"] == 0, (picks, r.routed)
     # the positive control: one session's conversation grows past sticky_chars beyond the system message
     convo = [system, {"role": "user", "content": "task 0: fix the bug in module 0"}]
-    convo += [{"role": "assistant", "content": "reading files " * 3000}, {"role": "tool", "content": "def f(): pass " * 1000}]
+    convo += [
+        {"role": "assistant", "content": "reading files " * 3000},
+        {"role": "tool", "content": "def f(): pass " * 1000},
+    ]
     home = r.pick(_request_text(path, {"messages": convo}), head=_request_head(path, {"messages": convo}))
     r.load[home] += 20  # far past balance_abs
     nxt = convo + [{"role": "assistant", "content": "next step"}]
@@ -371,10 +389,12 @@ def test_with_the_debug_switch_each_pin_and_side_request_logs_its_worker(capsys,
     r = Router(["a", "b"])
     w, side = _pin_side_failover(r)
     out = [ln for ln in capsys.readouterr().out.splitlines() if "is down" not in ln]
-    assert out == [f"trnrt.router: session 's' pinned to worker {w} ({r.workers[w]})",
-                   f"trnrt.router: side request of session 's' to worker {side} ({r.workers[side]})",
-                   f"trnrt.router: session 's' failed over from worker {w} ({r.workers[w]}, down) to worker {1 - w} "
-                   f"({r.workers[1 - w]})"]
+    assert out == [
+        f"trnrt.router: session 's' pinned to worker {w} ({r.workers[w]})",
+        f"trnrt.router: side request of session 's' to worker {side} ({r.workers[side]})",
+        f"trnrt.router: session 's' failed over from worker {w} ({r.workers[w]}, down) to worker {1 - w} "
+        f"({r.workers[1 - w]})",
+    ]
 
 
 def test_by_default_no_line_names_a_session(capsys, monkeypatch):
@@ -384,8 +404,10 @@ def test_by_default_no_line_names_a_session(capsys, monkeypatch):
     r = Router(["a", "b"])
     w, _ = _pin_side_failover(r)
     out = [ln for ln in capsys.readouterr().out.splitlines() if "is down" not in ln]
-    assert out == [f"trnrt.router: a session failed over from worker {w} ({r.workers[w]}, down) to worker {1 - w} "
-                   f"({r.workers[1 - w]})"]
+    assert out == [
+        f"trnrt.router: a session failed over from worker {w} ({r.workers[w]}, down) to worker {1 - w} "
+        f"({r.workers[1 - w]})"
+    ]
     assert Router(["a"], log_sessions=True).log_sessions and not Router(["a"]).log_sessions
 
 
@@ -404,7 +426,11 @@ def test_a_compaction_keeps_an_established_pin_and_rekeys():
     r = Router(["a", "b"])
     w = r.pick("", session="s", key=("s", "f1"), tools=True)
     r.load[w] += 5
-    assert r.pick("", session="s", key=("s", "f2"), tools=True) == w and r.routed["rekey"] == 1 and r.keys["s"] == ("s", "f2")
+    assert (
+        r.pick("", session="s", key=("s", "f2"), tools=True) == w
+        and r.routed["rekey"] == 1
+        and r.keys["s"] == ("s", "f2")
+    )
     assert r.pick("", session="s", key=("s", "f2"), tools=True) == w and r.routed["side"] == 0
 
 
@@ -458,8 +484,10 @@ def test_end_to_end_a_title_request_is_not_pinned_with_its_session():
         ports = [_free_port() for _ in range(3)]
         router = Router([f"http://127.0.0.1:{p}" for p in ports[:2]])
         apps = [worker(0), worker(1), build_router_app(router, poll_s=0)]
-        servers = [uvicorn.Server(uvicorn.Config(a, host="127.0.0.1", port=p, log_level="warning"))
-                   for a, p in zip(apps, ports)]
+        servers = [
+            uvicorn.Server(uvicorn.Config(a, host="127.0.0.1", port=p, log_level="warning"))
+            for a, p in zip(apps, ports)
+        ]
         tasks = [asyncio.create_task(s.serve()) for s in servers]
         try:
             while not all(s.started for s in servers):
@@ -469,6 +497,7 @@ def test_end_to_end_a_title_request_is_not_pinned_with_its_session():
             task = {"role": "user", "content": "Fix the parser."}
             tools = [{"type": "function", "function": {"name": "read", "parameters": {"type": "object"}}}]
             async with httpx.AsyncClient(timeout=30) as c:
+
                 async def ask(messages, with_tools):
                     body = {"model": "glm", "session_id": "s1", "messages": messages}
                     if with_tools:

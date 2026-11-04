@@ -87,8 +87,10 @@ def test_router_does_not_cap_streams_in_flight():
 
         ports = [free_port() for _ in range(3)]
         apps = [worker, worker, build_router_app(Router([f"http://127.0.0.1:{p}" for p in ports[:2]]))]
-        servers = [uvicorn.Server(uvicorn.Config(a, host="127.0.0.1", port=p, log_level="warning"))
-                   for a, p in zip(apps, ports)]
+        servers = [
+            uvicorn.Server(uvicorn.Config(a, host="127.0.0.1", port=p, log_level="warning"))
+            for a, p in zip(apps, ports)
+        ]
         tasks = [asyncio.create_task(s.serve()) for s in servers]
         try:
             while not all(s.started for s in servers):
@@ -104,7 +106,7 @@ def test_router_does_not_cap_streams_in_flight():
                 calls = asyncio.gather(*(one(i) for i in range(n)))
                 try:
                     await asyncio.wait_for(release.wait(), timeout=20)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     release.set()  # let the streams that did arrive finish, then report how many there were
                 lasts = await calls
             assert lasts == ["data: [DONE]"] * n
@@ -187,6 +189,7 @@ def _stub_worker(i: int, chat_status: int = 200):
         if app.state.status != 200:
             raise HTTPException(status_code=app.state.status, detail="engine failed: rank 3 exited")
         if body.get("stream"):
+
             async def stream():
                 yield ('data: {"choices": [{"delta": {"content": "w%d"}}]}\n\n' % i).encode()
                 yield b"data: [DONE]\n\n"
@@ -221,8 +224,9 @@ def test_router_health_and_models_follow_the_workers():
     async def main() -> None:
         ports = [_free_port() for _ in range(3)]
         router = Router([f"http://127.0.0.1:{p}" for p in ports[:2]])
-        servers, tasks = await _start([(_stub_worker(0), ports[0]), (_stub_worker(1), ports[1]),
-                                       (build_router_app(router, poll_s=0), ports[2])])
+        servers, tasks = await _start(
+            [(_stub_worker(0), ports[0]), (_stub_worker(1), ports[1]), (build_router_app(router, poll_s=0), ports[2])]
+        )
         base = f"http://127.0.0.1:{ports[2]}"
         try:
             async with httpx.AsyncClient(timeout=30) as c:
@@ -265,8 +269,9 @@ def test_a_body_that_is_not_a_json_object_is_answered_400_and_reaches_no_worker(
         servers, tasks = await _start([(worker, ports[0]), (build_router_app(router, poll_s=0), ports[1])])
         try:
             async with httpx.AsyncClient(timeout=30) as c:
-                r = await c.post(f"http://127.0.0.1:{ports[1]}{path}", content=body,
-                                 headers={"Content-Type": "application/json"})
+                r = await c.post(
+                    f"http://127.0.0.1:{ports[1]}{path}", content=body, headers={"Content-Type": "application/json"}
+                )
                 assert r.status_code == 400, r.text
                 assert r.json()["detail"] == "the request body must be a JSON object"
                 assert router.load == [0] and worker.state.chats == 0
@@ -292,13 +297,19 @@ def test_a_503_from_a_request_marks_its_worker_down_and_the_request_goes_to_anot
         ports = [_free_port() for _ in range(3)]
         router = Router([f"http://127.0.0.1:{p}" for p in ports[:2]])
         failed, live = _stub_worker(0, chat_status=503), _stub_worker(1)
-        servers, tasks = await _start([(failed, ports[0]), (live, ports[1]),
-                                       (build_router_app(router, poll_s=0), ports[2])])
+        servers, tasks = await _start(
+            [(failed, ports[0]), (live, ports[1]), (build_router_app(router, poll_s=0), ports[2])]
+        )
         base = f"http://127.0.0.1:{ports[2]}"
 
         def body(sid: str, **kw) -> dict:
-            return {"model": "glm", "stream": stream, "session_id": sid,
-                    "messages": [{"role": "user", "content": sid}], **kw}
+            return {
+                "model": "glm",
+                "stream": stream,
+                "session_id": sid,
+                "messages": [{"role": "user", "content": sid}],
+                **kw,
+            }
 
         async def ask(c, b) -> tuple[int, str]:
             r = await c.post(base + "/v1/chat/completions", json=b)

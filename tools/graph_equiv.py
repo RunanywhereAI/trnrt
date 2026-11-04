@@ -74,6 +74,7 @@ class Names:
 
 # ---- captures ----
 
+
 def load_capture(root, cache_subdir):
     ranks = {}
     for p in glob.glob(os.path.join(root, "capture", "rank*.json")):
@@ -129,6 +130,7 @@ def pair_by_signature(ref_ranks, new_ranks, sig_ref, sig_new):
 
 # ---- HLO ----
 
+
 def _decode_bc(bc):
     for m in _B64.finditer(bc):
         blob = m.group(0)
@@ -159,7 +161,7 @@ def _norm_kernel_config(cfg, names):
         for k in [k for k in klir if "rev" in k.lower()]:
             klir.pop(k)
         cfg["klir_binary"] = klir
-    for k in [k for k in cfg if "rev" == k.lower()]:
+    for k in [k for k in cfg if k.lower() == "rev"]:
         cfg.pop(k)
     return cfg, path
 
@@ -199,7 +201,9 @@ def normalize_hlo(path, names, pb2):
             for k in list(ins.frontend_attributes.map.keys()):
                 ins.frontend_attributes.map[k] = names.name(ins.frontend_attributes.map[k])
             if ins.opcode == "custom-call" and ins.custom_call_target == NKI_TARGET:
-                cfg = _decode_bc(ins.backend_config if isinstance(ins.backend_config, bytes) else ins.backend_config.encode())
+                cfg = _decode_bc(
+                    ins.backend_config if isinstance(ins.backend_config, bytes) else ins.backend_config.encode()
+                )
                 if cfg is not None:
                     cfg, kpath = _norm_kernel_config(cfg, names)
                     kernels.append((cfg.get("func_name", "?"), kpath))
@@ -222,6 +226,7 @@ def hlo_diff(a, b, pb2, limit=12):
 
 
 # ---- kernels (.colz) ----
+
 
 def _frame_decoder():
     """A one-frame zstd decoder factory: stdlib compression.zstd (3.14+), else the zstandard module, else None."""
@@ -309,6 +314,7 @@ def kernel_digest(path, names):
 
 # ---- the rest ----
 
+
 def _read(p):
     try:
         with open(p, "rb") as f:
@@ -330,6 +336,7 @@ def norm_command(txt, mask_key=True):
         args = shlex.split(txt.decode())
     except ValueError:
         return txt
+
     def one(a):
         if "/" not in a or a.startswith("--internal"):
             return a
@@ -361,7 +368,9 @@ def compare_pair(ref_dir, new_dir, names_ref, names_new, pb2, kernels=True):
     if ha != hb:
         diffs.append("hlo")
         notes += hlo_diff(ha, hb, pb2)
-    if norm_command(_read(os.path.join(ref_dir, "command.txt"))) != norm_command(_read(os.path.join(new_dir, "command.txt"))):
+    if norm_command(_read(os.path.join(ref_dir, "command.txt"))) != norm_command(
+        _read(os.path.join(new_dir, "command.txt"))
+    ):
         diffs.append("command")
     ma = norm_meta(_read(os.path.join(ref_dir, ".artifact_metadata_v0.json")))
     mb = norm_meta(_read(os.path.join(new_dir, ".artifact_metadata_v0.json")))
@@ -398,8 +407,12 @@ def main(argv=None):
     ap.add_argument("--cache-subdir", default="cache/neuron/compile_cache")
     ap.add_argument("--hlo-proto-path", help="a directory holding hlo_pb2 when libtorch_neuronx_lite is not installed")
     ap.add_argument("--no-kernels", dest="kernels", action="store_false", help="skip the kernel-body comparison")
-    ap.add_argument("--pair-by", choices=("order", "signature"), default="order",
-                    help="pair each rank's graphs by visit order (default) or by input signature")
+    ap.add_argument(
+        "--pair-by",
+        choices=("order", "signature"),
+        default="order",
+        help="pair each rank's graphs by visit order (default) or by input signature",
+    )
     ap.add_argument("--json", help="write per-pair records and the summary here")
     a = ap.parse_args(argv)
     pb2 = hlo_pb2(a.hlo_proto_path)
@@ -408,17 +421,20 @@ def main(argv=None):
     ref_ranks, ref_cache = load_capture(a.ref_root, a.cache_subdir)
     new_ranks, new_cache = load_capture(a.new_root, a.cache_subdir)
     if a.pair_by == "signature":
-        sig = lambda cache: (lambda k: _read(os.path.join(cache, k, "example_inputs.txt")))
+        sig = lambda cache: lambda k: _read(os.path.join(cache, k, "example_inputs.txt"))
         pairs, problems = pair_by_signature(ref_ranks, new_ranks, sig(ref_cache), sig(new_cache))
     else:
         pairs, problems = pair(ref_ranks, new_ranks)
     done, records, bad = {}, [], 0
     for r, i, ka, kb in pairs:
         if (ka, kb) not in done:
-            done[(ka, kb)] = compare_pair(os.path.join(ref_cache, ka), os.path.join(new_cache, kb), names_ref, names_new,
-                                          pb2, a.kernels)
+            done[(ka, kb)] = compare_pair(
+                os.path.join(ref_cache, ka), os.path.join(new_cache, kb), names_ref, names_new, pb2, a.kernels
+            )
         diffs, notes, kernels = done[(ka, kb)]
-        records.append({"rank": r, "index": i, "ref": ka, "new": kb, "diffs": diffs, "notes": notes, "kernels": kernels})
+        records.append(
+            {"rank": r, "index": i, "ref": ka, "new": kb, "diffs": diffs, "notes": notes, "kernels": kernels}
+        )
     distinct = len(done)
     differ = sorted({(ka, kb) for (ka, kb), (d, _, _) in done.items() if d})
     for ka, kb in differ:
@@ -429,12 +445,23 @@ def main(argv=None):
     for p in problems:
         print(f"PROBLEM {p}")
     ok = not differ and not problems
-    print(f"GRAPH_EQUIV pairs={len(pairs)} distinct={distinct} differ={len(differ)} problems={len(problems)} "
-          f"verdict={'EQUAL' if ok else 'DIFFER'}")
+    print(
+        f"GRAPH_EQUIV pairs={len(pairs)} distinct={distinct} differ={len(differ)} problems={len(problems)} "
+        f"verdict={'EQUAL' if ok else 'DIFFER'}"
+    )
     if a.json:
         with open(a.json, "w") as f:
-            json.dump({"pairs": records, "problems": problems, "distinct": distinct, "differ": [list(x) for x in differ],
-                       "verdict": "EQUAL" if ok else "DIFFER"}, f, indent=1)
+            json.dump(
+                {
+                    "pairs": records,
+                    "problems": problems,
+                    "distinct": distinct,
+                    "differ": [list(x) for x in differ],
+                    "verdict": "EQUAL" if ok else "DIFFER",
+                },
+                f,
+                indent=1,
+            )
     return 0 if ok else 1
 
 

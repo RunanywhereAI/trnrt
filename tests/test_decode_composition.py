@@ -43,6 +43,7 @@ def serve(path, monkeypatch, host: bool, drop_y: bool = False, seen: list | None
             def dropped(layer, pend):
                 out = real_pend(layer, pend)
                 return None if out is None else (out[0], out[1], torch.zeros_like(out[2]))
+
             mp.setattr(HY, "_shell_pend", dropped)
         if seen is not None:
             real = KS.decode
@@ -50,6 +51,7 @@ def serve(path, monkeypatch, host: bool, drop_y: bool = False, seen: list | None
             def spy(model, layer, S, positions, state_slot, pend=None):
                 seen.append(pend is not None)
                 return real(model, layer, S, positions, state_slot, pend=pend)
+
             mp.setattr(KS, "decode", spy)
         eng = engine(path, dtype=torch.bfloat16, max_num_seqs=4, max_prefill_tokens=16)
         try:

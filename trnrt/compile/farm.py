@@ -132,8 +132,20 @@ def missing_kernels(hlo_path: str) -> list[str]:
 
 def compiler_command(neuronx_cc: str, hlo: str, target: str, neff: str, log: str, args: list[str]) -> list[str]:
     """The command LNL's neuroncc_compile runs (compile/backend.py)."""
-    return [neuronx_cc, "compile", hlo, "--framework", "XLA", "--target", target, "--output", neff,
-            "--logfile", log, *args]
+    return [
+        neuronx_cc,
+        "compile",
+        hlo,
+        "--framework",
+        "XLA",
+        "--target",
+        target,
+        "--output",
+        neff,
+        "--logfile",
+        log,
+        *args,
+    ]
 
 
 @dataclass
@@ -171,8 +183,14 @@ def _tree_rss(pid: int) -> int:
     return total
 
 
-def run_compile(entry: str, *, work_root: str | None = None, neuronx_cc: str | None = None,
-                sample_seconds: float = 1.0, rss: list[int] | None = None) -> Result:
+def run_compile(
+    entry: str,
+    *,
+    work_root: str | None = None,
+    neuronx_cc: str | None = None,
+    sample_seconds: float = 1.0,
+    rss: list[int] | None = None,
+) -> Result:
     """Compile `entry`'s graph.hlo with its own compiler arguments into the entry: the NEFF, the log
     and command.txt, then the completion marker LAST, which makes it an LNL cache hit. rss: a
     one-element list kept at the compiler's process-tree resident bytes, as last sampled."""
@@ -180,8 +198,13 @@ def run_compile(entry: str, *, work_root: str | None = None, neuronx_cc: str | N
     try:
         target, args = entry_args(entry)
     except (OSError, ValueError) as err:  # a capture killed after renaming graph.hlo into place, before command.txt
-        return Result(key, False, 0.0, -1, error=f"{type(err).__name__}: {err}: an incomplete entry; remove {entry} "
-                                                 "and run capture again")
+        return Result(
+            key,
+            False,
+            0.0,
+            -1,
+            error=f"{type(err).__name__}: {err}: an incomplete entry; remove {entry} and run capture again",
+        )
     hlo = os.path.join(entry, HLO)
     neff, log = os.path.join(entry, neff_name(key)), os.path.join(entry, LOG)
     cc = neuronx_cc or shutil.which("neuronx-cc")
@@ -190,9 +213,15 @@ def run_compile(entry: str, *, work_root: str | None = None, neuronx_cc: str | N
     cmd = compiler_command(cc, hlo, target, neff, log, args)
     gone = missing_kernels(hlo)
     if gone:
-        return Result(key, False, 0.0, -1, args=args,
-                      error=f"{len(gone)} NKI kernel binaries missing, e.g. {gone[0]}: compile on the host that "
-                            "captured, or copy its NKI kernel directory here")
+        return Result(
+            key,
+            False,
+            0.0,
+            -1,
+            args=args,
+            error=f"{len(gone)} NKI kernel binaries missing, e.g. {gone[0]}: compile on the host that "
+            "captured, or copy its NKI kernel directory here",
+        )
     tmp = os.path.join(entry, f"{COMMAND}.tmp-{os.getpid()}")
     with open(tmp, "w") as f:
         f.write(shlex.join(cmd))
@@ -224,9 +253,17 @@ def run_compile(entry: str, *, work_root: str | None = None, neuronx_cc: str | N
     with open(err_path, "rb") as f:
         err = f.read().decode(errors="replace")[-2000:]
     ok = proc.returncode == 0 and os.path.exists(neff)
-    res = Result(key, ok, seconds, proc.returncode, cpu_seconds=ru.ru_utime + ru.ru_stime,
-                 max_rss_gb=ru.ru_maxrss / 2**20, peak_tree_rss_gb=peak[0] / 2**30, args=args,
-                 error="" if ok else (err or f"exit {proc.returncode}, no NEFF written"))
+    res = Result(
+        key,
+        ok,
+        seconds,
+        proc.returncode,
+        cpu_seconds=ru.ru_utime + ru.ru_stime,
+        max_rss_gb=ru.ru_maxrss / 2**20,
+        peak_tree_rss_gb=peak[0] / 2**30,
+        args=args,
+        error="" if ok else (err or f"exit {proc.returncode}, no NEFF written"),
+    )
     if res.ok:
         res.neff_bytes = os.path.getsize(neff)
         shutil.rmtree(cwd, ignore_errors=True)  # a failed compile's scratch tree stays, for its logs
@@ -269,9 +306,16 @@ def admits(avail: int | None, held: list[int], workers: int, reserve: float) -> 
     return avail - sum(max(0.0, reserve - h) for h in held) >= reserve
 
 
-def compile_entries(entries: list[str], workers: int, work_root: str | None = None,
-                    neuronx_cc: str | None = None, on_result=None, mem_per_compile: float = MEM_PER_COMPILE_GB * GiB,
-                    mem_available=host_mem_available, poll_seconds: float = 1.0) -> list[Result]:
+def compile_entries(
+    entries: list[str],
+    workers: int,
+    work_root: str | None = None,
+    neuronx_cc: str | None = None,
+    on_result=None,
+    mem_per_compile: float = MEM_PER_COMPILE_GB * GiB,
+    mem_available=host_mem_available,
+    poll_seconds: float = 1.0,
+) -> list[Result]:
     """run_compile over `entries`, the largest graph.hlo first (size is the best cheap proxy for
     compile time), so the tail of the batch is short graphs. A compile starts when `admits` allows
     it: at most `workers` at once, each reserving `mem_per_compile` bytes of mem_available(), which
@@ -326,6 +370,7 @@ def compile_entries(entries: list[str], workers: int, work_root: str | None = No
 
 # -- the command line ----------------------------------------------------------------------------
 
+
 def _keys_filter(a) -> set[str] | None:
     keys = set()
     if a.keys:
@@ -364,15 +409,24 @@ def cmd_decisions(a, dirs) -> int:
     shape_dir = a.shape_dir or dirs["shapes"]
     fp8_max = platform.fp8_max(capture.DEFAULT_TARGET)
     ranks = None if a.ranks == "all" else [int(x) for x in a.ranks.split(",")]
-    rec = capture.compute_decisions(a.model, shape_dir, a.tp, fp8_max, ranks=ranks,
-                                    prefixes=a.layers.split(",") if a.layers else None, procs=a.procs,
-                                    revision=a.revision)
+    rec = capture.compute_decisions(
+        a.model,
+        shape_dir,
+        a.tp,
+        fp8_max,
+        ranks=ranks,
+        prefixes=a.layers.split(",") if a.layers else None,
+        procs=a.procs,
+        revision=a.revision,
+    )
     mine = {k: v for k, v in rec["decisions"].items() if k.startswith(f"fp8_max={fp8_max:g} tp={a.tp} ")}
     vals = sorted({(v["moe_prefill_dq"], v["moe_prefill_down"]) for v in mine.values()})
-    print(f"{shape_dir}/{capture.DECISIONS}: {len(mine)} (layer, rank) decisions at fp8_max={fp8_max:g} "
-          f"tp={a.tp} from {rec['model']}@{rec['revision']} in {rec['seconds']} s; (dq, down) values {vals}; "
-          f"experts read per decision: max {max((v['experts_read'] for v in mine.values()), default=0)}",
-          flush=True)
+    print(
+        f"{shape_dir}/{capture.DECISIONS}: {len(mine)} (layer, rank) decisions at fp8_max={fp8_max:g} "
+        f"tp={a.tp} from {rec['model']}@{rec['revision']} in {rec['seconds']} s; (dq, down) values {vals}; "
+        f"experts read per decision: max {max((v['experts_read'] for v in mine.values()), default=0)}",
+        flush=True,
+    )
     return 0
 
 
@@ -387,18 +441,22 @@ def check_engine_args(argv: list[str]) -> None:
     add_engine_args(ap)
     _, unknown = ap.parse_known_args(argv)
     if unknown:
-        raise SystemExit(f"capture: not engine arguments: {shlex.join(unknown)}. After `--` come the engine arguments "
-                         "the server runs with, spelled out in full (the engine group of `python -m trnrt serve "
-                         "--help`); the server's own, such as --engines and --port, do not change the graphs: leave "
-                         "them out")
+        raise SystemExit(
+            f"capture: not engine arguments: {shlex.join(unknown)}. After `--` come the engine arguments "
+            "the server runs with, spelled out in full (the engine group of `python -m trnrt serve "
+            "--help`); the server's own, such as --engines and --port, do not change the graphs: leave "
+            "them out"
+        )
 
 
 def cmd_capture(a, dirs, engine_config) -> int:
     from . import capture
 
     if engine_config is None:
-        raise SystemExit("capture needs the serve command line's engine_config(argv) -> EngineConfig "
-                         "(trnrt/__main__.py passes it to main)")
+        raise SystemExit(
+            "capture needs the serve command line's engine_config(argv) -> EngineConfig "
+            "(trnrt/__main__.py passes it to main)"
+        )
     check_engine_args(list(a.serve))
     shape_dir = a.shape_dir or dirs["shapes"]
     if not os.path.exists(os.path.join(shape_dir, capture.HEADERS)):
@@ -425,14 +483,22 @@ def cmd_compile(a, dirs) -> int:
         todo = [d for d in todo if cache.key_of(d) in want]
     cc = shutil.which(a.neuronx_cc or "neuronx-cc")  # once, not as every entry's failure
     if todo and cc is None:
-        raise SystemExit(f"{a.neuronx_cc or 'neuronx-cc'}: no such compiler (activate the Neuron SDK's environment, or "
-                         "pass --neuronx-cc)")
+        raise SystemExit(
+            f"{a.neuronx_cc or 'neuronx-cc'}: no such compiler (activate the Neuron SDK's environment, or "
+            "pass --neuronx-cc)"
+        )
     workers, reserve = a.workers or os.cpu_count() or 1, a.mem_per_compile_gb * GiB
     avail = host_mem_available()
-    room = ("MemAvailable unknown: --workers alone limits them" if avail is None else
-            f"MemAvailable {avail / GiB:.0f} GB, room for {int(avail // reserve)} now")
-    print(f"{len(todo)} entries to compile under {root}: at most {workers} at once, each reserving "
-          f"{a.mem_per_compile_gb:g} GB of host memory ({room})", flush=True)
+    room = (
+        "MemAvailable unknown: --workers alone limits them"
+        if avail is None
+        else f"MemAvailable {avail / GiB:.0f} GB, room for {int(avail // reserve)} now"
+    )
+    print(
+        f"{len(todo)} entries to compile under {root}: at most {workers} at once, each reserving "
+        f"{a.mem_per_compile_gb:g} GB of host memory ({room})",
+        flush=True,
+    )
     t0 = time.time()
 
     def show(r: Result) -> None:
@@ -442,15 +508,24 @@ def cmd_compile(a, dirs) -> int:
             with open(a.log, "a") as f:
                 f.write(json.dumps(row) + "\n")
 
-    results = compile_entries(todo, workers, a.work_root, cc, on_result=show, mem_per_compile=reserve,
-                              mem_available=host_mem_available)
+    results = compile_entries(
+        todo, workers, a.work_root, cc, on_result=show, mem_per_compile=reserve, mem_available=host_mem_available
+    )
     bad = [r for r in results if not r.ok]
-    summary = {"summary": True, "entries": len(results), "failed": len(bad),
-               "retried": sum(r.attempt > 1 for r in results), "workers": workers,
-               "mem_per_compile_gb": a.mem_per_compile_gb, "wall_seconds": round(time.time() - t0, 1)}
+    summary = {
+        "summary": True,
+        "entries": len(results),
+        "failed": len(bad),
+        "retried": sum(r.attempt > 1 for r in results),
+        "workers": workers,
+        "mem_per_compile_gb": a.mem_per_compile_gb,
+        "wall_seconds": round(time.time() - t0, 1),
+    }
     if any(oom_killed(r) for r in bad):
-        summary["hint"] = ("the OOM killer took compiles that ran alone: this host has too little memory for them "
-                           "(see each one's peak_tree_rss_gb)")
+        summary["hint"] = (
+            "the OOM killer took compiles that ran alone: this host has too little memory for them "
+            "(see each one's peak_tree_rss_gb)"
+        )
     print(json.dumps(summary), flush=True)
     return 1 if bad else 0
 
@@ -461,27 +536,35 @@ def cmd_strip(a, dirs) -> int:
     root = cache.local_root(dirs["cache_root"])
     if not any(os.path.exists(os.path.join(d, cache.MARKER)) for d in cache.entries(root)):
         raise SystemExit(f"{root}: no compiled entries; run compile first, with this --out")
-    s = strip.strip_cache(root, keys=_keys_filter(a), workers=a.workers,
-                          on_entry=lambda rep: print(json.dumps(rep), flush=True))
+    s = strip.strip_cache(
+        root, keys=_keys_filter(a), workers=a.workers, on_entry=lambda rep: print(json.dumps(rep), flush=True)
+    )
     print(json.dumps({"summary": True, "root": root, **s}), flush=True)
     return 1 if s["refused"] else 0
 
 
 def build_parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(prog="python -m trnrt compile", description=__doc__, allow_abbrev=False,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(
+        prog="python -m trnrt compile",
+        description=__doc__,
+        allow_abbrev=False,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     def common(p):
-        p.add_argument("--out", default=cache.DEFAULT_OUT,
-                       help="the pipeline's work directory: shapes/, capture/ and the cache root cache/ "
-                            "(default %(default)s)")
+        p.add_argument(
+            "--out",
+            default=cache.DEFAULT_OUT,
+            help="the pipeline's work directory: shapes/, capture/ and the cache root cache/ (default %(default)s)",
+        )
 
     sh = sub.add_parser("shapes", allow_abbrev=False, help="config and safetensors headers of a checkpoint")
     common(sh)
     sh.add_argument("model", help="a Hugging Face repo id, or a local checkpoint directory")
-    sh.add_argument("--revision", default=None, help="the repo's commit (default: its default branch, resolved "
-                                                     "and printed)")
+    sh.add_argument(
+        "--revision", default=None, help="the repo's commit (default: its default branch, resolved and printed)"
+    )
     sh.add_argument("--shape-dir", default=None, help="default <out>/shapes")
 
     dc = sub.add_parser("decisions", allow_abbrev=False, help="the load-time decisions that read weight values")
@@ -498,20 +581,31 @@ def build_parser() -> argparse.ArgumentParser:
     common(cp)
     cp.add_argument("--shape-dir", default=None, help="default <out>/shapes")
     cp.add_argument("--ranks", default="all", help="all, or a comma list")
-    cp.add_argument("--procs", type=int, default=None,
-                    help="rank processes at once after rank 0 (default: tp, at most half the CPUs)")
+    cp.add_argument(
+        "--procs",
+        type=int,
+        default=None,
+        help="rank processes at once after rank 0 (default: tp, at most half the CPUs)",
+    )
     cp.add_argument("--target", default="trn2", help="the Neuron target to compile for (default %(default)s)")
     cp.add_argument("serve", nargs=argparse.REMAINDER, help="-- then the engine arguments the server runs with")
 
     c = sub.add_parser("compile", allow_abbrev=False, help="neuronx-cc on every captured entry without a NEFF")
     common(c)
-    c.add_argument("--workers", type=int, default=None,
-                   help="most compiles at once (default: one per CPU); host memory admits fewer: "
-                        "--mem-per-compile-gb")
-    c.add_argument("--mem-per-compile-gb", type=float, default=MEM_PER_COMPILE_GB,
-                   help="host memory each compile reserves, GB (default %(default)g): neuronx-cc can take tens of "
-                        "GB on one of these graphs. A compile starts only while MemAvailable, less what the running "
-                        "ones have yet to take of theirs, holds it; one the OOM killer takes runs once more, alone")
+    c.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="most compiles at once (default: one per CPU); host memory admits fewer: --mem-per-compile-gb",
+    )
+    c.add_argument(
+        "--mem-per-compile-gb",
+        type=float,
+        default=MEM_PER_COMPILE_GB,
+        help="host memory each compile reserves, GB (default %(default)g): neuronx-cc can take tens of "
+        "GB on one of these graphs. A compile starts only while MemAvailable, less what the running "
+        "ones have yet to take of theirs, holds it; one the OOM killer takes runs once more, alone",
+    )
     c.add_argument("--keys", default=None, help="only these keys (comma list)")
     c.add_argument("--keys-file", default=None, help="only these keys (a capture's keys.json)")
     c.add_argument("--work-root", default=None, help="where neuronx-cc's scratch trees go (default: the temp dir)")
@@ -536,4 +630,6 @@ def main(argv: list[str] | None = None, engine_config=None) -> int:
     dirs = cache.out_dirs(a.out)
     if a.cmd == "capture":
         return cmd_capture(a, dirs, engine_config)
-    return {"shapes": cmd_shapes, "decisions": cmd_decisions, "compile": cmd_compile, "strip": cmd_strip}[a.cmd](a, dirs)
+    return {"shapes": cmd_shapes, "decisions": cmd_decisions, "compile": cmd_compile, "strip": cmd_strip}[a.cmd](
+        a, dirs
+    )

@@ -21,11 +21,22 @@ import pytest
 pytest.importorskip("fastapi")
 pytest.importorskip("httpx")
 
-from tests.test_serve_api import PLAIN, SDK_CHAT, TOOLS, ScriptedEngine  # noqa: E402
+from tests.test_serve_api import PLAIN, SDK_CHAT, TOOLS, ScriptedEngine
 
 TEMPLATE = os.path.join(os.path.dirname(__file__), "fixtures", "GLM-5.3-Flash-chat_template.jinja")
-TAGS = ["[gMASK]", "<sop>", "<|system|>", "<|user|>", "<|assistant|>", "<|observation|>", "<think>", "</think>",
-        "Reasoning Effort: Low", "Reasoning Effort: High", "Reasoning Effort: Max"]
+TAGS = [
+    "[gMASK]",
+    "<sop>",
+    "<|system|>",
+    "<|user|>",
+    "<|assistant|>",
+    "<|observation|>",
+    "<think>",
+    "</think>",
+    "Reasoning Effort: Low",
+    "Reasoning Effort: High",
+    "Reasoning Effort: Max",
+]
 MSG = {"messages": [{"role": "user", "content": "hi"}]}
 
 
@@ -41,7 +52,7 @@ def _glm_engine() -> ScriptedEngine:
     return eng
 
 
-@pytest.fixture()
+@pytest.fixture
 def client():
     from fastapi.testclient import TestClient
 
@@ -92,13 +103,18 @@ def test_no_reasoning_effort_is_the_templates_max(client):
 
 
 def test_values_the_template_would_ignore_are_refused(client):
-    for extra in ({"reasoning_effort": "medium"}, {"reasoning_effort": "minimal"}, {"reasoning_effort": "none"},
-                  {"reasoning_effort": "xhigh"}, {"reasoning_effort": "Low"},
-                  {"chat_template_kwargs": {"reasoning_effort": "medium"}},
-                  {"reasoning_effort": "low", "chat_template_kwargs": {"reasoning_effort": "high"}},
-                  {"chat_template_kwargs": {"enable_thinking": False}},
-                  {"chat_template_kwargs": {"enable_thinking": "no"}},
-                  {"chat_template_kwargs": {"thinking": True}}):
+    for extra in (
+        {"reasoning_effort": "medium"},
+        {"reasoning_effort": "minimal"},
+        {"reasoning_effort": "none"},
+        {"reasoning_effort": "xhigh"},
+        {"reasoning_effort": "Low"},
+        {"chat_template_kwargs": {"reasoning_effort": "medium"}},
+        {"reasoning_effort": "low", "chat_template_kwargs": {"reasoning_effort": "high"}},
+        {"chat_template_kwargs": {"enable_thinking": False}},
+        {"chat_template_kwargs": {"enable_thinking": "no"}},
+        {"chat_template_kwargs": {"thinking": True}},
+    ):
         r = client.post("/v1/chat/completions", json={**MSG, **extra})
         assert r.status_code == 400, (extra, r.text)
     r = client.post("/v1/chat/completions", json={**MSG, "chat_template_kwargs": {"enable_thinking": False}})

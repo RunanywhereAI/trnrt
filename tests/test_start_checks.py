@@ -20,12 +20,16 @@ from trnrt.engine import start_checks as S
 
 # A host's /proc/buddyinfo at a refused start: node 0's Normal zone had no free order-10 block while the total over
 # every zone passed the all-zone floor.
-SHORT_NODE = ("Node 0, zone      DMA      1      0      1      0      1      1      1      0      1      1      3\n"
-              "Node 0, zone    DMA32   1015    979    736    535    373    228    105     44     19     10    700\n"
-              "Node 0, zone   Normal  15342   9211   4561   1866    711    222     51      8      1      0      0\n"
-              "Node 1, zone   Normal   2011   1302    988    701    522    410    322    250    200    150   1200\n")
-PLENTY = ("Node 0, zone   Normal  15342   9211   4561   1866    711    222     51      8      1      0   9000\n"
-          "Node 1, zone   Normal   2011   1302    988    701    522    410    322    250    200    150   7000\n")
+SHORT_NODE = (
+    "Node 0, zone      DMA      1      0      1      0      1      1      1      0      1      1      3\n"
+    "Node 0, zone    DMA32   1015    979    736    535    373    228    105     44     19     10    700\n"
+    "Node 0, zone   Normal  15342   9211   4561   1866    711    222     51      8      1      0      0\n"
+    "Node 1, zone   Normal   2011   1302    988    701    522    410    322    250    200    150   1200\n"
+)
+PLENTY = (
+    "Node 0, zone   Normal  15342   9211   4561   1866    711    222     51      8      1      0   9000\n"
+    "Node 1, zone   Normal   2011   1302    988    701    522    410    322    250    200    150   7000\n"
+)
 
 
 def test_one_short_node_is_short():
@@ -55,8 +59,12 @@ def _trn2(procs: dict[int, list[dict]] | None = None) -> list[dict]:
     """neuron-ls -j -a on a trn2.48xlarge at LNC 2: 16 devices of 4 logical cores; procs: device -> its processes."""
     out = []
     for d in range(16):
-        rec = {"neuron_device": d, "nc_count": 4, "logical_neuroncore_config": 2,
-               "neuroncore_ids": list(range(4 * d, 4 * d + 4))}
+        rec = {
+            "neuron_device": d,
+            "nc_count": 4,
+            "logical_neuroncore_config": 2,
+            "neuroncore_ids": list(range(4 * d, 4 * d + 4)),
+        }
         if procs and d in procs:
             rec["neuron_processes"] = procs[d]
         out.append(rec)

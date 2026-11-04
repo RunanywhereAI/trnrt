@@ -66,8 +66,9 @@ def check_streaming(text: str, forbidden=(), **kw) -> dict:
         reasoning, content, calls = collect(stream(text, cuts, **kw))
         assert reasoning.strip("\n") == full.get("reasoning_content", ""), (cuts, reasoning)
         assert content.strip() == (full["content"] or "").strip(), (cuts, content)
-        assert [(c["name"], c["arguments"]) for c in calls] == \
-            [(c["function"]["name"], c["function"]["arguments"]) for c in full_calls], (cuts, calls)
+        assert [(c["name"], c["arguments"]) for c in calls] == [
+            (c["function"]["name"], c["function"]["arguments"]) for c in full_calls
+        ], (cuts, calls)
         for tag in forbidden:
             assert tag not in reasoning and tag not in content, (cuts, tag)
     return full

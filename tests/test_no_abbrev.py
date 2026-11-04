@@ -45,9 +45,11 @@ def test_every_parser_refuses_abbreviations():
 
 
 def test_the_scan_flags_a_parser_that_abbreviates():
-    src = ("import argparse\n"
-           "a = argparse.ArgumentParser(prog='x')\n"
-           "b = argparse.ArgumentParser(prog='y', allow_abbrev=False)\n"
-           "c = argparse.ArgumentParser(allow_abbrev=True)\n"
-           "s = b.add_subparsers().add_parser('run')\n")
+    src = (
+        "import argparse\n"
+        "a = argparse.ArgumentParser(prog='x')\n"
+        "b = argparse.ArgumentParser(prog='y', allow_abbrev=False)\n"
+        "c = argparse.ArgumentParser(allow_abbrev=True)\n"
+        "s = b.add_subparsers().add_parser('run')\n"
+    )
     assert abbreviating(src, "f.py") == ["f.py:2", "f.py:4", "f.py:5"]

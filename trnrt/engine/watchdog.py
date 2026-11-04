@@ -73,8 +73,11 @@ class ExecWatchdog:
         try:
             yield
         except BaseException as e:  # an error raised by the runtime inside a watched section: say where we were
-            print(f"EXEC WATCHDOG rank {self.rank}: {type(e).__name__} in {what}; {self._calls()}",
-                  file=sys.stderr, flush=True)
+            print(
+                f"EXEC WATCHDOG rank {self.rank}: {type(e).__name__} in {what}; {self._calls()}",
+                file=sys.stderr,
+                flush=True,
+            )
             raise
         finally:
             with self._lock:
@@ -90,9 +93,11 @@ class ExecWatchdog:
         return "last calls (oldest first): " + "; ".join(f"{n} {k} ({now - t:.1f} s ago)" for t, n, k in items)
 
     def report(self, what: str, dt: float) -> str:
-        return (f"EXEC WATCHDOG rank {self.rank}: {what} blocked for {dt:.0f} s (TRNRT_EXEC_TIMEOUT_S="
-                f"{self.timeout:g}); a rank that stopped taking part in the calls leaves the others waiting in "
-                f"their collectives: compare the ranks' call lists. {self._calls()}")
+        return (
+            f"EXEC WATCHDOG rank {self.rank}: {what} blocked for {dt:.0f} s (TRNRT_EXEC_TIMEOUT_S="
+            f"{self.timeout:g}); a rank that stopped taking part in the calls leaves the others waiting in "
+            f"their collectives: compare the ranks' call lists. {self._calls()}"
+        )
 
     def close(self) -> None:
         """Stop the checking thread (idempotent)."""

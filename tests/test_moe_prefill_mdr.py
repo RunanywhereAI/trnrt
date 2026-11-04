@@ -37,7 +37,7 @@ def test_split3_is_exact():
     both signs and over GLM-5.3-Flash's loaded down scales; round-to-nearest pieces fail some order on the same values."""
     g = torch.Generator().manual_seed(0)
     t = torch.rand(400000, generator=g) * torch.exp2(torch.randint(-30, 10, (400000,), generator=g).float())
-    t = torch.cat([t, -t[:1000], torch.tensor([1.0, 2.0 ** -20, 3.0, 0.0])])
+    t = torch.cat([t, -t[:1000], torch.tensor([1.0, 2.0**-20, 3.0, 0.0])])
     blob = mdd.pack(*checkpoint_experts()[0])
     t = torch.cat([t, mdd.unpack_down(blob, 1024)[1].float().flatten()])
     p = md.split3(t)
@@ -95,7 +95,7 @@ def test_inputs_guard_the_table():
     assert set(a) == set(b)
     for k in set(a) - {"pc", "dsc", "dfr", "rev"}:
         va, vb = a[k], b[k]
-        assert (torch.equal(va, vb) if isinstance(va, torch.Tensor) else va == vb), k
+        assert torch.equal(va, vb) if isinstance(va, torch.Tensor) else va == vb, k
     assert md.kernel_inputs(x, topv, topi, blob, 1, 0.05, B=64, down=fused, ctl=1)["pc"] == 3
 
 
@@ -149,13 +149,15 @@ def test_trn2_parser_takes_the_kernel(pc, monkeypatch):
     blob = mdd.pack(*checkpoint_experts()[0])
     down = mp.down_factors(blob, 1024)
     x, topv, topi = routing(256, skew=True)
-    a = md.kernel_inputs(x, topv, topi, blob, 1, 0.05, B=64, down=(down[0], md.fused_drain_table(*down, 1024)),
-                         ctl=pc - 2)
+    a = md.kernel_inputs(
+        x, topv, topi, blob, 1, 0.05, B=64, down=(down[0], md.fused_drain_table(*down, 1024)), ctl=pc - 2
+    )
 
     def np_(v):
         if not isinstance(v, torch.Tensor):
             return v
         return v.float().numpy().astype(ml_dtypes.bfloat16) if v.dtype == torch.bfloat16 else v.numpy()
+
     kw = {k: np_(v) for k, v in a.items()}
     assert str(source_to_mlir(md.kernel(), **kw, target="trn2", frontend=FrontendKind.PARSER))
 

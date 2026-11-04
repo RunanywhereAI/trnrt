@@ -29,9 +29,9 @@ from trnrt.kernels import dense_half as DH
 from trnrt.kernels import ffn_half as FH
 from trnrt.kernels import ffn_half_pb as FB
 from trnrt.kernels import ffn_half_shared as FS
+from trnrt.kernels import mhc_split as MS
 from trnrt.kernels import moe_dedupe as mdd
 from trnrt.kernels import moe_half as mh
-from trnrt.kernels import mhc_split as MS
 from trnrt.kernels import rowiso as RI
 from trnrt.kernels import shell
 from trnrt.kernels import shell as SH
@@ -61,9 +61,15 @@ def _body(f: ast.FunctionDef) -> list:
 
 # -- ffn_half_pb: the Sinkhorn's hooks and their schedule ----------------------------------------------------------
 
+
 def _is_piece(s) -> bool:
-    return (isinstance(s, ast.Expr) and isinstance(s.value, ast.Call) and isinstance(s.value.func, ast.Name)
-            and s.value.func.id == "_piece")
+    return (
+        isinstance(s, ast.Expr)
+        and isinstance(s.value, ast.Call)
+        and isinstance(s.value.func, ast.Name)
+        and s.value.func.id == "_piece"
+    )
+
 
 def _linear(stmts):
     """Every statement in source order, compound ones before their children."""
@@ -73,12 +79,20 @@ def _linear(stmts):
             if hasattr(s, field) and isinstance(getattr(s, field), list):
                 yield from _linear(getattr(s, field))
 
+
 def _calls(s) -> list[str]:
     """The nisa.* / shell.* calls a simple statement makes (not a compound one's children)."""
     if isinstance(s, (ast.For, ast.If, ast.While)):
         return []
-    return [ast.unparse(n) for n in ast.walk(s) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
-            and isinstance(n.func.value, ast.Name) and n.func.value.id in ("nisa", "shell")]
+    return [
+        ast.unparse(n)
+        for n in ast.walk(s)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and isinstance(n.func.value, ast.Name)
+        and n.func.value.id in ("nisa", "shell")
+    ]
+
 
 def _hook_sites(pb: str) -> list[tuple[str, str, str]]:
     """(hook index expression, the last instruction before it, the first after it) per _piece call, in source order."""
@@ -87,33 +101,42 @@ def _hook_sites(pb: str) -> list[tuple[str, str, str]]:
     for i, s in enumerate(seq):
         if _is_piece(s):
             before = next(c for t in reversed(seq[:i]) for c in reversed(_calls(t)))
-            after = next(c for t in seq[i + 1:] for c in _calls(t))
+            after = next(c for t in seq[i + 1 :] for c in _calls(t))
             out.append((ast.unparse(s.value.args[6]), before, after))
     return out
 
-WANT = [("0", "nisa.nc_matmul(dst=pl", "shell.sigmoid_exp(dst=sc, src=pl"),
-        ("1", "nisa.nc_matmul(dst=gps", "nisa.tensor_copy(dst=gub, src=gps"),
-        ("2", "nisa.nc_matmul(dst=aps", "nisa.tensor_copy(dst=at, src=aps"),
-        ("2 + it", "nisa.nc_matmul(dst=pd[:, s, c, :]", "nisa.tensor_tensor(dst=y.flatten_dims(2, 3)")]
+
+WANT = [
+    ("0", "nisa.nc_matmul(dst=pl", "shell.sigmoid_exp(dst=sc, src=pl"),
+    ("1", "nisa.nc_matmul(dst=gps", "nisa.tensor_copy(dst=gub, src=gps"),
+    ("2", "nisa.nc_matmul(dst=aps", "nisa.tensor_copy(dst=at, src=aps"),
+    ("2 + it", "nisa.nc_matmul(dst=pd[:, s, c, :]", "nisa.tensor_tensor(dst=y.flatten_dims(2, 3)"),
+]
+
 
 def _sites_ok(pb: str) -> bool:
     got = _hook_sites(pb)
-    return len(got) == len(WANT) and all(p == wp and b.startswith(wb) and a.startswith(wa)
-                                         for (p, b, a), (wp, wb, wa) in zip(got, WANT))
+    return len(got) == len(WANT) and all(
+        p == wp and b.startswith(wb) and a.startswith(wa) for (p, b, a), (wp, wb, wa) in zip(got, WANT)
+    )
+
 
 def _covers(n: int, step: int, n_half: int = 39) -> bool:
     """Hooks 0 .. 2 + n's pieces [p step, min((p + 1) step, n_half)) cover 0 .. n_half - 1 once, in order."""
     got = [r for p in range(3 + n) for r in range(p * step, min((p + 1) * step, n_half))]
     return got == list(range(n_half))
 
+
 def test_hooks_sit_at_the_preregistered_points():
     assert _sites_ok(PB), _hook_sites(PB)
+
 
 def test_the_loop_hook_is_guarded_by_n_inside_stage_c():
     f = _fn(PB, "half_body_pb")
     stage = next(s for s in _linear(_body(f)) if isinstance(s, ast.If) and ast.unparse(s.test) == "1 <= it <= NL")
     guard = [s for s in stage.body if isinstance(s, ast.If) and ast.unparse(s.test) == "it <= n_hk"]
     assert len(guard) == 1 and all(_is_piece(b) for b in guard[0].body)
+
 
 @pytest.mark.parametrize("T,pieces,step", [(1, 4, 10), (2, 5, 8), (4, 7, 6), (6, 8, 5), (8, 10, 4)])
 def test_schedule_is_the_preregistered_table(T, pieces, step):
@@ -123,6 +146,7 @@ def test_schedule_is_the_preregistered_table(T, pieces, step):
     assert st == step and sum(1 for p in range(3 + n) if p * st < 39) == pieces
     assert _covers(n, st)
     assert n <= NQ - (NQ + 1) // 2  # program 1's group count, the smaller: both programs reach every Lk
+
 
 @pytest.mark.parametrize("plant", ["hook-moved", "hook-dropped", "floor-step"])
 def test_a_planted_change_breaks_a_hook_pin(plant):
@@ -140,7 +164,7 @@ def test_a_planted_change_breaks_a_hook_pin(plant):
 
 def test_rev_is_one_crc_of_the_source_and_its_helpers():
     own = SH.kernel_rev(FB.__file__, "# -- the kernel source", "    ffn_half_kernel = None")
-    assert FB.REV == zlib.crc32(repr((own, SH.REV, MS.REV, mh.REV, RI.REV, FB.P)).encode()) ^ SH.MIX_REV
+    assert zlib.crc32(repr((own, SH.REV, MS.REV, mh.REV, RI.REV, FB.P)).encode()) ^ SH.MIX_REV == FB.REV
     assert FH.REV == FB.REV
     # an edit of shell moves SH.REV and mh.REV (which folds it) by the same bits: the one CRC moves, an XOR would not
     d = 0x5A5A
@@ -160,8 +184,14 @@ def test_run_launches_the_pb_kernel(monkeypatch):
         def __getitem__(self, grid):
             def call(**args):
                 seen.append((self.k, args["rev"], args["fin"], grid))
-                return (torch.zeros(T, hc * H, dtype=torch.bfloat16), torch.zeros(T, hc), torch.zeros(T, hc * hc),
-                        torch.zeros(npg, 128, T, H // 128), torch.zeros(npg, T, H))
+                return (
+                    torch.zeros(T, hc * H, dtype=torch.bfloat16),
+                    torch.zeros(T, hc),
+                    torch.zeros(T, hc * hc),
+                    torch.zeros(npg, 128, T, H // 128),
+                    torch.zeros(npg, T, H),
+                )
+
             return call
 
     hop = types.ModuleType("libtorch_neuronx_lite.nki.nki_hop")
@@ -173,14 +203,37 @@ def test_run_launches_the_pb_kernel(monkeypatch):
     monkeypatch.setattr(FB, "ffn_half_kernel", kpb)
     S = torch.zeros(T, hc, H, dtype=torch.bfloat16)
     pend = (torch.zeros(T, hc), torch.zeros(T, hc, hc), torch.zeros(npg, T, H, dtype=torch.bfloat16))
-    blobs = {torch.bfloat16: torch.zeros(1), torch.float32: torch.zeros(1), "fn": torch.zeros(1),
-             "base": torch.zeros(1), "scale": torch.zeros(1), "post_norm": torch.zeros(1)}
-    FH.run(S, pend, blobs, torch.zeros(E, 1), Is=128, K=8, scale=2.5, group=4, ring=3, limit=10.0, rsp=0, hc=hc,
-           iters=20, hc_eps=1e-6, rms_eps=1e-5, grid=npg)
+    blobs = {
+        torch.bfloat16: torch.zeros(1),
+        torch.float32: torch.zeros(1),
+        "fn": torch.zeros(1),
+        "base": torch.zeros(1),
+        "scale": torch.zeros(1),
+        "post_norm": torch.zeros(1),
+    }
+    FH.run(
+        S,
+        pend,
+        blobs,
+        torch.zeros(E, 1),
+        Is=128,
+        K=8,
+        scale=2.5,
+        group=4,
+        ring=3,
+        limit=10.0,
+        rsp=0,
+        hc=hc,
+        iters=20,
+        hc_eps=1e-6,
+        rms_eps=1e-5,
+        grid=npg,
+    )
     assert seen == [(kpb, FB.REV, RI.FIN, npg)], seen
 
 
 # -- ffn_half_shared: the served kernel's body for the fused DSA layer ----------------------------------------------
+
 
 def _sbody(f: ast.FunctionDef) -> list:
     return [ast.unparse(s) for s in _body(f)]
@@ -223,14 +276,15 @@ def test_helpers_are_the_served_objects_not_copies():
 
 def test_rev_covers_the_body_and_folds_the_served_rev():
     body = SH.kernel_rev(FS.__file__, "# -- the body source", "    ffn_half_body = None")
-    assert FS.REV == zlib.crc32(repr((body, FB.REV)).encode())
-    assert FS.REV != zlib.crc32(repr((body, FB.REV ^ 1)).encode())  # a served change (source or knob) re-keys
+    assert zlib.crc32(repr((body, FB.REV)).encode()) == FS.REV
+    assert zlib.crc32(repr((body, FB.REV ^ 1)).encode()) != FS.REV  # a served change (source or knob) re-keys
     a = SHARED.index("# -- the body source")
     assert SHARED.index("def ffn_half_body", a) < SHARED.index("    ffn_half_body = None", a)  # the body is covered
 
 
-@pytest.mark.parametrize("plant", ["served-drift", "shared-drift", "statement-dropped", "argument-renamed",
-                                   "annotation-changed", "rev-kept"])
+@pytest.mark.parametrize(
+    "plant", ["served-drift", "shared-drift", "statement-dropped", "argument-renamed", "annotation-changed", "rev-kept"]
+)
 def test_a_planted_change_breaks_the_pin(plant):
     if plant == "served-drift":  # the served kernel changes; the copy does not follow
         old = "s_pv = nl.ndarray((T, F), dtype=bf16, buffer=nl.private_hbm)"
@@ -262,7 +316,7 @@ def _front(src: str, name: str) -> list:
     """The kernel's statements from the mix's SBUF tile through _norm_xc, unparsed."""
     st = [ast.unparse(s) for s in _fn(src, name).body]
     a = st.index(FRONT_FIRST)
-    return st[a:st.index(FRONT_LAST, a) + 1]
+    return st[a : st.index(FRONT_LAST, a) + 1]
 
 
 def test_front_is_the_served_kernels():
@@ -297,18 +351,39 @@ def test_body_swiglu_lines_are_half_body_pbs():
     divergence)."""
     shared = [ast.unparse(s) for s in _fn(PB, "half_body_pb").body]
     dense = [ast.unparse(s) for s in _fn(DENSE, "dense_body").body]
-    lines = ("gub = nl.ndarray((T, J), dtype=bf16, buffer=nl.sbuf)",
-             "gcl = nl.ndarray((T, ih), dtype=bf16, buffer=nl.sbuf)",
-             "slf = nl.ndarray((T, ih), dtype=f32, buffer=nl.sbuf)",
-             "nisa.activation(dst=slf, op=nl.silu, data=gcl)",
-             "ab = nl.ndarray((T, ih), dtype=bf16, buffer=nl.sbuf)")
+    lines = (
+        "gub = nl.ndarray((T, J), dtype=bf16, buffer=nl.sbuf)",
+        "gcl = nl.ndarray((T, ih), dtype=bf16, buffer=nl.sbuf)",
+        "slf = nl.ndarray((T, ih), dtype=f32, buffer=nl.sbuf)",
+        "nisa.activation(dst=slf, op=nl.silu, data=gcl)",
+        "ab = nl.ndarray((T, ih), dtype=bf16, buffer=nl.sbuf)",
+    )
     for ln in lines:
         assert ln in shared and ln in dense, ln
-    sh = [s for s in shared if s.startswith(("nisa.tensor_scalar(dst=gcl", "nisa.tensor_scalar(dst=ucl",
-                                              "nisa.tensor_tensor(dst=ab", "nisa.tensor_copy(dst=slb"))]
-    de = [s.replace("engine=VE", "engine=nisa.vector_engine") for s in dense
-          if s.startswith(("nisa.tensor_scalar(dst=gcl", "nisa.tensor_scalar(dst=ucl", "nisa.tensor_tensor(dst=ab",
-                           "nisa.tensor_copy(dst=slb"))]
+    sh = [
+        s
+        for s in shared
+        if s.startswith(
+            (
+                "nisa.tensor_scalar(dst=gcl",
+                "nisa.tensor_scalar(dst=ucl",
+                "nisa.tensor_tensor(dst=ab",
+                "nisa.tensor_copy(dst=slb",
+            )
+        )
+    ]
+    de = [
+        s.replace("engine=VE", "engine=nisa.vector_engine")
+        for s in dense
+        if s.startswith(
+            (
+                "nisa.tensor_scalar(dst=gcl",
+                "nisa.tensor_scalar(dst=ucl",
+                "nisa.tensor_tensor(dst=ab",
+                "nisa.tensor_copy(dst=slb",
+            )
+        )
+    ]
     assert len(sh) == 4 and sh == de
 
 
@@ -316,8 +391,8 @@ def _layer_weights(Ir=384, H=256, seed=3):
     from trnrt.models.quant import quantize_fp8_rows
 
     g = torch.Generator().manual_seed(seed)
-    gu8, gus = quantize_fp8_rows(torch.randn(2 * Ir, H, generator=g) * H ** -0.5)
-    dn8, dns = quantize_fp8_rows(torch.randn(H, Ir, generator=g) * Ir ** -0.5)
+    gu8, gus = quantize_fp8_rows(torch.randn(2 * Ir, H, generator=g) * H**-0.5)
+    dn8, dns = quantize_fp8_rows(torch.randn(H, Ir, generator=g) * Ir**-0.5)
     return gu8, gus, dn8, dns
 
 
@@ -332,13 +407,13 @@ def test_pack_layout(npg):
     ih, C = Ir // npg, H // P
     w = dequant(gu8, gus, torch.bfloat16).to(torch.bfloat16)
     d = dequant(dn8, dns, torch.bfloat16).to(torch.bfloat16)
-    gu = blob[off["o_gu"]:off["o_gu"] + npg * P * C * 2 * ih].view(npg, P, C, 2 * ih)
-    dn = blob[off["o_dn"]:off["o_dn"] + npg * ih * H].view(npg, ih, H)
+    gu = blob[off["o_gu"] : off["o_gu"] + npg * P * C * 2 * ih].view(npg, P, C, 2 * ih)
+    dn = blob[off["o_dn"] : off["o_dn"] + npg * ih * H].view(npg, ih, H)
     for p in range(npg):
-        for (i, c, j) in ((0, 0, 0), (5, 1, ih - 1), (P - 1, C - 1, ih), (17, 0, 2 * ih - 1)):
+        for i, c, j in ((0, 0, 0), (5, 1, ih - 1), (P - 1, C - 1, ih), (17, 0, 2 * ih - 1)):
             row = p * ih + j if j < ih else Ir + p * ih + (j - ih)
             assert torch.equal(gu[p, i, c, j], w[row, c * P + i]), (p, i, c, j)
-        assert torch.equal(dn[p], d[:, p * ih:(p + 1) * ih].t())
+        assert torch.equal(dn[p], d[:, p * ih : (p + 1) * ih].t())
     # a planted wrong layout (k read as h = i C + c instead of c 128 + i) is caught by the same reads
     assert any(not torch.equal(gu[0, i, c, 0], w[0, i * C + c]) for (i, c) in ((5, 1), (17, 0), (100, 1)))
 
@@ -357,7 +432,11 @@ def test_emulate_is_hybrids_swiglu():
     g = torch.Generator().manual_seed(7)
     O = 2 * hc + hc * hc
     S = torch.randn(T, hc, H, generator=g).bfloat16()
-    pend = (torch.rand(T, hc, generator=g) * 2, torch.full((T, hc, hc), 1 / hc), (0.5 * torch.randn(2, T, H)).bfloat16())
+    pend = (
+        torch.rand(T, hc, generator=g) * 2,
+        torch.full((T, hc, hc), 1 / hc),
+        (0.5 * torch.randn(2, T, H)).bfloat16(),
+    )
     fn = (0.05 * torch.randn(O, hc * H, generator=g)).bfloat16()
     base, scale = 0.1 * torch.randn(O, generator=g), 1 + 0.1 * torch.randn(3, generator=g)
     pn = (1 + 0.1 * torch.randn(H, generator=g)).bfloat16()
@@ -385,6 +464,7 @@ def test_rev_covers_the_served_front():
 
 # -- moe_half: the MoE half's packed layout ------------------------------------------------------------------------
 
+
 def test_packed_blobs_at_the_served_shapes():
     """E 288, H 4096, Is 64 per rank, two programs: one bf16 blob (the router's [k, e] copy in two blocks of 144
     experts, each program's 32 + 32
@@ -406,12 +486,15 @@ def fp8_layer(E=8, H=256, Is=8, seed=0):
     layer = nn.Module()
     layer.router = nn.Parameter((torch.randn(E, H, generator=g) * 0.05).bfloat16(), requires_grad=False)
     layer.router_bias = nn.Parameter(torch.randn(E, generator=g) * 0.05, requires_grad=False)
-    layer.shared_gate_up = nn.Parameter((torch.randn(2 * Is, H, generator=g) * 16).to(torch.float8_e4m3fn),
-                                        requires_grad=False)
-    layer.shared_gate_up_scale = nn.Parameter(torch.rand(2 * Is, H // P, generator=g) * 0.01 + 1e-3,
-                                              requires_grad=False)
-    layer.shared_down = nn.Parameter((torch.randn(H, Is, generator=g) * 16).to(torch.float8_e4m3fn),
-                                     requires_grad=False)
+    layer.shared_gate_up = nn.Parameter(
+        (torch.randn(2 * Is, H, generator=g) * 16).to(torch.float8_e4m3fn), requires_grad=False
+    )
+    layer.shared_gate_up_scale = nn.Parameter(
+        torch.rand(2 * Is, H // P, generator=g) * 0.01 + 1e-3, requires_grad=False
+    )
+    layer.shared_down = nn.Parameter(
+        (torch.randn(H, Is, generator=g) * 16).to(torch.float8_e4m3fn), requires_grad=False
+    )
     layer.shared_down_scale = nn.Parameter(torch.rand(H, 1, generator=g) * 0.01 + 1e-3, requires_grad=False)
     return layer
 
@@ -427,8 +510,19 @@ def test_pack_returns_fn_in_the_kernels_layout():
     L = fp8_layer(E, H, Is)
     fn = torch.zeros(O, F, dtype=torch.bfloat16)
     fn[5, 3 * (F // P) + 2] = 1.0  # o 5, p 3, j 2 -> [p, j, o] = [3, 2, 5]
-    b = FH.pack(L.router, L.router_bias, L.shared_gate_up, L.shared_gate_up_scale, L.shared_down, L.shared_down_scale,
-                fn, torch.ones(H), torch.zeros(O), torch.ones(3), npg=2)
+    b = FH.pack(
+        L.router,
+        L.router_bias,
+        L.shared_gate_up,
+        L.shared_gate_up_scale,
+        L.shared_down,
+        L.shared_down_scale,
+        fn,
+        torch.ones(H),
+        torch.zeros(O),
+        torch.ones(3),
+        npg=2,
+    )
     assert b["fn"].shape == (P, F // P, O) and b["fn"].dtype == torch.bfloat16
     assert b["fn"][3, 2, 5] == 1 and b["fn"].float().abs().sum() == 1
     assert torch.equal(b["fn"], MF.fn_j(fn))
@@ -460,7 +554,7 @@ def test_fill_lays_out_the_loaded_weights(monkeypatch):
         for j, h in [(0, 0), (ih - 1, H - 1), (2, 77)]:
             assert v["dn"][p, j, h] == d[h, p * ih + j]
     assert torch.equal(v["rb"][0], layer.router_bias.float())
-    flat = torch.cat([w[0:ih], w[Is:Is + ih]]).reshape(P, H // P, 2 * ih)  # the same bytes, no [i, c] permute
+    flat = torch.cat([w[0:ih], w[Is : Is + ih]]).reshape(P, H // P, 2 * ih)  # the same bytes, no [i, c] permute
     assert not torch.equal(v["gu"][0], flat)
 
 
@@ -492,16 +586,21 @@ def test_the_predicate_takes_a_dense_kda_decode_layer_on_its_own_conditions(monk
     assert _pred(monkeypatch) is True
     assert _pred(monkeypatch, host=False) is False
     assert _pred(monkeypatch, dev="meta") is True and _pred(monkeypatch, dev="meta", blob=False) is False
-    assert _pred(monkeypatch, moe=True, dev="meta") is True and _pred(monkeypatch, moe=True, dev="meta", blob=False) is False
+    assert (
+        _pred(monkeypatch, moe=True, dev="meta") is True
+        and _pred(monkeypatch, moe=True, dev="meta", blob=False) is False
+    )
     assert _pred(monkeypatch, kda=False) is False and _pred(monkeypatch, lim=None) is False
-    assert _pred(monkeypatch, rows=HY.MOE_HALF_BELOW) is False and _pred(monkeypatch, rows=HY.MOE_HALF_BELOW - 1) is True
+    assert (
+        _pred(monkeypatch, rows=HY.MOE_HALF_BELOW) is False and _pred(monkeypatch, rows=HY.MOE_HALF_BELOW - 1) is True
+    )
     assert _pred(monkeypatch, dec=False) is False and _pred(monkeypatch, sp=True) is False
 
 
 def test_skip_t_keeps_the_xla_dense_ffn_at_two_rows(monkeypatch):
     """At 2 rows the XLA dense FFN is faster than the dense half: those calls keep it; 1, 3, 4, 6 and 8 rows take the
     dense half; an MoE layer is not affected."""
-    assert DH.SKIP_T == frozenset((2,))
+    assert frozenset((2,)) == DH.SKIP_T
     assert [_pred(monkeypatch, rows=r, dev="meta") for r in (1, 2, 3, 4, 6, 8)] == [True, False, True, True, True, True]
     assert _pred(monkeypatch, rows=2, moe=True, dev="meta") is True
 
@@ -519,10 +618,17 @@ def _takes_layer(**kw):
     return types.SimpleNamespace(**a)
 
 
-@pytest.mark.parametrize("layer,fam,lim,want", [
-    ({}, "glm5_next", 10.0, True), ({"moe": True}, "glm5_next", 10.0, False),
-    ({"gate_up_scale": None}, "glm5_next", 10.0, False), ({"down_scale": None}, "glm5_next", 10.0, False),
-    ({}, "other", 10.0, False), ({}, "glm5_next", None, False)])
+@pytest.mark.parametrize(
+    "layer,fam,lim,want",
+    [
+        ({}, "glm5_next", 10.0, True),
+        ({"moe": True}, "glm5_next", 10.0, False),
+        ({"gate_up_scale": None}, "glm5_next", 10.0, False),
+        ({"down_scale": None}, "glm5_next", 10.0, False),
+        ({}, "other", 10.0, False),
+        ({}, "glm5_next", None, False),
+    ],
+)
 def test_dense_half_takes(layer, fam, lim, want):
     cfg = types.SimpleNamespace(hybrid=types.SimpleNamespace(family=fam, swiglu_limit=lim))
     assert DH.takes(_takes_layer(**layer), cfg) is want
@@ -553,6 +659,7 @@ def test_the_dense_host_branch_is_the_served_dense_ffn_block(monkeypatch, seed):
 
     def ffn(model, layer, sp):
         return lambda x: (x.float() * 1.5 - 0.25).to(x.dtype)
+
     monkeypatch.setattr(HY, "_ffn", ffn)
     monkeypatch.setattr(HY, "SHELL_HOST", True)
     st = HY.mix_out(post_a, comb_a, Y_a.float().sum(0).to(S.dtype), S, True)
@@ -577,8 +684,15 @@ class _Model:
 
     def __init__(self, scale: float = 2.5, limit: float = 10.0):
         hy = types.SimpleNamespace(hc=HC, hc_eps=1e-6, sinkhorn_iters=20, family="glm5_next", swiglu_limit=limit)
-        self.cfg = types.SimpleNamespace(hybrid=hy, rms_norm_eps=1e-5, hidden_size=H, num_experts=E,
-                                         num_experts_per_tok=K, norm_topk_prob=True, routed_scaling_factor=scale)
+        self.cfg = types.SimpleNamespace(
+            hybrid=hy,
+            rms_norm_eps=1e-5,
+            hidden_size=H,
+            num_experts=E,
+            num_experts_per_tok=K,
+            norm_topk_prob=True,
+            routed_scaling_factor=scale,
+        )
         self.dtype, self.moe_inter = torch.bfloat16, 64
 
     def _out_reduce(self, y):
@@ -592,7 +706,7 @@ def _ffn_case(T: int, npg: int, seed: int = 5):
 
     g = torch.Generator().manual_seed(seed)
     layer = fp8_layer(E, H, IS, seed)
-    layer.router.data = (torch.randn(E, H, generator=g) * H ** -0.5).bfloat16()
+    layer.router.data = (torch.randn(E, H, generator=g) * H**-0.5).bfloat16()
     layer.w_blob = mdd.pack(*experts128(seed=seed, e=E, h=H))
     layer.moe, layer.moe_blob, layer.moe_tiles, layer.down_t = True, True, True, True
     O = 2 * HC + HC * HC
@@ -600,20 +714,51 @@ def _ffn_case(T: int, npg: int, seed: int = 5):
     layer.hc_ffn_base = torch.randn(O, generator=g) * 0.5
     layer.hc_ffn_scale = torch.rand(3, generator=g) + 0.5
     layer.post_norm = (1 + 0.1 * torch.randn(H, generator=g)).bfloat16()
-    blobs = FH.pack(layer.router, layer.router_bias, layer.shared_gate_up, layer.shared_gate_up_scale,
-                    layer.shared_down, layer.shared_down_scale, layer.hc_ffn_fn, layer.post_norm, layer.hc_ffn_base,
-                    layer.hc_ffn_scale, npg=npg)
+    blobs = FH.pack(
+        layer.router,
+        layer.router_bias,
+        layer.shared_gate_up,
+        layer.shared_gate_up_scale,
+        layer.shared_down,
+        layer.shared_down_scale,
+        layer.hc_ffn_fn,
+        layer.post_norm,
+        layer.hc_ffn_base,
+        layer.hc_ffn_scale,
+        npg=npg,
+    )
     S = (torch.randn(T, HC, H, generator=g) * 0.5).bfloat16()
-    pend = (torch.rand(T, HC, generator=g) * 2, torch.softmax(torch.randn(T, HC, HC, generator=g), -1),
-            (torch.randn(npg, T, H, generator=g) * 0.3).bfloat16())
+    pend = (
+        torch.rand(T, HC, generator=g) * 2,
+        torch.softmax(torch.randn(T, HC, HC, generator=g), -1),
+        (torch.randn(npg, T, H, generator=g) * 0.3).bfloat16(),
+    )
     return layer, blobs, S, pend
 
 
 def _ffn_sim(layer, blobs, S, pend, npg: int, monkeypatch):
     monkeypatch.setenv("NEURON_PLATFORM_TARGET_OVERRIDE", "trn2")
     monkeypatch.setattr(shell, "programs", lambda: npg)
-    return FH.run(S, pend, blobs, layer.w_blob, Is=IS, K=K, scale=2.5, group=mdd.group_size(1), ring=FH.RING,
-                  limit=10.0, rsp=0, hc=HC, iters=20, hc_eps=1e-6, rms_eps=1e-5, simulate=True, grid=npg, dbg=1)
+    return FH.run(
+        S,
+        pend,
+        blobs,
+        layer.w_blob,
+        Is=IS,
+        K=K,
+        scale=2.5,
+        group=mdd.group_size(1),
+        ring=FH.RING,
+        limit=10.0,
+        rsp=0,
+        hc=HC,
+        iters=20,
+        hc_eps=1e-6,
+        rms_eps=1e-5,
+        simulate=True,
+        grid=npg,
+        dbg=1,
+    )
 
 
 def _ulps(a, b):
@@ -634,8 +779,9 @@ def _routed(model, layer, xn):
     """moe_half.emulate's routed half: decoder._route's experts and weights through the pairs kernel's arithmetic, in
     bf16."""
     topv, topi = model._route(layer, xn)
-    return mdd.emulate_pairs(xn, topv, topi, layer.w_blob, act=mdd.ACTS["silu_clamp"],
-                             limit=model.cfg.hybrid.swiglu_limit).to(xn.dtype)
+    return mdd.emulate_pairs(
+        xn, topv, topi, layer.w_blob, act=mdd.ACTS["silu_clamp"], limit=model.cfg.hybrid.swiglu_limit
+    ).to(xn.dtype)
 
 
 @needs_nki

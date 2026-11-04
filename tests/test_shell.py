@@ -106,8 +106,12 @@ def test_the_nki_helpers_in_the_simulator(monkeypatch):
 
 
 def test_packed_layout_is_aligned_disjoint_and_in_order():
-    shapes = {"wp": ((2, 4, 300), torch.bfloat16), "dtb": ((2, 128, 1), torch.float32),
-              "outT": ((128, 2, 8), torch.bfloat16), "o_norm": ((128,), torch.float32)}
+    shapes = {
+        "wp": ((2, 4, 300), torch.bfloat16),
+        "dtb": ((2, 128, 1), torch.float32),
+        "outT": ((128, 2, 8), torch.bfloat16),
+        "o_norm": ((128,), torch.float32),
+    }
     lay = SH.packed_layout(shapes)
     assert set(lay) == {torch.bfloat16, torch.float32}
     n, idx = lay[torch.bfloat16]

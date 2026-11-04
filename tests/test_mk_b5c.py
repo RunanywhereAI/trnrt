@@ -96,27 +96,29 @@ def test_the_served_rev_span_holds_none_of_the_chunked_code_and_revc_is_its_own(
     c = SRC.index("# -- the chunked glue (_b5c")
     assert c > end and "_b5c" not in SRC[a:end] and "mk_ffn_b5c_kernel" not in SRC[a:end]
     own = SH.kernel_rev(MK.__file__, "# -- the chunked glue (_b5c", "# -- the chunked glue end")
-    assert MK.REVC == zlib.crc32(repr((own, MK.REV)).encode()) and MK.REVC != MK.REV
+    assert zlib.crc32(repr((own, MK.REV)).encode()) == MK.REVC and MK.REVC != MK.REV
 
 
 def test_the_chunked_kernel_is_the_served_one_but_for_its_glue():
     """mk_ffn_b5c_kernel takes mk_ffn_b5_kernel's parameters and calls the FFN half's body with the same arguments; only
     its glue call differs (_b5c for _b5)."""
+
     def fn(name):
         return next(f for f in ast.walk(ast.parse(SRC)) if isinstance(f, ast.FunctionDef) and f.name == name)
 
     served, chunked = fn("mk_ffn_b5_kernel"), fn("mk_ffn_b5c_kernel")
     assert ast.unparse(served.args) == ast.unparse(chunked.args)
     body = [ast.unparse(s) for s in served.body if not isinstance(s, ast.Expr)]
-    assert [ast.unparse(s) for s in chunked.body if not isinstance(s, ast.Expr)] == \
-        [s.replace("_b5(fo[3], fo[4])", "_b5c(fo[3], fo[4])") for s in body]
+    assert [ast.unparse(s) for s in chunked.body if not isinstance(s, ast.Expr)] == [
+        s.replace("_b5(fo[3], fo[4])", "_b5c(fo[3], fo[4])") for s in body
+    ]
 
 
 @pytest.mark.parametrize("T,chunked", [(2, False), (4, False), (6, False), (8, False), (12, True), (16, True)])
 def test_decode_layer_split_picks_the_served_kernel_at_eight_rows_or_fewer(T, chunked):
     """The dispatch rule as decode_layer_split computes it, at H 4096 and grid 2: a program's rows x H / 128 > 128
     takes the chunked kernel and REVC; T <= 8 keeps the served kernel and REV (no graph of 8 rows or fewer moves)."""
-    body = SRC[SRC.index("def decode_layer_split"):SRC.index("# -- the kernel source")]
+    body = SRC[SRC.index("def decode_layer_split") : SRC.index("# -- the kernel source")]
     assert "chunked = (T // npg) * (H // 128) > 128" in body
     assert "rev=REVC if chunked else REV" in body
     assert "mk_ffn_b5c_kernel if chunked else mk_ffn_b5_kernel" in body

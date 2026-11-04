@@ -15,8 +15,10 @@ pytest.importorskip("uvicorn")
 
 import trnrt.__main__ as cli  # noqa: E402
 
-MISS = ("NEURON_LIBTORCH_ASSERT_CACHE_HIT: compile cache miss for key 0123abcd. All graphs must be pre-compiled when "
-        "assert_cache_hit is enabled.")
+MISS = (
+    "NEURON_LIBTORCH_ASSERT_CACHE_HIT: compile cache miss for key 0123abcd. All graphs must be pre-compiled when "
+    "assert_cache_hit is enabled."
+)
 
 
 def _last(cmd: list[str], flag: str) -> str:
@@ -297,8 +299,12 @@ def test_cache_miss_reads_the_chain_and_only_a_miss():
     assert cli.cache_miss(RuntimeError("x\n" + MISS + "\ny")) == MISS
     assert cli.cache_miss(RuntimeError("compile failed")) is None
     # LNL's refusal of a contradictory environment names the variable but is no miss
-    assert cli.cache_miss(ValueError("NEURON_LIBTORCH_DISABLE_COMPILE_CACHE and NEURON_LIBTORCH_ASSERT_CACHE_HIT "
-                                     "cannot both be set")) is None
+    assert (
+        cli.cache_miss(
+            ValueError("NEURON_LIBTORCH_DISABLE_COMPILE_CACHE and NEURON_LIBTORCH_ASSERT_CACHE_HIT cannot both be set")
+        )
+        is None
+    )
 
 
 @pytest.fixture
@@ -306,6 +312,7 @@ def stand_in(host, engine, monkeypatch):
     """serve's engine commands run in this process: `python -m trnrt engine ARGV` as trnrt.__main__.main(ARGV), with the
     stand-in LLMEngine. An engine that parses its argv starts and answers /health; one that does not exits with
     argparse's status 2."""
+
     def popen(cmd, env=None, preexec_fn=None):
         assert cmd[1:4] == ["-m", "trnrt", "engine"], cmd
         e = FakeEngine(host, cmd, env)

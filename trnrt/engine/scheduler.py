@@ -104,7 +104,7 @@ def page_chain(req: Request, ps: int) -> list[int]:
     if not st[4]:
         chain, n, h = st[2], st[1], st[2][-1] if st[2] else 0
         while n + ps <= len(tok):
-            page = tuple(tok[n:n + ps])
+            page = tuple(tok[n : n + ps])
             if -1 in page:  # a placeholder: the chain stops here until the next rebuild
                 st[4] = True
                 break
@@ -142,7 +142,7 @@ def shared_pages_req(a: Request, b: Request, ps: int, limit: int) -> int:
     if m == n:
         return n
     k = m  # the first m pages are shared; the rest by slices
-    while k < n and ta[k * ps:(k + 1) * ps] == tb[k * ps:(k + 1) * ps]:
+    while k < n and ta[k * ps : (k + 1) * ps] == tb[k * ps : (k + 1) * ps]:
         k += 1
     return k
 
@@ -492,8 +492,7 @@ class Scheduler:
             if other.is_decoding or other.status is not Status.RUNNING:
                 continue
             j = self._shared_with(req, other)
-            if j > other.num_computed and j not in other.ckpt_targets \
-                    and all(p != j for p, _, _ in other.ckpt_pending):
+            if j > other.num_computed and j not in other.ckpt_targets and all(p != j for p, _, _ in other.ckpt_pending):
                 bisect.insort(other.ckpt_targets, j)
 
     def _prefix_in_progress(self, req: Request) -> bool:
@@ -516,8 +515,9 @@ class Scheduler:
                 continue
             if best is None:  # what req resumes from now (its checkpoint match)
                 ps = self.cfg.page_size
-                best = self.radix.match_checkpoint(req.token_ids, max_pages=self._prompt_pages(req, ps))[0] \
-                    .num_pages * ps
+                best = (
+                    self.radix.match_checkpoint(req.token_ids, max_pages=self._prompt_pages(req, ps))[0].num_pages * ps
+                )
             if max(soon) > best:
                 return True
         return False
@@ -660,8 +660,9 @@ class Scheduler:
                 pos, row, decode = item
                 if pos > n_full * ps:
                     keep.append(item)
-                elif not self.radix.attach_checkpoint(req.token_ids, pos // ps, row,
-                                                      anchor=not decode and pos == prompt_end):
+                elif not self.radix.attach_checkpoint(
+                    req.token_ids, pos // ps, row, anchor=not decode and pos == prompt_end
+                ):
                     self.states.free_ckpt(row)  # another request's checkpoint got there first
             req.ckpt_pending = keep
 
@@ -670,8 +671,12 @@ class Scheduler:
         for _, row, _ in req.ckpt_pending:  # past the KV the request keeps: never valid
             self.states.free_ckpt(row)
         req.ckpt_pending, req.ckpt_targets, req.ckpt_restore = [], [], None
-        if (status is Status.FINISHED and req.session_id is not None and req.node is not None
-                and req.finish_reason != "abort"):
+        if (
+            status is Status.FINISHED
+            and req.session_id is not None
+            and req.node is not None
+            and req.finish_reason != "abort"
+        ):
             self.radix.session_register(req.session_id, req.session_gen, req.node)
         tail = req.pages[self._cacheable(req) // self.cfg.page_size :]  # what _cache did not take
         if tail:

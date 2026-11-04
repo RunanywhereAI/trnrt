@@ -40,10 +40,13 @@ def test_counts_are_summed_over_the_layers():
 
 def test_the_report_says_exact_only_with_nothing_past_f():
     line = E.local_k_report(None, [150.0, 4.0, 0.0], "this engine's run")
-    assert line == (f"local-K this engine's run: 4 of 150 rows failed the certificate (2.67e-02), 0 past CP_LOCAL_F = "
-                    f"{mla.CP_LOCAL_F} (EXACT)")
-    assert E.local_k_report([100.0, 1.0, 0.0], [150.0, 4.0, 2.0], "x").endswith("2 past CP_LOCAL_F = "
-                                                                                  f"{mla.CP_LOCAL_F} (NOT EXACT)")
+    assert line == (
+        f"local-K this engine's run: 4 of 150 rows failed the certificate (2.67e-02), 0 past CP_LOCAL_F = "
+        f"{mla.CP_LOCAL_F} (EXACT)"
+    )
+    assert E.local_k_report([100.0, 1.0, 0.0], [150.0, 4.0, 2.0], "x").endswith(
+        f"2 past CP_LOCAL_F = {mla.CP_LOCAL_F} (NOT EXACT)"
+    )
     assert "3 of 50 rows" in E.local_k_report([100.0, 1.0, 0.0], [150.0, 4.0, 2.0], "x")
     assert E.local_k_report(None, None, "x") is None
 
@@ -62,8 +65,10 @@ def test_close_prints_the_report_once(capsys):
     eng = _engine(_Model([100, 3, 0], [50, 1, 0]))
     eng.close()
     out = capsys.readouterr().out.splitlines()
-    assert out == [f"local-K this engine's run: 4 of 150 rows failed the certificate (2.67e-02), 0 past CP_LOCAL_F = "
-                   f"{mla.CP_LOCAL_F} (EXACT)"]
+    assert out == [
+        f"local-K this engine's run: 4 of 150 rows failed the certificate (2.67e-02), 0 past CP_LOCAL_F = "
+        f"{mla.CP_LOCAL_F} (EXACT)"
+    ]
     eng.close()  # idempotent: no second report
     assert capsys.readouterr().out == ""
 
@@ -83,9 +88,11 @@ def test_close_reports_nothing_after_a_failure_or_without_counters(capsys):
 
 
 def _stub():
-    return types.SimpleNamespace(scheduler=types.SimpleNamespace(running=[], waiting=[], num_preemptions=0),
-                                 pool=types.SimpleNamespace(num_usable=100, num_free=90),
-                                 radix=types.SimpleNamespace(evictable_pages=4))
+    return types.SimpleNamespace(
+        scheduler=types.SimpleNamespace(running=[], waiting=[], num_preemptions=0),
+        pool=types.SimpleNamespace(num_usable=100, num_free=90),
+        radix=types.SimpleNamespace(evictable_pages=4),
+    )
 
 
 def test_metrics_render_the_counts_last_read():
@@ -95,8 +102,12 @@ def test_metrics_render_the_counts_last_read():
     m.set_local_k([150.0, 4.0, 0.0])
     assert not m.local_k_wanted
     text = m.render(_stub())
-    for line in ("# TYPE trnrt:dsa_local_k_rows_total counter", "trnrt:dsa_local_k_rows_total 150",
-                 "trnrt:dsa_local_k_failed_rows_total 4", "trnrt:dsa_local_k_inexact_rows_total 0"):
+    for line in (
+        "# TYPE trnrt:dsa_local_k_rows_total counter",
+        "trnrt:dsa_local_k_rows_total 150",
+        "trnrt:dsa_local_k_failed_rows_total 4",
+        "trnrt:dsa_local_k_inexact_rows_total 0",
+    ):
         assert line in text.splitlines(), line
 
 

@@ -90,7 +90,9 @@ def agents_pair(root: str = ROOT) -> list[str]:
 
 def tracked_markdown(root: str = ROOT) -> list[str]:
     files = subprocess.run(["git", "-C", root, "ls-files", "-z", "*.md"], capture_output=True, check=True).stdout
-    return [os.path.join(root, p) for p in files.decode().split("\0") if p and not os.path.islink(os.path.join(root, p))]
+    return [
+        os.path.join(root, p) for p in files.decode().split("\0") if p and not os.path.islink(os.path.join(root, p))
+    ]
 
 
 def main(argv: list[str] | None = None) -> int:

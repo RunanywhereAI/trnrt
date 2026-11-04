@@ -34,7 +34,7 @@ def test_inputs_are_mdrs_with_its_own_rev():
     assert a["rev"] == tb.REV and b["rev"] == md.REV and set(a) == set(b)
     for k in set(a) - {"rev"}:
         va, vb = a[k], b[k]
-        assert (torch.equal(va, vb) if isinstance(va, torch.Tensor) else va == vb), k
+        assert torch.equal(va, vb) if isinstance(va, torch.Tensor) else va == vb, k
 
 
 def test_the_dispatch_takes_tsb_from_min_tokens(monkeypatch):
@@ -49,11 +49,14 @@ def test_the_dispatch_takes_tsb_from_min_tokens(monkeypatch):
     monkeypatch.setattr(md, "moe_prefill_mdr", lambda x, *a, **k: calls.append("mdr") or x)
     monkeypatch.setattr(tb, "moe_prefill_tsb", lambda x, *a, **k: calls.append(("tsb", k.get("down"))) or x)
     monkeypatch.setattr(moe_dedupe, "moe_dedupe", lambda x, *a, **k: calls.append("dedupe") or x)
-    model = types.SimpleNamespace(cfg=types.SimpleNamespace(num_experts_per_tok=2), moe_inter=4,
-                                  _route=lambda layer, x: (torch.ones(x.shape[0], 2),
-                                                           torch.zeros(x.shape[0], 2, dtype=torch.long)))
-    layer = types.SimpleNamespace(moe_blob=True, moe_tiles=True, w_blob=None, moe_prefill_dq=False,
-                                  moe_prefill_dsc="s", moe_prefill_dfr="t")
+    model = types.SimpleNamespace(
+        cfg=types.SimpleNamespace(num_experts_per_tok=2),
+        moe_inter=4,
+        _route=lambda layer, x: (torch.ones(x.shape[0], 2), torch.zeros(x.shape[0], 2, dtype=torch.long)),
+    )
+    layer = types.SimpleNamespace(
+        moe_blob=True, moe_tiles=True, w_blob=None, moe_prefill_dq=False, moe_prefill_dsc="s", moe_prefill_dfr="t"
+    )
     monkeypatch.setattr(torch.Tensor, "device", property(lambda self: torch.device("meta")), raising=False)
     hybrid._moe_clamped(model, layer, torch.zeros(4, 8), 10.0)
     hybrid._moe_clamped(model, layer, torch.zeros(3, 8), 10.0)
@@ -93,4 +96,7 @@ def test_trn2_parser_takes_the_kernel(monkeypatch):
         if not isinstance(v, torch.Tensor):
             return v
         return v.float().numpy().astype(ml_dtypes.bfloat16) if v.dtype == torch.bfloat16 else v.numpy()
-    assert str(source_to_mlir(tb.kernel(), **{k: np_(v) for k, v in a.items()}, target="trn2", frontend=FrontendKind.PARSER))
+
+    assert str(
+        source_to_mlir(tb.kernel(), **{k: np_(v) for k, v in a.items()}, target="trn2", frontend=FrontendKind.PARSER)
+    )

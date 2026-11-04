@@ -24,7 +24,7 @@ HI, D, PPK, NPG = 32, 128, 8, 128  # indexer heads, head dim, local pools per pa
 def inputs(T, seed=0):
     g = torch.Generator().manual_seed(seed)
     q = (torch.randn(T, HI, D, generator=g) * 0.3).bfloat16()
-    w = torch.rand(T, HI, generator=g) * D ** -0.5
+    w = torch.rand(T, HI, generator=g) * D**-0.5
     pkc = (torch.randn(600, PPK * D, generator=g) * 0.3).bfloat16()
     table = torch.stack([torch.randperm(599, generator=g)[:NPG] + 1 for _ in range(T)])  # each row its own pages
     P = NPG * PPK
@@ -55,15 +55,16 @@ def test_a_piece_read_with_its_first_rows_pages_fails(monkeypatch):
 
 def _layer(pkc):
     dsa = types.SimpleNamespace(head_dim=D)
-    return types.SimpleNamespace(spec=types.SimpleNamespace(mla=types.SimpleNamespace(dsa=dsa)),
-                                 pool_key=pkc.view(-1, D), v_cache=None)
+    return types.SimpleNamespace(
+        spec=types.SimpleNamespace(mla=types.SimpleNamespace(dsa=dsa)), pool_key=pkc.view(-1, D), v_cache=None
+    )
 
 
 @pytest.mark.parametrize("rows,T,pieces", [(0, 12, []), (8, 8, []), (8, 12, [12]), (8, 16, [16])])
 def test_cp_scores_takes_the_pieces_only_past_the_setting(monkeypatch, rows, T, pieces):
     q, w, pkc, table, _, nloc = inputs(T, seed=T)
     pk = torch.zeros(T, NPG * PPK, D, dtype=torch.bfloat16)  # its shape only: the kernel path reads the page rows
-    scale = D ** -0.5
+    scale = D**-0.5
     monkeypatch.setattr(mla, "CP_INDEX_ROWS", 0)
     want = mla._cp_scores(None, _layer(pkc), q, w, pk, table, nloc, scale)
     monkeypatch.setattr(mla, "CP_INDEX_ROWS", rows)

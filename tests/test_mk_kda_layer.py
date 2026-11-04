@@ -68,12 +68,16 @@ def _run_keywords(src: str, fn: str) -> dict:
 def decode_args_errors(fhsrc: str, msrc: str) -> list[str]:
     """decode_layer_split's FH.run keywords against ffn_half.decode's: decode_args' `kw = dict(...)` plus decode's
     own (grid), module globals as FH.<name>."""
-    d = next(s.value for s in ast.walk(_fn(fhsrc, "decode_args")) if isinstance(s, ast.Assign)
-             and [ast.unparse(t) for t in s.targets] == ["kw"])
+    d = next(
+        s.value
+        for s in ast.walk(_fn(fhsrc, "decode_args"))
+        if isinstance(s, ast.Assign) and [ast.unparse(t) for t in s.targets] == ["kw"]
+    )
     served = {k.arg: ast.unparse(k.value) for k in d.keywords}
     served.update(_run_keywords(fhsrc, "_decode_moe" if "def _decode_moe" in fhsrc else "decode"))
-    glob = {t.id for s in ast.parse(fhsrc).body if isinstance(s, ast.Assign) for t in s.targets
-            if isinstance(t, ast.Name)}
+    glob = {
+        t.id for s in ast.parse(fhsrc).body if isinstance(s, ast.Assign) for t in s.targets if isinstance(t, ast.Name)
+    }
     served = {k: (f"FH.{v}" if v in glob else v) for k, v in served.items()}
     got = _run_keywords(msrc, "decode_layer_split")
     got.pop("build_only", None)
@@ -89,8 +93,11 @@ def test_decode_layer_split_passes_the_served_decodes_keywords():
 def test_hybrid_hands_the_split_layer_its_raw_pend():
     """hybrid passes the previous layer's (post, comb, y) to decode_layer_split as is: decode_layer_split puts it into
     the shell's slot form itself."""
-    c = next(c for c in ast.walk(ast.parse(HSRC)) if isinstance(c, ast.Call)
-             and ast.unparse(c.func) == "MK.decode_layer_split")
+    c = next(
+        c
+        for c in ast.walk(ast.parse(HSRC))
+        if isinstance(c, ast.Call) and ast.unparse(c.func) == "MK.decode_layer_split"
+    )
     assert {k.arg: ast.unparse(k.value) for k in c.keywords} == {"pend": "pend"}
 
 
@@ -111,14 +118,15 @@ def test_layer_takes_needs_whole_rows_per_program_and_fits_the_glue():
 
 def test_rev_is_one_crc_of_its_parts():
     own = SH.kernel_rev(MK.__file__, "# -- the kernel source", "    mk_ffn_b5_kernel = None")
-    assert MK.REV == zlib.crc32(repr((own, FB.REV, SH.REV)).encode())
+    assert zlib.crc32(repr((own, FB.REV, SH.REV)).encode()) == MK.REV
     assert zlib.crc32(repr((own, FB.REV ^ 1, SH.REV)).encode()) != MK.REV  # ffn_half_pb's edit re-keys it
 
 
 def test_the_pins_fail_on_planted_sources():
     assert split_kernel_errors(FBSRC, MSRC.replace("o_rb, 0, fin, frev)", "o_rb, 0, fin, rev)", 1))  # outer rev
-    assert split_kernel_errors(FBSRC, MSRC.replace("hc, iters, eps, rms_eps, sig, skf,\n", "hc, iters, rms_eps, eps, "
-                                                                                           "sig, skf,\n", 1))
+    assert split_kernel_errors(
+        FBSRC, MSRC.replace("hc, iters, eps, rms_eps, sig, skf,\n", "hc, iters, rms_eps, eps, sig, skf,\n", 1)
+    )
     assert split_kernel_errors(FBSRC.replace("fin: int, rev: int):", "fin: int, rev: int, x: int):", 1), MSRC)
     assert decode_args_errors(FHSRC, MSRC.replace("ring=FH.RING,", "ring=3,", 1))
     assert decode_args_errors(FHSRC, MSRC.replace("rsp=MH.RSPLIT,", "rsp=0,", 1))

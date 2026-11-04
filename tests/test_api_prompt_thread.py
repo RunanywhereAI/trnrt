@@ -16,8 +16,12 @@ import types
 import pytest
 
 TEMPLATE = "{% for m in messages %}{{ m['content'] }} {% endfor %}"
-CHAT = {"messages": [{"role": "system", "content": "t5 t17 t42"}, {"role": "user", "content": "t99 t7 t3 t250 t11"}],
-        "max_tokens": 8, "temperature": 0, "ignore_eos": True}
+CHAT = {
+    "messages": [{"role": "system", "content": "t5 t17 t42"}, {"role": "user", "content": "t99 t7 t3 t250 t11"}],
+    "max_tokens": 8,
+    "temperature": 0,
+    "ignore_eos": True,
+}
 
 
 def _save_tokenizer(path, vocab: int) -> None:
@@ -45,8 +49,9 @@ def server(tmp_path_factory):
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
-    srv = uvicorn.Server(uvicorn.Config(api.build_app(eng, "test-model"), host="127.0.0.1", port=port,
-                                        log_level="warning"))
+    srv = uvicorn.Server(
+        uvicorn.Config(api.build_app(eng, "test-model"), host="127.0.0.1", port=port, log_level="warning")
+    )
     th = threading.Thread(target=srv.run, daemon=True)
     th.start()
     deadline = time.perf_counter() + 60
@@ -68,6 +73,7 @@ def test_the_prompt_and_the_output_are_the_loops(server, monkeypatch):
     def spy(tok, *a):
         seen.append((threading.current_thread().name, tok is server.engine.tokenizer))
         return real(tok, *a)
+
     monkeypatch.setattr(api, "chat_prompt", spy)
     import httpx
 
@@ -75,8 +81,11 @@ def test_the_prompt_and_the_output_are_the_loops(server, monkeypatch):
     assert r.status_code == 200, r.text
     assert seen == [("trnrt-prompt_0", False)]  # the worker thread, its own tokenizer
     assert r.json()["usage"]["prompt_tokens"] == len(want)
-    c = httpx.post(server.url + "/v1/completions", json={"prompt": want, "max_tokens": 8, "temperature": 0,
-                                                         "ignore_eos": True}, timeout=60)
+    c = httpx.post(
+        server.url + "/v1/completions",
+        json={"prompt": want, "max_tokens": 8, "temperature": 0, "ignore_eos": True},
+        timeout=60,
+    )
     assert r.json()["choices"][0]["message"]["content"] == c.json()["choices"][0]["text"]
 
 
@@ -91,12 +100,14 @@ def test_another_stream_flows_while_a_prompt_renders(server, monkeypatch):
         rendering.set()
         time.sleep(2.0)
         return real(*a)
+
     monkeypatch.setattr(api, "chat_prompt", slow)
     step = server.engine.step
 
     def paced():  # the stream outlasts the render (a tiny model on CPU decodes 500 tokens in well under 2 s)
         time.sleep(0.01)
         return step()
+
     monkeypatch.setattr(server.engine, "step", paced)
     times = []
 
@@ -106,6 +117,7 @@ def test_another_stream_flows_while_a_prompt_renders(server, monkeypatch):
             for line in r.iter_lines():
                 if line.startswith("data: ") and line != "data: [DONE]":
                     times.append(time.perf_counter())
+
     th = threading.Thread(target=stream)
     th.start()
     deadline = time.perf_counter() + 60

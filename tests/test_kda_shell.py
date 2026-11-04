@@ -60,15 +60,31 @@ def stand_in(seed: int, R: int = 9):
         return (torch.randn(*shape, generator=g) * s).to(bf)
 
     spec = SimpleNamespace(kind="kda", conv_kernel=K, head_k_dim=D, head_v_dim=D, gate_act="sigmoid", lower_bound=LB)
-    L = SimpleNamespace(spec=spec, nk=NV, nv=NV, conv_w=w(CD, K, s=0.3), f_a=w(D, H), f_b=w(NV * D, D, s=0.1),
-                        dt_bias=torch.randn(NV * D, generator=g) * 0.5, A_log=torch.randn(NV, generator=g) * 0.3,
-                        g_a=w(D, H), g_b=w(NV * D, D, s=0.1), o_norm=1 + torch.randn(D, generator=g) * 0.1,
-                        in_qkv=w(CD, H), in_b=w(NV, H), out=w(H, NV * D),
-                        in_norm=(1 + torch.randn(H, generator=g) * 0.1).to(bf),
-                        conv_state=torch.randn(R, K - 1, CD, generator=g).to(bf),
-                        rec_state=torch.randn(R, NV, D, D, generator=g) * 0.1)
-    m = SimpleNamespace(cfg=SimpleNamespace(rms_norm_eps=EPS, hybrid=None), dtype=bf, page_size=256,
-                        _w=lambda layer, name: getattr(layer, name))
+    L = SimpleNamespace(
+        spec=spec,
+        nk=NV,
+        nv=NV,
+        conv_w=w(CD, K, s=0.3),
+        f_a=w(D, H),
+        f_b=w(NV * D, D, s=0.1),
+        dt_bias=torch.randn(NV * D, generator=g) * 0.5,
+        A_log=torch.randn(NV, generator=g) * 0.3,
+        g_a=w(D, H),
+        g_b=w(NV * D, D, s=0.1),
+        o_norm=1 + torch.randn(D, generator=g) * 0.1,
+        in_qkv=w(CD, H),
+        in_b=w(NV, H),
+        out=w(H, NV * D),
+        in_norm=(1 + torch.randn(H, generator=g) * 0.1).to(bf),
+        conv_state=torch.randn(R, K - 1, CD, generator=g).to(bf),
+        rec_state=torch.randn(R, NV, D, D, generator=g) * 0.1,
+    )
+    m = SimpleNamespace(
+        cfg=SimpleNamespace(rms_norm_eps=EPS, hybrid=None),
+        dtype=bf,
+        page_size=256,
+        _w=lambda layer, name: getattr(layer, name),
+    )
     return m, L, g
 
 
@@ -89,8 +105,9 @@ def test_the_half_emulation_is_the_served_decode_form(B):
     slots = torch.stack([torch.where(positions > 0, slot, torch.full_like(slot, R)), slot]).to(torch.int32)
     wcat = torch.cat([L.in_qkv, L.f_a, L.g_a, L.in_b])
     with torch.no_grad():
-        y, conv, rec = KH.emulate(x, L.in_norm, wcat, L.conv_w, conv0, L.f_b, L.g_b, L.dt_bias, L.A_log, L.o_norm,
-                                  L.out, rec0, slots, LB, EPS)
+        y, conv, rec = KH.emulate(
+            x, L.in_norm, wcat, L.conv_w, conv0, L.f_b, L.g_b, L.dt_bias, L.A_log, L.o_norm, L.out, rec0, slots, LB, EPS
+        )
     # the fused projection may sum its columns in another blocking than four separate linears: allow bf16 ulps
     assert torch.allclose(y.float(), want.float(), rtol=2e-2, atol=2e-3), (y.float() - want.float()).abs().max()
     # row 0 is the scratch row, which _write_rows' one-row form also writes
@@ -110,9 +127,23 @@ def test_a_wrong_gate_is_caught():
     conv0, rec0 = L.conv_state.clone(), L.rec_state.clone()
     with torch.no_grad():
         want = LA._mix_rows(m, L, rms_norm(x, L.in_norm, EPS), positions, torch.zeros(B, dtype=torch.long), slot)
-        y, _, _ = KH.emulate(x, L.in_norm, torch.cat([L.in_qkv, L.f_a, L.g_a, L.in_b]), L.conv_w, conv0, L.f_b,
-                             L.g_b, L.dt_bias, L.A_log, L.o_norm, L.out, rec0,
-                             torch.stack([slot, slot]).to(torch.int32), LB - 1.0, EPS)
+        y, _, _ = KH.emulate(
+            x,
+            L.in_norm,
+            torch.cat([L.in_qkv, L.f_a, L.g_a, L.in_b]),
+            L.conv_w,
+            conv0,
+            L.f_b,
+            L.g_b,
+            L.dt_bias,
+            L.A_log,
+            L.o_norm,
+            L.out,
+            rec0,
+            torch.stack([slot, slot]).to(torch.int32),
+            LB - 1.0,
+            EPS,
+        )
     assert not torch.allclose(y.float(), want.float(), rtol=2e-2, atol=2e-3)
 
 
@@ -138,9 +169,30 @@ def case(T: int, seed: int, npg: int):
 def emulated(c, npg: int, mix: bool, lb: float = LB):
     L = c["L"]
     with torch.no_grad():
-        return KS.emulate(c["S"], c["fn"], c["base"], c["scale"], ITERS, HC_EPS, EPS, L.in_norm, c["wcat"], L.conv_w,
-                          L.conv_state.clone(), L.f_b, L.g_b, L.dt_bias, L.A_log, L.o_norm, L.out, L.rec_state.clone(),
-                          c["slots"], lb, npg, pend=c["pend"] if mix else None)
+        return KS.emulate(
+            c["S"],
+            c["fn"],
+            c["base"],
+            c["scale"],
+            ITERS,
+            HC_EPS,
+            EPS,
+            L.in_norm,
+            c["wcat"],
+            L.conv_w,
+            L.conv_state.clone(),
+            L.f_b,
+            L.g_b,
+            L.dt_bias,
+            L.A_log,
+            L.o_norm,
+            L.out,
+            L.rec_state.clone(),
+            c["slots"],
+            lb,
+            npg,
+            pend=c["pend"] if mix else None,
+        )
 
 
 def test_arrange_fn_is_h_layout_per_stream():
@@ -156,8 +208,23 @@ def test_arrange_fn_is_h_layout_per_stream():
 def test_pack_holds_every_arranged_tensor(npg):
     c = case(2, 3, npg)
     L = c["L"]
-    t = KS.arrange(c["wcat"], L.conv_w, L.f_b, L.g_b, L.dt_bias, L.out, c["fn"], L.in_norm, L.A_log, L.o_norm,
-                   c["base"], c["scale"], NV, npg, HC)
+    t = KS.arrange(
+        c["wcat"],
+        L.conv_w,
+        L.f_b,
+        L.g_b,
+        L.dt_bias,
+        L.out,
+        c["fn"],
+        L.in_norm,
+        L.A_log,
+        L.o_norm,
+        c["base"],
+        c["scale"],
+        NV,
+        npg,
+        HC,
+    )
     blobs = KS.pack(t, H, NV, K, npg, HC)
     offs = KS.offsets(H, NV, K, npg, HC)
     for name, (shape, dt) in KS.shapes(H, NV, K, npg, HC).items():
@@ -165,7 +232,7 @@ def test_pack_holds_every_arranged_tensor(npg):
         for d in shape:
             n *= d
         o = offs["o_" + name]
-        assert torch.equal(blobs[dt][o:o + n].view(shape), t[name].to(dt).reshape(shape)), name
+        assert torch.equal(blobs[dt][o : o + n].view(shape), t[name].to(dt).reshape(shape)), name
 
 
 def test_partials_add_up_to_the_half():
@@ -177,8 +244,23 @@ def test_partials_add_up_to_the_half():
 
     x, _, _ = MP.emulate(c["S"], c["fn"], c["base"], c["scale"], ITERS, HC_EPS, EPS)
     with torch.no_grad():
-        y, conv, rec = KH.emulate(x, L.in_norm, c["wcat"], L.conv_w, L.conv_state.clone(), L.f_b, L.g_b, L.dt_bias,
-                                  L.A_log, L.o_norm, L.out, L.rec_state.clone(), c["slots"], LB, EPS)
+        y, conv, rec = KH.emulate(
+            x,
+            L.in_norm,
+            c["wcat"],
+            L.conv_w,
+            L.conv_state.clone(),
+            L.f_b,
+            L.g_b,
+            L.dt_bias,
+            L.A_log,
+            L.o_norm,
+            L.out,
+            L.rec_state.clone(),
+            c["slots"],
+            LB,
+            EPS,
+        )
     _, _, _, P2, conv2, rec2 = emulated(c, 2, False)
     _, _, _, P1, _, _ = emulated(c, 1, False)
     assert P2.shape == (2, 2, H) and torch.equal(P1[0], y)
@@ -194,20 +276,58 @@ def test_the_mix_in_is_mhc_mix_of_the_summed_partials():
     assert torch.equal(Sn, want)
 
 
-def _simulated(T: int, grid: int, mix: bool, lb: float = LB, seed: int | None = None, comb_scale: float = 1.0,
-               c=None, iters: int = ITERS):
+def _simulated(
+    T: int,
+    grid: int,
+    mix: bool,
+    lb: float = LB,
+    seed: int | None = None,
+    comb_scale: float = 1.0,
+    c=None,
+    iters: int = ITERS,
+):
     c = case(T, 30 + 4 * T + grid if seed is None else seed, grid) if c is None else c
     L = c["L"]
     want = emulated(c, grid, mix)
-    t = KS.arrange(c["wcat"], L.conv_w, L.f_b, L.g_b, L.dt_bias, L.out, c["fn"], L.in_norm, L.A_log, L.o_norm,
-                   c["base"], c["scale"], NV, grid, HC)
+    t = KS.arrange(
+        c["wcat"],
+        L.conv_w,
+        L.f_b,
+        L.g_b,
+        L.dt_bias,
+        L.out,
+        c["fn"],
+        L.in_norm,
+        L.A_log,
+        L.o_norm,
+        c["base"],
+        c["scale"],
+        NV,
+        grid,
+        HC,
+    )
     blobs = KS.pack(t, H, NV, K, grid, HC)
     pend = None
     if mix:
         post_p, comb_p, Yp = c["pend"]
         pend = (post_p, comb_p * comb_scale, Yp)
-    got = KS.run(c["S"], blobs, L.conv_state.clone(), L.rec_state.clone(), c["slots"], H=H, nv=NV, hc=HC,
-                 iters=iters, hc_eps=HC_EPS, rms_eps=EPS, lb=lb, pend=pend, simulate=True, grid=grid)
+    got = KS.run(
+        c["S"],
+        blobs,
+        L.conv_state.clone(),
+        L.rec_state.clone(),
+        c["slots"],
+        H=H,
+        nv=NV,
+        hc=HC,
+        iters=iters,
+        hc_eps=HC_EPS,
+        rms_eps=EPS,
+        lb=lb,
+        pend=pend,
+        simulate=True,
+        grid=grid,
+    )
     return want, got
 
 
@@ -235,8 +355,19 @@ def _rec_rel(want, got):
 
 
 @pytest.mark.skipif(not NKI, reason="needs the NKI package (Neuron venv)")
-@pytest.mark.parametrize("T,grid,mix", [(1, 1, False), (2, 1, True), (1, 2, False), (1, 2, True), (5, 2, True),
-                                        (8, 2, False), (8, 1, False), (8, 2, True)])
+@pytest.mark.parametrize(
+    "T,grid,mix",
+    [
+        (1, 1, False),
+        (2, 1, True),
+        (1, 2, False),
+        (1, 2, True),
+        (5, 2, True),
+        (8, 2, False),
+        (8, 1, False),
+        (8, 2, True),
+    ],
+)
 def test_the_kernel_in_the_simulator_is_the_emulation(T, grid, mix, monkeypatch):
     monkeypatch.setenv("NEURON_PLATFORM_TARGET_OVERRIDE", "trn2")
     want, got = _simulated(T, grid, mix)
@@ -261,8 +392,23 @@ if NKI:
     import nki.language as nl
 
     @nki.jit
-    def _pre_only(S, post_p, comb_p, Yp, bb, bf, H: int, hc: int, iters: int, hc_eps: float, rms_eps: float,
-                  mix_in: int, o_fnh: int, o_base: int, o_scale: int):
+    def _pre_only(
+        S,
+        post_p,
+        comb_p,
+        Yp,
+        bb,
+        bf,
+        H: int,
+        hc: int,
+        iters: int,
+        hc_eps: float,
+        rms_eps: float,
+        mix_in: int,
+        o_fnh: int,
+        o_base: int,
+        o_scale: int,
+    ):
         """The shell's prologue alone (the same shell helpers, the same arguments): x [T, H] bf16, post, comb."""
         T = S.shape[0]
         W, P_ = H // 128, 128
@@ -289,8 +435,23 @@ def _kernel_x(c, grid: int, mix: bool, S=None):
     import numpy as np
 
     L = c["L"]
-    t = KS.arrange(c["wcat"], L.conv_w, L.f_b, L.g_b, L.dt_bias, L.out, c["fn"], L.in_norm, L.A_log, L.o_norm,
-                   c["base"], c["scale"], NV, grid, HC)
+    t = KS.arrange(
+        c["wcat"],
+        L.conv_w,
+        L.f_b,
+        L.g_b,
+        L.dt_bias,
+        L.out,
+        c["fn"],
+        L.in_norm,
+        L.A_log,
+        L.o_norm,
+        c["base"],
+        c["scale"],
+        NV,
+        grid,
+        HC,
+    )
     blobs = KS.pack(t, H, NV, K, grid, HC)
     offs = KS.offsets(H, NV, K, grid, HC)
     S = c["S"] if S is None else S
@@ -301,10 +462,22 @@ def _kernel_x(c, grid: int, mix: bool, S=None):
         return x.float().numpy().astype(ml_dtypes.bfloat16)
 
     x, post, comb = nki.simulate(_pre_only)(
-        S=b16(S.reshape(T, HC * H)), post_p=post_p.float().numpy(), comb_p=comb_p.float().reshape(T, HC * HC).numpy(),
-        Yp=b16(Yp), bb=b16(blobs[torch.bfloat16]), bf=blobs[torch.float32].numpy(), H=H, hc=HC, iters=ITERS,
-        hc_eps=HC_EPS, rms_eps=EPS, mix_in=int(mix), o_fnh=offs["o_fnh"], o_base=offs["o_base"],
-        o_scale=offs["o_scale"])
+        S=b16(S.reshape(T, HC * H)),
+        post_p=post_p.float().numpy(),
+        comb_p=comb_p.float().reshape(T, HC * HC).numpy(),
+        Yp=b16(Yp),
+        bb=b16(blobs[torch.bfloat16]),
+        bf=blobs[torch.float32].numpy(),
+        H=H,
+        hc=HC,
+        iters=ITERS,
+        hc_eps=HC_EPS,
+        rms_eps=EPS,
+        mix_in=int(mix),
+        o_fnh=offs["o_fnh"],
+        o_base=offs["o_base"],
+        o_scale=offs["o_scale"],
+    )
     f = lambda a: torch.from_numpy(np.asarray(a).astype(np.float32))  # noqa: E731
     return f(x).to(bf), f(post), f(comb).view(T, HC, HC)
 
@@ -312,8 +485,25 @@ def _kernel_x(c, grid: int, mix: bool, S=None):
 def _pinned(c, x, grid: int, conv, rec, qkv=None):
     L = c["L"]
     with torch.no_grad():
-        return KS.emulate_half(x, L.in_norm, c["wcat"], L.conv_w, conv, L.f_b, L.g_b, L.dt_bias, L.A_log, L.o_norm,
-                               L.out, rec, c["slots"], LB, EPS, grid, qkv=qkv)
+        return KS.emulate_half(
+            x,
+            L.in_norm,
+            c["wcat"],
+            L.conv_w,
+            conv,
+            L.f_b,
+            L.g_b,
+            L.dt_bias,
+            L.A_log,
+            L.o_norm,
+            L.out,
+            rec,
+            c["slots"],
+            LB,
+            EPS,
+            grid,
+            qkv=qkv,
+        )
 
 
 @pytest.mark.skipif(not NKI, reason="needs the NKI package (Neuron venv)")
@@ -351,8 +541,23 @@ def _seam(grid: int, steps: int = 12, skip_write_at: int | None = None, pin_qkv:
     L = c["L"]
     R = L.rec_state.shape[0]
     slot = torch.tensor([1, 3, 5, 7])
-    t = KS.arrange(c["wcat"], L.conv_w, L.f_b, L.g_b, L.dt_bias, L.out, c["fn"], L.in_norm, L.A_log, L.o_norm,
-                   c["base"], c["scale"], NV, grid, HC)
+    t = KS.arrange(
+        c["wcat"],
+        L.conv_w,
+        L.f_b,
+        L.g_b,
+        L.dt_bias,
+        L.out,
+        c["fn"],
+        L.in_norm,
+        L.A_log,
+        L.o_norm,
+        c["base"],
+        c["scale"],
+        NV,
+        grid,
+        HC,
+    )
     blobs = KS.pack(t, H, NV, K, grid, HC)
     g = torch.Generator().manual_seed(92)
     kconv, krec = L.conv_state.clone(), L.rec_state.clone()
@@ -366,8 +571,22 @@ def _seam(grid: int, steps: int = 12, skip_write_at: int | None = None, pin_qkv:
         kslots = c["slots"].clone()
         if s == skip_write_at:
             kslots[1, 2] = R
-        _, post, _, _, kconv, krec = KS.run(S, blobs, kconv, krec, kslots, H=H, nv=NV, hc=HC, iters=ITERS,
-                                            hc_eps=HC_EPS, rms_eps=EPS, lb=LB, simulate=True, grid=grid)
+        _, post, _, _, kconv, krec = KS.run(
+            S,
+            blobs,
+            kconv,
+            krec,
+            kslots,
+            H=H,
+            nv=NV,
+            hc=HC,
+            iters=ITERS,
+            hc_eps=HC_EPS,
+            rms_eps=EPS,
+            lb=LB,
+            simulate=True,
+            grid=grid,
+        )
         x, xpost, _ = _kernel_x(c, grid, False, S=S)
         qkv = kconv[slot, K - 2] if pin_qkv else None  # each row's newest conv entry: this step's projected q, k, v
         _, pconv, prec = _pinned(c, x, grid, pconv, prec, qkv=qkv)
@@ -458,9 +677,14 @@ def test_the_prologue_under_the_released_prior(monkeypatch):
     monkeypatch.setenv("NEURON_PLATFORM_TARGET_OVERRIDE", "trn2")
     hc = _released_hc(0)
     base = hc["base"].float()
-    cb = base[2 * HC:].view(HC, HC)
-    print("released comb base: diagonal", cb.diag().tolist(), "off-diagonal range",
-          (cb - torch.diag(cb.diag())).min().item(), (cb + torch.eye(HC) * 1e9).min().item())
+    cb = base[2 * HC :].view(HC, HC)
+    print(
+        "released comb base: diagonal",
+        cb.diag().tolist(),
+        "off-diagonal range",
+        (cb - torch.diag(cb.diag())).min().item(),
+        (cb + torch.eye(HC) * 1e9).min().item(),
+    )
     c = case(2, 101, 2)
     c["fn"], c["base"], c["scale"] = hc["fn"].to(bf), base, hc["scale"].float()
     want, got = _simulated(2, 2, True, c=c)
@@ -479,14 +703,44 @@ def test_the_row_batched_recurrence_is_the_pair_pipeline_bit_for_bit(T, grid, mi
     monkeypatch.setenv("NEURON_PLATFORM_TARGET_OVERRIDE", "trn2")
     c = case(T, 60 + T + grid, grid)
     L = c["L"]
-    t = KS.arrange(c["wcat"], L.conv_w, L.f_b, L.g_b, L.dt_bias, L.out, c["fn"], L.in_norm, L.A_log, L.o_norm,
-                   c["base"], c["scale"], NV, grid, HC)
+    t = KS.arrange(
+        c["wcat"],
+        L.conv_w,
+        L.f_b,
+        L.g_b,
+        L.dt_bias,
+        L.out,
+        c["fn"],
+        L.in_norm,
+        L.A_log,
+        L.o_norm,
+        c["base"],
+        c["scale"],
+        NV,
+        grid,
+        HC,
+    )
     blobs = KS.pack(t, H, NV, K, grid, HC)
     outs = {}
     for recb in (0, 1):
-        outs[recb] = KS.run(c["S"], blobs, L.conv_state.clone(), L.rec_state.clone(), c["slots"], H=H, nv=NV, hc=HC,
-                            iters=ITERS, hc_eps=HC_EPS, rms_eps=EPS, lb=LB, pend=c["pend"] if mix else None,
-                            simulate=True, grid=grid, recb=recb)
+        outs[recb] = KS.run(
+            c["S"],
+            blobs,
+            L.conv_state.clone(),
+            L.rec_state.clone(),
+            c["slots"],
+            H=H,
+            nv=NV,
+            hc=HC,
+            iters=ITERS,
+            hc_eps=HC_EPS,
+            rms_eps=EPS,
+            lb=LB,
+            pend=c["pend"] if mix else None,
+            simulate=True,
+            grid=grid,
+            recb=recb,
+        )
     for name, a, b in zip(("S", "post", "comb", "P", "conv", "rec"), outs[0], outs[1]):
         if a is None:
             continue
@@ -502,15 +756,44 @@ def test_the_batched_xn_is_the_per_row_xn_bit_for_bit(T, grid, mix, monkeypatch)
     monkeypatch.setenv("NEURON_PLATFORM_TARGET_OVERRIDE", "trn2")
     c = case(T, 70 + T + grid, grid)
     L = c["L"]
-    t = KS.arrange(c["wcat"], L.conv_w, L.f_b, L.g_b, L.dt_bias, L.out, c["fn"], L.in_norm, L.A_log, L.o_norm,
-                   c["base"], c["scale"], NV, grid, HC)
+    t = KS.arrange(
+        c["wcat"],
+        L.conv_w,
+        L.f_b,
+        L.g_b,
+        L.dt_bias,
+        L.out,
+        c["fn"],
+        L.in_norm,
+        L.A_log,
+        L.o_norm,
+        c["base"],
+        c["scale"],
+        NV,
+        grid,
+        HC,
+    )
     blobs = KS.pack(t, H, NV, K, grid, HC)
     outs = {}
     for xnb in (False, True):
         monkeypatch.setattr(KS, "XNB", xnb)
-        outs[xnb] = KS.run(c["S"], blobs, L.conv_state.clone(), L.rec_state.clone(), c["slots"], H=H, nv=NV, hc=HC,
-                           iters=ITERS, hc_eps=HC_EPS, rms_eps=EPS, lb=LB, pend=c["pend"] if mix else None,
-                           simulate=True, grid=grid)
+        outs[xnb] = KS.run(
+            c["S"],
+            blobs,
+            L.conv_state.clone(),
+            L.rec_state.clone(),
+            c["slots"],
+            H=H,
+            nv=NV,
+            hc=HC,
+            iters=ITERS,
+            hc_eps=HC_EPS,
+            rms_eps=EPS,
+            lb=LB,
+            pend=c["pend"] if mix else None,
+            simulate=True,
+            grid=grid,
+        )
     for name, a, b in zip(("S", "post", "comb", "P", "conv", "rec"), outs[False], outs[True]):
         if a is None:
             continue
@@ -519,8 +802,10 @@ def test_the_batched_xn_is_the_per_row_xn_bit_for_bit(T, grid, mix, monkeypatch)
 
 
 @pytest.mark.skipif(not NKI, reason="needs the NKI package (Neuron venv)")
-@pytest.mark.parametrize("T,grid,mix,pad", [(1, 2, False, False), (4, 2, True, False), (6, 2, False, True),
-                                            (8, 2, False, False), (8, 1, True, True)])
+@pytest.mark.parametrize(
+    "T,grid,mix,pad",
+    [(1, 2, False, False), (4, 2, True, False), (6, 2, False, True), (8, 2, False, False), (8, 1, True, True)],
+)
 def test_the_batched_conv_is_the_row_at_a_time_conv_bit_for_bit(T, grid, mix, pad, monkeypatch):
     """cbat 1 (every row's conv state read by one indirect DMA with a vector offset, written back by another, 3 hp
     transposes in all) against cbat 0 (a DMA and 3 hp transposes per row): the same data moved and transposed, so every
@@ -532,14 +817,44 @@ def test_the_batched_conv_is_the_row_at_a_time_conv_bit_for_bit(T, grid, mix, pa
     slots = c["slots"].clone()
     if pad:
         slots[0, -1] = -1
-    t = KS.arrange(c["wcat"], L.conv_w, L.f_b, L.g_b, L.dt_bias, L.out, c["fn"], L.in_norm, L.A_log, L.o_norm,
-                   c["base"], c["scale"], NV, grid, HC)
+    t = KS.arrange(
+        c["wcat"],
+        L.conv_w,
+        L.f_b,
+        L.g_b,
+        L.dt_bias,
+        L.out,
+        c["fn"],
+        L.in_norm,
+        L.A_log,
+        L.o_norm,
+        c["base"],
+        c["scale"],
+        NV,
+        grid,
+        HC,
+    )
     blobs = KS.pack(t, H, NV, K, grid, HC)
     outs = {}
     for cbat in (0, 1):
-        outs[cbat] = KS.run(c["S"], blobs, L.conv_state.clone(), L.rec_state.clone(), slots, H=H, nv=NV, hc=HC,
-                            iters=ITERS, hc_eps=HC_EPS, rms_eps=EPS, lb=LB, pend=c["pend"] if mix else None,
-                            simulate=True, grid=grid, cbat=cbat)
+        outs[cbat] = KS.run(
+            c["S"],
+            blobs,
+            L.conv_state.clone(),
+            L.rec_state.clone(),
+            slots,
+            H=H,
+            nv=NV,
+            hc=HC,
+            iters=ITERS,
+            hc_eps=HC_EPS,
+            rms_eps=EPS,
+            lb=LB,
+            pend=c["pend"] if mix else None,
+            simulate=True,
+            grid=grid,
+            cbat=cbat,
+        )
     for name, a, b in zip(("S", "post", "comb", "P", "conv", "rec"), outs[0], outs[1]):
         if a is None:
             continue
@@ -556,8 +871,23 @@ def test_the_batched_conv_traces_fewer_transposes(monkeypatch):
     T, grid = 6, 2
     c = case(T, 7, grid)
     L = c["L"]
-    t = KS.arrange(c["wcat"], L.conv_w, L.f_b, L.g_b, L.dt_bias, L.out, c["fn"], L.in_norm, L.A_log, L.o_norm,
-                   c["base"], c["scale"], NV, grid, HC)
+    t = KS.arrange(
+        c["wcat"],
+        L.conv_w,
+        L.f_b,
+        L.g_b,
+        L.dt_bias,
+        L.out,
+        c["fn"],
+        L.in_norm,
+        L.A_log,
+        L.o_norm,
+        c["base"],
+        c["scale"],
+        NV,
+        grid,
+        HC,
+    )
     blobs = KS.pack(t, H, NV, K, grid, HC)
     counts = {}
     for cbat in (0, 1):
@@ -567,9 +897,25 @@ def test_the_batched_conv_traces_fewer_transposes(monkeypatch):
         def spy(*a, **kw):
             calls.append(1)
             return real(*a, **kw)
+
         monkeypatch.setattr(nki.isa, "nc_matmul", spy)
-        KS.run(c["S"], blobs, L.conv_state.clone(), L.rec_state.clone(), c["slots"], H=H, nv=NV, hc=HC, iters=ITERS,
-               hc_eps=HC_EPS, rms_eps=EPS, lb=LB, simulate=True, grid=grid, cbat=cbat)
+        KS.run(
+            c["S"],
+            blobs,
+            L.conv_state.clone(),
+            L.rec_state.clone(),
+            c["slots"],
+            H=H,
+            nv=NV,
+            hc=HC,
+            iters=ITERS,
+            hc_eps=HC_EPS,
+            rms_eps=EPS,
+            lb=LB,
+            simulate=True,
+            grid=grid,
+            cbat=cbat,
+        )
         monkeypatch.setattr(nki.isa, "nc_matmul", real)
         counts[cbat] = len(calls)
     hp = NV // grid
@@ -590,13 +936,13 @@ def test_the_per_row_xn_is_kept_at_the_skip_row_count():
     there, in the hashed source (so a NEFF of one form is never served for the other)."""
     assert KS.XNB is True and KS.XNB_SKIP_T == 6
     src = open(KS.__file__).read()
-    span = src[src.index("try:  # the Neuron venv"):src.index("    kda_shell_kernel = None")]
+    span = src[src.index("try:  # the Neuron venv") : src.index("    kda_shell_kernel = None")]
     assert span.count("if XNB and B != XNB_SKIP_T:") == 1
     assert span.count("for b in range(0 if XNB and B != XNB_SKIP_T else B):") == 1
 
 
-
 # -- the wiring (models/hybrid.py init_layer / load_layer, kernels/kda_shell.py register / fill / decode) -------------
+
 
 def _cfg():
     hy = HY.HybridSpec("glm5_next", hc=HC, sinkhorn_iters=ITERS, hc_eps=HC_EPS, swiglu_limit=7.0)
@@ -638,9 +984,23 @@ def test_fill_packs_arrange_of_the_loaded_weights(monkeypatch, npg):
     layer, _ = _layer(monkeypatch, npg)
     KS.fill(layer)
     wcat = torch.cat([layer.in_qkv, layer.f_a, layer.g_a, layer.in_b])
-    t = KS.arrange(wcat, layer.conv_w, layer.f_b, layer.g_b, layer.dt_bias, layer.out, layer.hc_attn_fn.data,
-                   layer.in_norm, layer.A_log, layer.o_norm, layer.hc_attn_base.data, layer.hc_attn_scale.data, NV, npg,
-                   HC)
+    t = KS.arrange(
+        wcat,
+        layer.conv_w,
+        layer.f_b,
+        layer.g_b,
+        layer.dt_bias,
+        layer.out,
+        layer.hc_attn_fn.data,
+        layer.in_norm,
+        layer.A_log,
+        layer.o_norm,
+        layer.hc_attn_base.data,
+        layer.hc_attn_scale.data,
+        NV,
+        npg,
+        HC,
+    )
     for name, v in SH.packed_views(layer, "ks_", KS.shapes(*layer.ks_dims)).items():
         assert torch.equal(v, t[name].to(v.dtype).reshape(v.shape)), name
 
@@ -658,16 +1018,50 @@ def test_the_shell_composition_is_the_served_attention_block(monkeypatch, npg):
     wcat = torch.cat([layer.in_qkv, layer.f_a, layer.g_a, layer.in_b])
 
     def half(xn):
-        return KH.emulate(xn, layer.in_norm, wcat, layer.conv_w, layer.conv_state.clone(), layer.f_b, layer.g_b,
-                          layer.dt_bias, layer.A_log, layer.o_norm, layer.out, layer.rec_state.clone(), slots, LB, EPS,
-                          norm=False)[0]
+        return KH.emulate(
+            xn,
+            layer.in_norm,
+            wcat,
+            layer.conv_w,
+            layer.conv_state.clone(),
+            layer.f_b,
+            layer.g_b,
+            layer.dt_bias,
+            layer.A_log,
+            layer.o_norm,
+            layer.out,
+            layer.rec_state.clone(),
+            slots,
+            LB,
+            EPS,
+            norm=False,
+        )[0]
 
     with torch.no_grad():
         served = HY._block(model, layer, "attn", streams, layer.in_norm, half, False)
-        S, post, comb, Pp, _, _ = KS.emulate(streams.view(T, HC, H), layer.hc_attn_fn, layer.hc_attn_base,
-                                             layer.hc_attn_scale, ITERS, HC_EPS, EPS, layer.in_norm, wcat, layer.conv_w,
-                                             layer.conv_state.clone(), layer.f_b, layer.g_b, layer.dt_bias, layer.A_log,
-                                             layer.o_norm, layer.out, layer.rec_state.clone(), slots, LB, npg)
+        S, post, comb, Pp, _, _ = KS.emulate(
+            streams.view(T, HC, H),
+            layer.hc_attn_fn,
+            layer.hc_attn_base,
+            layer.hc_attn_scale,
+            ITERS,
+            HC_EPS,
+            EPS,
+            layer.in_norm,
+            wcat,
+            layer.conv_w,
+            layer.conv_state.clone(),
+            layer.f_b,
+            layer.g_b,
+            layer.dt_bias,
+            layer.A_log,
+            layer.o_norm,
+            layer.out,
+            layer.rec_state.clone(),
+            slots,
+            LB,
+            npg,
+        )
         shelled = HY.mix_out(post, comb, Pp.float().sum(0).to(bf), S, True)
     if npg == 1:
         assert torch.equal(shelled, served)

@@ -11,11 +11,11 @@ import math
 import pytest
 import torch
 
+from tests import test_kda_shell as TKS
+from tests.test_ffn_half import fp8_layer
 from trnrt.kernels import kda_shell as KS
 from trnrt.kernels import moe_half as MH
 from trnrt.kernels import shell as SH
-from tests import test_kda_shell as TKS
-from tests.test_ffn_half import fp8_layer
 
 
 def _nan_empty(monkeypatch):
@@ -34,7 +34,7 @@ def _padding(shapes: dict) -> dict:
     for dt, (n, idx) in SH.packed_layout(shapes).items():
         m = torch.ones(n, dtype=torch.bool)
         for off, shape in idx.values():
-            m[off:off + math.prod(shape)] = False
+            m[off : off + math.prod(shape)] = False
         out[dt] = m
     return out
 
@@ -99,8 +99,19 @@ def test_ffn_half_pack_pads_with_zeros(monkeypatch):
     E, H, Is, hc = 8, 256, 8, 4
     L = fp8_layer(E, H, Is)
     O = 2 * hc + hc * hc
-    b = FH.pack(L.router, L.router_bias, L.shared_gate_up, L.shared_gate_up_scale, L.shared_down, L.shared_down_scale,
-                torch.zeros(O, hc * H), torch.ones(H), torch.zeros(O), torch.ones(3), npg=2)
+    b = FH.pack(
+        L.router,
+        L.router_bias,
+        L.shared_gate_up,
+        L.shared_gate_up_scale,
+        L.shared_down,
+        L.shared_down_scale,
+        torch.zeros(O, hc * H),
+        torch.ones(H),
+        torch.zeros(O),
+        torch.ones(3),
+        npg=2,
+    )
     pads = _padding(MH.shapes(E, H, Is, 2))
     assert pads[torch.float32].any()
     for dt, pad in pads.items():

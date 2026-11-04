@@ -71,8 +71,10 @@ def free_port(core_base: int | None = None) -> int:
         for p in range(b.start, b.stop - 1, 2):
             if port_free(p) and port_free(p + 1):
                 return p
-        raise RuntimeError(f"no free port pair in core base {core_base}'s band {b.start}-{b.stop - 1}: another job on "
-                           f"the same cores, or its sockets still in TIME_WAIT")
+        raise RuntimeError(
+            f"no free port pair in core base {core_base}'s band {b.start}-{b.stop - 1}: another job on "
+            f"the same cores, or its sockets still in TIME_WAIT"
+        )
     for _ in range(50):
         with socket.socket() as a:
             a.bind(("0.0.0.0", 0))
@@ -90,8 +92,11 @@ _ENV_KEYS = ("MASTER_ADDR", "MASTER_PORT", "NEURON_RT_VISIBLE_CORES", "NEURON_RT
 def process_state() -> dict:
     import torch
 
-    return {"env": {k: os.environ.get(k) for k in _ENV_KEYS}, "threads": torch.get_num_threads(),
-            "affinity": os.sched_getaffinity(0) if hasattr(os, "sched_getaffinity") else None}
+    return {
+        "env": {k: os.environ.get(k) for k in _ENV_KEYS},
+        "threads": torch.get_num_threads(),
+        "affinity": os.sched_getaffinity(0) if hasattr(os, "sched_getaffinity") else None,
+    }
 
 
 def restore_process_state(saved: dict) -> None:
@@ -130,8 +135,9 @@ def neuron_devices() -> list[dict]:
     import subprocess
 
     exe = shutil.which("neuron-ls") or "/opt/aws/neuron/bin/neuron-ls"
-    return json.loads(subprocess.run([exe, "--json-output"], capture_output=True, text=True, timeout=60,
-                                     check=True).stdout)
+    return json.loads(
+        subprocess.run([exe, "--json-output"], capture_output=True, text=True, timeout=60, check=True).stdout
+    )
 
 
 def numa_cpus(core: int, devices: list[dict], lnc: int | None = None) -> set[int] | None:
@@ -172,8 +178,11 @@ def numa_pin(rank: int, core_base: int, devices: list[dict] | None = None) -> se
         return None
     _PIN = {"core_base": core_base, "devices": devs, "launched": set(launched), "lnc": int(lnc) if lnc else None}
     if mask is None:
-        print(f"NUMA pin: rank {rank} not pinned (no CPU of core {core_base + rank}'s node in the launch "
-              f"mask)", file=sys.stderr, flush=True)
+        print(
+            f"NUMA pin: rank {rank} not pinned (no CPU of core {core_base + rank}'s node in the launch mask)",
+            file=sys.stderr,
+            flush=True,
+        )
         return None
     os.sched_setaffinity(0, mask)
     return mask
@@ -196,8 +205,11 @@ def rank_threads(world: int) -> int:
     sharers = world
     if _PIN is not None:
         p = _PIN
-        sharers = sum(1 for r in range(world)
-                      if (pin_mask(p["core_base"] + r, p["devices"], p["launched"], p["lnc"]) or p["launched"]) == mine)
+        sharers = sum(
+            1
+            for r in range(world)
+            if (pin_mask(p["core_base"] + r, p["devices"], p["launched"], p["lnc"]) or p["launched"]) == mine
+        )
         sharers = sharers or world  # the affinity moved since numa_pin: no rank's mask is it, so assume all
     return max(1, len(mine) // sharers)
 
@@ -225,8 +237,9 @@ def init_rank(rank: int, world: int, port: int) -> None:
     # rank finds. A process that imported it before starting an engine had a patched rank 0 and unpatched workers,
     # and the gloo mesh never formed (measured: a tp=2 CPU engine hung). The port here is chosen by this module.
     try:
-        c10d.init_process_group("gloo", rank=rank, world_size=world, init_method=f"tcp://127.0.0.1:{port}",
-                                timeout=TIMEOUT)
+        c10d.init_process_group(
+            "gloo", rank=rank, world_size=world, init_method=f"tcp://127.0.0.1:{port}", timeout=TIMEOUT
+        )
     except BaseException:
         if not dist.is_initialized():
             c10d._world.group_count = count
@@ -295,7 +308,7 @@ class ShmChannel:
         self.seen = 0
 
     @classmethod
-    def create(cls, world: int, nbytes: int = 0) -> "ShmChannel":
+    def create(cls, world: int, nbytes: int = 0) -> ShmChannel:
         from multiprocessing import shared_memory
 
         nbytes = nbytes or SHM_BYTES
@@ -304,7 +317,7 @@ class ShmChannel:
         return cls(shm, world, 0, True, nbytes)
 
     @classmethod
-    def attach(cls, name: str, world: int, rank: int) -> "ShmChannel":
+    def attach(cls, name: str, world: int, rank: int) -> ShmChannel:
         from multiprocessing import resource_tracker, shared_memory
 
         # A reader never touches the resource tracker: the creator registers the segment and unlinks it. The engine's
@@ -402,9 +415,12 @@ def send(msg) -> None:
             _CH["failed"] = True
             import sys
 
-            print(f"trnrt: no shared-memory channel for the tensor-parallel calls ({type(e).__name__}: {e}); they go "
-                  "over gloo, which is slower (TRNRT_TP_SHM=0 chooses gloo from the start)", file=sys.stderr,
-                  flush=True)
+            print(
+                f"trnrt: no shared-memory channel for the tensor-parallel calls ({type(e).__name__}: {e}); they go "
+                "over gloo, which is slower (TRNRT_TP_SHM=0 chooses gloo from the start)",
+                file=sys.stderr,
+                flush=True,
+            )
         else:
             _CH["ch"] = ch
             dist.broadcast_object_list([(_SHM_HELLO, ch.shm.name)], src=0)

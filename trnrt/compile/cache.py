@@ -54,8 +54,12 @@ DEFAULT_OUT = "~/.cache/trnrt"  # the compile pipeline's work directory (farm.py
 def out_dirs(out: str) -> dict[str, str]:
     """The pipeline's directories under its work directory `out` (module docstring)."""
     out = os.path.abspath(os.path.expanduser(out))
-    return {"out": out, "shapes": os.path.join(out, "shapes"), "capture": os.path.join(out, "capture"),
-            "cache_root": os.path.join(out, "cache")}
+    return {
+        "out": out,
+        "shapes": os.path.join(out, "shapes"),
+        "capture": os.path.join(out, "capture"),
+        "cache_root": os.path.join(out, "cache"),
+    }
 
 
 def cache_root() -> str:
@@ -89,8 +93,9 @@ def is_complete(entry: str) -> bool:
     metadata of any version (.artifact_metadata_v<N>.json)."""
     import glob
 
-    return (all(os.path.exists(os.path.join(entry, f)) for f in (HLO, neff_name(key_of(entry)), MARKER))
-            and bool(glob.glob(os.path.join(glob.escape(entry), ".artifact_metadata_v*.json"))))
+    return all(os.path.exists(os.path.join(entry, f)) for f in (HLO, neff_name(key_of(entry)), MARKER)) and bool(
+        glob.glob(os.path.join(glob.escape(entry), ".artifact_metadata_v*.json"))
+    )
 
 
 def entries(root: str) -> list[str]:

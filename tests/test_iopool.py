@@ -55,8 +55,10 @@ class FakeExecutable:
         self.rows = rows
 
     def __call__(self, *inputs):
-        outputs = [inputs[self.io_map[i]] if i in self.io_map else torch.empty(self.rows, dtype=torch.float32)
-                   for i in range(2)]
+        outputs = [
+            inputs[self.io_map[i]] if i in self.io_map else torch.empty(self.rows, dtype=torch.float32)
+            for i in range(2)
+        ]
         self.executor.execute(tuple(inputs), outputs)
         return outputs[: self.original_output_count]
 
@@ -75,9 +77,20 @@ def runner(k: int, pieces: int = 2, rank: int = 0):
         return h
 
     r = types.SimpleNamespace(
-        tp_send=None, _decode=decode, _prefill=None, compile_seconds={}, exec_counts={}, watchdog=None,
-        model=types.SimpleNamespace(tp_rank=rank), device=torch.device("cpu"), calls=collections.defaultdict(int),
-        launch_bound=mr.LaunchBound(), iopool=iopool.Pool(k=k, names={"decode"}, rank=rank), exe=exe, board=board)
+        tp_send=None,
+        _decode=decode,
+        _prefill=None,
+        compile_seconds={},
+        exec_counts={},
+        watchdog=None,
+        model=types.SimpleNamespace(tp_rank=rank),
+        device=torch.device("cpu"),
+        calls=collections.defaultdict(int),
+        launch_bound=mr.LaunchBound(),
+        iopool=iopool.Pool(k=k, names={"decode"}, rank=rank),
+        exe=exe,
+        board=board,
+    )
     r._dev = types.MethodType(mr.ModelRunner._dev, r)
     r.call = lambda x: types.MethodType(mr.ModelRunner._exec_inner, r)("decode", KEY, [x])
     return r

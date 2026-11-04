@@ -123,9 +123,20 @@ def _trips(mod, nl, trip: int) -> dict[int, int]:
     TRIPS.clear()
     for pid in (0, 1):
         nl.pid = pid
-        mod.dsa_long_select_t_kernel(qT=Tile((1, 128, 4, 128)), w=Tile((1, 128, 4)), npool=Tile((1, 128, 1)),
-                                     pk=Tile((8192, 128)), identb=Tile((128, 128)), trip=Tile((1, 1), trip), keep=512,
-                                     scale=0.1, sub=64, lsub=8, one=0, rev=0)
+        mod.dsa_long_select_t_kernel(
+            qT=Tile((1, 128, 4, 128)),
+            w=Tile((1, 128, 4)),
+            npool=Tile((1, 128, 1)),
+            pk=Tile((8192, 128)),
+            identb=Tile((128, 128)),
+            trip=Tile((1, 1), trip),
+            keep=512,
+            scale=0.1,
+            sub=64,
+            lsub=8,
+            one=0,
+            rev=0,
+        )
     return dict(TRIPS)
 
 

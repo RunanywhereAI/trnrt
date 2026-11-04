@@ -42,7 +42,7 @@ def neff(seed: int = 1, size_fmt: str = "<Q", size_twice: bool = False, members=
 
 
 def _members(blob: bytes) -> dict[str, bytes]:
-    with tarfile.open(fileobj=io.BytesIO(blob[strip.HEADER:]), mode="r:gz") as tf:
+    with tarfile.open(fileobj=io.BytesIO(blob[strip.HEADER :]), mode="r:gz") as tf:
         return {m.name: tf.extractfile(m).read() for m in tf.getmembers() if m.isfile()}
 
 
@@ -52,18 +52,22 @@ def test_strip_drops_the_debug_members_and_rewrites_the_header_fields():
     assert sorted(_members(new)) == ["neff.json", "sg00/def.json", "sg00/program.bin"]
     assert all(_members(new)[k] == v for k, v in _members(old).items() if not k.endswith(".dbg"))
     assert [n for n, _ in rep["removed"]] == ["sg00/debug_info_0.dbg", "debug_info_1.dbg"]
-    data = new[strip.HEADER:]
-    head = new[:strip.HEADER]
+    data = new[strip.HEADER :]
+    head = new[: strip.HEADER]
     at = rep["fields"]["data_size"][0]
     assert struct.unpack_from("<Q", head, at)[0] == len(data) and rep["bytes"] == (len(old), len(new))
     md5 = hashlib.md5(data).digest()
     assert head.count(md5) == 2 and rep["fields"]["md5"] == [at + 8, at + 8 + 16 + 7]
     assert hashlib.sha256(data).hexdigest().encode() in head
-    assert hashlib.md5(old[strip.HEADER:]).digest() not in head
+    assert hashlib.md5(old[strip.HEADER :]).digest() not in head
     # every other header byte as it was
     changed = [i for i in range(strip.HEADER) if head[i] != old[i]]
-    fields = set(range(at, at + 8)) | set(range(at + 8, at + 24)) | set(range(at + 31, at + 47)) \
+    fields = (
+        set(range(at, at + 8))
+        | set(range(at + 8, at + 24))
+        | set(range(at + 31, at + 47))
         | set(range(at + 47, at + 47 + 64))
+    )
     assert set(changed) <= fields
 
 
@@ -121,7 +125,7 @@ def test_strip_cache_strips_in_place_and_keeps_every_entry_a_cache_hit(tmp_path)
         assert cache.is_complete(str(d))
         assert cache.read_marker(str(d))["neff_size"] == str(len(blob))
         assert struct.unpack_from("<Q", blob, 63)[0] == len(blob) - strip.HEADER
-        assert blob[:strip.HEADER].count(hashlib.md5(blob[strip.HEADER:]).digest()) == 2
+        assert blob[: strip.HEADER].count(hashlib.md5(blob[strip.HEADER :]).digest()) == 2
     assert (bad / cache.neff_name(bad.name)).read_bytes() == bad_blob  # refused: untouched
     assert cache.read_marker(str(bad))["neff_size"] == str(len(bad_blob))
     assert (raw / cache.neff_name(raw.name)).read_bytes() == before[raw.name]
@@ -153,5 +157,7 @@ def test_strip_command_line(tmp_path, capsys):
     summary = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
     assert summary["stripped"] == 1 and summary["entries"] == 1
     assert farm.main(["strip", "--out", str(tmp_path / "out")]) == 0
-    assert all(not [m for m in _members((root / k / cache.neff_name(k)).read_bytes()) if m.endswith(".dbg")]
-               for k in os.listdir(root))
+    assert all(
+        not [m for m in _members((root / k / cache.neff_name(k)).read_bytes()) if m.endswith(".dbg")]
+        for k in os.listdir(root)
+    )

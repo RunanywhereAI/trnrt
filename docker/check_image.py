@@ -54,7 +54,7 @@ def attr(module: str, *names: str):
     for n in names:
         if not hasattr(m, n):
             importlib.import_module(f"{module}.{n}")
-    return None
+    return
 
 
 def dist_version(dist: str, version=importlib.metadata.version) -> str:
@@ -110,9 +110,8 @@ def backend():
     _register_compile_backends, SDK 2.32), so without a device only the function it registers is checked."""
     import glob
 
-    import torch._dynamo as dynamo
-
     import libtorch_neuronx_lite  # noqa: F401  registers the "neuron" device and, with a device, the backend
+    import torch._dynamo as dynamo
     from libtorch_neuronx_lite.compile.backend import compile as lnl_compile
 
     if not glob.glob("/dev/neuron*"):
@@ -134,6 +133,7 @@ def device_graph():
 
     platform.configure_runtime_env()
     import libtorch_neuronx_lite  # noqa: F401
+
     from trnrt.engine.model_runner import canonical_neuron_backend, neuronx_cc_args
 
     def f(x, w):
@@ -143,13 +143,20 @@ def device_graph():
     x, w = torch.randn(64, 128, generator=g), torch.randn(128, 256, generator=g)
     want = f(x, w)
     dev = torch.device("neuron:0")
-    fn = torch.compile(f, backend=canonical_neuron_backend(), fullgraph=True, dynamic=False,
-                       options={"compiler_args": neuronx_cc_args(torch.bfloat16)})
+    fn = torch.compile(
+        f,
+        backend=canonical_neuron_backend(),
+        fullgraph=True,
+        dynamic=False,
+        options={"compiler_args": neuronx_cc_args(torch.bfloat16)},
+    )
     got = fn(x.to(dev), w.to(dev)).cpu()
     err = (got - want).abs().max().item()
     if not err < 0.05 * want.abs().max().item():  # a bf16 matmul's error at most
         raise RuntimeError(f"max |device - cpu| {err}")
-    return f"max |device - cpu| {err:.3g} (output max {want.abs().max().item():.3g}), {platform.describe().get('target')}"
+    return (
+        f"max |device - cpu| {err:.3g} (output max {want.abs().max().item():.3g}), {platform.describe().get('target')}"
+    )
 
 
 def main() -> int:
@@ -159,8 +166,20 @@ def main() -> int:
 
     check("python", lambda: sys.version.split()[0])
     check("trnrt version", trnrt_versions)
-    for dist in ("torch", "libtorch-neuronx-lite", "nki", "neuronx-cc", "transformers", "tokenizers",
-                 "safetensors", "huggingface_hub", "fastapi", "uvicorn", "pydantic", "numpy"):
+    for dist in (
+        "torch",
+        "libtorch-neuronx-lite",
+        "nki",
+        "neuronx-cc",
+        "transformers",
+        "tokenizers",
+        "safetensors",
+        "huggingface_hub",
+        "fastapi",
+        "uvicorn",
+        "pydantic",
+        "numpy",
+    ):
         check(f"dist {dist}", lambda d=dist: dist_version(d))
     check("transformers glm5_next", glm5_next)
     check("nki", lambda: attr("nki", "jit", "simulate"))
@@ -169,19 +188,32 @@ def main() -> int:
     check("nki.isa.constants.oob_mode", lambda: attr("nki.isa.constants", "oob_mode"))
     check("libtorch_neuronx_lite.nki.nki_hop.wrap_nki", lambda: attr("libtorch_neuronx_lite.nki.nki_hop", "wrap_nki"))
     check("libtorch_neuronx_lite.compile.cache", lambda: attr("libtorch_neuronx_lite.compile", "cache"))
-    check("libtorch_neuronx_lite.compile.backend",
-          lambda: attr("libtorch_neuronx_lite.compile.backend", "_parse_compiler_args",
-                       "_apply_platform_compiler_args", "preprocess_and_validate_inputs"))
-    check("libtorch_neuronx_lite.compile.capture_backend",
-          lambda: attr("libtorch_neuronx_lite.compile.capture_backend", "run_fx_to_hlo_pipeline",
-                       "setup_workdir_common"))
+    check(
+        "libtorch_neuronx_lite.compile.backend",
+        lambda: attr(
+            "libtorch_neuronx_lite.compile.backend",
+            "_parse_compiler_args",
+            "_apply_platform_compiler_args",
+            "preprocess_and_validate_inputs",
+        ),
+    )
+    check(
+        "libtorch_neuronx_lite.compile.capture_backend",
+        lambda: attr("libtorch_neuronx_lite.compile.capture_backend", "run_fx_to_hlo_pipeline", "setup_workdir_common"),
+    )
     check("libtorch_neuronx_lite.compile.hlo", lambda: attr("libtorch_neuronx_lite.compile.hlo", "load_hlo_module"))
-    check("libtorch_neuronx_lite.compile.platform",
-          lambda: attr("libtorch_neuronx_lite.compile.platform", "resolve_target", "get_platform_target"))
-    check("libtorch_neuronx_lite.compile.schema", lambda: attr("libtorch_neuronx_lite.compile.schema", "create_metadata"))
+    check(
+        "libtorch_neuronx_lite.compile.platform",
+        lambda: attr("libtorch_neuronx_lite.compile.platform", "resolve_target", "get_platform_target"),
+    )
+    check(
+        "libtorch_neuronx_lite.compile.schema", lambda: attr("libtorch_neuronx_lite.compile.schema", "create_metadata")
+    )
     check("libtorch_neuronx_lite.pyhlo.xla_data_pb2", lambda: attr("libtorch_neuronx_lite.pyhlo", "xla_data_pb2"))
-    check("libtorch_neuronx_lite.overrides",
-          lambda: attr("libtorch_neuronx_lite.overrides", "neuron_collectives", "xla_collectives"))
+    check(
+        "libtorch_neuronx_lite.overrides",
+        lambda: attr("libtorch_neuronx_lite.overrides", "neuron_collectives", "xla_collectives"),
+    )
     check("torch.compile backend neuron_libtorch", backend)
     check("neuronx-cc --version", lambda: cli("neuronx-cc", "--version"))
     check("trnrt modules", trnrt_modules)

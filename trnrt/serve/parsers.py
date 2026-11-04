@@ -65,11 +65,29 @@ _BLOCK_TAGS = (TOOL_CLOSE, ARG_KEY_OPEN, ARG_KEY_CLOSE, ARG_VALUE_OPEN, ARG_VALU
 
 # utils.py _TYPE_ALIASES
 _TYPE_ALIASES = {
-    "str": "string", "text": "string", "varchar": "string", "char": "string", "enum": "string",
-    "int": "integer", "int32": "integer", "int64": "integer", "uint": "integer", "uint32": "integer",
-    "uint64": "integer", "long": "integer", "short": "integer", "unsigned": "integer",
-    "float": "number", "float32": "number", "float64": "number", "double": "number",
-    "bool": "boolean", "dict": "object", "arr": "array", "list": "array", "sequence": "array",
+    "str": "string",
+    "text": "string",
+    "varchar": "string",
+    "char": "string",
+    "enum": "string",
+    "int": "integer",
+    "int32": "integer",
+    "int64": "integer",
+    "uint": "integer",
+    "uint32": "integer",
+    "uint64": "integer",
+    "long": "integer",
+    "short": "integer",
+    "unsigned": "integer",
+    "float": "number",
+    "float32": "number",
+    "float64": "number",
+    "double": "number",
+    "bool": "boolean",
+    "dict": "object",
+    "arr": "array",
+    "list": "array",
+    "sequence": "array",
 }
 
 
@@ -86,9 +104,21 @@ def _schema_types(schema) -> set[str]:
         types.update(x for x in t if isinstance(x, str))
     enum = schema.get("enum")
     for v in enum if isinstance(enum, list) else ():
-        types.add("null" if v is None else "boolean" if isinstance(v, bool) else "integer" if isinstance(v, int)
-                  else "number" if isinstance(v, float) else "array" if isinstance(v, list)
-                  else "object" if isinstance(v, dict) else "string")
+        types.add(
+            "null"
+            if v is None
+            else "boolean"
+            if isinstance(v, bool)
+            else "integer"
+            if isinstance(v, int)
+            else "number"
+            if isinstance(v, float)
+            else "array"
+            if isinstance(v, list)
+            else "object"
+            if isinstance(v, dict)
+            else "string"
+        )
     for key in ("anyOf", "oneOf", "allOf"):
         if isinstance(schema.get(key), list):
             for choice in schema[key]:
@@ -178,6 +208,7 @@ def _args_json(items: list[tuple[str, str, bool]], complete: bool, props: dict) 
 # The GLM tool block
 # ---------------------------------------------------------------------------------------
 
+
 def _scan(body: str, done: bool) -> tuple[str | None, str]:
     """A tool block's (function name, raw argument text) from its text after `<tool_call>` (vLLM glm47_moe.py, which
     reads both the inline layout and GLM-4.5's newline one). The name ends at the first `<arg_key>`, newline or the end
@@ -201,6 +232,7 @@ def _arguments(args: str, complete: bool, props: dict) -> str:
 # ---------------------------------------------------------------------------------------
 # Request-level rules
 # ---------------------------------------------------------------------------------------
+
 
 def template_messages(messages: list, developer_to_system: bool = False) -> list:
     """The request's messages as the chat template takes them: an assistant turn's tool_calls arguments as an object (a
@@ -260,9 +292,11 @@ def tool_choice_error(tool_choice) -> str | None:
     if tool_choice is None or tool_choice in ("none", "auto"):
         return None
     if tool_choice == "required" or isinstance(tool_choice, dict):
-        return ("`tool_choice` \"required\" and named tools are not supported: they need guided decoding, which this "
-                "server does not run. Send \"auto\" or \"none\".")
-    return f"Invalid value for `tool_choice`: {tool_choice}! Only \"none\" and \"auto\" are supported."
+        return (
+            '`tool_choice` "required" and named tools are not supported: they need guided decoding, which this '
+            'server does not run. Send "auto" or "none".'
+        )
+    return f'Invalid value for `tool_choice`: {tool_choice}! Only "none" and "auto" are supported.'
 
 
 def chat_finish_reason(finish: str | None, called: bool) -> str | None:
@@ -278,6 +312,7 @@ def chat_finish_reason(finish: str | None, called: bool) -> str | None:
 # ---------------------------------------------------------------------------------------
 # The state machine
 # ---------------------------------------------------------------------------------------
+
 
 def _find(text: str, tags) -> tuple[int, str | None]:
     """The earliest tag in text (the longest one on a tie)."""
@@ -305,6 +340,7 @@ def _safe_len(text: str, tags, final: bool) -> int:
 @dataclass
 class _Slot:
     """The call of the tool block being parsed."""
+
     index: int | None = None  # set once the call is announced
     skip: bool = False  # the block yields no call (no name, or a name the request did not offer)
     muted: bool = False  # parallel_tool_calls=False: calls after the first are dropped
@@ -320,8 +356,13 @@ class StreamParser:
     content. thinking_open: the prompt ended inside a reasoning block. tool_defs: the request's OpenAI `tools`, used to
     type arguments by their schema and to refuse names the request did not offer (None: any name)."""
 
-    def __init__(self, tools: bool = False, thinking_open: bool = False, tool_defs: list | None = None,
-                 parallel_tool_calls: bool = True):
+    def __init__(
+        self,
+        tools: bool = False,
+        thinking_open: bool = False,
+        tool_defs: list | None = None,
+        parallel_tool_calls: bool = True,
+    ):
         self.tools = bool(tools)
         self.tool_defs = tool_defs
         self.parallel = parallel_tool_calls
@@ -348,7 +389,7 @@ class StreamParser:
             if st == "start":
                 s = self._buf.lstrip()
                 if s.startswith(THINK_OPEN):
-                    self._buf = s[len(THINK_OPEN):]
+                    self._buf = s[len(THINK_OPEN) :]
                     self._enter_think()
                     continue
                 if not final and THINK_OPEN.startswith(s):
@@ -366,12 +407,12 @@ class StreamParser:
                 if i:
                     out.append({"reasoning_content": self._buf[:i]})
                 if tag == THINK_OPEN:  # a repeated start tag is absorbed
-                    self._buf = self._buf[i + len(tag):]
+                    self._buf = self._buf[i + len(tag) :]
                     continue
                 self._closed = True
                 self._state = "content"
                 if tag == THINK_CLOSE:
-                    self._buf = self._buf[i + len(tag):]
+                    self._buf = self._buf[i + len(tag) :]
                     self._skip_nl = True
                 else:  # the tool opener stays for the content state
                     self._buf = self._buf[i:]
@@ -382,7 +423,9 @@ class StreamParser:
                     if not self._buf and not final:
                         return _coalesce(out)
                     self._skip_nl = False
-                tags = [THINK_OPEN]  # a later start tag opens another reasoning block (vLLM glm47 (CONTENT, THINK_START))
+                tags = [
+                    THINK_OPEN
+                ]  # a later start tag opens another reasoning block (vLLM glm47 (CONTENT, THINK_START))
                 if self.tools:
                     tags.append(TOOL_OPEN)
                 if self._closed:
@@ -394,7 +437,7 @@ class StreamParser:
                         out.append({"content": self._buf[:n]})
                         self._buf = self._buf[n:]
                     return _coalesce(out)
-                before, self._buf = self._buf[:i], self._buf[i + len(tag):]
+                before, self._buf = self._buf[:i], self._buf[i + len(tag) :]
                 if tag == TOOL_OPEN:
                     if before.strip():
                         out.append({"content": before})
@@ -409,13 +452,13 @@ class StreamParser:
             j = self._buf.find(TOOL_CLOSE)
             if j >= 0 or final:
                 body = self._buf[:j] if j >= 0 else self._buf
-                self._buf = self._buf[j + len(TOOL_CLOSE):] if j >= 0 else ""
+                self._buf = self._buf[j + len(TOOL_CLOSE) :] if j >= 0 else ""
                 out += self._block(body, True, TOOL_CLOSE if j >= 0 else "")
                 self._state = "content"
                 if not self._buf:
                     return _coalesce(out)
                 continue
-            out += self._block(self._buf[:_safe_len(self._buf, _BLOCK_TAGS, False)], False, "")
+            out += self._block(self._buf[: _safe_len(self._buf, _BLOCK_TAGS, False)], False, "")
             return _coalesce(out)
 
     def _props(self, name: str) -> dict:
@@ -451,12 +494,16 @@ class StreamParser:
             text = _arguments(args, done, self._props(slot.name))
             diff = ""
             if text.startswith(slot.sent):  # never retract what was streamed
-                diff, slot.sent = text[len(slot.sent):], text
+                diff, slot.sent = text[len(slot.sent) :], text
             if not slot.muted and (announce or diff):
                 call = {"index": slot.index, "function": {"arguments": diff}}
                 if announce:
-                    call = {"index": slot.index, "id": slot.id, "type": "function",
-                            "function": {"name": slot.name, "arguments": diff}}
+                    call = {
+                        "index": slot.index,
+                        "id": slot.id,
+                        "type": "function",
+                        "function": {"name": slot.name, "arguments": diff},
+                    }
                 out.append({"tool_calls": [call]})
                 self.saw_tool = True
         if done:
@@ -486,8 +533,13 @@ def _coalesce(deltas: list[dict]) -> list[dict]:
     return out
 
 
-def parse_full(text: str, tools: bool = False, thinking_open: bool = False, tool_defs: list | None = None,
-               parallel_tool_calls: bool = True) -> dict:
+def parse_full(
+    text: str,
+    tools: bool = False,
+    thinking_open: bool = False,
+    tool_defs: list | None = None,
+    parallel_tool_calls: bool = True,
+) -> dict:
     """Non-streaming: split a whole completion into content, reasoning_content, tool_calls."""
     p = StreamParser(tools, thinking_open, tool_defs, parallel_tool_calls)
     deltas = p.push(text, final=True)
@@ -499,15 +551,18 @@ def parse_full(text: str, tools: bool = False, thinking_open: bool = False, tool
     for d in deltas:
         for c in d.get("tool_calls", ()):
             if "id" in c:
-                by_index[c["index"]] = {"id": c["id"], "type": "function",
-                                        "function": {"name": c["function"]["name"], "arguments": ""}}
+                by_index[c["index"]] = {
+                    "id": c["id"],
+                    "type": "function",
+                    "function": {"name": c["function"]["name"], "arguments": ""},
+                }
             by_index[c["index"]]["function"]["arguments"] += c["function"]["arguments"]
     calls = [by_index[i] for i in sorted(by_index)]
     if calls:
         content = content.strip()  # vLLM strips content when calls were made
     elif "reasoning_content" in msg:
         content = content.strip("\n")
-    msg["content"] = content if content else None
+    msg["content"] = content or None
     if calls:
         msg["tool_calls"] = calls
     return msg

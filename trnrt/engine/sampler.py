@@ -75,7 +75,7 @@ def topk_large(x: torch.Tensor, k: int, chunk: int = 128):
 def logsumexp_large(x: torch.Tensor, chunk: int = 128) -> torch.Tensor:
     """logsumexp over a long last axis, folded the same way. Returns [B, 1]."""
     B, V = x.shape
-    if V <= chunk:
+    if chunk >= V:
         return torch.logsumexp(x, dim=-1, keepdim=True)
     pad = (-V) % chunk
     if pad:
@@ -83,8 +83,14 @@ def logsumexp_large(x: torch.Tensor, chunk: int = 128) -> torch.Tensor:
     return torch.logsumexp(torch.logsumexp(x.view(B, -1, chunk), dim=-1), dim=-1, keepdim=True)
 
 
-def apply_penalties(logits: torch.Tensor, hist_ids: torch.Tensor, out_counts: torch.Tensor,
-                    rep: torch.Tensor, freq: torch.Tensor, pres: torch.Tensor) -> torch.Tensor:
+def apply_penalties(
+    logits: torch.Tensor,
+    hist_ids: torch.Tensor,
+    out_counts: torch.Tensor,
+    rep: torch.Tensor,
+    freq: torch.Tensor,
+    pres: torch.Tensor,
+) -> torch.Tensor:
     """vLLM semantics. hist_ids [B, M]: every distinct token in the prompt or the output
     (rows padded by repeating their first entry, which makes the scatter idempotent);
     out_counts [B, M]: occurrences in the output only. repetition_penalty divides positive
@@ -97,8 +103,15 @@ def apply_penalties(logits: torch.Tensor, hist_ids: torch.Tensor, out_counts: to
     return torch.scatter(logits, 1, hist_ids, g)
 
 
-def _draw(cv: torch.Tensor, ci: torch.Tensor, temperature: torch.Tensor, top_p: torch.Tensor, top_k: torch.Tensor,
-          min_p: torch.Tensor, noise: torch.Tensor):
+def _draw(
+    cv: torch.Tensor,
+    ci: torch.Tensor,
+    temperature: torch.Tensor,
+    top_p: torch.Tensor,
+    top_k: torch.Tensor,
+    min_p: torch.Tensor,
+    noise: torch.Tensor,
+):
     """One sampled candidate per row from the K candidates cv [B, K] (fp32 logits, sorted descending) whose ids are
     ci [B, K]: the distribution at the row's temperature, filtered by top-p, top-k and min-p (the best candidate
     always kept), drawn with the Gumbel-max trick on `noise`. Returns (its id from ci, its index [B, 1] into cv)."""
@@ -117,9 +130,16 @@ def _draw(cv: torch.Tensor, ci: torch.Tensor, temperature: torch.Tensor, top_p: 
     return torch.gather(ci, 1, choice).squeeze(1), choice
 
 
-def sample(logits: torch.Tensor, temperature: torch.Tensor, top_p: torch.Tensor,
-           top_k: torch.Tensor, min_p: torch.Tensor, noise: torch.Tensor,
-           bitmask: torch.Tensor | None = None, penalties: tuple | None = None) -> torch.Tensor:
+def sample(
+    logits: torch.Tensor,
+    temperature: torch.Tensor,
+    top_p: torch.Tensor,
+    top_k: torch.Tensor,
+    min_p: torch.Tensor,
+    noise: torch.Tensor,
+    bitmask: torch.Tensor | None = None,
+    penalties: tuple | None = None,
+) -> torch.Tensor:
     """logits [B, V] fp32; temperature/top_p/min_p [B] fp32; top_k [B] int64 (0 = off);
     noise [B, K] uniform in (0, 1); bitmask: always None (no guided decoding; the parameter keeps
     the models' call sites); penalties: optional (hist_ids, out_counts, rep, freq, pres) for
@@ -146,8 +166,16 @@ def sample(logits: torch.Tensor, temperature: torch.Tensor, top_p: torch.Tensor,
     return torch.cat([token.unsqueeze(1).float(), token_lp, raw_idx[:, :N].float(), top_lp], dim=1)
 
 
-def sample_candidates(cand_vals: torch.Tensor, cand_ids: torch.Tensor, lse: torch.Tensor, temperature: torch.Tensor,
-                      top_p: torch.Tensor, top_k: torch.Tensor, min_p: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
+def sample_candidates(
+    cand_vals: torch.Tensor,
+    cand_ids: torch.Tensor,
+    lse: torch.Tensor,
+    temperature: torch.Tensor,
+    top_p: torch.Tensor,
+    top_k: torch.Tensor,
+    min_p: torch.Tensor,
+    noise: torch.Tensor,
+) -> torch.Tensor:
     """sample() without penalties, from a candidate set instead of the logits: cand_vals [B, C] fp32 logits,
     cand_ids [B, C] their vocabulary ids as fp32 (exact below 2^24), C >= max(K, N), holding the logits' top
     max(K, N), and lse [B, 1] the logits' log-sum-exp. The vocabulary-parallel sampler passes the union of every
@@ -178,5 +206,9 @@ def unpack(out, n: int):
     """Host side: the first `n` rows of a sampler output as (tokens, logprobs, top_ids, top_lps)."""
     out = out[:n]
     N = NUM_TOP_LOGPROBS
-    return (out[:, 0].long().tolist(), out[:, 1].tolist(),
-            out[:, 2:2 + N].long().tolist(), out[:, 2 + N:2 + 2 * N].tolist())
+    return (
+        out[:, 0].long().tolist(),
+        out[:, 1].tolist(),
+        out[:, 2 : 2 + N].long().tolist(),
+        out[:, 2 + N : 2 + 2 * N].tolist(),
+    )

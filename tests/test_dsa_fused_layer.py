@@ -55,7 +55,7 @@ def _span(path, sig: str, first: str, last: str) -> str:
     src = pathlib.Path(path).read_text() if not isinstance(path, str) or "\n" not in path else path
     a = src.index(sig)
     b = src.index(first, a)
-    return src[b:src.index(last, b) + len(last)]
+    return src[b : src.index(last, b) + len(last)]
 
 
 def _fn(src: str, name: str) -> ast.FunctionDef:
@@ -92,7 +92,8 @@ def test_section_pins_catch_a_planted_change():
     lines = _code(body)
     drift = src.replace(body, body.replace(lines[5].strip(), lines[5].strip() + " + 0", 1), 1)
     assert _code(_span(drift, "    def _sel2(", first, last)) != _code(
-        _span(dsh.__file__, "    def dsa_shell_sel2_kernel(", first, last))
+        _span(dsh.__file__, "    def dsa_shell_sel2_kernel(", first, last)
+    )
 
 
 def test_revs_carry_their_parts():
@@ -100,13 +101,15 @@ def test_revs_carry_their_parts():
     fused call."""
     k = "# -- the kernel source"
     assert S2.REV == SH.kernel_rev(S2.__file__, k, k + " end") ^ dsh.REV2 != dsh.REV2
-    assert SA.REV == SH.kernel_rev(SA.__file__, k, k + " end") ^ dsh.REV2 ^ dsh.REVA ^ S2.REV
-    assert SAT.REV == SH.kernel_rev(SAT.__file__, k, k + " end") ^ SA.REV ^ CT.REV
+    assert SH.kernel_rev(SA.__file__, k, k + " end") ^ dsh.REV2 ^ dsh.REVA ^ S2.REV == SA.REV
+    assert SH.kernel_rev(SAT.__file__, k, k + " end") ^ SA.REV ^ CT.REV == SAT.REV
     assert SAT.REV not in (SA.REV, CT.REV)
-    assert SATWF_M.REV == SH.kernel_rev(SATWF_M.__file__, k, "    dsa_satwf_kernel = None") ^ SAT.REV ^ CW.REV ^ FS.REV
-    assert SATWFC_M.REV == SH.kernel_rev(SATWFC_M.__file__, k, "    dsa_satwfc_kernel = None") ^ SATWF_M.REV ^ MS.REV_K
-    assert CT.REV == (SH.kernel_rev(CT.__file__, "LP = 16", "# -- the tail end")
-                      ^ SH.kernel_rev(CT.__file__, "    def _tail_heads_hs(", "# -- _tail_heads_hs end"))
+    assert SH.kernel_rev(SATWF_M.__file__, k, "    dsa_satwf_kernel = None") ^ SAT.REV ^ CW.REV ^ FS.REV == SATWF_M.REV
+    assert SH.kernel_rev(SATWFC_M.__file__, k, "    dsa_satwfc_kernel = None") ^ SATWF_M.REV ^ MS.REV_K == SATWFC_M.REV
+    assert (
+        SH.kernel_rev(CT.__file__, "LP = 16", "# -- the tail end")
+        ^ SH.kernel_rev(CT.__file__, "    def _tail_heads_hs(", "# -- _tail_heads_hs end")
+    ) == CT.REV
 
 
 def test_tail_helpers_are_cc_tails():
@@ -166,8 +169,14 @@ ISSUE = "        ar_world_issue(Y, S0, S1, Z1, world, pid, npg=npg, fence=fz)"
 FFN = "        fh = ffn_half_body(S, post_p, comb_p, Yp,"
 EDITS = [  # (anchor, lines inserted after it / the replacement, mode)
     (O_OUT, ["        comb_i = nl.ndarray((B, hc * hc), dtype=F32, buffer=nl.private_hbm)"], "after"),
-    (AR_S2, ["        cpa = _sk_tile(comb_p, B, hc, eps, skf)",
-             "        _sk_piece(cpa, comb_i, hc, iters, eps, skf, ckp, 0)"], "after"),
+    (
+        AR_S2,
+        [
+            "        cpa = _sk_tile(comb_p, B, hc, eps, skf)",
+            "        _sk_piece(cpa, comb_i, hc, iters, eps, skf, ckp, 0)",
+        ],
+        "after",
+    ),
     (A2A, ["        _sk_piece(cpa, comb_i, hc, iters, eps, skf, ckp, 1)"], "after"),
     (ISSUE, ["        _sk_piece(cpa, comb_i, hc, iters, eps, skf, ckp, 2)"], "after"),
     (FFN, ["        fh = ffn_half_body(S, post_p, comb_i, Yp,"], "prefix"),
@@ -175,8 +184,14 @@ EDITS = [  # (anchor, lines inserted after it / the replacement, mode)
 
 
 def _kbody(src: str, sig: str) -> list[str]:
-    return _code(_span(src, sig, "        B = cand.shape[0]\n",
-                       "        return (gv, gc, out, o, lse, srows, sbias, over, Yp, o_out) + tuple(fh)\n"))
+    return _code(
+        _span(
+            src,
+            sig,
+            "        B = cand.shape[0]\n",
+            "        return (gv, gc, out, o, lse, srows, sbias, over, Yp, o_out) + tuple(fh)\n",
+        )
+    )
 
 
 def _pin_errors(satwf: str, satwfc: str) -> list:
@@ -188,9 +203,9 @@ def _pin_errors(satwf: str, satwfc: str) -> list:
             continue
         i = hits[0]
         if mode == "after":
-            want[i + 1:i + 1] = new
+            want[i + 1 : i + 1] = new
         else:
-            want[i] = new[0] + want[i][len(anchor):]
+            want[i] = new[0] + want[i][len(anchor) :]
     got = _kbody(satwfc, "    def dsa_satwfc_kernel(")
     if got != want:
         bad.append(f"dsa_satwfc's kernel differs from dsa_satwf's beyond the named edits ({len(got)} vs {len(want)})")
@@ -206,8 +221,9 @@ def test_arguments_are_satwfs_plus_ckp():
     a, b = _fn(SATWF, "dsa_satwf_kernel").args, _fn(SATWFC, "dsa_satwfc_kernel").args
     assert [x.arg for x in b.args] == [x.arg for x in a.args] + ["ckp"]
     assert [ast.unparse(d) for d in b.defaults] == [ast.unparse(d) for d in a.defaults] + ["3"]
-    assert ([ast.unparse(x.annotation) for x in b.args if x.annotation is not None]
-            == [ast.unparse(x.annotation) for x in a.args if x.annotation is not None] + ["int"])
+    assert [ast.unparse(x.annotation) for x in b.args if x.annotation is not None] == [
+        ast.unparse(x.annotation) for x in a.args if x.annotation is not None
+    ] + ["int"]
 
 
 @pytest.mark.parametrize("plant", ["satwf-drift", "satwfc-drift", "edit-dropped"])
@@ -366,7 +382,7 @@ def test_heads_stacked_bitwise(monkeypatch, T, so, wu):
 
 def _no_heads(*args, **kwargs):
     """A stand-in that writes nothing (a named function: the tracer reads called functions' source)."""
-    return None
+    return
 
 
 @needs_nki

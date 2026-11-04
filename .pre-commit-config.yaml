@@ -1,5 +1,6 @@
 # pre-commit run --all-files   (CI runs exactly this; `make lint` too)
-# No formatter: reformatting traced code (trnrt/kernels, trnrt/models) changes its compiled graphs. See AGENTS.md.
+# The formatter and linter skip traced code (trnrt/kernels, trnrt/models and the modules listed in pyproject.toml):
+# a moved line there can change its compiled graphs. See AGENTS.md.
 default_install_hook_types: [pre-commit]
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
@@ -26,6 +27,7 @@ repos:
     rev: v0.15.1
     hooks:
       - id: ruff-check
+      - id: ruff-format
   - repo: local
     hooks:
       - id: check-docs

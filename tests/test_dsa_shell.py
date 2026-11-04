@@ -42,7 +42,7 @@ def case(B: int, NPg: int, Hi: int, nloc, seed: int = 0, repeat: bool = False, p
     if repeat:
         table[:, 1::7] = table[:, :1]  # every 7th page is the row's first: its 8 pools' scores recur
     q = torch.randn(B, Hi, D, generator=g).bfloat16()
-    w = torch.randn(B, Hi, generator=g) * (D ** -0.5)
+    w = torch.randn(B, Hi, generator=g) * (D**-0.5)
     return q, w, pkc, table, torch.tensor(nloc, dtype=torch.int64)
 
 
@@ -62,7 +62,7 @@ def test_scores_are_the_xla_forms():
     _, _, _, sc = dsh.emulate(q, w, pkc, table, nloc, 128, 8, 0)
     prow = dsa_long.cp_pool_rows(table, 256, 4, 8)
     pk = pkc.view(-1, D)[prow]  # [B, Pl, D]
-    ref = dsa_long.scores(q, w * D ** 0.5, pk, nloc, D ** -0.5)
+    ref = dsa_long.scores(q, w * D**0.5, pk, nloc, D**-0.5)
     live = torch.arange(sc.shape[1]).view(1, -1) < nloc.view(-1, 1)
     torch.testing.assert_close(sc[live], ref[live], rtol=1e-5, atol=1e-5)
     assert torch.all(sc[~live] == dsh.NEG_INF) and torch.all(ref[~live] == dsh.NEG_INF)
@@ -95,6 +95,7 @@ def test_a_wrong_page_width_is_caught(monkeypatch):
 
 
 # -- the merge and the slot table (emulation) -------------------------------------------------------------------------
+
 
 def merge_case(T: int, A: int, keep: int, NPg: int, npool, seed: int = 0, levels: int | None = None):
     """Every rank's local list as the context-parallel decode branch makes it (dsa_long.select_device over the rank's
@@ -156,10 +157,11 @@ def test_merge_tail_slot():
             assert [bool(x == 0) for x in sbias[b, keep]] == vis
             m = n // A
             assert int(srows[b, keep]) == int(table[b, m // PPP]) * PPP + m % PPP
-            assert torch.all(srows[b, keep + 1:] == 0) and torch.all(sbias[b, keep + 1:] == dsh.NEG_INF)
+            assert torch.all(srows[b, keep + 1 :] == 0) and torch.all(sbias[b, keep + 1 :] == dsh.NEG_INF)
 
 
 # -- sel2 in the NKI simulator ------------------------------------------------------------------------------------------
+
 
 def _served(q, w, pkc, table, nloc, keep, A, rank):
     """The served selection's tensors from the dsa_index kernel's scores (simulated, grid 1), then the exact selection
@@ -178,8 +180,19 @@ def _served(q, w, pkc, table, nloc, keep, A, rank):
     wb = w.float().repeat(1, 4).unsqueeze(1).expand(B, 128, 4 * Hi).contiguous()
     bf = lambda t: t.float().numpy().astype(ml_dtypes.bfloat16)  # noqa: E731
     sc = nki.simulate(dsa_index.dsa_index_kernel)(
-        qT=bf(qT), wb=wb.numpy(), pkc=bf(pkc), ppg=dsa_index.page_groups(table).numpy(), cand=cand.numpy(),
-        identb=bf(torch.eye(128)), rev=dsa_index.REV, dge=0, spl=1, nr=dsa_index.NR, qr=dsa_index.QR, dbg=0)
+        qT=bf(qT),
+        wb=wb.numpy(),
+        pkc=bf(pkc),
+        ppg=dsa_index.page_groups(table).numpy(),
+        cand=cand.numpy(),
+        identb=bf(torch.eye(128)),
+        rev=dsa_index.REV,
+        dge=0,
+        spl=1,
+        nr=dsa_index.NR,
+        qr=dsa_index.QR,
+        dbg=0,
+    )
     sc = torch.from_numpy(np.asarray(sc, dtype=np.float32))
     lp, lc = dsa_long.select_device(sc, keep)
     k = torch.arange(keep).view(1, keep)
@@ -196,12 +209,15 @@ def _bits(a, b):
 
 @needs_nki
 @pytest.mark.parametrize("grid", [1, 2])
-@pytest.mark.parametrize("B,NPg,nloc,keep,repeat", [
-    (1, 256, [2048 - 5], 128, False),            # one chunk of 16 columns
-    (2, 1024, [8191, 90], 128, True),           # a row under keep, ties
-    (5, 256, [1024, 1025, 0, 513, 2047], 128, True),  # an empty row, rows across the programs
-    (8, 1024, [8000, 300, 1500, 2000, 64, 1024, 777, 8191], 256, False),  # B 8: four rows per program
-])
+@pytest.mark.parametrize(
+    "B,NPg,nloc,keep,repeat",
+    [
+        (1, 256, [2048 - 5], 128, False),  # one chunk of 16 columns
+        (2, 1024, [8191, 90], 128, True),  # a row under keep, ties
+        (5, 256, [1024, 1025, 0, 513, 2047], 128, True),  # an empty row, rows across the programs
+        (8, 1024, [8000, 300, 1500, 2000, 64, 1024, 777, 8191], 256, False),  # B 8: four rows per program
+    ],
+)
 def test_sel2_is_the_served_bits(monkeypatch, grid, B, NPg, nloc, keep, repeat):
     monkeypatch.setenv("NEURON_PLATFORM_TARGET_OVERRIDE", "trn2")
     q, w, pkc, table, nl_ = case(B, NPg, 8, nloc, seed=70 + B + NPg, repeat=repeat)
@@ -281,7 +297,7 @@ def test_compact2_stacked_bitwise(monkeypatch, grid, B):
 
 def _no_compaction(X, ii, bb):
     """A _compact2s that writes nothing (the dispatch control below)."""
-    return None
+    return
 
 
 @needs_nki
@@ -305,6 +321,7 @@ def test_compact2_stacked_dispatch_control(monkeypatch, grid):
 
 
 # -- attend in the NKI simulator ----------------------------------------------------------------------------------------
+
 
 def attend_case(T: int, keep: int, NPg: int, npool, seed: int = 0, hot_rank: int | None = None, levels=None):
     """attend's inputs: merge_case's lists (slot rows below the cache's pool rows), every head's latent query [T, 16,
@@ -366,8 +383,9 @@ def _fallback_sim(q, kc, srows, sbias, grid):
     conv = {k: _np(v) for k, v in args.items()}
     it = np.array([[-(-T // rpi)]], dtype=np.int32)
     k = dns.dsa_slots_n_s_kernel
-    o, ls = nki.simulate(k[grid] if grid > 1 else k)(**conv, n_iter=it, scale=0.05, fp8=1, want_lse=1, rev=dns.REV,
-                                                     qkw=ds.QKW)
+    o, ls = nki.simulate(k[grid] if grid > 1 else k)(
+        **conv, n_iter=it, scale=0.05, fp8=1, want_lse=1, rev=dns.REV, qkw=ds.QKW
+    )
     o = torch.from_numpy(np.asarray(o, dtype=np.float32)).reshape(Np, H, R)[:T]
     ls = torch.from_numpy(np.asarray(ls, dtype=np.float32)).reshape(Np, H)[:T]
     return o, ls
@@ -375,9 +393,17 @@ def _fallback_sim(q, kc, srows, sbias, grid):
 
 @needs_nki
 @pytest.mark.parametrize("grid", [1, 2])
-@pytest.mark.parametrize("T,npool,levels,hot", [(1, [2000], 16, None), (2, [2047, 600], 16, None),
-                                                (3, [2000, 900, 1500], None, None), (4, [2000, 7, 1500, 2047], 16, None),
-                                                (5, [2000, 2001, 600, 7, 1500], 16, None), (2, [1805, 1797], None, 5)])
+@pytest.mark.parametrize(
+    "T,npool,levels,hot",
+    [
+        (1, [2000], 16, None),
+        (2, [2047, 600], 16, None),
+        (3, [2000, 900, 1500], None, None),
+        (4, [2000, 7, 1500, 2047], 16, None),
+        (5, [2000, 2001, 600, 7, 1500], 16, None),
+        (2, [1805, 1797], None, 5),
+    ],
+)
 def test_attend_served_form_is_the_served_chain(monkeypatch, grid, T, npool, levels, hot):
     """attend in its served form against the served chain: the slot rows, bias and over, bit for bit; o and lse bit for
     bit where no row is over (the compacted slots), and the fallback's where one is (the fold). Ties across ranks at the
@@ -389,8 +415,23 @@ def test_attend_served_form_is_the_served_chain(monkeypatch, grid, T, npool, lev
     ran = False
     for rank in (0, 5):
         want = _served_attend(ev, ec, rows_sel, table, pos, q, kc, keep, rank, ns)
-        got = dsh.attend(ev, ec, rows_sel, table, pos, q, kc, keep, 8, torch.tensor([rank]), 0.05, ns=ns,
-                         simulate=True, grid=grid, **SERVED_ATTEND)
+        got = dsh.attend(
+            ev,
+            ec,
+            rows_sel,
+            table,
+            pos,
+            q,
+            kc,
+            keep,
+            8,
+            torch.tensor([rank]),
+            0.05,
+            ns=ns,
+            simulate=True,
+            grid=grid,
+            **SERVED_ATTEND,
+        )
         assert torch.equal(want[2], got[2]) and _bits(want[3], got[3]), ("slots", T, rank)
         assert float(got[4]) == float(want[4]), ("over", T, rank)
         if float(want[4]) == 0:
@@ -412,9 +453,10 @@ def test_attend_served_form_is_the_served_chain(monkeypatch, grid, T, npool, lev
 
 @needs_nki
 @pytest.mark.parametrize("grid", [1, 2])
-@pytest.mark.parametrize("T,npool,hot,hot_rows,seed", [(1, [1805], 5, None, 306),
-                                                       (2, [1805, 1797], 5, None, 7),
-                                                       (4, [1805, 2000, 1797, 600], 5, (2, 4), 309)])
+@pytest.mark.parametrize(
+    "T,npool,hot,hot_rows,seed",
+    [(1, [1805], 5, None, 306), (2, [1805, 1797], 5, None, 7), (4, [1805, 2000, 1797, 600], 5, (2, 4), 309)],
+)
 def test_attend_fold_control(monkeypatch, grid, T, npool, hot, hot_rows, seed):
     """The positive control for the fold: without it (fo 0) an over row's o is the compaction's, which differs from the
     fallback's, so the fold's equality to the fallback above means its loop ran. hot_rows (2, 4) at T 4: only rows 2-3
@@ -422,32 +464,68 @@ def test_attend_fold_control(monkeypatch, grid, T, npool, hot, hot_rows, seed):
     exchange)."""
     monkeypatch.setenv("NEURON_PLATFORM_TARGET_OVERRIDE", "trn2")
     keep, NPg, ns = 128, 32, 256
-    ev, ec, rows_sel, table, pos, q, kc = attend_case(T, keep, NPg, npool, seed=seed,
-                                                      hot_rank=hot if hot_rows is None else None)
+    ev, ec, rows_sel, table, pos, q, kc = attend_case(
+        T, keep, NPg, npool, seed=seed, hot_rank=hot if hot_rows is None else None
+    )
     if hot_rows is not None:  # rank hot's entries outrank every other rank's, in rows hot_rows[0] .. [1] - 1 only
         a, b = hot_rows
         ev[hot, a:b] = torch.where(ev[hot, a:b] > dsa_long.VISIBLE, ev[hot, a:b] + 10.0, ev[hot, a:b])
     kw = dict(SERVED_ATTEND, fo=0)
     ran = False
     for rank in (0, 5):
-        base = dsh.attend(ev, ec, rows_sel, table, pos, q, kc, keep, 8, torch.tensor([rank]), 0.05, ns=ns,
-                          simulate=True, grid=grid, **kw)
-        got = dsh.attend(ev, ec, rows_sel, table, pos, q, kc, keep, 8, torch.tensor([rank]), 0.05, ns=ns,
-                         simulate=True, grid=grid, **SERVED_ATTEND)
+        base = dsh.attend(
+            ev,
+            ec,
+            rows_sel,
+            table,
+            pos,
+            q,
+            kc,
+            keep,
+            8,
+            torch.tensor([rank]),
+            0.05,
+            ns=ns,
+            simulate=True,
+            grid=grid,
+            **kw,
+        )
+        got = dsh.attend(
+            ev,
+            ec,
+            rows_sel,
+            table,
+            pos,
+            q,
+            kc,
+            keep,
+            8,
+            torch.tensor([rank]),
+            0.05,
+            ns=ns,
+            simulate=True,
+            grid=grid,
+            **SERVED_ATTEND,
+        )
         assert torch.equal(base[2], got[2]) and _bits(base[3], got[3]) and float(base[4]) == float(got[4])
         if float(base[4]):
             ran = True
             want = _fallback_sim(q, kc, base[2], base[3], grid)
             assert not _bits(base[0], want[0]), ("control: fo 0's o is the fallback's", T, rank)
             if hot_rows is not None and grid == 2:  # rows 0-1 are not over: their compaction ran, and differs
-                assert not _bits(base[0][:hot_rows[0]], want[0][:hot_rows[0]]), ("control: exchange", rank)
+                assert not _bits(base[0][: hot_rows[0]], want[0][: hot_rows[0]]), ("control: exchange", rank)
             assert _bits(want[0], got[0]) and _bits(want[1], got[1]), ("o / lse", T, rank)
     assert ran, "no rank took the over path"
 
 
 @needs_nki
-@pytest.mark.parametrize("NPg,T,npool", [(1024, 6, [60000, 9000, 33000, 1205, 64001, 48000]),
-                                         (4096, 8, [250000, 9000, 131000, 1205, 64001, 48000, 262143, 77777])])
+@pytest.mark.parametrize(
+    "NPg,T,npool",
+    [
+        (1024, 6, [60000, 9000, 33000, 1205, 64001, 48000]),
+        (4096, 8, [250000, 9000, 131000, 1205, 64001, 48000, 262143, 77777]),
+    ],
+)
 def test_attend_at_the_served_decode_shapes(monkeypatch, NPg, T, npool):
     """attend in its served form at the served decode shapes: the 1024- and 4096-page buckets, B6 and B8, keep 512, 640
     slots, grid 2: the served chain's slot rows, bias, o and lse, bit for bit, on two ranks. (Pages repeat in the table
@@ -458,8 +536,23 @@ def test_attend_at_the_served_decode_shapes(monkeypatch, NPg, T, npool):
     table = table % 512  # pool rows < 4096, inside attend_case's latent cache
     for rank in (0, 3):
         want = _served_attend(ev, ec, rows_sel, table, pos, q, kc, keep, rank, ns)
-        got = dsh.attend(ev, ec, rows_sel, table, pos, q, kc, keep, 8, torch.tensor([rank]), 0.05, ns=ns,
-                         simulate=True, grid=2, **SERVED_ATTEND)
+        got = dsh.attend(
+            ev,
+            ec,
+            rows_sel,
+            table,
+            pos,
+            q,
+            kc,
+            keep,
+            8,
+            torch.tensor([rank]),
+            0.05,
+            ns=ns,
+            simulate=True,
+            grid=2,
+            **SERVED_ATTEND,
+        )
         assert torch.equal(want[2], got[2]) and _bits(want[3], got[3]), ("slots", NPg, T, rank)
         assert float(got[4]) == float(want[4]), ("over", NPg, T, rank)
         if float(want[4]) == 0:
@@ -480,8 +573,23 @@ def test_attend_short_contexts_b8(monkeypatch):
     pos = torch.tensor(pos)
     for rank in (0, 3, 7):
         want = _served_attend(ev, ec, rows_sel, table, pos, q, kc, keep, rank, ns)
-        got = dsh.attend(ev, ec, rows_sel, table, pos, q, kc, keep, 8, torch.tensor([rank]), 0.05, ns=ns,
-                         simulate=True, grid=2, **SERVED_ATTEND)
+        got = dsh.attend(
+            ev,
+            ec,
+            rows_sel,
+            table,
+            pos,
+            q,
+            kc,
+            keep,
+            8,
+            torch.tensor([rank]),
+            0.05,
+            ns=ns,
+            simulate=True,
+            grid=2,
+            **SERVED_ATTEND,
+        )
         assert float(want[4]) == 0 and float(got[4]) == 0, ("over", rank)
         for b in range(8):
             assert torch.equal(want[2][b], got[2][b]) and _bits(want[3][b], got[3][b]), ("slots", rank, b)

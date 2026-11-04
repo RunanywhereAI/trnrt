@@ -16,18 +16,33 @@ tests/tool_parsers/test_glm47_moe_tool_parser.py where it has a case.
 from tests.parser_util import args, check_streaming, names
 from trnrt.serve.parsers import parse_full
 
-TAGS = ("<think>", "</think>", "<tool_call>", "</tool_call>", "<arg_key>", "</arg_key>", "<arg_value>",
-        "</arg_value>")
-TOOLS = [{"type": "function", "function": {"name": "get_current_date", "parameters": {}}},
-         {"type": "function", "function": {"name": "get_weather", "parameters": {
-             "type": "object", "properties": {"city": {"type": "string"}, "date": {"type": "string"},
-                                              "days": {"type": "integer"}, "filters": {"type": "object"}}}}}]
+TAGS = ("<think>", "</think>", "<tool_call>", "</tool_call>", "<arg_key>", "</arg_key>", "<arg_value>", "</arg_value>")
+TOOLS = [
+    {"type": "function", "function": {"name": "get_current_date", "parameters": {}}},
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "city": {"type": "string"},
+                    "date": {"type": "string"},
+                    "days": {"type": "integer"},
+                    "filters": {"type": "object"},
+                },
+            },
+        },
+    },
+]
 KW = dict(tools=True, tool_defs=TOOLS)
 
 
 def test_thinking_on_prompt_opened_the_block():
-    out = ("The user wants Beijing weather.</think>Checking.<tool_call>get_weather<arg_key>city</arg_key>"
-           "<arg_value>Beijing</arg_value><arg_key>days</arg_key><arg_value>2</arg_value></tool_call>")
+    out = (
+        "The user wants Beijing weather.</think>Checking.<tool_call>get_weather<arg_key>city</arg_key>"
+        "<arg_value>Beijing</arg_value><arg_key>days</arg_key><arg_value>2</arg_value></tool_call>"
+    )
     m = check_streaming(out, forbidden=TAGS, thinking_open=True, **KW)
     assert m["reasoning_content"] == "The user wants Beijing weather."
     assert m["content"] == "Checking."
@@ -40,8 +55,10 @@ def test_thinking_off():
 
 
 def test_newline_layout_thinking_on():
-    out = ("\n<think>Need the tool.</think>\nChecking.\n<tool_call>get_weather\n<arg_key>city</arg_key>\n"
-           "<arg_value>Beijing</arg_value>\n<arg_key>date</arg_key>\n<arg_value>tomorrow</arg_value>\n</tool_call>")
+    out = (
+        "\n<think>Need the tool.</think>\nChecking.\n<tool_call>get_weather\n<arg_key>city</arg_key>\n"
+        "<arg_value>Beijing</arg_value>\n<arg_key>date</arg_key>\n<arg_value>tomorrow</arg_value>\n</tool_call>"
+    )
     m = check_streaming(out, forbidden=TAGS, **KW)
     assert m["reasoning_content"] == "Need the tool." and m["content"] == "Checking."
     assert args(m) == [{"city": "Beijing", "date": "tomorrow"}]
@@ -70,15 +87,19 @@ def test_whitespace_only_content_is_none():
 
 
 def test_object_value_follows_the_schema():
-    out = ('<tool_call>get_weather<arg_key>filters</arg_key><arg_value>{"rain": true, "hours": [9, 12]}</arg_value>'
-           "<arg_key>city</arg_key><arg_value>Seoul</arg_value></tool_call>")
+    out = (
+        '<tool_call>get_weather<arg_key>filters</arg_key><arg_value>{"rain": true, "hours": [9, 12]}</arg_value>'
+        "<arg_key>city</arg_key><arg_value>Seoul</arg_value></tool_call>"
+    )
     m = check_streaming(out, forbidden=TAGS, **KW)
     assert args(m) == [{"filters": {"rain": True, "hours": [9, 12]}, "city": "Seoul"}]
 
 
 def test_parallel_calls():
-    out = ("<tool_call>get_weather<arg_key>city</arg_key><arg_value>Beijing</arg_value></tool_call>"
-           "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Shanghai</arg_value></tool_call>")
+    out = (
+        "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Beijing</arg_value></tool_call>"
+        "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Shanghai</arg_value></tool_call>"
+    )
     m = check_streaming(out, forbidden=TAGS, **KW)
     assert args(m) == [{"city": "Beijing"}, {"city": "Shanghai"}]
     assert len({c["id"] for c in m["tool_calls"]}) == 2
@@ -95,8 +116,10 @@ def test_unknown_function_is_content():
 
 
 def test_unknown_function_next_to_a_valid_call():
-    out = ("<tool_call>search_web<arg_key>q</arg_key><arg_value>x</arg_value></tool_call>"
-           "<tool_call>get_current_date</tool_call>")
+    out = (
+        "<tool_call>search_web<arg_key>q</arg_key><arg_value>x</arg_value></tool_call>"
+        "<tool_call>get_current_date</tool_call>"
+    )
     m = check_streaming(out, **KW)
     assert names(m) == ["get_current_date"]
     assert m["content"] == "<tool_call>search_web<arg_key>q</arg_key><arg_value>x</arg_value></tool_call>"

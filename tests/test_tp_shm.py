@@ -164,8 +164,9 @@ def test_a_call_larger_than_the_segment_goes_through_the_broadcast(monkeypatch):
 
 
 def _fake_dist(world: int, sent: list):
-    return types.SimpleNamespace(broadcast_object_list=lambda objs, src=0: sent.append(objs[0]),
-                                 get_world_size=lambda: world, get_rank=lambda: 0)
+    return types.SimpleNamespace(
+        broadcast_object_list=lambda objs, src=0: sent.append(objs[0]), get_world_size=lambda: world, get_rank=lambda: 0
+    )
 
 
 def test_a_segment_that_cannot_be_made_sends_every_call_over_gloo(monkeypatch, capsys):
@@ -211,8 +212,9 @@ def test_the_default_is_on_and_only_0_turns_it_off():
     out = {}
     for v in (None, "0", "1", ""):
         e = dict(env, PYTHONPATH=root, **({} if v is None else {"TRNRT_TP_SHM": v}))
-        out[v] = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True, cwd=root,
-                                env=e).stdout.split()
+        out[v] = subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, text=True, check=True, cwd=root, env=e
+        ).stdout.split()
     on, off = ["True", str(64 << 20)], ["False", str(64 << 20)]
     assert out == {None: on, "0": off, "1": on, "": on}
 
@@ -306,7 +308,6 @@ def test_send_and_recv_over_a_real_process_group(monkeypatch, shm):
     """Three CPU ranks, rank 0 in this process: the calls arrive in order on both workers; with the channel, only the
     hello and the call larger than the 4 KiB segment go over gloo, and the shutdown closes the segment on every rank."""
     import multiprocessing as mp
-
     from multiprocessing import shared_memory
 
     world, port = 3, _port()
@@ -391,7 +392,9 @@ def _gen(model, tp_n):
         eng.close()
 
 
-@pytest.mark.parametrize("nbytes", [64 << 20, 512], ids=["tp2", "tp2, a 512-byte segment: most calls take the fallback"])
+@pytest.mark.parametrize(
+    "nbytes", [64 << 20, 512], ids=["tp2", "tp2, a 512-byte segment: most calls take the fallback"]
+)
 def test_engines_match_with_the_channel(model, monkeypatch, nbytes):
     monkeypatch.setattr(tp, "SHM", False)
     want = _gen(model, 2)

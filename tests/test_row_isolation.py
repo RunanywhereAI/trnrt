@@ -14,14 +14,15 @@ import numpy as np
 import pytest
 import torch
 
+from tests import test_kda_shell as TKS
 from trnrt.kernels import kda_shell as KS
 from trnrt.kernels import rowiso as RI
 from trnrt.kernels import shell
-from tests import test_kda_shell as TKS
 
 needs_nki = pytest.mark.skipif(importlib.util.find_spec("nki") is None, reason="needs the NKI package (simulator)")
 T = 4
 BAD = 1  # the row made non-finite (position > 0, so it reads its own state rows)
+
 
 def _bits(t: torch.Tensor) -> torch.Tensor:
     t = t.contiguous()
@@ -34,20 +35,52 @@ def _same(a: torch.Tensor, b: torch.Tensor) -> bool:
 
 # -- the KDA shell ------------------------------------------------------------------------------------------------------
 
+
 def _kda_case(seed: int = 41):
     c = TKS.case(T, seed, 2)
     L = c["L"]
-    t = KS.arrange(c["wcat"], L.conv_w, L.f_b, L.g_b, L.dt_bias, L.out, c["fn"], L.in_norm, L.A_log, L.o_norm,
-                   c["base"], c["scale"], TKS.NV, 2, TKS.HC)
+    t = KS.arrange(
+        c["wcat"],
+        L.conv_w,
+        L.f_b,
+        L.g_b,
+        L.dt_bias,
+        L.out,
+        c["fn"],
+        L.in_norm,
+        L.A_log,
+        L.o_norm,
+        c["base"],
+        c["scale"],
+        TKS.NV,
+        2,
+        TKS.HC,
+    )
     c["blobs"] = KS.pack(t, TKS.H, TKS.NV, TKS.K, 2, TKS.HC)
     return c
 
 
 def _kda(c, S, conv, fin: int, cbat: int):
     L = c["L"]
-    _, post, comb, Pp, cpo, rpo = KS.run(S, c["blobs"], conv.clone(), L.rec_state.clone(), c["slots"], H=TKS.H,
-                                         nv=TKS.NV, hc=TKS.HC, iters=TKS.ITERS, hc_eps=TKS.HC_EPS, rms_eps=TKS.EPS,
-                                         lb=TKS.LB, simulate=True, grid=2, recb=cbat, cbat=cbat, fin=fin)
+    _, post, comb, Pp, cpo, rpo = KS.run(
+        S,
+        c["blobs"],
+        conv.clone(),
+        L.rec_state.clone(),
+        c["slots"],
+        H=TKS.H,
+        nv=TKS.NV,
+        hc=TKS.HC,
+        iters=TKS.ITERS,
+        hc_eps=TKS.HC_EPS,
+        rms_eps=TKS.EPS,
+        lb=TKS.LB,
+        simulate=True,
+        grid=2,
+        recb=cbat,
+        cbat=cbat,
+        fin=fin,
+    )
     wr = c["slots"][1].long()
     return {"post": post, "comb": comb, "P": Pp.transpose(0, 1), "conv": cpo[wr], "rec": rpo[wr]}  # rows first
 
@@ -195,6 +228,7 @@ def test_finite_or_zero_mixed_neighbours_in_the_simulator(monkeypatch):
 
 # -- fin 2 (kernels/rowiso.py) -------------------------------------------------------------------------------------
 
+
 def _fz3_reference(bits: torch.Tensor) -> torch.Tensor:
     """finite_or_zero3's arithmetic on bf16 bit patterns, in fp32 as the engine computes it."""
     b = bits.to(torch.float32)
@@ -210,6 +244,7 @@ def test_finite_or_zero3_is_finite_or_zero_on_every_pattern():
 
 
 if importlib.util.find_spec("nki") is not None:
+
     @nki.jit
     def _fz3_kernel(x):
         """rowiso.finite_or_zero3 on a bf16 [p, n] input, returned."""
@@ -264,8 +299,23 @@ def test_kda_shell_fin2_holds_a_projection_overflow(monkeypatch):
     assert float(dots[BAD]) > fmax and float(dots[keep].abs().max()) < fmax / 8, dots  # the construction holds
     w = c["wcat"].clone()
     w[3 * TKS.NV * TKS.D] = (sgn * s).to(w.dtype)  # f_a's first row (wcat = in_qkv, f_a, g_a, in_b)
-    t = KS.arrange(w, L.conv_w, L.f_b, L.g_b, L.dt_bias, L.out, c["fn"], L.in_norm, L.A_log, L.o_norm, c["base"],
-                   c["scale"], TKS.NV, 2, TKS.HC)
+    t = KS.arrange(
+        w,
+        L.conv_w,
+        L.f_b,
+        L.g_b,
+        L.dt_bias,
+        L.out,
+        c["fn"],
+        L.in_norm,
+        L.A_log,
+        L.o_norm,
+        c["base"],
+        c["scale"],
+        TKS.NV,
+        2,
+        TKS.HC,
+    )
     c2 = dict(c, wcat=w, blobs=KS.pack(t, TKS.H, TKS.NV, TKS.K, 2, TKS.HC))
     S_ok = c["S"].clone()
     S_ok[BAD] = c["S"][(BAD + 1) % T]  # a finite row the weights are not aimed at
@@ -280,12 +330,14 @@ def test_kda_shell_fin2_holds_a_projection_overflow(monkeypatch):
 def _count_isa(monkeypatch, run, names=("tensor_scalar", "scalar_tensor_tensor", "tensor_tensor", "nc_matmul")):
     """How many times the trace calls each nisa op (the forms must trace differently, or a bit-equality compares a
     form with itself)."""
-    counts = {n: 0 for n in names}
+    counts = dict.fromkeys(names, 0)
     real = {n: getattr(nisa, n) for n in names}
     for n in names:
+
         def spy(*a, _n=n, **kw):
             counts[_n] += 1
             return real[_n](*a, **kw)
+
         monkeypatch.setattr(nisa, n, spy)
     try:
         run()
@@ -310,8 +362,9 @@ def test_fin2_traces_differently_from_fin1(monkeypatch):
     monkeypatch.setenv("NEURON_PLATFORM_TARGET_OVERRIDE", "trn2")
     c = _kda_case()
     k = {f: _count_isa(monkeypatch, lambda f=f: _kda(c, c["S"], c["L"].conv_state, f, 1)) for f in (1, 2)}
-    assert _per_trace(k[1], k[2], {"tensor_scalar": -7, "scalar_tensor_tensor": 1, "tensor_tensor": -3,
-                                   "nc_matmul": 0}), k
+    assert _per_trace(
+        k[1], k[2], {"tensor_scalar": -7, "scalar_tensor_tensor": 1, "tensor_tensor": -3, "nc_matmul": 0}
+    ), k
 
 
 def test_the_served_isolation_is_fin_2():

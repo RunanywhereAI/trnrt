@@ -35,6 +35,7 @@ def _close_open() -> None:
 class StepStats:
     """The work the last step() launched (decodes, prefill tokens, and its graph calls by kind) and that step() call's
     wall time. The call that launches a step reads the previous one, so its seconds belong to the previous launch."""
+
     num_decode: int = 0
     num_prefill_tokens: int = 0
     seconds: float = 0.0
@@ -66,21 +67,27 @@ def pool_pages(cfg: EngineConfig, mcfg: ModelConfig) -> int:
     """Pages in the KV pool. The pool is a graph input shape (every layer graph's KV cache), so a capture
     (trnrt/compile/capture.py) must size it exactly as the engine does."""
     from ..models.decoder import kv_heads_per_rank, state_bytes_per_token_rank
-
     from .model_runner import kv_cache_torch_dtype
 
     # KV for one page on ONE rank: each rank holds its attention rank's share of the KV heads
     # (or one replicated head when the attention TP exceeds the head count).
     attn_tp = resolve_attention_tp(mcfg, cfg)
-    page_bytes = (mcfg.kv_bytes_per_token(kv_cache_torch_dtype(cfg)) * cfg.page_size
-                  * kv_heads_per_rank(mcfg.num_kv_heads, attn_tp) // mcfg.num_kv_heads)
-    page_bytes += state_bytes_per_token_rank(mcfg, attn_tp, cfg.dtype,
-                                             kv_cache_torch_dtype(cfg) == torch.float8_e4m3fn) * cfg.page_size
+    page_bytes = (
+        mcfg.kv_bytes_per_token(kv_cache_torch_dtype(cfg))
+        * cfg.page_size
+        * kv_heads_per_rank(mcfg.num_kv_heads, attn_tp)
+        // mcfg.num_kv_heads
+    )
+    page_bytes += (
+        state_bytes_per_token_rank(mcfg, attn_tp, cfg.dtype, kv_cache_torch_dtype(cfg) == torch.float8_e4m3fn)
+        * cfg.page_size
+    )
     # Context-parallel DSA (models/dsa_long.py): a rank holds 1 / cp of every page.
     page_bytes //= _cp_degree(mcfg, attn_tp)
     # A model of linear-attention layers only has no KV: pages then only count positions.
-    return cfg.num_pages or (int(cfg.kv_cache_gb * 2**30 // page_bytes) + 1 if page_bytes
-                             else cfg.max_num_seqs * cfg.max_pages_per_seq + 1)
+    return cfg.num_pages or (
+        int(cfg.kv_cache_gb * 2**30 // page_bytes) + 1 if page_bytes else cfg.max_num_seqs * cfg.max_pages_per_seq + 1
+    )
 
 
 def set_decode_routes(cfg: EngineConfig) -> None:
@@ -119,8 +126,10 @@ def local_k_report(before: list[float] | None, after: list[float] | None, what: 
     from ..models import mla
 
     rows, failed, past = (a - b for a, b in zip(after, before or [0.0, 0.0, 0.0]))
-    return (f"local-K {what}: {failed:.0f} of {rows:.0f} rows failed the certificate ({failed / max(rows, 1):.2e}), "
-            f"{past:.0f} past CP_LOCAL_F = {mla.CP_LOCAL_F} ({'EXACT' if past == 0 else 'NOT EXACT'})")
+    return (
+        f"local-K {what}: {failed:.0f} of {rows:.0f} rows failed the certificate ({failed / max(rows, 1):.2e}), "
+        f"{past:.0f} past CP_LOCAL_F = {mla.CP_LOCAL_F} ({'EXACT' if past == 0 else 'NOT EXACT'})"
+    )
 
 
 def build_shard(cfg: EngineConfig, path: str, num_pages: int, rank: int = 0):
@@ -167,9 +176,22 @@ def build_shard(cfg: EngineConfig, path: str, num_pages: int, rank: int = 0):
 
     # Weights the checkpoint stores as FP8 stay FP8 on the device (fp32 block scales, dequantized in-graph).
     keep_fp8 = mcfg.quant_block is not None or mcfg.quant_expert_block is not None
-    model = load_model(path, mcfg, cfg.dtype, device, cfg.max_model_len, rank, cfg.tp, group,
-                       keep_fp8=keep_fp8, fp8_max=fp8_e4m3_max(device), vocab_parallel=True,
-                       moe_kernel=cfg.resolved_moe_kernel(), attn_tp=atp, attn_group=attn_group)
+    model = load_model(
+        path,
+        mcfg,
+        cfg.dtype,
+        device,
+        cfg.max_model_len,
+        rank,
+        cfg.tp,
+        group,
+        keep_fp8=keep_fp8,
+        fp8_max=fp8_e4m3_max(device),
+        vocab_parallel=True,
+        moe_kernel=cfg.resolved_moe_kernel(),
+        attn_tp=atp,
+        attn_group=attn_group,
+    )
     if cp_group is not None:
         model.cp_group = cp_group
     runner = ModelRunner(model, mcfg, cfg, num_pages, device, kv_heads=model.nkv, model_path=path)
@@ -197,8 +219,10 @@ class LLMEngine:
 
             port = tp.free_port(cfg.tp_core_base if cfg.device == "neuron" else None)
             ctx = mp.get_context("spawn")
-            self._workers = [ctx.Process(target=tp.worker_main, args=(r, cfg, path, num_pages, port), daemon=True)
-                             for r in range(1, cfg.tp)]
+            self._workers = [
+                ctx.Process(target=tp.worker_main, args=(r, cfg, path, num_pages, port), daemon=True)
+                for r in range(1, cfg.tp)
+            ]
             self._tp_saved = tp.process_state()
             try:
                 for w in self._workers:
@@ -271,8 +295,9 @@ class LLMEngine:
         self.last_step = StepStats()
         self._inflight = None  # (plan, launches) of a step whose results are not read yet
 
-    def add_request(self, prompt_ids: list[int], params: SamplingParams, rid: str | None = None,
-                    session_id: str | None = None) -> Request:
+    def add_request(
+        self, prompt_ids: list[int], params: SamplingParams, rid: str | None = None, session_id: str | None = None
+    ) -> Request:
         why = unsupported(params)
         if why:  # before anything is built or queued: the request never reaches a step
             raise ValueError(f"{why} is not supported; send the request without it")
@@ -428,11 +453,14 @@ class LLMEngine:
         for s in plan.prefills:
             launches.append(([s], self.runner.prefill(s), "prefill"))
             self._save_states([s])
-        self.last_step = StepStats(len(plan.decodes), sum(s.num_tokens for s in plan.prefills),
-                                   decode_calls=sum(k == "decode" for _, _, k in launches),
-                                   prefill_calls=len(plan.prefills),
-                                   num_restored=sum(s.restore is not None for s in plan.prefills),
-                                   prefill_chunks=len(plan.prefills))
+        self.last_step = StepStats(
+            len(plan.decodes),
+            sum(s.num_tokens for s in plan.prefills),
+            decode_calls=sum(k == "decode" for _, _, k in launches),
+            prefill_calls=len(plan.prefills),
+            num_restored=sum(s.restore is not None for s in plan.prefills),
+            prefill_chunks=len(plan.prefills),
+        )
         return launches
 
     def _restore_states(self, plan) -> None:
@@ -482,7 +510,7 @@ class LLMEngine:
                 continue
             # Only the tail can newly contain a stop string; decode enough of it to cover
             # the longest one plus multi-token characters.
-            tail = self.tokenizer.decode(req.output_ids[-(max(len(x) for x in stops) + 8):])
+            tail = self.tokenizer.decode(req.output_ids[-(max(len(x) for x in stops) + 8) :])
             if any(x in tail for x in stops):
                 self.scheduler.finish_now(req, "stop")
                 done.append(req)

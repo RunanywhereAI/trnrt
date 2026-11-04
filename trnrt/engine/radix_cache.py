@@ -43,8 +43,8 @@ from .kv_pool import PagePool
 class RadixNode:
     key: list[int] = field(default_factory=list)
     pages: list[int] = field(default_factory=list)
-    parent: "RadixNode | None" = None
-    children: dict[tuple[int, ...], "RadixNode"] = field(default_factory=dict)
+    parent: RadixNode | None = None
+    children: dict[tuple[int, ...], RadixNode] = field(default_factory=dict)
     lock_ref: int = 0
     last_access: int = 0
     # Session registrations whose path runs through this node, and those ending here.
@@ -435,13 +435,16 @@ class RadixCache:
             if len(k) % ps:
                 return None
             for j in range(0, len(k), ps):
-                h = hash((h, tuple(k[j:j + ps])))
+                h = hash((h, tuple(k[j : j + ps])))
             m.__dict__["_hend"] = h
         return h
 
     def _drop_ckpt(self, node: RadixNode, offload: bool) -> None:
-        h = self.path_hash(node) if offload and self.offload_ckpt is not None and self.offload_ckpt_hash is not None \
+        h = (
+            self.path_hash(node)
+            if offload and self.offload_ckpt is not None and self.offload_ckpt_hash is not None
             else None
+        )
         if h is not None:
             self.offload_ckpt_hash(h, node.ckpt)
         elif offload and self.offload_ckpt is not None:

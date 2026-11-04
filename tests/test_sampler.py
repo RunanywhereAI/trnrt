@@ -13,8 +13,14 @@ def run(logits, temperature=0.0, top_p=1.0, top_k=0, min_p=0.0, K=64, seed=0):
     B = logits.shape[0]
     g = torch.Generator().manual_seed(seed)
     f = lambda v: torch.full((B,), v, dtype=torch.float32)  # noqa: E731
-    return sample(logits, f(temperature), f(top_p), torch.full((B,), top_k, dtype=torch.int64),
-                  f(min_p), torch.rand(B, K, generator=g))
+    return sample(
+        logits,
+        f(temperature),
+        f(top_p),
+        torch.full((B,), top_k, dtype=torch.int64),
+        f(min_p),
+        torch.rand(B, K, generator=g),
+    )
 
 
 def test_greedy_and_raw_logprobs():
@@ -80,14 +86,14 @@ def test_penalized_token_is_not_sampled_but_logprobs_stay_raw():
     B = 1
     f = lambda v: torch.full((B,), v)  # noqa: E731
     pen = (torch.tensor([[0]]), torch.tensor([[3.0]]), f(1.0), f(1.0), f(0.0))
-    out = sample(logits, f(0.0), f(1.0), torch.zeros(B, dtype=torch.int64), f(0.0), torch.rand(B, 64),
-                 penalties=pen)
+    out = sample(logits, f(0.0), f(1.0), torch.zeros(B, dtype=torch.int64), f(0.0), torch.rand(B, 64), penalties=pen)
     tokens, lps, top_ids, _ = unpack(out, 1)
     assert tokens == [1] and top_ids[0][0] == 0
     assert abs(lps[0] - torch.log_softmax(logits, -1)[0, 1].item()) < 1e-5
 
 
 # -- the vocabulary-parallel form ----------------------------------------------------------------------------------
+
 
 def shards(logits: torch.Tensor, tp: int, M: int):
     """The union of tp shards' top M (values, fp32 ids) and their log-sum-exps combined, as the vocabulary-parallel
@@ -106,8 +112,12 @@ def shards(logits: torch.Tensor, tp: int, M: int):
 
 
 def params(B, temperature, top_k, top_p, min_p=0.0):
-    return (torch.full((B,), temperature), torch.full((B,), top_p), torch.full((B,), top_k, dtype=torch.int64),
-            torch.full((B,), min_p))
+    return (
+        torch.full((B,), temperature),
+        torch.full((B,), top_p),
+        torch.full((B,), top_k, dtype=torch.int64),
+        torch.full((B,), min_p),
+    )
 
 
 def check_same(got, want, N=NUM_TOP_LOGPROBS):
@@ -149,6 +159,7 @@ def test_one_candidate_k(tp):
 
 # -- the NaN guard (_selectable) ------------------------------------------------------------------------------------
 
+
 def _topk_large_unguarded(x, k, chunk=128):
     """topk_large without the guard: what a selection over a NaN row reads on a device that returns out-of-range ids."""
     B, V = x.shape
@@ -169,8 +180,14 @@ def _topk_large_unguarded(x, k, chunk=128):
 def _args(B=4, K=8, V=4096, seed=0):
     g = torch.Generator().manual_seed(seed)
     logits = torch.randn(B, V, generator=g) * 3
-    return (logits, torch.tensor([0.0, 0.7, 1.0, 1.3])[:B], torch.full((B,), 0.9), torch.zeros(B, dtype=torch.long),
-            torch.full((B,), 0.02), torch.rand(B, K, generator=g))
+    return (
+        logits,
+        torch.tensor([0.0, 0.7, 1.0, 1.3])[:B],
+        torch.full((B,), 0.9),
+        torch.zeros(B, dtype=torch.long),
+        torch.full((B,), 0.02),
+        torch.rand(B, K, generator=g),
+    )
 
 
 @pytest.mark.parametrize("V", [300, 4096, 32000])
@@ -189,7 +206,7 @@ def test_nan_and_neg_inf_rows_select_in_range(V):
     logits[1] = float("nan")
     logits[2] = float("-inf")
     out = S.sample(logits, *rest)
-    ids = torch.cat([out[:, :1], out[:, 2:2 + NUM_TOP_LOGPROBS]], 1)
+    ids = torch.cat([out[:, :1], out[:, 2 : 2 + NUM_TOP_LOGPROBS]], 1)
     assert ((ids >= 0) & (ids < V)).all()
     ref = S.sample(*(_args(V=V)[0][[0, 3]],) + tuple(r[[0, 3]] for r in rest))
     assert torch.equal(out[[0, 3]], ref), "a NaN row changed its neighbours' samples"

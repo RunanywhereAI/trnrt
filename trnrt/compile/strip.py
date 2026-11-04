@@ -71,22 +71,28 @@ def strip(neff: bytes, drop: str = DROP) -> tuple[bytes, dict]:
         if at:
             if len(at) != 1:
                 raise ValueError(f"the data size {len(data)} appears {len(at)} times in the header as {fmt}")
-            head[at[0]:at[0] + struct.calcsize(fmt)] = struct.pack(fmt, len(new))
+            head[at[0] : at[0] + struct.calcsize(fmt)] = struct.pack(fmt, len(new))
             fields["data_size"] = (at[0], fmt, len(data), len(new))
             break
     if "data_size" not in fields:
-        raise ValueError(f"the data size {len(data)} is not in the header (as <Q or <I): its layout is not the one "
-                         "assumed; nothing written")
+        raise ValueError(
+            f"the data size {len(data)} is not in the header (as <Q or <I): its layout is not the one "
+            "assumed; nothing written"
+        )
     for name in ("md5", "sha1", "sha256"):
         old, rep = hashlib.new(name, data), hashlib.new(name, new)
         for a, b in ((old.digest(), rep.digest()), (old.hexdigest().encode(), rep.hexdigest().encode())):
             at = _find_all(bytes(head), a)
             for i in at:
-                head[i:i + len(a)] = b
+                head[i : i + len(a)] = b
             if at:
                 fields[name] = at if len(at) > 1 else at[0]
-    return bytes(head) + new, {"removed": removed, "removed_bytes": sum(s for _, s in removed), "fields": fields,
-                               "bytes": (len(neff), HEADER + len(new))}
+    return bytes(head) + new, {
+        "removed": removed,
+        "removed_bytes": sum(s for _, s in removed),
+        "fields": fields,
+        "bytes": (len(neff), HEADER + len(new)),
+    }
 
 
 def strip_entry(entry: str, drop: str = DROP) -> dict:
@@ -112,8 +118,14 @@ def strip_entry(entry: str, drop: str = DROP) -> dict:
         f.write(new)
     os.replace(tmp, path)
     cache.write_marker(entry, len(new))  # after the NEFF: the marker describes the NEFF in place
-    return {"key": key, "status": "stripped", "bytes": rep["bytes"], "removed": len(rep["removed"]),
-            "removed_mb": round(rep["removed_bytes"] / 1e6, 1), "fields": rep["fields"]}
+    return {
+        "key": key,
+        "status": "stripped",
+        "bytes": rep["bytes"],
+        "removed": len(rep["removed"]),
+        "removed_mb": round(rep["removed_bytes"] / 1e6, 1),
+        "fields": rep["fields"],
+    }
 
 
 def strip_cache(root: str, keys=None, workers: int = 4, drop: str = DROP, on_entry=None) -> dict:
@@ -122,10 +134,20 @@ def strip_cache(root: str, keys=None, workers: int = 4, drop: str = DROP, on_ent
     parallel). Returns counts by status and the NEFF bytes before and after."""
     from concurrent.futures import ThreadPoolExecutor
 
-    todo = [d for d in cache.entries(root) if os.path.exists(os.path.join(d, cache.MARKER))
-            and (keys is None or cache.key_of(d) in keys)]
-    counts = {"entries": len(todo), "stripped": 0, "already": 0, "refused": 0, "skipped": 0,
-              "bytes_before": 0, "bytes_after": 0}
+    todo = [
+        d
+        for d in cache.entries(root)
+        if os.path.exists(os.path.join(d, cache.MARKER)) and (keys is None or cache.key_of(d) in keys)
+    ]
+    counts = {
+        "entries": len(todo),
+        "stripped": 0,
+        "already": 0,
+        "refused": 0,
+        "skipped": 0,
+        "bytes_before": 0,
+        "bytes_after": 0,
+    }
     with ThreadPoolExecutor(max(1, workers)) as pool:
         for rep in pool.map(lambda d: strip_entry(d, drop), todo):
             counts[rep["status"]] += 1

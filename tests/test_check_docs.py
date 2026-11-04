@@ -40,8 +40,11 @@ def test_broken_links_and_anchors_are_reported(tmp_path):
         "```\n[inside a fence](ignored.md)\n```\n"
     )
     found = cd.broken(str(doc), root=str(tmp_path))
-    assert found == ["doc.md:4: nope.md (no such file)", "doc.md:4: other.md#nope (no heading #nope)",
-                     "doc.md:5: missing.svg (no such file)"]
+    assert found == [
+        "doc.md:4: nope.md (no such file)",
+        "doc.md:4: other.md#nope (no heading #nope)",
+        "doc.md:5: missing.svg (no such file)",
+    ]
 
 
 def test_claude_md_must_be_a_symlink_to_agents_md(tmp_path):

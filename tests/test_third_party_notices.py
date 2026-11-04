@@ -13,14 +13,14 @@ import pytest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NOTICES = "THIRD_PARTY_NOTICES.md"
-OWN = re.compile(rb"RunanywhereAI", re.I)
+OWN = re.compile(rb"RunanywhereAI", re.IGNORECASE)
 MARKERS = re.compile(
     rb"(copyright\s+(\(c\)\s*)?(\d{4}[-\d, ]*)?\s*(?!runanywhere)[a-z][^\n]{2,}"
     rb"|spdx-license-identifier"
     rb"|licensed under the (apache|mit|bsd)"
     rb"|portions\s+(adapted|copied|derived|taken)\s+from"
     rb"|\badapted from\s+[a-z0-9_.-]+/[a-z0-9_.-]+)",
-    re.I,
+    re.IGNORECASE,
 )
 SKIP = {"LICENSE", "NOTICE", NOTICES, "tests/test_third_party_notices.py"}
 
@@ -59,19 +59,31 @@ def covered(path, listed):
 def check(root, paths):
     text = open(os.path.join(root, NOTICES)).read() if os.path.exists(os.path.join(root, NOTICES)) else ""
     listed = listed_paths(text)
-    problems = [f"{NOTICES} lists {l}, which does not exist" for l in listed if not os.path.exists(os.path.join(root, l))]
-    problems += [f"{p} carries a third-party marker but {NOTICES} does not list it" for p in marked_files(root, paths)
-                 if not covered(p, listed)]
+    problems = [
+        f"{NOTICES} lists {l}, which does not exist" for l in listed if not os.path.exists(os.path.join(root, l))
+    ]
+    problems += [
+        f"{p} carries a third-party marker but {NOTICES} does not list it"
+        for p in marked_files(root, paths)
+        if not covered(p, listed)
+    ]
     return problems
 
 
 def _tracked(root):
-    return [p for p in subprocess.run(["git", "-C", root, "ls-files", "-z"], capture_output=True, check=True).stdout
-            .decode().split("\0") if p]
+    return [
+        p
+        for p in subprocess.run(["git", "-C", root, "ls-files", "-z"], capture_output=True, check=True)
+        .stdout.decode()
+        .split("\0")
+        if p
+    ]
 
 
-@pytest.mark.skipif(not os.path.isdir(os.path.join(ROOT, ".git")) and not os.path.isfile(os.path.join(ROOT, ".git")),
-                    reason="needs the git checkout")
+@pytest.mark.skipif(
+    not os.path.isdir(os.path.join(ROOT, ".git")) and not os.path.isfile(os.path.join(ROOT, ".git")),
+    reason="needs the git checkout",
+)
 def test_notices_match_the_tree():
     problems = check(ROOT, _tracked(ROOT))
     assert not problems, "\n".join(problems)
@@ -80,11 +92,17 @@ def test_notices_match_the_tree():
 def test_planted_header_is_caught(tmp_path):
     (tmp_path / "pkg").mkdir()
     (tmp_path / "pkg" / "own.py").write_text("# Copyright 2026 RunanywhereAI\n")
-    (tmp_path / "pkg" / "theirs.py").write_text("# SPDX-License-Identifier: Apache-2.0\n# Copyright contributors to Foo\n")
-    head = ("# Third-party notices\n\n## Source included in this repository\n\n| Path | Origin | License | Changes |\n"
-            "|---|---|---|---|\n")
+    (tmp_path / "pkg" / "theirs.py").write_text(
+        "# SPDX-License-Identifier: Apache-2.0\n# Copyright contributors to Foo\n"
+    )
+    head = (
+        "# Third-party notices\n\n## Source included in this repository\n\n| Path | Origin | License | Changes |\n"
+        "|---|---|---|---|\n"
+    )
     (tmp_path / NOTICES).write_text(head)
     paths = ["pkg/own.py", "pkg/theirs.py", NOTICES]
     assert check(str(tmp_path), paths) == [f"pkg/theirs.py carries a third-party marker but {NOTICES} does not list it"]
-    (tmp_path / NOTICES).write_text(head + "| `pkg/theirs.py` | Foo | Apache-2.0 | none |\n| `pkg/gone.py` | x | y | z |\n")
+    (tmp_path / NOTICES).write_text(
+        head + "| `pkg/theirs.py` | Foo | Apache-2.0 | none |\n| `pkg/gone.py` | x | y | z |\n"
+    )
     assert check(str(tmp_path), paths) == [f"{NOTICES} lists pkg/gone.py, which does not exist"]

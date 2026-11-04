@@ -3,7 +3,7 @@ PYTHON ?= python3.13
 VENV ?= .venv
 BIN := $(VENV)/bin
 
-.PHONY: help dev lint test check docs image clean
+.PHONY: help dev lint typecheck test check docs image clean
 
 help:  ## list the targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F ':.*## ' '{printf "  %-8s %s\n", $$1, $$2}'
@@ -18,10 +18,13 @@ dev:  ## create .venv: CPU torch, editable install with test and lint tools, the
 lint:  ## pre-commit on every file (ruff, file checks, docs links)
 	$(BIN)/pre-commit run --all-files
 
+typecheck:  ## mypy over the host code (traced code is excluded in pyproject.toml)
+	$(BIN)/mypy
+
 test:  ## the CPU test suite
 	$(BIN)/pytest -q
 
-check: lint test  ## lint, then the tests
+check: lint typecheck test  ## lint, type-check, then the tests
 
 docs:  ## check that every relative Markdown link resolves
 	$(BIN)/python tools/check_docs.py
