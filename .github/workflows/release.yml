@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   build:
-    if: github.repository == 'RunanywhereAI/trnrt'
+    if: github.repository == 'RunanywhereAI/trnrt-glm'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:

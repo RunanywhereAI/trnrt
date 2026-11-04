@@ -77,5 +77,5 @@ TrnRT serves one model family today. The model-facing contract a second family m
 The router, the page pool, the sampler, tensor parallelism and the compile cache layout do not depend on the model.
 The engine, scheduler and prefix caches still assume a hybrid model with recurrent state (the engine refuses a model
 without it), and the compile steps know GLM's tensor names. A second family starts by lifting those assumptions. Open a
-[model request](https://github.com/RunanywhereAI/trnrt/issues/new?template=30-model-request.yml) to discuss a family
+[model request](https://github.com/RunanywhereAI/trnrt-glm/issues/new?template=30-model-request.yml) to discuss a family
 before starting on one.

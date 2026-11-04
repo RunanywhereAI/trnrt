@@ -19,8 +19,8 @@ Build the image, build the compile cache on any x86_64 host, then serve on a `tr
 ### 1. Get the code
 
 ```bash
-git clone https://github.com/RunanywhereAI/trnrt.git
-cd trnrt
+git clone https://github.com/RunanywhereAI/trnrt-glm.git
+cd trnrt-glm
 ```
 
 Run the commands below from the repository's root.
