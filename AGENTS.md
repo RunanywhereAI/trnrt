@@ -41,8 +41,8 @@ Nothing here needs a Trainium device. Device-only work (`docker/check_image.py -
    they never mutate the scheduler or pools directly.
 7. **Unsupported API fields are refused with a 400 that says why**, never silently ignored.
 8. **Numbers in the docs carry their context**: instance, Neuron SDK, configuration, workload, precision, baseline,
-   and how correctness was checked. Where a doc tags its numbers ([M] measured, [D] derived, [E] estimate), keep the
-   tags.
+   and how correctness was checked. Docs that tag their numbers ([M] measured, [D] derived, [E] estimate), such as
+   `docs/MEGAKERNELS.md`, keep the tags.
 
 ## Tests
 
@@ -58,7 +58,8 @@ Nothing here needs a Trainium device. Device-only work (`docker/check_image.py -
 
 - Host code passes ruff (the full rule set in `pyproject.toml`, zero violations), the ruff formatter and mypy. A
   `# noqa` or `# type: ignore` names its code and gives its reason.
-- Library code logs through `logging.getLogger(__name__)`, never `print`; entry points call `trnrt.log.configure()`.
+- Library code logs through `logging.getLogger(__name__)`, never `print` (one exception: a status line in the frozen
+  `trnrt/engine/model_runner.py`); the CLIs print their own user-facing status lines and call `trnrt.log.configure()`.
   A message that must survive an unconfigured process (a hang report before exit) uses `trnrt.log.always`.
 
 - Commit subjects are `<area>: <what changes>`, written as a sentence (`router: answer a malformed body with 400`).

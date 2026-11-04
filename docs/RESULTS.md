@@ -86,6 +86,15 @@ Unique prompts with one output token, so the cost is all prompt processing:
 
 A 4,096-token prefill chunk takes 716.9 ms end to end (median of 24 calls, timed on the host).
 
+## Decode step
+
+The served batch-8 decode period (one decode step of 8 requests, host-timed) as the NKI megakernels landed, measured
+on trn2.48xlarge:
+
+| Date (2026) | 16 Oct | 17 Oct | 24 Oct | 26 Oct | 1 Nov |
+|---|---|---|---|---|---|
+| Batch-8 decode step, ms | 34.3 | 32.24 | 25.05 | 24.83 | 24.24 |
+
 ## Where a decode step's time goes
 
 A device profile of one batch-8 decode step at 122,880 tokens of context, on the critical core, taken on an earlier

@@ -4,10 +4,11 @@
 
 ```bash
 make dev     # .venv with Python 3.13: CPU torch, editable install with test and lint tools, the pre-commit hook
-make check   # pre-commit on every file, then the CPU test suite
+make check   # lint, type-check, then the CPU test suite
 ```
 
-`make help` lists every target. Without `make`, install CPU torch first
+`make help` lists every target. If `python3.13` on your PATH is a shim (uv, pyenv) that cannot create a venv, pass the
+interpreter's real path: `make dev PYTHON=/path/to/python3.13`. Without `make`, install CPU torch first
 (`pip install torch --index-url https://download.pytorch.org/whl/cpu`), then run
 `pip install -e '.[dev]' transformers==5.17.0 tokenizers==0.23.3`.
 
@@ -31,8 +32,8 @@ docker run --rm --entrypoint python trnrt -m pytest
 
 Two tests document known limits rather than bugs. `tests/test_dsa_long.py::test_cp_engine_matches_replicated` is a
 strict expected failure ([KNOWN_ISSUES.md](KNOWN_ISSUES.md)).
-`tests/test_router.py::test_router_does_not_cap_streams_in_flight` opens 130 connections at once, which can exceed
-macOS's default listen backlog of 128; it passes on Linux.
+`tests/test_router.py::test_router_does_not_cap_streams_in_flight` opens 130 connections at once, more than macOS's
+default listen backlog of 128, so it runs on Linux only (CI).
 
 ## Lint
 

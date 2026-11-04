@@ -6,7 +6,7 @@ BIN := $(VENV)/bin
 .PHONY: help dev lint typecheck test check docs image clean
 
 help:  ## list the targets
-	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F ':.*## ' '{printf "  %-8s %s\n", $$1, $$2}'
+	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F ':.*## ' '{printf "  %-10s %s\n", $$1, $$2}'
 
 dev:  ## create .venv: CPU torch, editable install with test and lint tools, the pre-commit hook
 	$(PYTHON) -m venv $(VENV)

@@ -30,8 +30,9 @@ from the exact selection.
   measured, so on requests built from such chunks the first-token and end-to-end times may be optimistic.
 - **Watching it.** Each engine counts these rows on rank 0's row group, warmup included: `/metrics` reports
   `trnrt:dsa_local_k_rows_total`, `trnrt:dsa_local_k_failed_rows_total` (rows that failed the certificate) and
-  `trnrt:dsa_local_k_inexact_rows_total` (rows past the limit, which kept the merged shortlist), and the engine prints
-  the same counts when it closes, EXACT only if no row went past the limit.
+  `trnrt:dsa_local_k_inexact_rows_total` (rows past the limit, which kept the merged shortlist), and the engine logs
+  the same counts when it closes (stderr), EXACT only if no row went past the limit: at INFO when EXACT, at WARNING
+  when NOT EXACT, so `TRNRT_LOG_LEVEL=WARNING` still shows an inexact run.
 
 ## Batch 12 beyond 32 agents: the host-side prompt cache fills
 

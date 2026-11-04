@@ -31,7 +31,7 @@ across device and host memory. **GLM-5.3-Flash is the first supported model; mor
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/assets/cards-dark.svg">
     <source media="(prefers-color-scheme: light)" srcset="docs/assets/cards-light.svg">
-    <img alt="3.57M tokens per minute on one trn2.48xlarge (AgentX, batch 12). 24 ms decode step at 8 concurrent users, down from 34 ms. $0.040 per million tokens at the spot price, $0.167 on a capacity block." src="docs/assets/cards-dark.svg" width="100%">
+    <img alt="3.57M tokens per minute on one trn2.48xlarge (AgentX, batch 12). 24 ms batch-8 decode step, down from 34.3 ms with NKI megakernels. $0.040 per million tokens at the spot price, $0.167 on a capacity block." src="docs/assets/cards-dark.svg" width="100%">
   </picture>
 </p>
 
@@ -44,7 +44,7 @@ across device and host memory. **GLM-5.3-Flash is the first supported model; mor
 | **Prefix cache** | A radix tree over FP8 KV pages, plus a host-memory tier for evicted pages and state checkpoints. |
 | **Two engines per box** | Each engine is tensor-parallel over 32 logical NeuronCores, behind a session-affine router. |
 | **OpenAI API** | Chat and completions, streaming, tool calls and reasoning output. |
-| **Offline compile** | Every graph is built on a CPU host, so the serving box never compiles. |
+| **Offline compile** | Every graph is built on a CPU host; the serving box loads them and compiles nothing by default. |
 
 ## Quickstart
 
@@ -138,8 +138,8 @@ Tokens count input (cached input included) and output. Spot price: $8.60/h, us-e
 at $35.76/h, the batch 12 cost is $0.167 per million tokens. Full tables, cold-prompt latencies, long prompts and
 methodology are in [docs/RESULTS.md](docs/RESULTS.md).
 
-These numbers were measured with an earlier build of trnrt. The graph-equivalence gate holds this repository to compiling
-the same graphs, and a check of this repository on a device is in progress
+These numbers were measured with an earlier build of TrnRT. The graph-equivalence check read EQUAL for that build's
+batch-8 graphs on 4 of 32 ranks; the full 32-rank run, batch 12, and a device check of this repository are in progress
 ([docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md#verification-status)).
 
 ## How it works

@@ -17,6 +17,6 @@
 
 ## Checklist
 
-- [ ] `make check` passes (pre-commit and the CPU suite)
+- [ ] `make check` passes (lint, type-check and the CPU suite)
 - [ ] Tests cover the change
 - [ ] Docs updated (README, `docs/`, `CHANGELOG.md`)

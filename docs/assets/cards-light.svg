@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1280" height="240" viewBox="0 0 1280 240" role="img" aria-labelledby="title desc">
 <title id="title">TrnRT at a glance</title>
-<desc id="desc">Throughput: 3.57M tokens per minute, one trn2.48xlarge on AgentX, batch 12; Decode Step: 24 ms at 8 concurrent users, down from 34 ms with NKI megakernels; Cost: $0.040 per million tokens, spot price; $0.167 on a capacity block</desc>
+<desc id="desc">Throughput: 3.57M tokens per minute, one trn2.48xlarge on AgentX, batch 12; Decode Step: 24 ms batch-8 decode step, down from 34.3 ms with NKI megakernels; Cost: $0.040 per million tokens, spot price; $0.167 on a capacity block</desc>
 <defs><linearGradient id="ra" x1="6" y1="6" x2="38.8354" y2="35.7082" gradientUnits="userSpaceOnUse"><stop stop-color="#FF6900"/><stop offset="1" stop-color="#FB2C36"/></linearGradient><radialGradient id="glow" cx="0.5" cy="0.5" r="0.5"><stop offset="0" stop-color="#ff6900" stop-opacity="0.12"/><stop offset="1" stop-color="#ff6900" stop-opacity="0"/></radialGradient><pattern id="dots" width="24" height="24" patternUnits="userSpaceOnUse"><circle cx="2" cy="2" r="1.1" fill="#10182b" fill-opacity="0.07"/></pattern></defs>
 <rect x="0.75" y="0.75" width="408.5" height="238.5" rx="24" fill="#ffffff" stroke="#10182b" stroke-opacity="0.1" stroke-width="1.5"/>
 <rect x="36" y="30" width="28" height="4" rx="2" fill="#ff6900"/>
@@ -12,8 +12,8 @@
 <rect x="470" y="30" width="28" height="4" rx="2" fill="#ff6900"/>
 <text x="470" y="66" font-family="'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="16" font-weight="500" letter-spacing="2.6" fill="#10182b">DECODE STEP</text>
 <text x="467" y="138" font-family="'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="72" font-weight="600" letter-spacing="-2" fill="#10182b">24 ms</text>
-<text x="470" y="176" font-family="'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="24" font-weight="500" fill="#10182b" fill-opacity="0.82">at 8 concurrent users</text>
-<text x="470" y="212" font-family="'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="18" fill="#10182b" fill-opacity="0.62">down from 34 ms with NKI megakernels</text>
+<text x="470" y="176" font-family="'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="24" font-weight="500" fill="#10182b" fill-opacity="0.82">batch-8 decode step</text>
+<text x="470" y="212" font-family="'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="18" fill="#10182b" fill-opacity="0.62">down from 34.3 ms with NKI megakernels</text>
 <rect x="868.75" y="0.75" width="408.5" height="238.5" rx="24" fill="#ffffff" stroke="#10182b" stroke-opacity="0.1" stroke-width="1.5"/>
 <rect x="904" y="30" width="28" height="4" rx="2" fill="#ff6900"/>
 <text x="904" y="66" font-family="'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="16" font-weight="500" letter-spacing="2.6" fill="#10182b">COST</text>

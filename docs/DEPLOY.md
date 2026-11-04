@@ -12,7 +12,7 @@ Build the image, build the compile cache on any x86_64 host, then serve on a `tr
 | Model | `zai-org/GLM-5.3-Flash` at revision `eb9eb208eb0d988989d07a6a12d0fdeb5f52574a`, FP8 weights as released, 328 GB: the same revision for compiling and serving |
 | Disk | on each host, the built image (26.7 GB); on the compile host, the compile output under `$OUT`; on the serving host, the checkpoint (328 GB) and the compile cache |
 | Time | building the compile cache takes hours. Start-up loads the weights and warms every compiled graph, one engine at a time, and each engine has `--startup-timeout` (default 3600 s) to come up |
-| Cost | one trn2.48xlarge for as long as it serves; [RESULTS.md](RESULTS.md) gives the cost per million tokens and per request at the two prices above |
+| Cost | one trn2.48xlarge for as long as it serves; [RESULTS.md](RESULTS.md) gives the cost per million tokens and per request at the capacity-block and spot prices |
 
 ## Steps
 

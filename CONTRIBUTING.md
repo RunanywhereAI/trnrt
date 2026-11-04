@@ -23,10 +23,12 @@ cleanly without them. [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) lists every tes
 
 ## Rules every change follows
 
-1. **Traced code changes graphs.** Any edit under `trnrt/kernels/` or `trnrt/models/`, and any change to a graph
-   shape, changes the compiled graphs. That includes a comment that moves a line. A change there needs
-   `tools/graph_equiv.py` evidence, and a device run for new kernel forms. Say in the PR what it changes and how you
-   checked it. Host-side code (`trnrt/serve/`, most of `trnrt/engine/`, `trnrt/compile/`) has no such constraint.
+1. **Traced code changes graphs.** Any edit under `trnrt/kernels/` or `trnrt/models/`, or in
+   `trnrt/engine/model_runner.py`, `trnrt/compile/capture.py`, `trnrt/config.py` or `trnrt/platform.py`, and any
+   change to a graph shape, can change the compiled graphs. That includes a comment that moves a line. A change there
+   needs `tools/graph_equiv.py` evidence, and a device run for new kernel forms. Say in the PR what it changes and how
+   you checked it. The rest of the host code (`trnrt/serve/`, the rest of `trnrt/engine/` and `trnrt/compile/`) has
+   no such constraint.
 2. **A performance claim carries its context.** State the instance, Neuron SDK, configuration (`--preset` and flags),
    workload and shapes, precision, the baseline it is compared with, and how correctness was checked. A number
    without these does not go in the docs.

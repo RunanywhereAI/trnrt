@@ -2,6 +2,7 @@
 concurrent streams."""
 
 import random
+import sys
 
 import pytest
 
@@ -41,6 +42,7 @@ def test_router_spreads_unrelated_requests_and_respects_load():
     assert r.pick("anything") == 1 and r.routed["balance"] == 1
 
 
+@pytest.mark.skipif(sys.platform == "darwin", reason="130 connections at once exceed macOS's listen backlog of 128")
 def test_router_does_not_cap_streams_in_flight():
     """Every concurrent stream reaches a worker: the router's connection pool is not a cap on requests in flight
     (httpx's default, 100 connections shared by every worker, held a whole host at 100 in flight and queued the rest

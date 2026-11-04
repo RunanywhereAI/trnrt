@@ -17,7 +17,8 @@ and versions follow [Semantic Versioning](https://semver.org/). Rebuild the comp
 - The display name is TrnRT. The package, the `trnrt` command, environment variables and metric names are unchanged.
 - Server, engine and router messages go through Python `logging`, on stderr. Their text is unchanged, and
   `TRNRT_LOG_LEVEL` sets the level. They used to be printed, some on stdout. A hang report still reaches stderr when
-  nothing has configured logging.
+  nothing has configured logging. The CLIs' own start-up status lines (`engine up in`, `bucket warmup`,
+  `engine N ready after`) are still printed, as is one status line in the frozen `model_runner.py`.
 - Code style: the ruff formatter and a strict ruff rule set over all host code, tests and tools, plus mypy with zero
   errors. All enforced in pre-commit and CI. Traced code (kernels, models) is excluded, so no compiled graph changes.
 
