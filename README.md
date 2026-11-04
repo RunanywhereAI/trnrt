@@ -178,7 +178,7 @@ More in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ```bash
 make dev     # editable install with test and lint tools (Python 3.13)
-make check   # lint, then the CPU test suite
+make check   # lint, type-check, then the CPU test suite
 ```
 
 See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for the test tiers and CI, [CONTRIBUTING.md](CONTRIBUTING.md) to send a

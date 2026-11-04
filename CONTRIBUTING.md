@@ -15,7 +15,7 @@ Thanks for helping. Bug reports, performance work, kernel fixes, docs and new mo
 ```bash
 git clone https://github.com/RunanywhereAI/trnrt.git && cd trnrt
 make dev      # Python 3.13 venv: editable install, test and lint tools, the pre-commit hook
-make check    # lint, then the CPU test suite
+make check    # lint, type-check, then the CPU test suite
 ```
 
 The CPU suite needs no NeuronCore. Kernel tests that need the NKI simulator, and tests that need a checkpoint, skip
