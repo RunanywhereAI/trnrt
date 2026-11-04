@@ -19,4 +19,3 @@ compiler_workdir/
 /out/
 *.log
 .env
-

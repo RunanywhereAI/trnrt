@@ -204,4 +204,3 @@ def test_a_template_that_knows_developer_keeps_it():
 
     assert template_knows_developer(Tok()) and template_knows_developer(Named()) and template_knows_developer(Listed())
     assert not template_knows_developer(Prose())
-

@@ -1,18 +1,25 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "trnrt"
 dynamic = ["version"]
-description = "GLM-5.3-Flash inference on AWS Trainium2, with NKI decode megakernels"
+description = "LLM inference on AWS Trainium2, with NKI megakernels: an OpenAI-compatible server, 1M-token context and prefix caching"
 readme = "README.md"
 requires-python = ">=3.13"
-license = { file = "LICENSE" }
-authors = [{ name = "RunanywhereAI" }]
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "RunAnywhere", email = "security@runanywhere.ai" }]
+keywords = ["llm", "inference", "trainium", "aws", "neuron", "nki", "serving", "openai"]
 classifiers = [
-  "License :: OSI Approved :: Apache Software License",
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.13",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
   "numpy",
@@ -28,11 +35,16 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest"]
+test = ["pytest>=8", "openai>=1.40", "ml_dtypes"]
+lint = ["ruff==0.15.1", "pre-commit>=4"]
+dev = ["trnrt[test,lint]"]
 
 [project.urls]
-Homepage = "https://github.com/RunanywhereAI/trnrt-glm"
-Repository = "https://github.com/RunanywhereAI/trnrt-glm"
+Homepage = "https://github.com/RunanywhereAI/trnrt"
+Repository = "https://github.com/RunanywhereAI/trnrt"
+Documentation = "https://github.com/RunanywhereAI/trnrt/tree/main/docs"
+Issues = "https://github.com/RunanywhereAI/trnrt/issues"
+Changelog = "https://github.com/RunanywhereAI/trnrt/blob/main/CHANGELOG.md"
 
 [project.scripts]
 trnrt = "trnrt.__main__:main"
@@ -45,3 +57,21 @@ include = ["trnrt*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = ["-ra", "--strict-markers", "--strict-config"]
+xfail_strict = true
+
+[tool.ruff]
+target-version = "py313"
+line-length = 120
+extend-exclude = ["build", "dist"]
+
+[tool.ruff.lint]
+# Correctness only: pyflakes, syntax errors, and a few bug-prone patterns. No formatter runs on this repository, since
+# reformatting a traced module (trnrt/kernels, trnrt/models) would change its compiled graphs (AGENTS.md).
+select = ["F", "E9", "B006", "B008", "PLE"]
+# Unused locals are kept in kernel code on purpose: they name tile shapes next to the loops that use them.
+ignore = ["F841"]
+
+[tool.ruff.lint.per-file-ignores]
+# Traced code is frozen against edits that change graphs; its imports stay as they are.
+"trnrt/kernels/**" = ["F401"]
