@@ -102,6 +102,17 @@ def test_close_reports_nothing_after_a_failure_or_without_counters(written):
     assert "NOT EXACT" in "\n".join(written())
 
 
+def test_an_inexact_report_is_a_warning_and_an_exact_one_info(caplog):
+    """A selection past CP_LOCAL_F is a correctness signal: it must survive TRNRT_LOG_LEVEL=WARNING."""
+    caplog.set_level(logging.WARNING, logger="trnrt")
+    _engine(_Model([100, 3, 0])).close()
+    assert caplog.records == []  # EXACT: info, below the level
+    _engine(_Model([100, 3, 1])).close()
+    (rec,) = caplog.records
+    assert rec.levelno == logging.WARNING
+    assert "NOT EXACT" in rec.getMessage()
+
+
 def _stub():
     return types.SimpleNamespace(
         scheduler=types.SimpleNamespace(running=[], waiting=[], num_preemptions=0),

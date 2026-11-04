@@ -49,7 +49,9 @@ linted for correctness (pyflakes) only. A moved line in a kernel can change its 
 compile cache. A change there is made by hand, on purpose, with `tools/graph_equiv.py` evidence.
 
 Server and engine messages go through `logging` (`trnrt/log.py`): library code logs, and each entry point configures
-output once. `TRNRT_LOG_LEVEL` sets the level (default `INFO`).
+output once. `TRNRT_LOG_LEVEL` sets the level (default `INFO`). A program that embeds TrnRT (builds an engine or an
+app itself, under its own uvicorn for example) calls `trnrt.log.configure()` once, or configures the root logger
+itself; `configure()` then adds no second handler. Hang reports reach stderr either way.
 
 ## CI
 

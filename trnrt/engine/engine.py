@@ -358,8 +358,8 @@ class LLMEngine:
             # a step still in flight on a collective with the dead rank would never let the counters be read.
             try:
                 line = local_k_report(None, self.local_k_counts(), "this engine's run")
-                if line:
-                    logger.info("%s", line)
+                if line:  # an inexact selection is a correctness signal: never below WARNING
+                    logger.log(logging.WARNING if "NOT EXACT" in line else logging.INFO, "%s", line)
             except Exception as e:  # noqa: BLE001 - a report, never a reason not to close
                 logger.warning("local-K report failed: %r", e)
         _OPEN.discard(self)
