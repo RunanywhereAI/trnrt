@@ -239,6 +239,7 @@ def test_finite_or_zero3_every_bf16_pattern_in_the_simulator(monkeypatch):
     assert np.array_equal(got, want), int((got != want).sum())
 
 
+@needs_nki
 def test_kda_shell_fin2_holds_a_projection_overflow(monkeypatch):
     """fin 2's narrower contract at kda_shell. fin 2 zeroes xn, so a FINITE xn row whose projection overflows to inf is
     not zeroed. The weights-stationary projection has no PE transposes over the rows, so the inf stays in its row. That the overflow happened in the kernel: BAD's row differs between fin 1 (which zeroes the inf)

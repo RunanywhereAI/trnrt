@@ -39,6 +39,11 @@ PATTERNS = [(label, re.compile(rx.encode(), re.I if nocase else 0), kind) for la
 SAMPLES = _SPEC["samples"]
 # NOTICE carries the one attribution line the license requires; only the attribution patterns are exempt there.
 EXEMPT = {"NOTICE": {"attribution"}}
+# Commits whose message predates this scan. History is published unchanged, so these are exempt by full hash, each with
+# the reason; a new commit gets no exemption.
+EXEMPT_COMMITS = {
+    "e47040be9903990aa0f4c6bc18eac686043656cf": "a merge of two working branches, named in its message",
+}
 
 
 def _git(root, *args):
@@ -72,6 +77,8 @@ def scan(root):
         rec = rec.strip(b"\n")
         if rec:
             sha, rest = rec.split(b"\x00", 1)
+            if sha.decode() in EXEMPT_COMMITS:
+                continue
             hits += _hits(rest, f"commit {sha[:12].decode()}")
     return hits
 

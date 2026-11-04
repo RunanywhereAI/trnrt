@@ -129,9 +129,9 @@ def test_free_dominated_keeps_one_prompt_end_checkpoint_per_path(glm):
     eng = eng_(glm)
     try:
         prompt = p1
-        for tail in [None] + tails:
-            if tail is not None:
-                prompt = prompt + list(r.output_ids) + tail
+        (r,) = eng.generate([prompt], sp(9))
+        for tail in tails:
+            prompt = prompt + list(r.output_ids) + tail
             (r,) = eng.generate([prompt], sp(9))
         anchors = [n for n in _nodes(eng.scheduler.radix) if n.ckpt is not None and n.anchor]
         assert len(anchors) == 1 and _depth(anchors[0]) == page_floor(len(prompt) - 1)
