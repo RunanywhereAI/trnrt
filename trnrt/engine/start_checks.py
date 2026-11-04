@@ -14,6 +14,9 @@ a failure deep in start-up. Only on Linux with --device neuron: anywhere else th
   with a node's Normal zone at 0 free blocks while hundreds of GiB were available: clean page cache (a checkpoint just
   read, other large files) breaks the blocks up, and dropping it gives them back. The floors are margins above that
   failure, not measured thresholds. TRNRT_SKIP_HOST_MEM_CHECK=1 skips it.
+
+A start that passes prints one line to stderr naming what each check found, or why it did not run, so an operator can
+see the checks ran.
 """
 
 from __future__ import annotations
@@ -55,21 +58,28 @@ def order10_short(total: int, nodes: dict[int, int]) -> bool:
 def host_memory_refusal(path: str | None = None) -> str | None:
     """Why the host's free contiguous memory is too short for the runtime's start, or None (also when `path`, default
     BUDDYINFO, cannot be read or lists no zone: nothing to check)."""
+    return host_memory_check(path)[0]
+
+
+def host_memory_check(path: str | None = None) -> tuple[str | None, str]:
+    """(host_memory_refusal's answer, what the check found when it passed: for the start's pass line)."""
     path = path or BUDDYINFO
     try:
         with open(path) as f:
             total, nodes, zones = parse_buddyinfo(f.read())
     except OSError:
-        return None
-    if not zones or not order10_short(total, nodes):
-        return None
+        return None, f"host memory not checked ({path} unreadable)"
+    if not zones:
+        return None, f"host memory not checked (no zone in {path})"
     by_node = ", ".join(f"node {k} {v}" for k, v in sorted(nodes.items())) or "none listed"
+    if not order10_short(total, nodes):
+        return None, f"host memory ok ({total} free order-10 blocks; Normal zones: {by_node})"
     return (f"too little contiguous free host memory for the Neuron runtime ({path}): {total} free order-10 (4 MiB) "
             f"blocks over all zones (needs {ORDER10_FLOOR}), and in each NUMA node's Normal zone: {by_node} (needs "
             f"{ORDER10_NODE_FLOOR} each). The runtime allocates each rank's host DMA rings from these blocks on the "
             "rank's node, and its start fails without them (\"Failed to allocate HOST memory\"). Clean page cache is "
             f"the usual cause: drop it on the host (`{DROP_CACHES}`) and start again, or set {SKIP_HOST_MEM}=1 to "
-            "start anyway.")
+            "start anyway."), ""
 
 
 def neuron_ls() -> list[dict] | None:
@@ -112,44 +122,57 @@ def device_users(devices: list[dict], wanted) -> list[tuple[int, object, str]]:
 
 def device_refusal(core_base: int, tp: int, lnc: int | None = None, devices: list[dict] | None = None) -> str | None:
     """Why this engine's devices are not free, or None (devices: neuron-ls's records, read here when None)."""
+    return device_check(core_base, tp, lnc, devices)[0]
+
+
+def device_check(core_base: int, tp: int, lnc: int | None = None,
+                 devices: list[dict] | None = None) -> tuple[str | None, str]:
+    """(device_refusal's answer, what the check found when it passed: for the start's pass line)."""
+    cores = f"cores {core_base}-{core_base + tp - 1}"
     if devices is None:
         try:
             devices = neuron_ls()
         except (OSError, ValueError, subprocess.SubprocessError) as e:
             return (f"could not list the Neuron devices' users (neuron-ls: {type(e).__name__}: {e}), and a failed read "
                     f"is never taken as free devices. Fix neuron-ls, or set {SKIP_DEVICE}=1 to start without this "
-                    "check.")
+                    "check."), ""
         if devices is None:
-            print(f"trnrt: neuron-ls not found: not checking that the Neuron devices of cores {core_base}-"
-                  f"{core_base + tp - 1} are free", file=sys.stderr, flush=True)
-            return None
+            print(f"trnrt: neuron-ls not found: not checking that the Neuron devices of {cores} are free",
+                  file=sys.stderr, flush=True)
+            return None, f"devices of {cores} not checked (no neuron-ls)"
     try:
         mine = engine_devices(core_base, tp, devices, lnc)
         users = device_users(devices, set(mine))
     except (KeyError, TypeError, ValueError, ZeroDivisionError) as e:
         return (f"could not read neuron-ls's device listing ({type(e).__name__}: {e}), and a failed read is never "
-                f"taken as free devices. Set {SKIP_DEVICE}=1 to start without this check.")
+                f"taken as free devices. Set {SKIP_DEVICE}=1 to start without this check."), ""
     if not users:
-        return None
+        return None, f"devices {', '.join(map(str, mine))} of {cores} free"
     named = "; ".join(f"pid {pid} on device {dev} ({cmd})" for dev, pid, cmd in users[:16])
     more = f"; and {len(users) - 16} more" if len(users) > 16 else ""
-    return (f"the Neuron devices of this engine's cores {core_base}-{core_base + tp - 1} (devices "
+    return (f"the Neuron devices of this engine's {cores} (devices "
             f"{', '.join(map(str, mine))}) are in use by another process: {named}{more}. Stop them (an engine of an "
             f"earlier run that did not exit, a neuron-monitor) and start again, or set {SKIP_DEVICE}=1 to start "
-            "anyway.")
+            "anyway."), ""
 
 
 def refusal(device: str, core_base: int, tp: int) -> str | None:
     """Why an engine of `tp` ranks on logical cores from `core_base` must not start on this host, or None. Nothing is
-    checked off Linux or off the Neuron device."""
+    checked off Linux or off the Neuron device. A pass prints one line to stderr: what each check found, or why it did
+    not run."""
     if device != "neuron" or not sys.platform.startswith("linux"):
         return None
+    found = f"devices not checked ({SKIP_DEVICE}=1)"
     if os.environ.get(SKIP_DEVICE) != "1":
         from .. import platform
 
-        why = device_refusal(core_base, tp, platform.LNC)
+        why, found = device_check(core_base, tp, platform.LNC)
         if why is not None:
             return why
+    mem = f"host memory not checked ({SKIP_HOST_MEM}=1)"
     if os.environ.get(SKIP_HOST_MEM) != "1":
-        return host_memory_refusal()
+        why, mem = host_memory_check()
+        if why is not None:
+            return why
+    print(f"trnrt: start checks passed: {found}; {mem}", file=sys.stderr, flush=True)
     return None
