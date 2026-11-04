@@ -4,7 +4,7 @@
 
 Report vulnerabilities privately, never in a public issue:
 
-- **GitHub:** [open a private security advisory](https://github.com/RunanywhereAI/trnrt/security/advisories/new), or
+- **GitHub:** [open a private security advisory](https://github.com/RunanywhereAI/trnrt-glm/security/advisories/new), or
 - **Email:** [security@runanywhere.ai](mailto:security@runanywhere.ai).
 
 Please include:
