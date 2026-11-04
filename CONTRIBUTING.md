@@ -13,7 +13,7 @@ Thanks for helping. Bug reports, performance work, kernel fixes, docs and new mo
 ## Set up
 
 ```bash
-git clone https://github.com/RunanywhereAI/trnrt-glm.git && cd trnrt-glm
+git clone https://github.com/RunanywhereAI/trnrt.git && cd trnrt
 make dev      # Python 3.13 venv: editable install, test and lint tools, the pre-commit hook
 make check    # lint, type-check, then the CPU test suite
 ```

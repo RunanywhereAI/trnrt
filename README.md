@@ -7,7 +7,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/RunanywhereAI/trnrt-glm/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/RunanywhereAI/trnrt-glm/ci.yml?branch=main&style=flat-square&labelColor=161515&label=CI"></a>
+  <a href="https://github.com/RunanywhereAI/trnrt/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/RunanywhereAI/trnrt/ci.yml?branch=main&style=flat-square&labelColor=161515&label=CI"></a>
   <a href="LICENSE"><img alt="License: Apache 2.0" src="https://img.shields.io/badge/license-Apache%202.0-fd7014?style=flat-square&labelColor=161515"></a>
   <img alt="Python 3.13" src="https://img.shields.io/badge/python-3.13-fd7014?style=flat-square&labelColor=161515">
   <img alt="AWS Trainium2" src="https://img.shields.io/badge/AWS-Trainium2-fd7014?style=flat-square&labelColor=161515">
@@ -54,7 +54,7 @@ You need Docker, a `trn2.48xlarge` to serve on, and any x86_64 host to compile o
 **1. Build the image** (Neuron SDK 2.32 (neuronx-cc 2.27), Python 3.13)
 
 ```bash
-git clone https://github.com/RunanywhereAI/trnrt-glm.git && cd trnrt-glm
+git clone https://github.com/RunanywhereAI/trnrt.git && cd trnrt
 docker build -f docker/Dockerfile \
   --build-arg TRNRT_VERSION=$(python3 -c 'import trnrt; print(trnrt.__version__)') \
   --build-arg TRNRT_REVISION=$(git rev-parse HEAD) -t trnrt .
@@ -118,7 +118,7 @@ The full guide covers what each step needs, start-up checks, the batch 4, 8 and 
 |---|---|
 | **AWS Trainium2**, `trn2.48xlarge` (16 chips, 2 engines × TP 32, LNC 2) | ✅ Supported |
 | **[GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash)** (320B MoE, 18B active, FP8, 1M-token context) | ✅ Supported |
-| More open models | 🔜 Coming soon. [Request a model](https://github.com/RunanywhereAI/trnrt-glm/issues/new?template=30-model-request.yml) |
+| More open models | 🔜 Coming soon. [Request a model](https://github.com/RunanywhereAI/trnrt/issues/new?template=30-model-request.yml) |
 
 GLM-5.3-Flash is where TrnRT starts. The engine, router, caches and compile pipeline are built to carry more model
 families, and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#adding-a-model-family) describes what a new one needs.
