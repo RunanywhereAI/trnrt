@@ -221,8 +221,9 @@ into slices of one PSUM tile, unfenced in-kernel collectives, and cross-program 
 accepted forms the compiler rejects. So every new form gets a device run checked by value, with a control.
 
 This repository's own check: the graphs this code builds, and their kernel binaries, are compared with the build the
-published numbers were measured on (144 graphs in the batch-8 configuration). They must match modulo names and `rev` values
-([`tools/graph_equiv.py`](../tools/graph_equiv.py)).
+published numbers were measured on. They must match modulo names and `rev` values
+([`tools/graph_equiv.py`](../tools/graph_equiv.py)). They do: all 157 graphs of the default batch-12 configuration read
+EQUAL on all 32 ranks.
 
 ## Prefill kernels
 
