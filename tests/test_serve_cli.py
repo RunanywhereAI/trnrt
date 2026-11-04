@@ -3,7 +3,6 @@ assertion unless --allow-compile, a cache miss ends start-up with its likely cau
 time and stops them all past --startup-timeout, and the argv serve hands each engine parses there. Fake engine
 processes and a fake /health: nothing is loaded or served."""
 
-import logging
 import os
 import signal
 import sys
@@ -16,18 +15,6 @@ httpx = pytest.importorskip("httpx")
 pytest.importorskip("uvicorn")
 
 import trnrt.__main__ as cli  # noqa: E402
-from trnrt import log  # noqa: E402
-
-
-@pytest.fixture(autouse=True)
-def _undo_logging_setup():
-    """main() configures trnrt's logger for its process; here several run in the test's own, so put it back."""
-    root = logging.getLogger(log.ROOT)
-    handlers, level = list(root.handlers), root.level
-    yield
-    root.handlers[:] = handlers
-    root.setLevel(level)
-
 
 MISS = (
     "NEURON_LIBTORCH_ASSERT_CACHE_HIT: compile cache miss for key 0123abcd. All graphs must be pre-compiled when "
