@@ -83,5 +83,6 @@ Set them on the server's container (`docker run -e NAME=value ...`); its engines
 | `TRNRT_TP_SHM_BYTES` | 67108864 (64 MiB) | that segment's size, one segment per engine in /dev/shm; a larger call goes over gloo |
 | `TRNRT_SKIP_DEVICE_CHECK` | unset | `1`: start without checking that the engine's Neuron devices are free |
 | `TRNRT_SKIP_HOST_MEM_CHECK` | unset | `1`: start without checking the host's free contiguous memory |
+| `TRNRT_LOG_LEVEL` | `INFO` | the level of the server's, engines' and router's log messages, on stderr (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
 | `TRNRT_ROUTER_LOG_SESSIONS` | unset | `1`, for debugging: the router's log names session ids: a line per new pin and per side request, and the id in its failover and return-home lines; unset, it logs no session id |
 | `NEURON_LIBTORCH_CACHE_ROOT` | `~/.cache/neuron_libtorch` | the compile cache's root ([DEPLOY.md](DEPLOY.md), step 4) |

@@ -667,7 +667,7 @@ async def _unless_disconnected(http: HTTPRequest, aw):
 
 
 def build_app(engine: LLMEngine, model_name: str) -> FastAPI:
-    app = FastAPI(title="trnRT")
+    app = FastAPI(title="TrnRT")
     loop_ = EngineLoop(engine)
     tok = engine.tokenizer
     # A chat request's prompt is rendered and tokenized on one worker thread with its own tokenizer, not on the event

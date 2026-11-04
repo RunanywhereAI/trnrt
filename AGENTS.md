@@ -11,9 +11,10 @@ tensor-parallel ranks behind a session-affine router, with NKI decode megakernel
 
 ```bash
 make dev                 # .venv (Python 3.13): CPU torch, editable install, test + lint tools, pre-commit hook
-make lint                # pre-commit run --all-files: ruff, file checks, tools/check_docs.py
+make lint                # pre-commit run --all-files: ruff lint + format, file checks, tools/check_docs.py
+make typecheck           # mypy over trnrt/, tools/, docker/
 make test                # pytest -q: the CPU suite, no NeuronCore needed
-make check               # both; CI runs the same (.github/workflows/ci.yml)
+make check               # all three; CI runs the same (.github/workflows/ci.yml)
 pytest tests/test_router.py -q    # one file
 ```
 
@@ -26,8 +27,8 @@ Nothing here needs a Trainium device. Device-only work (`docker/check_image.py -
    `trnrt/kernels/` or `trnrt/models/` (even a comment that shifts a line) can change every compiled graph and
    invalidate every compile cache. The same holds for anything that changes a graph shape: the seats, the bucket
    ladders, the pool sizes, the page size or a decode kernel route (`trnrt/config.py`, `trnrt/__main__.py` defaults).
-   Make such a change only on purpose, prove it with `tools/graph_equiv.py`, and say so in the PR. Never run a
-   formatter over these paths. The repository has no formatter configured for this reason.
+   Make such a change only on purpose, prove it with `tools/graph_equiv.py`, and say so in the PR. The formatter and
+   ruff's fixes skip these paths (`pyproject.toml` lists them); never run a formatter over them by hand.
 2. **Bump `trnrt.__version__` only for a release** ([docs/DEVELOPMENT.md](docs/DEVELOPMENT.md#releasing)). Captures
    record it, and each release gets its own compile cache.
 3. **Every argparse parser passes `allow_abbrev=False`** (`tests/test_no_abbrev.py`): one parser's argv is handed to
@@ -54,6 +55,11 @@ Nothing here needs a Trainium device. Device-only work (`docker/check_image.py -
   ([docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md)). Do not loosen its tolerance to make it pass.
 
 ## Style
+
+- Host code passes ruff (the full rule set in `pyproject.toml`, zero violations), the ruff formatter and mypy. A
+  `# noqa` or `# type: ignore` names its code and gives its reason.
+- Library code logs through `logging.getLogger(__name__)`, never `print`; entry points call `trnrt.log.configure()`.
+  A message that must survive an unconfigured process (a hang report before exit) uses `trnrt.log.always`.
 
 - Commit subjects are `<area>: <what changes>`, written as a sentence (`router: answer a malformed body with 400`).
 - Docstrings and comments say why, with the measurement or the reference behind a number.

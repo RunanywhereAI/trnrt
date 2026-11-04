@@ -21,7 +21,7 @@ the 63 executions the runtime queues), so the default leaves two orders of magni
 
 Not a licence to turn off the runtime's per-execution barrier (NEURON_RT_DISABLE_EXECUTION_BARRIER=1, which
 vllm-neuron 0.24 sets): without it a collective mismatch returns silently wrong numbers, and ranks alternating a
-world-collective graph with an attention-group one under host jitter deadlock. trnRT leaves it on.
+world-collective graph with an attention-group one under host jitter deadlock. TrnRT leaves it on.
 """
 
 from __future__ import annotations
@@ -32,6 +32,8 @@ import os
 import threading
 import time
 from contextlib import contextmanager
+
+from .. import log
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +77,15 @@ class ExecWatchdog:
         try:
             yield
         except BaseException as e:  # an error raised by the runtime inside a watched section: say where we were
-            logger.error("EXEC WATCHDOG rank %s: %s in %s; %s", self.rank, type(e).__name__, what, self._calls())
+            log.always(
+                logger,
+                logging.ERROR,
+                "EXEC WATCHDOG rank %s: %s in %s; %s",
+                self.rank,
+                type(e).__name__,
+                what,
+                self._calls(),
+            )
             raise
         finally:
             with self._lock:
@@ -110,7 +120,7 @@ class ExecWatchdog:
             dt = time.monotonic() - sec[1]
             if dt > self.timeout:
                 self.fired = True
-                logger.error("%s", self.report(sec[0], dt))
+                log.always(logger, logging.ERROR, "%s", self.report(sec[0], dt))  # then the process ends: never lose it
                 self._exit(EXIT_HANG)
                 return
 

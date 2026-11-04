@@ -1,4 +1,4 @@
-"""The trnRT command line.
+"""The TrnRT command line.
 
     python -m trnrt serve --model DIR [--port 8000]       # two engines and the router in front of them
     python -m trnrt engine --model DIR --core-base 0       # one engine and its OpenAI API, no router

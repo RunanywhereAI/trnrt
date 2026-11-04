@@ -279,7 +279,7 @@ class LLMEngine:
         # the deepest state checkpoint at or below it, checkpoints are written inside prefill chunks and at every page
         # boundary in decode, and a checkpoint a newer one dominates is freed when its path is released.
         if self.runner.state is None:
-            raise ValueError("trnRT serves models with linear-attention layers: this model has no recurrent state")
+            raise ValueError("TrnRT serves models with linear-attention layers: this model has no recurrent state")
         self.scheduler = Scheduler(scfg, self.pool, self.radix)
         self.scheduler.states = self.runner.state  # checkpoint rows of the state pool back the radix nodes
         self.radix.free_ckpt = self.runner.state.free_ckpt

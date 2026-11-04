@@ -34,5 +34,26 @@ def configure(level: int | str | None = None) -> None:
     root.addHandler(handler)
 
 
+def _reaches_output(logger: logging.Logger) -> bool:
+    """Whether a record from logger reaches any handler other than a NullHandler."""
+    lg: logging.Logger | None = logger
+    while lg is not None:
+        if any(not isinstance(h, logging.NullHandler) for h in lg.handlers):
+            return True
+        if not lg.propagate:
+            return False
+        lg = lg.parent
+    return False
+
+
+def always(logger: logging.Logger, level: int, msg: str, *args: object) -> None:
+    """Log a message that must never vanish (a hang report right before the process exits): if no entry point has
+    configured logging, it goes to stderr as well."""
+    logger.log(level, msg, *args)
+    if not _reaches_output(logger) or not logger.isEnabledFor(level):
+        sys.stderr.write((msg % args if args else msg) + "\n")
+        sys.stderr.flush()
+
+
 # A library adds no output of its own until an entry point configures it (the logging HOWTO's rule for libraries).
 logging.getLogger(ROOT).addHandler(logging.NullHandler())

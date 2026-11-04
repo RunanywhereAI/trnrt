@@ -29,9 +29,9 @@ def _save_tokenizer(path, vocab: int) -> None:
     from tokenizers import Tokenizer, models, pre_tokenizers
     from transformers import PreTrainedTokenizerFast
 
-    tk = Tokenizer(models.WordLevel({f"t{i}": i for i in range(vocab)}, unk_token="t0"))  # noqa: S106  the tokenizer's unknown-token string, not a secret
+    tk = Tokenizer(models.WordLevel({f"t{i}": i for i in range(vocab)}, unk_token="t0"))
     tk.pre_tokenizer = pre_tokenizers.Whitespace()
-    t = PreTrainedTokenizerFast(tokenizer_object=tk, unk_token="t0")  # noqa: S106  the tokenizer's unknown-token string, not a secret
+    t = PreTrainedTokenizerFast(tokenizer_object=tk, unk_token="t0")
     t.chat_template = TEMPLATE
     t.save_pretrained(str(path))
 

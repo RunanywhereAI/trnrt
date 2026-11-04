@@ -94,13 +94,13 @@ def _script(path: str) -> dict:
     for w, i in ids.items():
         words.pop(f"t{i}")
         words[w] = i
-    tk = Tokenizer(models.WordLevel(words, unk_token="t0"))  # noqa: S106  the tokenizer's unknown-token string, not a secret
+    tk = Tokenizer(models.WordLevel(words, unk_token="t0"))
     tk.pre_tokenizer = pre_tokenizers.Whitespace()
     tk.decoder = decoders.Fuse()
     # The chain ends on the model's EOS, which the engine keeps in a request's output ids and the server's detokenizer drops
     # only as a special token (skip_special_tokens), as GLM-5.3-Flash's own tokenizer marks every EOS. Unmarked, its word
     # ("t1") came back as the message's content.
-    t = PreTrainedTokenizerFast(tokenizer_object=tk, unk_token="t0", eos_token=f"t{eos}")  # noqa: S106  the tokenizer's unknown-token string, not a secret
+    t = PreTrainedTokenizerFast(tokenizer_object=tk, unk_token="t0", eos_token=f"t{eos}")
     t.chat_template = "{% for m in messages %}{{ m['content'] }} {% endfor %}ASSISTANT"
     t.save_pretrained(path)
     return ids

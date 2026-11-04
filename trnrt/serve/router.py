@@ -1,6 +1,6 @@
 """Session-affine router over the data-parallel engines of one host (two tensor-parallel engines on a trn2.48xlarge).
 
-Each worker is a full trnRT server (serve/api.py) on its own NeuronCores, with its own prefix cache.
+Each worker is a full TrnRT server (serve/api.py) on its own NeuronCores, with its own prefix cache.
 
 A request that carries a session id (the body field `session_id`) is routed by its session alone:
 - a known session goes to the worker it was pinned to, ALWAYS, whatever the load. An agent's next turn shares its whole
@@ -513,7 +513,7 @@ def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: floa
             if task is not None:
                 task.cancel()
 
-    app = FastAPI(title="trnRT router", lifespan=lifespan)
+    app = FastAPI(title="TrnRT router", lifespan=lifespan)
 
     @app.get("/health")
     async def health():

@@ -25,9 +25,9 @@ def _save_tokenizer(path, vocab: int) -> None:
     from tokenizers import Tokenizer, models, pre_tokenizers
     from transformers import PreTrainedTokenizerFast
 
-    tk = Tokenizer(models.WordLevel({f"t{i}": i for i in range(vocab)}, unk_token="t0"))  # noqa: S106  the tokenizer's unknown-token string, not a secret
+    tk = Tokenizer(models.WordLevel({f"t{i}": i for i in range(vocab)}, unk_token="t0"))
     tk.pre_tokenizer = pre_tokenizers.Whitespace()
-    PreTrainedTokenizerFast(tokenizer_object=tk, unk_token="t0").save_pretrained(str(path))  # noqa: S106  the tokenizer's unknown-token string, not a secret
+    PreTrainedTokenizerFast(tokenizer_object=tk, unk_token="t0").save_pretrained(str(path))
 
 
 @pytest.fixture(scope="module")

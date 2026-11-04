@@ -33,6 +33,25 @@ def test_configure_once_bare_messages_on_stderr(capsys, monkeypatch):
         _cleanup(root)
 
 
+def test_always_reaches_stderr_without_a_configured_handler(capsys, monkeypatch):
+    # cut trnrt off from the root logger, where pytest's own capture handler would otherwise count as output
+    monkeypatch.setattr(logging.getLogger(log.ROOT), "propagate", False)
+    lg = log.get("watchdog")
+    log.always(lg, logging.ERROR, "EXEC WATCHDOG rank %s: hung", 3)
+    assert capsys.readouterr().err == "EXEC WATCHDOG rank 3: hung\n"
+
+
+def test_always_logs_once_when_configured(capsys, monkeypatch):
+    root = logging.getLogger(log.ROOT)
+    monkeypatch.delenv("TRNRT_LOG_LEVEL", raising=False)
+    try:
+        log.configure()
+        log.always(log.get("watchdog"), logging.ERROR, "EXEC WATCHDOG rank %s: hung", 3)
+        assert capsys.readouterr().err == "EXEC WATCHDOG rank 3: hung\n"
+    finally:
+        _cleanup(root)
+
+
 def test_level_from_the_environment(monkeypatch):
     root = logging.getLogger(log.ROOT)
     monkeypatch.setenv("TRNRT_LOG_LEVEL", "warning")

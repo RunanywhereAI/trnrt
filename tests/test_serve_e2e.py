@@ -127,10 +127,10 @@ def _save_tokenizer(path: str, gen: list[int]) -> None:
 
     names = {i: f"t{i}" for i in range(VOCAB)}
     names.update(zip(gen, CALL))
-    tk = Tokenizer(models.WordLevel({w: i for i, w in names.items()}, unk_token="t0"))  # noqa: S106  the tokenizer's unknown-token string, not a secret
+    tk = Tokenizer(models.WordLevel({w: i for i, w in names.items()}, unk_token="t0"))
     tk.pre_tokenizer = pre_tokenizers.Whitespace()
     tk.decoder = decoders.Fuse()
-    tok = PreTrainedTokenizerFast(tokenizer_object=tk, unk_token="t0", eos_token=names[gen[9]])  # noqa: S106  the tokenizer's unknown-token string, not a secret
+    tok = PreTrainedTokenizerFast(tokenizer_object=tk, unk_token="t0", eos_token=names[gen[9]])
     tok.chat_template = TEMPLATE
     tok.save_pretrained(path)
     with open(os.path.join(path, "generation_config.json")) as f:

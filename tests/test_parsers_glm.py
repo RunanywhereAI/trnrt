@@ -109,7 +109,7 @@ def test_parallel_calls():
 
 def test_unknown_function_is_content():
     """vLLM glm47_moe validate_tool_names and SGLang parse_base_json reject a name the request
-    did not offer; trnRT returns the block as content rather than dropping it."""
+    did not offer; TrnRT returns the block as content rather than dropping it."""
     out = "Let me look.<tool_call>search_web<arg_key>q</arg_key><arg_value>x</arg_value></tool_call>"
     m = check_streaming(out, **KW)
     assert "tool_calls" not in m and m["content"] == out

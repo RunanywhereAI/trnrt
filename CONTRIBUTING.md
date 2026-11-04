@@ -42,7 +42,8 @@ cleanly without them. [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) lists every tes
 - Commit subject: `<area>: <what changes>`, written as a plain sentence. Examples: `router: answer a malformed body
   with 400` or `kda_half: one program's measured weight-stream rate`. The area is a module or doc name.
 - One logical change per commit. Keep each PR focused, and fill in the PR template.
-- CI runs `pre-commit run --all-files` and the CPU suite. Both must pass.
+- CI runs `pre-commit run --all-files` (ruff lint and format), mypy and the CPU suite. All must pass: `make check`
+  runs the same locally.
 
 ## License
 

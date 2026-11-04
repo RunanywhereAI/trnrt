@@ -1,4 +1,4 @@
-"""Check that this environment holds every Neuron piece trnRT imports, and that they work.
+"""Check that this environment holds every Neuron piece TrnRT imports, and that they work.
 
     python docker/check_image.py            # imports, the compiler CLI, the torch.compile backend
     python docker/check_image.py --device   # also compiles one graph and runs it on a NeuronCore
@@ -30,6 +30,7 @@ import pkgutil
 import shutil
 import subprocess
 import sys
+from typing import Any
 
 FAILED: list[str] = []
 # distribution -> the version prefix it must have (README.md and docs/DEPLOY.md "What you need": Neuron SDK 2.32, neuronx-cc 2.27; SDK
@@ -124,8 +125,8 @@ def backend():
 
 
 def device_graph():
-    """One small graph on a NeuronCore the way trnRT compiles its own (trnrt/engine/engine.py and
-    model_runner.py: the runtime env first, then LNL, device neuron:0, trnRT's backend wrapper and
+    """One small graph on a NeuronCore the way TrnRT compiles its own (trnrt/engine/engine.py and
+    model_runner.py: the runtime env first, then LNL, device neuron:0, TrnRT's backend wrapper and
     compiler arguments), against the CPU."""
     import torch
 
@@ -143,13 +144,9 @@ def device_graph():
     x, w = torch.randn(64, 128, generator=g), torch.randn(128, 256, generator=g)
     want = f(x, w)
     dev = torch.device("neuron:0")
-    fn = torch.compile(
-        f,
-        backend=canonical_neuron_backend(),
-        fullgraph=True,
-        dynamic=False,
-        options={"compiler_args": neuronx_cc_args(torch.bfloat16)},
-    )
+    # The Neuron backend takes its compiler arguments as a list, which torch.compile's stub does not describe.
+    options: dict[str, Any] = {"compiler_args": neuronx_cc_args(torch.bfloat16)}
+    fn = torch.compile(f, backend=canonical_neuron_backend(), fullgraph=True, dynamic=False, options=options)
     got = fn(x.to(dev), w.to(dev)).cpu()
     err = (got - want).abs().max().item()
     if not err < 0.05 * want.abs().max().item():  # a bf16 matmul's error at most

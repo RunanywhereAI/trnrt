@@ -8,8 +8,18 @@ and versions follow [Semantic Versioning](https://semver.org/). Rebuild the comp
 ### Added
 
 - Public release: README, docs, contributing and security policies, issue and pull request templates.
-- CI: pre-commit lint, the CPU test suite, a package build check and CodeQL. Tag-triggered release workflow.
+- CI: pre-commit (ruff lint and format), mypy, the CPU test suite, a package build check, Dockerfile lint and CodeQL.
+  Tag-triggered release workflow.
 - `tools/check_docs.py`: every relative Markdown link and image resolves.
+
+### Changed
+
+- The display name is TrnRT. The package, the `trnrt` command, environment variables and metric names are unchanged.
+- Server, engine and router messages go through Python `logging`, on stderr. Their text is unchanged, and
+  `TRNRT_LOG_LEVEL` sets the level. They used to be printed, some on stdout. A hang report still reaches stderr when
+  nothing has configured logging.
+- Code style: the ruff formatter and a strict ruff rule set over all host code, tests and tools, plus mypy with zero
+  errors. All enforced in pre-commit and CI. Traced code (kernels, models) is excluded, so no compiled graph changes.
 
 ### Fixed
 

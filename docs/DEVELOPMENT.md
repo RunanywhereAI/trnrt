@@ -36,15 +36,26 @@ macOS's default listen backlog of 128; it passes on Linux.
 
 ## Lint
 
-`pre-commit run --all-files` runs ruff, the file checks and `tools/check_docs.py`. Ruff checks correctness only:
-pyflakes, syntax errors and a few bug-prone patterns. **No formatter runs on this repository.** Reformatting a traced
-module (`trnrt/kernels/`, `trnrt/models/`) would change its compiled graphs, and every compile cache with them.
+| Tool | What it enforces | Run |
+|---|---|---|
+| ruff (lint) | pycodestyle, pyflakes, isort, pyupgrade, bugbear, bandit (security), pytest style, simplify, comprehensions, logging, refurb and more; every exception is listed with its reason in `pyproject.toml` | `make lint` |
+| ruff (format) | one code style, line length 120 | `make lint` |
+| mypy | types over `trnrt/`, `tools/` and `docker/` | `make typecheck` |
+| pre-commit | the above plus file hygiene (whitespace, EOF, YAML/TOML, merge markers, private keys, large files) and `tools/check_docs.py` | `pre-commit install` once; then on every commit |
+
+**Traced code is the one exception.** `trnrt/kernels/`, `trnrt/models/`, `trnrt/engine/model_runner.py`,
+`trnrt/compile/capture.py`, `trnrt/config.py` and `trnrt/platform.py` are never reformatted or auto-fixed, and are
+linted for correctness (pyflakes) only. A moved line in a kernel can change its compiled binary, and with it every
+compile cache. A change there is made by hand, on purpose, with `tools/graph_equiv.py` evidence.
+
+Server and engine messages go through `logging` (`trnrt/log.py`): library code logs, and each entry point configures
+output once. `TRNRT_LOG_LEVEL` sets the level (default `INFO`).
 
 ## CI
 
 | Workflow | Runs | On |
 |---|---|---|
-| `ci.yml` | pre-commit; the CPU suite; package build and `twine check`; Dockerfile lint | every push to `main` and every PR |
+| `ci.yml` | pre-commit (ruff lint and format, file checks, doc links); mypy; the CPU suite; package build and `twine check`; Dockerfile lint | every push to `main` and every PR |
 | `codeql.yml` | CodeQL security analysis of the Python (once the repository is public) | push and PR to `main`, weekly |
 | `release.yml` | build, check and attach the sdist and wheel to a GitHub release; PyPI when enabled | a `vX.Y.Z` tag that matches `trnrt.__version__` |
 

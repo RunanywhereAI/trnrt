@@ -124,8 +124,9 @@ ignore = [
 "trnrt/kernels/**" = ["E", "W", "I", "UP", "B", "S", "BLE", "A", "C4", "DTZ", "T20", "EXE", "ISC", "ICN", "LOG", "G", "PIE", "PT", "RET", "SIM", "TC", "ARG", "ERA", "PGH", "PLW", "PERF", "FURB", "FLY", "SLOT", "RUF", "F401", "F841"]
 "trnrt/models/**" = ["E", "W", "I", "UP", "B", "S", "BLE", "A", "C4", "DTZ", "T20", "EXE", "ISC", "ICN", "LOG", "G", "PIE", "PT", "RET", "SIM", "TC", "ARG", "ERA", "PGH", "PLW", "PERF", "FURB", "FLY", "SLOT", "RUF", "F841"]
 "trnrt/{engine/model_runner,compile/capture,config,platform}.py" = ["E", "W", "I", "UP", "B", "S", "BLE", "A", "C4", "DTZ", "T20", "EXE", "ISC", "ICN", "LOG", "G", "PIE", "PT", "RET", "SIM", "TC", "ARG", "ERA", "PGH", "PLW", "PERF", "FURB", "FLY", "SLOT", "RUF"]
-# Tests: asserts are pytest's API, stubs keep their callee's signature, seeded randomness is not cryptography.
-"tests/**" = ["S101", "S311", "ARG", "T20"]
+# Tests: asserts are pytest's API, stubs keep their callee's signature, seeded randomness is not cryptography, and a
+# tokenizer's unk_token is not a password.
+"tests/**" = ["S101", "S106", "S311", "ARG", "T20"]
 # Command-line programs print their output.
 "tools/**" = ["T20"]
 "docker/**" = ["T20"]
@@ -140,7 +141,7 @@ fixture-parentheses = false
 
 [tool.mypy]
 python_version = "3.13"
-files = ["trnrt", "tools"]
+files = ["trnrt", "tools", "docker"]
 ignore_missing_imports = true
 warn_unused_ignores = true
 warn_redundant_casts = true

@@ -63,12 +63,12 @@ def _engine(model):
 
 
 @pytest.fixture
-def written(capsys, caplog):
-    """What close wrote so far, one entry per line: its log records and anything it printed."""
+def written(caplog):
+    """What close logged so far, one entry per record."""
     caplog.set_level(logging.INFO, logger="trnrt")
 
     def lines() -> list[str]:
-        out = capsys.readouterr().out.splitlines() + caplog.messages
+        out = list(caplog.messages)
         caplog.clear()
         return out
 
