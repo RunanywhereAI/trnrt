@@ -2,9 +2,14 @@
 
 ## Verification status
 
-The published numbers were measured with an earlier build of TrnRT, and a graph-equivalence check
-(`tools/graph_equiv.py`) holds this repository to compiling the same graphs as that build. A full run of that check over
-all 32 ranks and a check of this repository on a device are in progress ([RESULTS.md](RESULTS.md)).
+The published numbers were measured with an earlier build of TrnRT. This repository passes these checks against that
+build ([RESULTS.md](RESULTS.md)):
+
+| Check | Result |
+|---|---|
+| Graph equivalence (`tools/graph_equiv.py`), all 32 ranks, default batch-12 configuration | EQUAL for all 157 graphs that build compiles |
+| Outputs on the device | Byte-identical to that build's on 384 of 384 requests |
+| The README's two-engine serve | Passes end to end |
 
 ## Prompt processing: a small share of sparse-attention selections are inexact
 
@@ -63,5 +68,5 @@ chunk-size floor, so the tolerance is not loosened. The test is marked as an exp
 pass, the suite fails until this entry and the mark are revisited.
 
 This CPU test does not measure served accuracy. The served engine's accuracy was checked on the device, against a
-high-precision reference, with the build the published numbers were measured on; a check of this repository on a device
-is in progress.
+high-precision reference, with the build the published numbers were measured on. On the device, this repository's
+outputs were byte-identical to that build's on 384 of 384 requests ([Verification status](#verification-status)).
