@@ -36,7 +36,7 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest>=8", "openai>=1.40", "ml_dtypes"]
-lint = ["ruff==0.15.1", "pre-commit>=4", "mypy==2.4.1"]
+lint = ["ruff==0.17.3", "pre-commit>=4", "mypy==2.4.1"]
 dev = ["trnrt[test,lint]"]
 
 [project.urls]
