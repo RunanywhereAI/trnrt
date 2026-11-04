@@ -117,7 +117,7 @@ The full guide covers what each step needs, start-up checks, the batch 4, 8 and 
 | Target | Status |
 |---|---|
 | **AWS Trainium2**, `trn2.48xlarge` (16 chips, 2 engines × TP 32, LNC 2) | ✅ Supported |
-| **[GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash)** (320B MoE, 18B active, FP8, 1M-token context) | ✅ Supported, device check of this repository in progress |
+| **[GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash)** (320B MoE, 18B active, FP8, 1M-token context) | ✅ Supported |
 | More open models | 🔜 Coming soon. [Request a model](https://github.com/RunanywhereAI/trnrt/issues/new?template=30-model-request.yml) |
 
 GLM-5.3-Flash is where TrnRT starts. The engine, router, caches and compile pipeline are built to carry more model
@@ -138,9 +138,13 @@ Tokens count input (cached input included) and output. Spot price: $8.60/h, us-e
 at $35.76/h, the batch 12 cost is $0.167 per million tokens. Full tables, cold-prompt latencies, long prompts and
 methodology are in [docs/RESULTS.md](docs/RESULTS.md).
 
-These numbers were measured with an earlier build of TrnRT. The graph-equivalence check read EQUAL for that build's
-batch-8 graphs on 4 of 32 ranks; the full 32-rank run, batch 12, and a device check of this repository are in progress
-([docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md#verification-status)).
+These numbers were measured with an earlier build of TrnRT. This repository passes these checks against that build
+([docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md#verification-status)):
+
+- Graph equivalence: EQUAL on all 32 ranks, for all 157 graphs that build compiles in the default batch-12
+  configuration.
+- Outputs: byte-identical to that build's on 384 of 384 requests.
+- Serving: the two-engine serve in the [Quickstart](#quickstart) passes end to end.
 
 ## How it works
 

@@ -34,23 +34,24 @@ Nothing here needs a Trainium device. Device-only work (`docker/check_image.py -
 3. **Every argparse parser passes `allow_abbrev=False`** (`tests/test_no_abbrev.py`): one parser's argv is handed to
    another, and an abbreviation silently became a different flag once.
 4. **The published tree names nothing it must not.** `tests/test_no_trace.py` scans every tracked file, path and
-   commit message against encoded patterns. Its docstring says what it looks for. The upstream project this code
-   derives from is credited in `NOTICE` and nowhere else. Run it before pushing; commit messages count.
+   commit message; its docstring says what it looks for. The upstream project this code derives from is credited on
+   `NOTICE`'s attribution line and nowhere else, and that check always runs. The maintainers' private patterns live
+   outside the repository, and their scan runs when `TRNRT_TRACE_PATTERNS` names that file. Run it before pushing;
+   commit messages count.
 5. **Copied source is listed in `THIRD_PARTY_NOTICES.md`** (`tests/test_third_party_notices.py` checks it).
 6. **The engine thread owns engine state.** API handlers hand work to it through its inbox (`trnrt/serve/api.py`);
    they never mutate the scheduler or pools directly.
 7. **Unsupported API fields are refused with a 400 that says why**, never silently ignored.
 8. **Numbers in the docs carry their context**: instance, Neuron SDK, configuration, workload, precision, baseline,
-   and how correctness was checked. Docs that tag their numbers ([M] measured, [D] derived, [E] estimate), such as
-   `docs/MEGAKERNELS.md`, keep the tags.
+   and how correctness was checked.
 
 ## Tests
 
 - Host code is tested on CPU. Kernels are tested against their `emulate()` reference; simulator tests are gated on the
   `nki` package with a `needs_nki` skip mark, and a new simulator test must carry it.
 - Engine tests build a tiny random GLM-5.3-Flash and need transformers 5.17.0 (`glm5_next`).
-- Env-gated tiers (`TRNRT_TEST_MODEL`, `TRNRT_TEST_GLM_CKPT`, `TRNRT_TEST_NETWORK=1`, `HLO_PB2_PATH`) are listed in
-  [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md#tests).
+- Env-gated tiers (`TRNRT_TEST_MODEL`, `TRNRT_TEST_GLM_CKPT`, `TRNRT_TEST_NETWORK=1`, `HLO_PB2_PATH`,
+  `TRNRT_TRACE_PATTERNS`) are listed in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md#tests).
 - `tests/test_dsa_long.py::test_cp_engine_matches_replicated` is a strict expected failure
   ([docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md)). Do not loosen its tolerance to make it pass.
 

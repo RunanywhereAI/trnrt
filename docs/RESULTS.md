@@ -2,10 +2,10 @@
 
 GLM-5.3-Flash on one AWS trn2.48xlarge, measured with an earlier build of TrnRT, in the configurations this repository
 reproduces ([CONFIGURATION.md](CONFIGURATION.md)). The graph-equivalence check (`tools/graph_equiv.py`) holds this
-repository to compiling the same graphs as that build. On 2 Nov 2026 it read
-EQUAL for 144 graphs on 4 of 32 ranks, before a later selection-kernel fix, and its positive control (one constant
-changed in one prefill kernel) read DIFFER on exactly the graphs that kernel builds. A full 32-rank run and an
-on-device check are in progress.
+repository to compiling the same graphs as that build. It read EQUAL on all 32 ranks, for all 157 graphs that build
+compiles in the default batch-12 configuration. Its positive control (one constant changed in one prefill kernel) read
+DIFFER on exactly the graphs that kernel builds. On the device, this repository's outputs were byte-identical to that
+build's on 384 of 384 requests, and the README's two-engine serve passes end to end.
 
 ## Serving layout
 
