@@ -31,7 +31,7 @@ across device and host memory. **GLM-5.3-Flash is the first supported model; mor
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/assets/cards-dark.svg">
     <source media="(prefers-color-scheme: light)" srcset="docs/assets/cards-light.svg">
-    <img alt="3.57M tokens per minute on one trn2.48xlarge (AgentX, batch 12). 24 ms batch-8 decode step, down from 34.3 ms with NKI megakernels. $0.040 per million tokens at the spot price, $0.167 on a capacity block." src="docs/assets/cards-dark.svg" width="100%">
+    <img alt="3.57M tokens per minute on one trn2.48xlarge (AgentX, batch 12). 24 ms batch-8 decode step, down from 32.2 ms with NKI megakernels. $0.040 per million tokens at the spot price, $0.167 on a capacity block." src="docs/assets/cards-dark.svg" width="100%">
   </picture>
 </p>
 
