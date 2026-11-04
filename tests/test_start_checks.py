@@ -7,6 +7,7 @@
   have no runtime user; processes on the other engine's devices, and processes without a runtime (neuron-ls itself, a
   monitor) do not count; a failing neuron-ls refuses, a missing one only warns;
 - nothing is checked on CPU or off Linux, and each check has its own skip switch.
+- a start that passes logs one line naming what each check found, or why it did not run; a refusal logs none.
 """
 
 from __future__ import annotations
@@ -148,3 +149,42 @@ def test_nothing_is_checked_on_cpu_or_off_linux(linux_host):
     assert S.refusal("cpu", 0, 32) is None
     linux_host.setattr(sys, "platform", "darwin")
     assert S.refusal("neuron", 0, 32) is None
+
+
+def test_a_pass_prints_one_line_of_what_each_check_found(linux_host, tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger="trnrt")
+
+    def logged() -> list[str]:
+        out = list(caplog.messages)
+        caplog.clear()
+        return out
+
+    linux_host.setattr(S, "neuron_ls", lambda: _trn2({2: [_rt(111, "engine 0 rank 2")]}))  # engine 0's device only
+    assert S.refusal("neuron", 0, 32) is not None  # engine 0: device 2 busy, and the memory short
+    assert logged() == []  # a refusal logs no pass line (cmd_engine reports the refusal)
+    assert S.refusal("neuron", 32, 32) is not None  # engine 1: devices free, the memory short
+    assert logged() == []
+    (tmp_path / "buddyinfo").write_text(PLENTY)
+    assert S.refusal("neuron", 32, 32) is None
+    assert logged() == [
+        (
+            "trnrt: start checks passed: devices 8, 9, 10, 11, 12, 13, 14, 15 of cores 32-63 free; host memory ok (16000 "
+            "free order-10 blocks; Normal zones: node 0 9000, node 1 7000)"
+        )
+    ]
+    linux_host.setattr(S, "neuron_ls", lambda: None)
+    assert S.refusal("neuron", 32, 32) is None
+    assert logged()[-1].startswith(
+        "trnrt: start checks passed: devices of cores 32-63 not checked (no neuron-ls); host memory ok"
+    )
+    linux_host.setenv(S.SKIP_DEVICE, "1")
+    linux_host.setenv(S.SKIP_HOST_MEM, "1")
+    assert S.refusal("neuron", 32, 32) is None
+    assert logged() == [
+        (
+            "trnrt: start checks passed: devices not checked (TRNRT_SKIP_DEVICE_CHECK=1); host memory not checked "
+            "(TRNRT_SKIP_HOST_MEM_CHECK=1)"
+        )
+    ]
+    assert S.refusal("cpu", 32, 32) is None
+    assert logged() == []  # nothing checked, nothing logged
