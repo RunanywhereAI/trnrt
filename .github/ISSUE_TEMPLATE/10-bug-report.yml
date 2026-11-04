@@ -1,0 +1,47 @@
+name: Bug report
+description: Something does not work as documented
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for the report. For a security issue, use SECURITY.md instead of a public issue.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what you expected
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Exact command and request
+      description: The full `trnrt ...` / `docker run ...` command, and the request if it is an API bug.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: The server's output around the failure (start-up checks, the engine's error, `/health`).
+      render: shell
+  - type: input
+    id: instance
+    attributes:
+      label: Instance type
+      placeholder: trn2.48xlarge
+    validations:
+      required: true
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: Output of `git rev-parse HEAD`, `neuron-ls`, and `pip list 2>/dev/null | grep -i -E "neuron|torch|transformers"`.
+      render: shell
+    validations:
+      required: true
+  - type: input
+    id: config
+    attributes:
+      label: Configuration
+      description: "`--preset`, `--max-running` and any other non-default flags"
