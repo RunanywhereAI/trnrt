@@ -111,9 +111,11 @@ def _run(path, first, second, mode: str, **kw):
         (req,) = eng.generate([second], sp)
         counts = None
         if hit:
-            counts = dict(
-                ckpts_saved=tier.ckpts_saved, ckpts_restored=tier.ckpts_restored, pages_restored=tier.restored
-            )
+            counts = {
+                "ckpts_saved": tier.ckpts_saved,
+                "ckpts_restored": tier.ckpts_restored,
+                "pages_restored": tier.restored,
+            }
         return list(req.output_ids), [x[0] for x in req.logprobs], [x for q, x, _ in spy.starts if q == req.rid], counts
     finally:
         eng.close()

@@ -68,7 +68,7 @@ def test_a_half_box_engine_shares_one_set(affinity, rank):
 
 
 @pytest.mark.parametrize(
-    "rank,want_mask,want",
+    ("rank", "want_mask", "want"),
     [
         (0, set(range(48, 72)), 24 // 16),  # node 1 & 0-71 = 48-71, ranks 0-15 share it: 1
         (16, set(range(48)), 48 // 16),  # node 0 & 0-71 = 0-47, ranks 16-31 share it: 3

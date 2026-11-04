@@ -96,7 +96,7 @@ def test_a_reply_that_differs_resumes_from_the_prompt_end_checkpoint(glm, p_len)
     (p1,), (tail,) = mk(81, (p_len,)), mk(82, (6,))
     eng = eng_(glm)
     try:
-        r1, r2, p2 = two_turns(eng, p1, 13, tail, edit=altered)
+        _, r2, p2 = two_turns(eng, p1, 13, tail, edit=altered)
         assert r2.num_cached_tokens == page_floor(len(p1) - 1), (r2.num_cached_tokens, len(p1))
         assert r2.output_ids == cold(glm, p2, 8)
         print(f"prompt {len(p1)}: the altered replay resumed at {r2.num_cached_tokens}")

@@ -15,16 +15,23 @@ never collide (libtorch_neuronx_lite defaults the CCOM root to MASTER_PORT other
 
 from __future__ import annotations
 
-import datetime
+import contextlib
+import datetime as dt
 import errno
+import logging
 import os
 import socket
+from typing import Any
 
 import torch.distributed as dist
 
+from ..log import configure as configure_logging
+
+logger = logging.getLogger(__name__)
+
 # Ranks > 0 wait in a broadcast while rank 0 compiles a new bucket, which can take tens of
 # minutes for a large model; the default 30-minute gloo timeout would kill a healthy job.
-TIMEOUT = datetime.timedelta(hours=4)
+TIMEOUT = dt.timedelta(hours=4)
 
 
 def port_free(p: int) -> bool:
@@ -33,7 +40,8 @@ def port_free(p: int) -> bool:
     address, and a long-lived process collects them (a test session held two dozen gloo listeners
     on the host's address, free_port probing 127.0.0.1 returned one of them, and rank 0's TCPStore
     bind failed)."""
-    families = [(socket.AF_INET, "0.0.0.0")] + ([(socket.AF_INET6, "::")] if socket.has_ipv6 else [])
+    # every interface (S104), as rank 0's TCPStore binds
+    families = [(socket.AF_INET, "0.0.0.0")] + ([(socket.AF_INET6, "::")] if socket.has_ipv6 else [])  # noqa: S104
     for fam, host in families:
         try:
             with socket.socket(fam) as s:
@@ -77,7 +85,7 @@ def free_port(core_base: int | None = None) -> int:
         )
     for _ in range(50):
         with socket.socket() as a:
-            a.bind(("0.0.0.0", 0))
+            a.bind(("0.0.0.0", 0))  # noqa: S104  # every interface, as rank 0's TCPStore will
             p = a.getsockname()[1]
         if port_free(p) and port_free(p + 1):
             return p
@@ -108,8 +116,9 @@ def restore_process_state(saved: dict) -> None:
         else:
             os.environ[k] = v
     torch.set_num_threads(saved["threads"])
-    if saved.get("affinity") is not None and os.sched_getaffinity(0) != saved["affinity"]:  # numa_pin's, on rank 0
-        os.sched_setaffinity(0, saved["affinity"])
+    # numa_pin's, on rank 0
+    if saved.get("affinity") is not None and os.sched_getaffinity(0) != saved["affinity"]:  # type: ignore[attr-defined, unused-ignore]  # Linux-only: mypy elsewhere has no os.sched_*affinity
+        os.sched_setaffinity(0, saved["affinity"])  # type: ignore[attr-defined, unused-ignore]  # Linux-only: mypy elsewhere has no os.sched_*affinity
 
 
 # NUMA pinning (host side only: no graph reads it): each device rank runs on the CPUs of its NeuronCore's NUMA node,
@@ -164,27 +173,23 @@ _PIN: dict | None = None
 def numa_pin(rank: int, core_base: int, devices: list[dict] | None = None) -> set[int] | None:
     """Pin the calling thread, and so every thread it starts after, to pin_mask of logical core core_base + rank
     (the runtime's NEURON_LOGICAL_NC_CONFIG when set, else neuron-ls's). Returns the mask, or None."""
-    global _PIN
-    import sys
-
+    global _PIN  # noqa: PLW0603  # what the last pin saw, process-wide state that rank_threads reads (tests reset it)
     _PIN = None
     lnc = os.environ.get("NEURON_LOGICAL_NC_CONFIG")
-    launched = os.sched_getaffinity(0)
+    launched = os.sched_getaffinity(0)  # type: ignore[attr-defined, unused-ignore]  # Linux-only: mypy elsewhere has no os.sched_*affinity
     try:
         devs = neuron_devices() if devices is None else devices
         mask = pin_mask(core_base + rank, devs, launched, int(lnc) if lnc else None)
     except (OSError, ValueError, KeyError, RuntimeError) as e:  # neuron-ls missing or failing: run as launched
-        print(f"NUMA pin: rank {rank} not pinned ({type(e).__name__}: {e})", file=sys.stderr, flush=True)
+        logger.warning("NUMA pin: rank %s not pinned (%s: %s)", rank, type(e).__name__, e)
         return None
     _PIN = {"core_base": core_base, "devices": devs, "launched": set(launched), "lnc": int(lnc) if lnc else None}
     if mask is None:
-        print(
-            f"NUMA pin: rank {rank} not pinned (no CPU of core {core_base + rank}'s node in the launch mask)",
-            file=sys.stderr,
-            flush=True,
+        logger.warning(
+            "NUMA pin: rank %s not pinned (no CPU of core %s's node in the launch mask)", rank, core_base + rank
         )
         return None
-    os.sched_setaffinity(0, mask)
+    os.sched_setaffinity(0, mask)  # type: ignore[attr-defined, unused-ignore]  # Linux-only: mypy elsewhere has no os.sched_*affinity
     return mask
 
 
@@ -296,8 +301,10 @@ class ShmChannel:
         import numpy as np
 
         self.shm, self.world, self.rank, self.owner = shm, world, rank, owner
-        self.ctl = np.ndarray((4,), dtype=np.uint64, buffer=shm.buf, offset=0)
-        self.acks = np.ndarray((world,), dtype=np.uint64, buffer=shm.buf, offset=self.HDR)
+        # numpy arrays over the segment, None once the channel is closed (close, drop_channel): a party still waiting
+        # then fails instead of reading an unmapped segment
+        self.ctl: Any = np.ndarray((4,), dtype=np.uint64, buffer=shm.buf, offset=0)
+        self.acks: Any = np.ndarray((world,), dtype=np.uint64, buffer=shm.buf, offset=self.HDR)
         self.off = self.HDR + -(-8 * world // 64) * 64
         if owner:
             self.ctl[3] = max(0, nbytes - self.off)
@@ -313,6 +320,8 @@ class ShmChannel:
 
         nbytes = nbytes or SHM_BYTES
         shm = shared_memory.SharedMemory(create=True, size=nbytes)
+        if shm.buf is None:
+            raise RuntimeError("a new shared-memory segment has no buffer")
         shm.buf[: cls.HDR + 8 * world] = bytes(cls.HDR + 8 * world)
         return cls(shm, world, 0, True, nbytes)
 
@@ -329,7 +338,7 @@ class ShmChannel:
             shm = shared_memory.SharedMemory(name=name, track=False)
         except TypeError:
             real = resource_tracker.register
-            resource_tracker.register = lambda *a, **k: None
+            resource_tracker.register = lambda *_a, **_k: None
             try:
                 shm = shared_memory.SharedMemory(name=name)
             finally:
@@ -388,7 +397,9 @@ class ShmChannel:
             box = [None]
             dist.broadcast_object_list(box, src=0)
             return box[0]
-        return pickle.loads(data)
+        if data is None:
+            raise RuntimeError(f"a shared-memory call in unknown mode {mode}")
+        return pickle.loads(data)  # noqa: S301  # rank 0 of this engine wrote it, the trust of broadcast_object_list
 
     def close(self) -> None:
         self.ctl = self.acks = None
@@ -413,13 +424,11 @@ def send(msg) -> None:
             ch = ShmChannel.create(dist.get_world_size())
         except (OSError, ValueError) as e:  # no usable /dev/shm: nothing was announced yet, so the calls go over gloo
             _CH["failed"] = True
-            import sys
-
-            print(
-                f"trnrt: no shared-memory channel for the tensor-parallel calls ({type(e).__name__}: {e}); they go "
+            logger.warning(
+                "trnrt: no shared-memory channel for the tensor-parallel calls (%s: %s); they go "
                 "over gloo, which is slower (TRNRT_TP_SHM=0 chooses gloo from the start)",
-                file=sys.stderr,
-                flush=True,
+                type(e).__name__,
+                e,
             )
         else:
             _CH["ch"] = ch
@@ -463,13 +472,12 @@ def drop_channel() -> None:
     if ch is None:
         return
     ch.ctl = ch.acks = None
-    try:
+    with contextlib.suppress(OSError):  # already gone
         ch.shm.unlink()
-    except OSError:  # already gone
-        pass
 
 
 def worker_main(rank: int, cfg, path: str, num_pages: int, port: int) -> None:
+    configure_logging()  # a spawned process starts with no logging configuration
     if cfg.device == "neuron":
         neuron_env(rank, port, cfg.tp_core_base)
     init_rank(rank, cfg.tp, port)

@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import logging
 import subprocess
 import sys
 
@@ -97,7 +98,7 @@ def test_only_runtime_users_of_the_engines_own_devices_refuse():
     assert S.device_refusal(0, 32, 2, busy) is None  # engine 0's devices are free
 
 
-def test_a_failing_neuron_ls_refuses_and_a_missing_one_warns(monkeypatch, capsys):
+def test_a_failing_neuron_ls_refuses_and_a_missing_one_warns(monkeypatch, caplog):
     def failing():
         raise subprocess.CalledProcessError(1, ["neuron-ls", "-j", "-a"])
 
@@ -105,8 +106,9 @@ def test_a_failing_neuron_ls_refuses_and_a_missing_one_warns(monkeypatch, capsys
     why = S.device_refusal(0, 32, 2)
     assert why is not None and "never taken as free" in why and "TRNRT_SKIP_DEVICE_CHECK=1" in why
     monkeypatch.setattr(S, "neuron_ls", lambda: None)
-    assert S.device_refusal(0, 32, 2) is None
-    assert "neuron-ls not found" in capsys.readouterr().err
+    with caplog.at_level(logging.INFO, logger="trnrt"):
+        assert S.device_refusal(0, 32, 2) is None
+    assert "trnrt: neuron-ls not found" in caplog.text
 
 
 def test_a_listing_it_cannot_read_refuses():
@@ -117,7 +119,7 @@ def test_a_listing_it_cannot_read_refuses():
 def test_neuron_ls_refuses_an_empty_listing(monkeypatch):
     monkeypatch.setattr(S.shutil, "which", lambda name: "/bin/neuron-ls")
     monkeypatch.setattr(S.subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, 0, stdout="[]"))
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="no Neuron device listed"):
         S.neuron_ls()
 
 

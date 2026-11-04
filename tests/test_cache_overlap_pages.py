@@ -240,10 +240,10 @@ def run(seed, num_pages=60, host=(40, 6), rows=8, seats=8, budget=16, abort_p=0.
 @pytest.mark.parametrize(
     "kw",
     [
-        dict(),
-        dict(num_pages=40, host=(30, 6)),
-        dict(num_pages=80, rows=4, host=(40, 3)),
-        dict(num_pages=50, budget=8, abort_p=0.05),
+        {},
+        {"num_pages": 40, "host": (30, 6)},
+        {"num_pages": 80, "rows": 4, "host": (40, 3)},
+        {"num_pages": 50, "budget": 8, "abort_p": 0.05},
     ],
 )
 def test_served_configuration_under_pressure_keeps_every_page_owned_once(kw):

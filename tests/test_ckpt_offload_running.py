@@ -52,7 +52,7 @@ def _run(path, first, second, mode: str, flush: bool = False, **kw):
         if hit:
             eng.generate([first], sp)
             rad, tier = eng.radix, eng.host_tier
-            counts = dict(running_offloaded=rad.num_running_offloaded, saved_before=tier.ckpts_saved)
+            counts = {"running_offloaded": rad.num_running_offloaded, "saved_before": tier.ckpts_saved}
             if flush:
                 rad.evict_checkpoints(rad.num_ckpts)
                 counts["host_ckpts"] = len(tier.ckpts)

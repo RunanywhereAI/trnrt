@@ -42,10 +42,15 @@ import bisect
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
-from .kv_pool import PagePool
-from .radix_cache import RadixCache
 from .request import Request, Status
+
+if TYPE_CHECKING:
+    from .host_cache import HostTier
+    from .kv_pool import PagePool
+    from .radix_cache import RadixCache
+    from .state_pool import StatePool
 
 PENDING = -1  # placeholder for a token sampled by a step whose results are not read yet
 
@@ -188,8 +193,8 @@ class Scheduler:
         # Set by the engine before the first schedule(): the state pool whose checkpoint rows back the
         # radix nodes (engine/state_pool.StatePool: alloc_ckpt / free_ckpt), and the host cache under the
         # radix cache (engine/host_cache.HostTier), when one is configured.
-        self.states = None
-        self.host = None
+        self._states: StatePool | None = None
+        self.host: HostTier | None = None
         # Set by an overlapping engine while a launched step's results are unread.
         self.in_flight = False
         self.waiting: deque[Request] = deque()
@@ -199,6 +204,16 @@ class Scheduler:
         self.ckpt_mid_placed = 0
         self.ckpt_mid_skipped = 0
         self._new_pending: list = []  # (request, pending checkpoint) the current plan created
+
+    @property
+    def states(self) -> StatePool:
+        if self._states is None:
+            raise RuntimeError("the scheduler has no state pool: set Scheduler.states before the first schedule()")
+        return self._states
+
+    @states.setter
+    def states(self, pool: StatePool) -> None:
+        self._states = pool
 
     # -- public API ---------------------------------------------------------------
 
@@ -265,11 +280,11 @@ class Scheduler:
                 self._cache(req)  # share a prefill chunk's full pages right away
                 continue
             at = s.end  # index of the placeholder
-            tok = int(tok)
-            req.token_ids[at] = tok
+            sampled = int(tok)
+            req.token_ids[at] = sampled
             if req.first_token_time is None:
                 req.first_token_time = now
-            reason = self._finish_reason(req, tok, length=at + 1)
+            reason = self._finish_reason(req, sampled, length=at + 1)
             if reason is not None:
                 # Drop placeholders of steps launched after this one, and count only KV
                 # that belongs to tokens the request keeps.
@@ -568,13 +583,16 @@ class Scheduler:
         checkpoint, so this restores the pages up to the deepest host checkpoint past the device one
         (none: nothing): copied into fresh device pages and inserted into the tree, then that
         checkpoint into a fresh row of the state pool. Returns the new match."""
+        host = self.host
+        if host is None:
+            raise RuntimeError("_restore needs the host cache")
         ids, ps = req.token_ids, self.cfg.page_size
         full = self.radix.match_prefix(ids, max_pages=kv_pages)
-        chain = page_chain(req, ps) if getattr(self.host, "ps", None) == ps else None  # the host cache's own hashes
-        slots = self.host.lookup(ids, kv_pages, limit, chain=chain)
-        ck = self.host.find_ckpt(ids, match.num_pages + 1, kv_pages + len(slots), chain=chain)
+        chain = page_chain(req, ps) if getattr(host, "ps", None) == ps else None  # the host cache's own hashes
+        slots = host.lookup(ids, kv_pages, limit, chain=chain)
+        ck = host.find_ckpt(ids, match.num_pages + 1, kv_pages + len(slots), chain=chain)
         keep = max(0, ck[0] - kv_pages) if ck is not None else 0
-        self.host.unpin(slots[keep:])
+        host.unpin(slots[keep:])
         slots = slots[:keep]
         if ck is None:
             return match, kv_pages
@@ -585,9 +603,9 @@ class Scheduler:
                     self.radix.evict(len(slots) - self.pool.num_free)
                 pages = self.pool.alloc(len(slots))
                 if pages is None:
-                    self.host.unpin(slots)
+                    host.unpin(slots)
                     return match, kv_pages
-                self.host.load(slots, pages)
+                host.load(slots, pages)
                 n = kv_pages + len(slots)
                 res = self.radix.insert(ids[: n * ps], list(full.pages) + pages)
                 for mine, tree in zip(pages, res.pages[kv_pages:]):
@@ -595,7 +613,7 @@ class Scheduler:
                         self.pool.free([mine])
             row = self._alloc_ckpt()
             if row is not None:
-                self.host.load_ckpt(ck[1], row)
+                host.load_ckpt(ck[1], row)
                 if not self.radix.attach_checkpoint(ids, ck[0], row):
                     self.states.free_ckpt(row)
         finally:

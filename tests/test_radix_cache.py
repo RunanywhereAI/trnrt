@@ -43,7 +43,7 @@ def test_insert_returns_tree_pages_for_an_existing_prefix():
     first = pool.alloc(2)
     rc.insert(ids, first)
     dup = pool.alloc(3)
-    res = rc.insert(ids + [8, 9, 10, 11], dup)
+    res = rc.insert([*ids, 8, 9, 10, 11], dup)
     assert res.pages[:2] == first and res.pages[2] == dup[2]
 
 
@@ -86,9 +86,9 @@ def test_eviction_cascades_to_parent_once_children_are_gone():
     pool, rc = make()
     base = list(range(8))
     p = pool.alloc(3)
-    rc.insert(base + [50, 51, 52, 53], p)
+    rc.insert([*base, 50, 51, 52, 53], p)
     q = pool.alloc(1)
-    rc.insert(base + [60, 61, 62, 63], [p[0], p[1], q[0]])
+    rc.insert([*base, 60, 61, 62, 63], [p[0], p[1], q[0]])
     assert rc.total_pages() == 4
     assert rc.evict(100) == 4
     assert pool.num_free == pool.num_usable
@@ -104,7 +104,7 @@ def test_evicting_a_node_frees_and_offloads_its_checkpoint():
     rc.insert(ids, pages)
     assert rc.attach_checkpoint(ids, 3, 7) and rc.num_ckpts == 1
     assert not rc.attach_checkpoint(ids, 3, 8), "a node keeps its first checkpoint"
-    m, kv = rc.match_checkpoint(ids + [99])
+    m, kv = rc.match_checkpoint([*ids, 99])
     assert m.node.ckpt == 7 and m.num_pages == 3 and kv == 3
     assert rc.evict(3) == 3
     assert offloaded == [(12, 0, pages, 7)] and freed == [7] and rc.num_ckpts == 0

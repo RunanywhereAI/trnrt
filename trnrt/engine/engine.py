@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import atexit
 import itertools
+import logging
 import os
 import time
 import weakref
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -17,7 +19,12 @@ from .model_runner import ModelRunner
 from .radix_cache import RadixCache
 from .request import Request, SamplingParams, Status, unsupported
 from .sampler import unpack
-from .scheduler import NeedSync, Scheduler, SchedulerConfig
+from .scheduler import NeedSync, Scheduler, SchedulerConfig, StepPlan
+
+if TYPE_CHECKING:
+    from .host_cache import HostTier
+
+logger = logging.getLogger(__name__)
 
 # Tensor-parallel engines not closed yet, held weakly: close() at exit (stopping the workers) without
 # keeping every engine a process ever made alive. atexit.register(self.close) did, so a test session
@@ -153,7 +160,7 @@ def build_shard(cfg: EngineConfig, path: str, num_pages: int, rank: int = 0):
         import libtorch_neuronx_lite  # noqa: F401  registers the "neuron" device
 
         if rank == 0:
-            print("trnrt platform", platform.check_runtime(), flush=True)
+            logger.info("trnrt platform %s", platform.check_runtime())
 
         device = torch.device("neuron:0")  # each rank sees exactly one logical NeuronCore
     else:
@@ -246,6 +253,7 @@ class LLMEngine:
         # libtorch_neuronx_lite before transformers, the order every spawned rank and trnrt/compile/capture.py have.
         from transformers import AutoTokenizer
 
+        self.tokenizer: Any  # a transformers tokenizer, or None for token-id-only use
         try:
             self.tokenizer = AutoTokenizer.from_pretrained(path)
         except (OSError, ValueError, TypeError):
@@ -278,7 +286,7 @@ class LLMEngine:
         # Host memory under the radix cache (engine/host_cache.py), per rank: half for state checkpoints, the rest for
         # KV pages. Evicted pages and checkpoints go there (a checkpoint on a running request's path too, when no row is
         # free), and a later hit copies them back.
-        self.host_tier = None
+        self.host_tier: HostTier | None = None
         if cfg.host_cache_gb > 0:
             from .host_cache import HostTier
 
@@ -293,7 +301,8 @@ class LLMEngine:
             self.scheduler.host = self.host_tier
         self._ids = itertools.count()
         self.last_step = StepStats()
-        self._inflight = None  # (plan, launches) of a step whose results are not read yet
+        # (plan, launches) of a step whose results are not read yet
+        self._inflight: tuple[StepPlan, list[Any]] | None = None
 
     def add_request(
         self, prompt_ids: list[int], params: SamplingParams, rid: str | None = None, session_id: str | None = None
@@ -350,9 +359,9 @@ class LLMEngine:
             try:
                 line = local_k_report(None, self.local_k_counts(), "this engine's run")
                 if line:
-                    print(line, flush=True)
+                    logger.info("%s", line)
             except Exception as e:  # noqa: BLE001 - a report, never a reason not to close
-                print(f"local-K report failed: {e!r}", flush=True)
+                logger.warning("local-K report failed: %r", e)
         _OPEN.discard(self)
         if runner is not None and getattr(runner, "watchdog", None) is not None:
             runner.watchdog.close()
@@ -485,9 +494,9 @@ class LLMEngine:
         results: dict[int, int] = {}
         for chunk, out, kind in launches:
             with watchdog.watched(self.runner.watchdog, f"reading back a {kind} call"):
-                dev_out, out = out, out.cpu()
-            self.runner.launch_bound.done_through(dev_out)  # this call and every launch before it are done
-            tokens, lps, top_ids, top_lps = unpack(out, len(chunk))
+                host_out = out.cpu()
+            self.runner.launch_bound.done_through(out)  # this call and every launch before it are done
+            tokens, lps, top_ids, top_lps = unpack(host_out, len(chunk))
             for i, s in enumerate(chunk):
                 results[id(s)] = tokens[i]
                 n = s.req.params.logprobs

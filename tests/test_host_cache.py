@@ -108,7 +108,7 @@ def test_clear_drops_everything():
 
 
 def test_both_parts_need_room():
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="room for at least one page and one state checkpoint"):
         HostTier(Moves(), page_size=2, capacity_pages=1, capacity_ckpts=0)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="room for at least one page and one state checkpoint"):
         HostTier(Moves(), page_size=2, capacity_pages=0, capacity_ckpts=1)

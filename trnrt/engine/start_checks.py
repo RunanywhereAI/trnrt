@@ -19,10 +19,13 @@ a failure deep in start-up. Only on Linux with --device neuron: anywhere else th
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import subprocess
 import sys
+
+logger = logging.getLogger(__name__)
 
 ORDER10_FLOOR = 1024  # free order-10 blocks over every zone: 4 GiB contiguous
 ORDER10_NODE_FLOOR = 256  # free order-10 blocks in each NUMA node's Normal zone (a rank allocates on its own node)
@@ -102,13 +105,15 @@ def engine_devices(core_base: int, tp: int, devices: list[dict], lnc: int | None
 
 def device_users(devices: list[dict], wanted) -> list[tuple[int, object, str]]:
     """(device, pid, command) of every process with a Neuron runtime on a device in `wanted`."""
-    out = []
+    out: list[tuple[int, object, str]] = []
     for d in devices:
         dev = int(d["neuron_device"])
         if dev in wanted:
-            for p in d.get("neuron_processes") or []:
-                if p.get("neuron_runtime_version"):
-                    out.append((dev, p.get("pid", "?"), str(p.get("command") or "?")))
+            out.extend(
+                (dev, p.get("pid", "?"), str(p.get("command") or "?"))
+                for p in d.get("neuron_processes") or []
+                if p.get("neuron_runtime_version")
+            )
     return out
 
 
@@ -124,11 +129,10 @@ def device_refusal(core_base: int, tp: int, lnc: int | None = None, devices: lis
                 "check."
             )
         if devices is None:
-            print(
-                f"trnrt: neuron-ls not found: not checking that the Neuron devices of cores {core_base}-"
-                f"{core_base + tp - 1} are free",
-                file=sys.stderr,
-                flush=True,
+            logger.warning(
+                "trnrt: neuron-ls not found: not checking that the Neuron devices of cores %s-%s are free",
+                core_base,
+                core_base + tp - 1,
             )
             return None
     try:

@@ -28,9 +28,14 @@ rows on the device (ModelRunner.copy_state).
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 
 from .request import Status
+
+if TYPE_CHECKING:
+    from .request import Request
 
 SCRATCH_ROW = 0
 
@@ -48,7 +53,7 @@ class StatePool:
         model.bind_state(self.conv, self.rec)
         # pop() hands out the lowest free row first.
         self._free = list(range(rows, 0, -1))
-        self._held: dict[str, tuple[int, object]] = {}  # rid -> (row, request)
+        self._held: dict[str, tuple[int, Request]] = {}  # rid -> (row, request)
         self._ckpt_free = list(range(self.zero_row - 1, rows, -1))
 
     def pools(self) -> list[torch.Tensor]:

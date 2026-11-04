@@ -74,7 +74,7 @@ def _checkpoint_states(eng, prompt, n_pages, monkeypatch):
 
 
 # One chunk holds the whole prompt, so its last page boundary is strictly inside the chunk.
-WIDE = dict(max_prefill_tokens=64)
+WIDE = {"max_prefill_tokens": 64}
 
 
 def test_the_in_chunk_checkpoint_is_bit_equal_to_one_a_chunk_ends_at(glm, monkeypatch):

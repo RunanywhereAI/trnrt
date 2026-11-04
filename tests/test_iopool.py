@@ -39,7 +39,7 @@ class FakeExecutor:
         self.sets = []  # every execution's IO addresses
 
     def execute(self, inputs, outputs):
-        h, w, board = inputs
+        h, w, _board = inputs
         self.sets.append(tuple(t.data_ptr() for t in (*inputs, *outputs)))
         out = outputs[0]
         out.zero_()  # a device writes its output as it goes: an output that is also an input is lost here
@@ -228,7 +228,7 @@ class FakeOut:
 
 
 @needs_runner
-@pytest.mark.parametrize("rank, done, waits", [(0, 5, 1), (0, 6, 0), (1, 6, 1), (1, 7, 0)])
+@pytest.mark.parametrize(("rank", "done", "waits"), [(0, 5, 1), (0, 6, 0), (1, 6, 1), (1, 7, 0)])
 def test_a_slot_is_rewritten_only_after_its_previous_call_is_done(rank, done, waits):
     """Slot 0's previous call ended with execution 5. Rank 0's done is its own read-back: done 6 covers it. A
     worker's done is rank 0's count (done_to), which may be one call's tail ahead of its own device: 6 is not enough
@@ -247,7 +247,7 @@ def test_a_slot_is_rewritten_only_after_its_previous_call_is_done(rank, done, wa
 
 
 @needs_runner
-@pytest.mark.parametrize("k, waits", [(2, True), (3, False), (iopool.POOL_K, False)])
+@pytest.mark.parametrize(("k", "waits"), [(2, True), (3, False), (iopool.POOL_K, False)])
 def test_k_against_the_decode_overlap(k, waits):
     """The served decode loop: rank 0 launches step c + 1, then reads step c back (overlap), and sends each call with
     its done count. A worker at K = 2 must wait for the step before every call (the pipeline serialises); from K = 3

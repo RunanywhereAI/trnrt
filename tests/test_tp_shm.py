@@ -14,6 +14,7 @@ ShmChannel, on unless TRNRT_TP_SHM=0).
 
 from __future__ import annotations
 
+import logging
 import os
 import queue
 import socket
@@ -169,7 +170,7 @@ def _fake_dist(world: int, sent: list):
     )
 
 
-def test_a_segment_that_cannot_be_made_sends_every_call_over_gloo(monkeypatch, capsys):
+def test_a_segment_that_cannot_be_made_sends_every_call_over_gloo(monkeypatch, caplog):
     """Nothing is announced before the segment exists, so a failed create (no usable /dev/shm) leaves the workers on
     the gloo path: every call goes there, said once; the engine's stop (drop_channel) clears the failure."""
     sent = []
@@ -181,11 +182,12 @@ def test_a_segment_that_cannot_be_made_sends_every_call_over_gloo(monkeypatch, c
 
     monkeypatch.setattr(tp.ShmChannel, "create", staticmethod(fail))
     try:
-        tp.send(("decode", 1))
-        tp.send(("decode", 2))
-        tp.send(None)
+        with caplog.at_level(logging.INFO, logger="trnrt"):
+            tp.send(("decode", 1))
+            tp.send(("decode", 2))
+            tp.send(None)
         assert sent == [("decode", 1), ("decode", 2), None] and tp._CH["ch"] is None and tp._CH["failed"]
-        assert capsys.readouterr().err.count("no shared-memory channel") == 1
+        assert caplog.text.count("trnrt: no shared-memory channel") == 1
     finally:
         tp.drop_channel()
     assert tp._CH == {"ch": None, "failed": False}
@@ -334,7 +336,7 @@ def test_send_and_recv_over_a_real_process_group(monkeypatch, shm):
 
         def rank0():  # on a thread: a send stuck on a dead worker fails the test below instead of hanging it
             try:
-                for m in msgs + [None]:
+                for m in [*msgs, None]:
                     tp.send(m)
                     if not names and tp._CH["ch"] is not None:
                         names.append(tp._CH["ch"].shm.name)

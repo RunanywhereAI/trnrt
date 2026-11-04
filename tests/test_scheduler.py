@@ -94,11 +94,9 @@ def run(sched: Scheduler, reqs, max_steps=10_000, check_every=1):
     while sched.has_work():
         plan = sched.schedule()
         assert plan, "scheduler made no progress"
-        tokens = []
-        for s in plan.seqs():
-            # The step "computes" positions [start, end); the next token depends only
-            # on the history up to end, exactly like a real model's last-position logits.
-            tokens.append(next_token(s.req.token_ids[: s.end]) if s.sample else -1)
+        # The step "computes" positions [start, end); the next token depends only
+        # on the history up to end, exactly like a real model's last-position logits.
+        tokens = [next_token(s.req.token_ids[: s.end]) if s.sample else -1 for s in plan.seqs()]
         sched.update(plan, tokens)
         steps += 1
         if steps % check_every == 0:
@@ -147,12 +145,12 @@ def test_shared_prefix_resumes_from_the_prompt_end_checkpoint():
     b, sharing those pages, resumes there."""
     sched = make()
     system = list(range(100, 140))  # 10 full pages
-    a = Request("a", system + [9, 10], SamplingParams(max_new_tokens=3))
+    a = Request("a", [*system, 9, 10], SamplingParams(max_new_tokens=3))
     sched.add(a)
     plan = sched.schedule()
     assert [(e.start, e.end, e.mid is not None) for e in plan.prefills] == [(0, 16, False)]
     run(sched, [])
-    b = Request("b", system + [11, 12, 13], SamplingParams(max_new_tokens=3))
+    b = Request("b", [*system, 11, 12, 13], SamplingParams(max_new_tokens=3))
     run(sched, [b])
     assert b.num_cached_tokens == len(system)
     assert b.output_ids == reference_output(b.prompt_ids, 3)
@@ -179,7 +177,7 @@ def test_concurrent_same_prefix_dedups_pages_and_waits_for_the_junction():
     end ahead (the junction with the others); the others wait for it and resume there."""
     sched = make(budget=64)
     system = list(range(200, 232))
-    reqs = [Request(f"c{i}", system + [i + 10], SamplingParams(max_new_tokens=5)) for i in range(4)]
+    reqs = [Request(f"c{i}", [*system, i + 10], SamplingParams(max_new_tokens=5)) for i in range(4)]
     run(sched, reqs)
     for r in reqs:
         assert r.output_ids == reference_output(r.prompt_ids, 5)
@@ -410,7 +408,7 @@ def test_session_turns_survive_pressure_that_evicts_other_prefixes():
                     )
                 ],
             )
-        t2 = Request("t2", convo + [9, 10, 11], SamplingParams(max_new_tokens=4, ignore_eos=True), session_id=session)
+        t2 = Request("t2", [*convo, 9, 10, 11], SamplingParams(max_new_tokens=4, ignore_eos=True), session_id=session)
         run(sched, [t2])
         assert t2.output_ids == reference_output_no_eos(t2.prompt_ids, 4)
         return t2.num_cached_tokens, sched

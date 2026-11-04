@@ -98,7 +98,7 @@ def test_penalized_token_is_not_sampled_but_logprobs_stay_raw():
 def shards(logits: torch.Tensor, tp: int, M: int):
     """The union of tp shards' top M (values, fp32 ids) and their log-sum-exps combined, as the vocabulary-parallel
     sampler gathers them."""
-    B, V = logits.shape
+    _, V = logits.shape
     Vr = -(-V // tp)
     pad = F.pad(logits, (0, tp * Vr - V), value=-1e30)
     vals, ids, lses = [], [], []
@@ -208,5 +208,5 @@ def test_nan_and_neg_inf_rows_select_in_range(V):
     out = S.sample(logits, *rest)
     ids = torch.cat([out[:, :1], out[:, 2 : 2 + NUM_TOP_LOGPROBS]], 1)
     assert ((ids >= 0) & (ids < V)).all()
-    ref = S.sample(*(_args(V=V)[0][[0, 3]],) + tuple(r[[0, 3]] for r in rest))
+    ref = S.sample(*(_args(V=V)[0][[0, 3]], *tuple(r[[0, 3]] for r in rest)))
     assert torch.equal(out[[0, 3]], ref), "a NaN row changed its neighbours' samples"
