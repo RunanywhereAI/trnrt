@@ -22,7 +22,7 @@ One engine is tensor-parallel over 32 logical NeuronCores (8 Trainium2 chips) at
 physical cores, so every kernel runs as **two NKI programs** (grid 2). The DSA caches are additionally
 context-parallel over groups of 8 ranks: each rank holds 1/8 of every sequence's latent, indexer keys and pool keys.
 A decode call carries 1, 2, 4, 6, 8 or 12 rows (requests) in the default configuration, and up to 8 in the batch-8
-configuration (README, Configuration), one graph per row count, and the whole step is one compiled graph. Every row
+configuration ([CONFIGURATION.md](CONFIGURATION.md)), one graph per row count, and the whole step is one compiled graph. Every row
 count runs on the same kernels.
 
 ## Why fuse
@@ -220,8 +220,8 @@ The simulator is necessary but not sufficient. It accepted forms the device comp
 into slices of one PSUM tile, unfenced in-kernel collectives, and cross-program reads of shared scratch. It also
 accepted forms the compiler rejects. So every new form gets a device run checked by value, with a control.
 
-This repository's own check: the graphs this code builds, and their kernel binaries, are compared with the engine it
-was extracted from (144 graphs in the batch-8 configuration). They must match modulo names and `rev` values
+This repository's own check: the graphs this code builds, and their kernel binaries, are compared with the build the
+published numbers were measured on (144 graphs in the batch-8 configuration). They must match modulo names and `rev` values
 ([`tools/graph_equiv.py`](../tools/graph_equiv.py)).
 
 ## Prefill kernels

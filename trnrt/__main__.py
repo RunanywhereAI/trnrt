@@ -71,7 +71,7 @@ def add_engine_args(ap: argparse.ArgumentParser) -> None:
     """The engine's arguments, with the served values as defaults."""
     g = ap.add_argument_group("engine")
     g.add_argument("--preset", default=None, choices=sorted(PRESETS),
-                   help="a named configuration (README, Configuration): its values become the defaults of the "
+                   help="a named configuration (docs/CONFIGURATION.md): its values become the defaults of the "
                         "arguments it sets; an argument given explicitly still wins")
     g.add_argument("--model", required=True, help="the checkpoint directory (or a Hugging Face repo id)")
     g.add_argument("--revision", default=None,

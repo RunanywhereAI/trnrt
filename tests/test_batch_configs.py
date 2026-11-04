@@ -8,7 +8,7 @@
   on every rank; the defaults raise them to batch 12's, batch8 leaves the modules' own;
 - out-of-range values are refused;
 - --moe-kernel, unset, follows the device (NKI kernels on Neuron, XLA on CPU);
-- the README documents both configurations.
+- docs/CONFIGURATION.md documents both configurations.
 """
 
 from __future__ import annotations
@@ -157,7 +157,7 @@ def test_build_shard_sets_the_routes_first():
 
 
 def test_the_readme_documents_both_configurations():
-    with open(os.path.join(ROOT, "README.md")) as f:
+    with open(os.path.join(ROOT, "docs", "CONFIGURATION.md")) as f:
         readme = f.read()
     assert "--preset batch8" in readme and "--max-running 4" in readme
     for flag, value in (("--max-num-seqs", "16"), ("--decode-buckets", "1,2,4,6,8,12"), ("--max-running", "12"),

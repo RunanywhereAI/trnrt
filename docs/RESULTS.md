@@ -1,8 +1,8 @@
 # Results
 
-GLM-5.3-Flash on one AWS trn2.48xlarge, measured with the engine this repository was extracted from, in the
-configurations this repository reproduces ([README, Configuration](../README.md#configuration)). The graph-equivalence
-check (`tools/graph_equiv.py`) holds this repository to compiling the same graphs as that engine. On 2 Nov 2026 it read
+GLM-5.3-Flash on one AWS trn2.48xlarge, measured with an earlier build of trnrt, in the configurations this repository
+reproduces ([CONFIGURATION.md](CONFIGURATION.md)). The graph-equivalence check (`tools/graph_equiv.py`) holds this
+repository to compiling the same graphs as that build. On 2 Nov 2026 it read
 EQUAL for 144 graphs on 4 of 32 ranks, before a later selection-kernel fix, and its positive control (one constant
 changed in one prefill kernel) read DIFFER on exactly the graphs that kernel builds. A full 32-rank run and an
 on-device check are in progress.
@@ -161,6 +161,18 @@ mix is synthetic: real agent traffic differs in content and pacing.
 - **Accuracy:** changes that should not move any bits are compared byte for byte. Everything else is checked against a
   high-precision reference on captured intermediates, not just final outputs. The benchmark numbers above ran with the
   sparse-attention selection that [KNOWN_ISSUES.md](KNOWN_ISSUES.md) describes.
+
+## Reproducing
+
+1. Serve the configuration under test ([DEPLOY.md](DEPLOY.md); `--preset batch8` and `--max-running 4` for batch 8 and
+   4, [CONFIGURATION.md](CONFIGURATION.md)).
+2. Run [AgentX](https://github.com/SemiAnalysisAI/agentx-harness) with its standard scenario and public trace set
+   against the router's `/v1` endpoint. Use a 1M-token context, one hour per concurrency point, and a load client on
+   a separate machine.
+3. Count a point only if the harness marks it a valid submission.
+
+A number added to these docs states the instance, Neuron SDK, configuration, workload and shapes, precision, the
+baseline it is compared with, and how correctness was checked ([CONTRIBUTING.md](../CONTRIBUTING.md)).
 
 ## Known issues
 

@@ -2,9 +2,9 @@
 
 ## Verification status
 
-This repository was extracted from the engine the published numbers were measured with, and a graph-equivalence check
-(`tools/graph_equiv.py`) holds it to compiling the same graphs. A full run of that check over all 32 ranks and a check
-of this repository on a device are in progress ([README, Status](../README.md#status); [RESULTS.md](RESULTS.md)).
+The published numbers were measured with an earlier build of trnrt, and a graph-equivalence check
+(`tools/graph_equiv.py`) holds this repository to compiling the same graphs as that build. A full run of that check over
+all 32 ranks and a check of this repository on a device are in progress ([RESULTS.md](RESULTS.md)).
 
 ## Prompt processing: a small share of sparse-attention selections are inexact
 
@@ -62,5 +62,5 @@ chunk-size floor, so the tolerance is not loosened. The test is marked as an exp
 pass, the suite fails until this entry and the mark are revisited.
 
 This CPU test does not measure served accuracy. The served engine's accuracy was checked on the device, against a
-high-precision reference, with the engine this repository was extracted from; a check of this repository on a device is
-in progress.
+high-precision reference, with the build the published numbers were measured on; a check of this repository on a device
+is in progress.

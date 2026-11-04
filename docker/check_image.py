@@ -32,7 +32,7 @@ import subprocess
 import sys
 
 FAILED: list[str] = []
-# distribution -> the version prefix it must have (README.md "What you need": Neuron SDK 2.32, neuronx-cc 2.27; SDK
+# distribution -> the version prefix it must have (README.md and docs/DEPLOY.md "What you need": Neuron SDK 2.32, neuronx-cc 2.27; SDK
 # 2.32 ships libtorch-neuronx-lite 2.11)
 WANT_VERSION = {"neuronx-cc": "2.27.", "libtorch-neuronx-lite": "2.11."}
 

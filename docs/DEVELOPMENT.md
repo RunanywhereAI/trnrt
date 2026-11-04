@@ -1,0 +1,59 @@
+# Development
+
+## Set up
+
+```bash
+make dev     # .venv with Python 3.13: CPU torch, editable install with test and lint tools, the pre-commit hook
+make check   # pre-commit on every file, then the CPU test suite
+```
+
+`make help` lists every target. Without `make`, install CPU torch first
+(`pip install torch --index-url https://download.pytorch.org/whl/cpu`), then run
+`pip install -e '.[dev]' transformers==5.17.0 tokenizers==0.23.3`.
+
+## Tests
+
+The suite runs on CPU, without a NeuronCore, on x86_64 Linux and on macOS. The image's versions are Python 3.13,
+transformers 5.17.0 and tokenizers 0.23.3. In the image:
+
+```bash
+docker run --rm --entrypoint python trnrt -m pytest
+```
+
+| Tier | What runs | Needs |
+|---|---|---|
+| CPU (default, CI) | Host code, the engine end to end on a tiny random model of GLM-5.3-Flash's architecture, the API and router over real HTTP, every kernel's `emulate()` reference | Nothing beyond `make dev` |
+| NKI simulator | Kernels against their reference in the NKI simulator | The Neuron venv's `nki` package; skipped otherwise |
+| Checkpoint | API tests over the real model; the KDA shell on the checkpoint's own weights | `TRNRT_TEST_MODEL` / `TRNRT_TEST_GLM_CKPT` = a local GLM-5.3-Flash directory |
+| Hub | Tests that read the model's small files (config, tokenizer, chat template, safetensors headers) from the Hub | `TRNRT_TEST_NETWORK=1` |
+| Graph equivalence | `tools/graph_equiv.py` over captured graphs | `libtorch_neuronx_lite`, or `HLO_PB2_PATH` = a directory holding `hlo_pb2.py`, plus `zstd` |
+| Device | `docker/check_image.py --device`, `tools/check_mixed.py`, serving | A Trainium2 host |
+
+Two tests document known limits rather than bugs. `tests/test_dsa_long.py::test_cp_engine_matches_replicated` is a
+strict expected failure ([KNOWN_ISSUES.md](KNOWN_ISSUES.md)).
+`tests/test_router.py::test_router_does_not_cap_streams_in_flight` opens 130 connections at once, which can exceed
+macOS's default listen backlog of 128; it passes on Linux.
+
+## Lint
+
+`pre-commit run --all-files` runs ruff, the file checks and `tools/check_docs.py`. Ruff checks correctness only:
+pyflakes, syntax errors and a few bug-prone patterns. **No formatter runs on this repository.** Reformatting a traced
+module (`trnrt/kernels/`, `trnrt/models/`) would change its compiled graphs, and every compile cache with them.
+
+## CI
+
+| Workflow | Runs | On |
+|---|---|---|
+| `ci.yml` | pre-commit; the CPU suite; package build and `twine check`; Dockerfile lint | every push to `main` and every PR |
+| `codeql.yml` | CodeQL security analysis of the Python | push and PR to `main`, weekly |
+| `release.yml` | build, check and attach the sdist and wheel to a GitHub release; PyPI when enabled | a `vX.Y.Z` tag that matches `trnrt.__version__` |
+
+Dependabot keeps the pinned actions current. Every third-party action is pinned to a commit SHA.
+
+## Releasing
+
+1. Bump `__version__` in `trnrt/__init__.py`. The version is part of every compile-cache key, so caches built for the
+   old version stop matching. Move `CHANGELOG.md`'s Unreleased entries under the new version.
+2. Merge to `main`, then tag: `git tag v0.2.0 && git push origin v0.2.0`.
+3. To publish to PyPI as well, configure a trusted publisher for the `pypi` environment, and set the repository
+   variable `PUBLISH_PYPI` to `true`.

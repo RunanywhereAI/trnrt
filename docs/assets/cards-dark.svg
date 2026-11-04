@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="456" viewBox="0 0 1280 456" role="img" aria-labelledby="title desc">
+<title id="title">trnrt at a glance</title>
+<desc id="desc">Throughput: 3.57M tokens / min, one trn2.48xlarge on AgentX, decode batch 12; Decode Step: 24 ms at 8 users, down from 34 ms, with NKI megakernels; Long Context: 1M tokens, first token in 190.8 s, a cached follow-up in 1.84 s; Cost: $0.040 per M tokens, at the $8.60/h spot price; $0.167 on a capacity block</desc>
+<defs><linearGradient id="ra" x1="6" y1="6" x2="38.8354" y2="35.7082" gradientUnits="userSpaceOnUse"><stop stop-color="#FF6900"/><stop offset="1" stop-color="#FB2C36"/></linearGradient><radialGradient id="glow" cx="0.5" cy="0.5" r="0.5"><stop offset="0" stop-color="#ff6900" stop-opacity="0.22"/><stop offset="1" stop-color="#ff6900" stop-opacity="0"/></radialGradient><pattern id="dots" width="24" height="24" patternUnits="userSpaceOnUse"><circle cx="2" cy="2" r="1.1" fill="#ffffff" fill-opacity="0.07"/></pattern></defs>
+<rect x="0.75" y="0.75" width="626.5" height="214.5" rx="24" fill="#1f1e1e" stroke="#ffffff" stroke-opacity="0.1" stroke-width="1.5"/>
+<text x="40" y="66" font-family="'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="16" font-weight="500" letter-spacing="2.6" fill="#fd7014">THROUGHPUT</text>
+<rect x="40" y="30" width="28" height="4" rx="2" fill="#fd7014"/>
+<text x="37" y="142" font-family="'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="76" font-weight="600" letter-spacing="-2" fill="#f5f2f2">3.57M<tspan font-size="30" font-weight="500" letter-spacing="0" fill-opacity="0.8" dx="14">tokens / min</tspan></text>
+<text x="40" y="184" font-family="'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="20" fill="#f5f2f2" fill-opacity="0.66">one trn2.48xlarge on AgentX, decode batch 12</text>
+<rect x="652.75" y="0.75" width="626.5" height="214.5" rx="24" fill="#1f1e1e" stroke="#ffffff" stroke-opacity="0.1" stroke-width="1.5"/>
+<text x="692" y="66" font-family="'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="16" font-weight="500" letter-spacing="2.6" fill="#fd7014">DECODE STEP</text>
+<rect x="692" y="30" width="28" height="4" rx="2" fill="#fd7014"/>
+<text x="689" y="142" font-family="'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="76" font-weight="600" letter-spacing="-2" fill="#f5f2f2">24 ms<tspan font-size="30" font-weight="500" letter-spacing="0" fill-opacity="0.8" dx="14">at 8 users</tspan></text>
+<text x="692" y="184" font-family="'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="20" fill="#f5f2f2" fill-opacity="0.66">down from 34 ms, with NKI megakernels</text>
+<rect x="0.75" y="240.75" width="626.5" height="214.5" rx="24" fill="#1f1e1e" stroke="#ffffff" stroke-opacity="0.1" stroke-width="1.5"/>
+<text x="40" y="306" font-family="'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="16" font-weight="500" letter-spacing="2.6" fill="#fd7014">LONG CONTEXT</text>
+<rect x="40" y="270" width="28" height="4" rx="2" fill="#fd7014"/>
+<text x="37" y="382" font-family="'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="76" font-weight="600" letter-spacing="-2" fill="#f5f2f2">1M<tspan font-size="30" font-weight="500" letter-spacing="0" fill-opacity="0.8" dx="14">tokens</tspan></text>
+<text x="40" y="424" font-family="'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="20" fill="#f5f2f2" fill-opacity="0.66">first token in 190.8 s, a cached follow-up in 1.84 s</text>
+<rect x="652.75" y="240.75" width="626.5" height="214.5" rx="24" fill="#1f1e1e" stroke="#ffffff" stroke-opacity="0.1" stroke-width="1.5"/>
+<text x="692" y="306" font-family="'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="16" font-weight="500" letter-spacing="2.6" fill="#fd7014">COST</text>
+<rect x="692" y="270" width="28" height="4" rx="2" fill="#fd7014"/>
+<text x="689" y="382" font-family="'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="76" font-weight="600" letter-spacing="-2" fill="#f5f2f2">$0.040<tspan font-size="30" font-weight="500" letter-spacing="0" fill-opacity="0.8" dx="14">per M tokens</tspan></text>
+<text x="692" y="424" font-family="'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="20" fill="#f5f2f2" fill-opacity="0.66">at the $8.60/h spot price; $0.167 on a capacity block</text>
+</svg>
