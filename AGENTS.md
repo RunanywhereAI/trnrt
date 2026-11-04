@@ -43,8 +43,7 @@ Nothing here needs a Trainium device. Device-only work (`docker/check_image.py -
    they never mutate the scheduler or pools directly.
 7. **Unsupported API fields are refused with a 400 that says why**, never silently ignored.
 8. **Numbers in the docs carry their context**: instance, Neuron SDK, configuration, workload, precision, baseline,
-   and how correctness was checked. Docs that tag their numbers ([M] measured, [D] derived, [E] estimate), such as
-   `docs/MEGAKERNELS.md`, keep the tags.
+   and how correctness was checked.
 
 ## Tests
 
