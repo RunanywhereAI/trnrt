@@ -1,213 +1,222 @@
-# trnRT for GLM-5.3-Flash
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/banner-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="docs/assets/banner-light.svg">
+    <img alt="TrnRT: the open LLM inference engine for AWS Trainium, by RunAnywhere" src="docs/assets/banner-dark.svg" width="100%">
+  </picture>
+</p>
 
-Serve GLM-5.3-Flash on one AWS trn2.48xlarge: two engines of 32 tensor-parallel ranks each behind a session-affine
-router, an OpenAI-compatible API with streaming and GLM tool calls, 1M-token context, and a prefix cache that keeps
-evicted KV pages and linear-attention state checkpoints in host memory.
+<p align="center">
+  <a href="https://github.com/RunanywhereAI/trnrt/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/RunanywhereAI/trnrt/ci.yml?branch=main&style=flat-square&labelColor=161515&label=CI"></a>
+  <a href="LICENSE"><img alt="License: Apache 2.0" src="https://img.shields.io/badge/license-Apache%202.0-fd7014?style=flat-square&labelColor=161515"></a>
+  <img alt="Python 3.13" src="https://img.shields.io/badge/python-3.13-fd7014?style=flat-square&labelColor=161515">
+  <img alt="AWS Trainium2" src="https://img.shields.io/badge/AWS-Trainium2-fd7014?style=flat-square&labelColor=161515">
+  <img alt="Neuron SDK 2.32" src="https://img.shields.io/badge/Neuron%20SDK-2.32-fd7014?style=flat-square&labelColor=161515">
+</p>
 
-**Status: work in progress.** This repository has not yet served on a device. A graph-equivalence gate
-(`tools/graph_equiv.py`) holds it to compiling the same graphs as the engine it was extracted from; that gate's full run
-and an on-device check are pending. The numbers in [docs/RESULTS.md](docs/RESULTS.md) were measured with that engine, in
-the configuration this repository's defaults reproduce.
+<p align="center">
+  <a href="#quickstart"><b>Quickstart</b></a> ·
+  <a href="docs/RESULTS.md"><b>Benchmarks</b></a> ·
+  <a href="docs/README.md"><b>Docs</b></a> ·
+  <a href="docs/MEGAKERNELS.md"><b>Kernels</b></a> ·
+  <a href="https://runanywhere.ai/blog"><b>Blog</b></a> ·
+  <a href="https://runanywhere.ai"><b>runanywhere.ai</b></a>
+</p>
 
-## What you need
+**TrnRT** is an open inference engine for large language models on AWS Trainium. It serves an OpenAI-compatible API
+from one `trn2.48xlarge`, runs decode as NKI megakernels (about one kernel per layer half), and keeps a prefix cache
+across device and host memory. **GLM-5.3-Flash is the first supported model; more open models are on the way.**
 
-| | |
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/cards-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="docs/assets/cards-light.svg">
+    <img alt="3.57M tokens per minute on one trn2.48xlarge (AgentX, batch 12). 24 ms batch-8 decode step, down from 32.2 ms with NKI megakernels. $0.040 per million tokens at the spot price, $0.167 on a capacity block." src="docs/assets/cards-dark.svg" width="100%">
+  </picture>
+</p>
+
+## Highlights
+
+| Feature | What it does |
 |---|---|
-| Serving host | one trn2.48xlarge: 16 Trainium2 chips (64 logical NeuronCores at LNC 2), 192 vCPUs, 2 TiB of host memory [unverified] |
-| Compile host | any x86_64 host with the Neuron compiler (the same container image); no NeuronCore needed. Its core count sets the compile time, and its memory need for a 32-rank capture is [unverified] |
-| Software | Neuron SDK 2.32 (neuronx-cc 2.27), Python 3.13: the container in `docker/` pins the base image by digest |
-| Model | `zai-org/GLM-5.3-Flash` (FP8 weights, as released), at one fixed revision for both compiling and serving |
-| Cost | one trn2.48xlarge for as long as it serves; see [docs/RESULTS.md](docs/RESULTS.md) for a cost per request at a public price [unverified] |
+| **NKI megakernels** | One fused kernel per layer half for decode: KDA attention, the fused DSA layer, mHC and the MoE FFN. |
+| **1M-token context** | Sparse attention (top 2,048) and linear attention, with fixed-size state. |
+| **Prefix cache** | A radix tree over FP8 KV pages, plus a host-memory tier for evicted pages and state checkpoints. |
+| **Two engines per box** | Each engine is tensor-parallel over 32 logical NeuronCores, behind a session-affine router. |
+| **OpenAI API** | Chat and completions, streaming, tool calls and reasoning output. |
+| **Offline compile** | Every graph is built on a CPU host; the serving box loads them and compiles nothing by default. |
 
 ## Quickstart
 
-### 1. Build the image
+You need Docker, a `trn2.48xlarge` to serve on, and any x86_64 host to compile on. New to Trainium? Start with
+[docs/AWS.md](docs/AWS.md).
+
+**1. Build the image** (Neuron SDK 2.32 (neuronx-cc 2.27), Python 3.13)
 
 ```bash
+git clone https://github.com/RunanywhereAI/trnrt.git && cd trnrt
 docker build -f docker/Dockerfile \
   --build-arg TRNRT_VERSION=$(python3 -c 'import trnrt; print(trnrt.__version__)') \
   --build-arg TRNRT_REVISION=$(git rev-parse HEAD) -t trnrt .
 ```
 
-The build checks every Neuron piece trnRT imports and its version, and that the image's transformers has `glm5_next`
-(`docker/check_image.py`).
-
-### 2. Build the compile cache (CPU host)
-
-A graph depends on the weights' shapes and dtypes, never their values. So the cache is built from the checkpoint's
-config and safetensors headers (a few MB, read without downloading the weights) on a host without NeuronCores:
+**2. Build the compile cache** (any x86_64 host, no NeuronCore needed; takes hours)
 
 ```bash
-OUT=/data/trnrt            # everything goes under one directory
-REV=<GLM-5.3-Flash commit>
-mkdir -p $OUT/nki          # the NKI kernel binaries, shared by every step
-# each step: `python -m trnrt` in a new container of the image, with $OUT at the same path and $OUT/nki mounted
-trnrt() { docker run --rm -v $OUT:$OUT -v $OUT/nki:/var/tmp/nki-intermediate-cache trnrt "$@"; }
+OUT=/data/trnrt REV=eb9eb208eb0d988989d07a6a12d0fdeb5f52574a
+mkdir -p $OUT/nki $OUT/work
+trnrt() { docker run --rm -e HF_TOKEN -v $OUT:$OUT \
+  -v $OUT/nki:/var/tmp/nki-intermediate-cache trnrt "$@"; }
 trnrt compile shapes zai-org/GLM-5.3-Flash --revision $REV --out $OUT
-trnrt compile decisions --model zai-org/GLM-5.3-Flash --revision $REV --out $OUT   # a few range reads per MoE layer
-trnrt compile capture --out $OUT -- --model $OUT/shapes                            # every graph, all 32 ranks
-trnrt compile compile --out $OUT                                                    # neuronx-cc on each graph
-trnrt compile strip --out $OUT                                                      # drop the NEFFs' debug info
+trnrt compile decisions --model zai-org/GLM-5.3-Flash --revision $REV --out $OUT
+trnrt compile capture --out $OUT -- --model $OUT/shapes
+trnrt compile compile --out $OUT --work-root $OUT/work
+trnrt compile strip --out $OUT
 ```
 
-Each step is its own `docker run --rm`, so whatever a step leaves inside its container is gone by the next. A graph
-that calls an NKI kernel names the kernel's compiled binary by absolute path under `/var/tmp/nki-intermediate-cache`.
-The capture writes those binaries, and neuronx-cc adds its own kernels there while compiling. So `capture` and
-`compile` must see the same directory at that path: the host's `$OUT/nki`, mounted into every step above. Without it,
-or on another host without a copy of it, `compile` fails every such graph ("NKI kernel binaries missing"). To split the
-steps across hosts, copy `$OUT/nki` with the cache. A serving engine traces its graphs again and rewrites the
-directory; whether it needs the compile host's copy on a cache hit is [unverified], so `serve` below mounts it too.
-
-`compile` runs as many neuronx-cc processes at once as host memory admits. One can take tens of GB, so each
-reserves `--mem-per-compile-gb` (default 30) of MemAvailable, and one the OOM killer takes runs once more, alone.
-
-`strip` is not optional at 1M-token buckets: the runtime holds each loaded NEFF in host memory several times over, and
-two engines' unstripped NEFFs do not fit.
-
-The arguments after `capture --` must be the engine arguments the server runs with, spelled out in full. Capture refuses
-any other; the server's own, such as `--engines` and `--port`, do not change the graphs. The defaults are the served
-configuration, so `--model` alone is enough. For the batch-12 configuration ([Configuration](#configuration)), pass
-`--preset batch12` to both `capture` and `serve`.
-
-### 3. Serve (trn2.48xlarge)
-
-Copy `$OUT/cache` and `$OUT/nki` to the serving host, download the checkpoint at the same revision, and start the
-server:
+**3. Serve** (on the `trn2.48xlarge`, with `$OUT/cache` and `$OUT/nki` copied over)
 
 ```bash
-docker run --rm --privileged --network host \
-  -v /data/trnrt/cache:/cache -v /data/trnrt/nki:/var/tmp/nki-intermediate-cache -v /models/GLM-5.3-Flash:/model \
+hf download zai-org/GLM-5.3-Flash --revision eb9eb208eb0d988989d07a6a12d0fdeb5f52574a \
+  --local-dir /models/GLM-5.3-Flash
+docker run --rm --privileged --network host --ipc=host \
+  -v /data/trnrt/cache:/cache \
+  -v /data/trnrt/nki:/var/tmp/nki-intermediate-cache \
+  -v /models/GLM-5.3-Flash:/model \
   -e NEURON_LIBTORCH_CACHE_ROOT=/cache \
   trnrt serve --model /model --port 8000
 ```
 
-`serve` starts two engines, on logical NeuronCores 0-31 and 32-63, on ports 8001 and 8002 of the host, one at a time:
-each loads its weights and warms every compiled graph from the cache, and the next starts once it answers `/health`.
-Then the router answers on `--port`.
+**4. Call it** with any OpenAI client
 
-- **A graph missing from the cache fails start-up.** The engines run with `NEURON_LIBTORCH_ASSERT_CACHE_HIT=1`: instead
-  of compiling on the serving host (neuronx-cc, minutes to hours per graph), the engine stops and names the missing
-  key, and `serve` stops every engine and exits nonzero. The cache was built for other arguments, another checkpoint
-  revision, another trnRT version or another Neuron SDK, or `NEURON_LIBTORCH_CACHE_ROOT` does not point at it.
-  `--allow-compile` compiles the missing graphs on the spot instead; give it a `--startup-timeout` that allows for that
-  (0: none).
-- **`--startup-timeout`** (default 3600 s): how long each engine has, from its start, to answer `/health`. Past it,
-  `serve` stops every engine and exits nonzero.
-- The router's `/health` answers 200 while both engines are up, 200 with `"status": "degraded"` while one is (its
-  requests and sessions go to the other), and 503 while neither is. The body names the engines that are down.
-- SIGTERM (`docker stop`) stops the router, then each engine, and `serve` exits with status 143.
+```python
+from openai import OpenAI
 
-### 4. Use it
-
-```bash
-curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{
-  "model": "glm",
-  "messages": [{"role": "user", "content": "What is the weather in Paris?"}],
-  "tools": [{"type": "function", "function": {"name": "get_weather",
-             "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}],
-  "session_id": "my-agent-session-1",
-  "stream": true
-}'
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="unused")
+reply = client.chat.completions.create(
+    model="glm",
+    messages=[{"role": "user", "content": "Write a haiku about Trainium."}],
+    extra_body={"session_id": "my-session"},  # keeps a conversation on one engine's prefix cache
+)
+print(reply.choices[0].message.content)
 ```
 
-- `session_id` pins a conversation to one engine, so each turn resumes from the prefix cache. Without it, the router
-  routes by the longest prefix it has sent to each engine.
-- Reasoning comes back as `reasoning_content`, and tool calls as OpenAI `tool_calls`.
-- GLM-5.3-Flash always reasons: its chat template has no switch to turn thinking off, so
-  `"chat_template_kwargs": {"enable_thinking": false}` is refused. `"reasoning_effort"` sets how hard it reasons:
-  `"low"`, `"high"` or `"max"`, the default. Other values are refused, since the template would answer them at max.
-- `max_tokens` counts reasoning too. Without it, a chat request may generate up to the rest of the context
-  (`--max-model-len` minus the prompt), as vLLM does; a completion stops at 16 tokens, the OpenAI API's default.
-- A response cut off by `max_tokens` has `finish_reason` `"length"`, even when it ends in a tool call: that call may
-  be incomplete.
-- A client that disconnects aborts its request, streamed or not.
-- Endpoints: `/v1/chat/completions`, `/v1/completions`, `/v1/models`, `/health`, `/metrics` (Prometheus).
-- Not supported, answered with 400: repetition, frequency and presence penalties, guided decoding (`response_format`
-  other than text, `tool_choice` `"required"` or a named tool), prompt logprobs and thinking budgets. Every graph
-  samples on the device, and these need host inputs no served graph takes.
-- Status codes: 400 for a request that cannot be served as sent (a field of the wrong type or out of range, a prompt
-  longer than the context, a chat template variable the template never reads); 500 for an error inside the engine;
-  503 once the engine has failed, with the reason on `/health`.
+The full guide covers what each step needs, start-up checks, the batch 4, 8 and 12 configurations and every flag:
+[deploy](docs/DEPLOY.md) · [API](docs/API.md) · [configuration](docs/CONFIGURATION.md).
 
-## Configuration
+## Supported hardware and models
 
-Every `serve` default is the served configuration, decode batches of up to 8 requests per engine:
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/support-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="docs/assets/support-light.svg">
+    <img alt="Hardware: AWS Trainium2 (trn2.48xlarge, 16 chips, 96 GiB HBM each, Neuron SDK 2.32), supported. Models: GLM-5.3-Flash (320B MoE, 18B active, FP8, 1M-token context), supported. More open models: coming soon." src="docs/assets/support-dark.svg" width="100%">
+  </picture>
+</p>
 
-| Argument | Default | |
-|---|---|---|
-| `--engines`, `--tp` | 2, 32 | engines per host, tensor-parallel ranks per engine |
-| `--max-model-len` | 1048576 | context per request |
-| `--max-num-seqs`, `--decode-buckets` | 8; 1,2,4,6,8 | request seats per engine, compiled batch sizes |
-| `--max-running` | (`--max-num-seqs`) | requests running at once per engine; host only |
-| `--max-prefill-tokens`, `--prefill-buckets` | 4096; 512,1024,2048,4096 | prefill chunk per step, compiled chunk sizes |
-| `--page-size`, `--page-buckets`, `--prefill-page-buckets` | 256; 512,1024,4096; 1024,4096 | KV page, compiled context lengths in pages |
-| `--kv-cache-gb`, `--kv-cache-dtype` | 4.0, fp8 | KV pool per rank |
-| `--state-checkpoints` | 16 | linear-attention state rows kept for the prefix cache |
-| `--host-cache-gb` | 4.0 | host memory per rank under the prefix cache (half for state checkpoints) |
+| Target | Status |
+|---|---|
+| **AWS Trainium2**, `trn2.48xlarge` (16 chips, 2 engines × TP 32, LNC 2) | ✅ Supported |
+| **[GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash)** (320B MoE, 18B active, FP8, 1M-token context) | ✅ Supported, device check of this repository in progress |
+| More open models | 🔜 Coming soon. [Request a model](https://github.com/RunanywhereAI/trnrt/issues/new?template=30-model-request.yml) |
 
-The bucket ladders, the pool sizes and the page size are graph shapes: changing any of them needs a new capture.
-`python -m trnrt engine` runs one engine without the router.
+GLM-5.3-Flash is where TrnRT starts. The engine, router, caches and compile pipeline are built to carry more model
+families, and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#adding-a-model-family) describes what a new one needs.
 
-### Batch 12: `--preset batch12`
+## Benchmarks
 
-Decode batches of up to 12 requests per engine. The preset sets these engine arguments; everything else stays at the
-defaults above:
+[SemiAnalysis AgentX](https://github.com/SemiAnalysisAI/agentx-harness) replays real coding-agent sessions. One
+`trn2.48xlarge` ran it at a 1M-token context with 32 concurrent agents, for one hour per point:
 
-| Argument | Default | `--preset batch12` | |
-|---|---|---|---|
-| `--max-num-seqs` | 8 | 16 | request seats per engine (the state pool's rows) |
-| `--decode-buckets` | 1,2,4,6,8 | 1,2,4,6,8,12 | compiled decode batch sizes |
-| `--max-running` | (`--max-num-seqs`) | 12 | requests running at once per engine |
-| `--kda-shell-max-rows` | 8 | 12 | KDA layers' decode attention as one fused kernel up to this many rows |
-| `--dsa-layer-max-rows` | 8 | 16 | DSA layers' decode attention and FFN as one fused kernel up to this many rows |
-| `--ffn-half-below` | 16 | 17 | decode FFN blocks as one fused kernel below this many rows |
-| `--dsa-index-rows` | 0 | 8 | the DSA indexer's decode scores in kernel calls of at most this many rows (0: one call) |
+| Decode batch | Requests / min | Tokens / min | Decode tok/s per user (p50) | First token, cached (p50) | $ / M tokens (spot) |
+|---|---|---|---|---|---|
+| 4 | 19.3 | 2.36M | 46.6 | 76.73 s | $0.061 |
+| 8 | 25.2 | 3.02M | 29.4 | 28.82 s | $0.047 |
+| **12** (default) | **28.9** | **3.57M** | 22.3 | 6.53 s | **$0.040** |
 
-So every decode step of up to 12 rows runs on the same fused decode kernels as the default configuration's steps of up
-to 8. The preset has its own graphs: 16 seats change every graph that carries the linear-attention state, prefill
-graphs included, and the 12-row decode graphs are new. Capture and serve with the same preset (step 2's shape
-directory and `trnrt` function; its entries sit beside the default configuration's in the cache, under their own keys,
-and `$OUT/capture` then holds this capture's records):
+Tokens count input (cached input included) and output. Spot price: $8.60/h, us-east-2, 3 Nov 2026. On a capacity block
+at $35.76/h, the batch 12 cost is $0.167 per million tokens. Full tables, cold-prompt latencies, long prompts and
+methodology are in [docs/RESULTS.md](docs/RESULTS.md).
 
-```bash
-trnrt compile capture --out $OUT -- --model $OUT/shapes --preset batch12
-trnrt compile compile --out $OUT
-trnrt compile strip --out $OUT
-docker run ... trnrt serve --model /model --port 8000 --preset batch12   # the mounts and variables of step 3
+These numbers were measured with an earlier build of TrnRT. The graph-equivalence check read EQUAL for that build's
+batch-8 graphs on 4 of 32 ranks; the full 32-rank run, batch 12, and a device check of this repository are in progress
+([docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md#verification-status)).
+
+## How it works
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/architecture-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="docs/assets/architecture-light.svg">
+    <img alt="Clients reach a session-affine router on port 8000, which sends each session to one of two engines. Each engine is tensor-parallel over 32 logical NeuronCores on 8 chips. Offline, five steps build the compile cache the engines load." src="docs/assets/architecture-dark.svg" width="100%">
+  </picture>
+</p>
+
+Decode is not limited by memory bandwidth here; small instructions, kernel boundaries and exposed collectives dominate it. So
+each decode megakernel follows three rules: keep the working set in SBUF, use both physical cores symmetrically, and move
+the collectives into the kernel. [docs/MEGAKERNELS.md](docs/MEGAKERNELS.md) walks through every kernel.
+
+## Repository layout
+
+```text
+trnrt/
+├── __main__.py   CLI: serve, engine, compile
+├── serve/        OpenAI API, session-affine router, output parsers
+├── engine/       scheduler, prefix caches, tensor parallelism
+├── models/       GLM-5.3-Flash: KDA, DSA, mHC, MoE, FP8 loading
+├── kernels/      NKI decode megakernels and prefill kernels
+└── compile/      offline compile: shapes, capture, neuronx-cc, strip
+docker/           the serving and compile image
+tools/            graph-equivalence gate, device checks, doc checks
+tests/            CPU test suite (no NeuronCore needed)
+docs/             guides, results, kernel notes
 ```
 
-An argument given explicitly overrides the preset's value. `--max-running` is host only; any other override changes
-the graphs and needs its own capture. As for the defaults, the graph-equivalence gate's run on this configuration and
-an on-device check are pending.
+More in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-### Batch 4: `--max-running 4`
-
-`--max-running N` admits at most N requests at once per engine (never more than `--max-num-seqs`); the rest wait in
-arrival order. It changes no graph, so it runs on the compile cache of the configuration it is added to. Batch 4 is
-the default configuration with `--max-running 4`, on the default compile cache:
+## Development
 
 ```bash
-docker run ... trnrt serve --model /model --port 8000 --max-running 4   # the mounts and variables of step 3
+make dev     # editable install with test and lint tools (Python 3.13)
+make check   # lint, type-check, then the CPU test suite
 ```
 
-### Supported scope
+See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for the test tiers and CI, [CONTRIBUTING.md](CONTRIBUTING.md) to send a
+change, and [SECURITY.md](SECURITY.md) to report a vulnerability.
 
-Supported scope is these configurations: the defaults (decode batches of up to 8 requests per engine), the defaults
-with a lower `--max-running` (batch 4: `--max-running 4`), and `--preset batch12` (decode batches of up to 12). Larger
-decode batches, and values of `--kda-shell-max-rows`, `--dsa-layer-max-rows`, `--ffn-half-below` and
-`--dsa-index-rows` other than the defaults and the preset's, are not supported. A prefill MoE call of 512 rows runs one dedupe kernel call and one of 600 rows or more
-the grouped-GEMM kernel; a call of 129 to 256 rows, which no served bucket makes, runs 128-row dedupe calls.
+## AWS resources
 
-## Tests
+| Resource | Link |
+|---|---|
+| Trainium2 and `trn2` instances | [aws.amazon.com/ec2/instance-types/trn2](https://aws.amazon.com/ec2/instance-types/trn2/) |
+| AWS Neuron SDK documentation | [awsdocs-neuron.readthedocs-hosted.com](https://awsdocs-neuron.readthedocs-hosted.com/) |
+| NKI (Neuron Kernel Interface) | [NKI documentation](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/general/nki/index.html) |
+| Neuron deep learning containers | [github.com/aws-neuron/deep-learning-containers](https://github.com/aws-neuron/deep-learning-containers) |
+| EC2 Capacity Blocks for ML | [aws.amazon.com/ec2/capacityblocks](https://aws.amazon.com/ec2/capacityblocks/) |
 
-```bash
-pip install -e '.[test]'
-pytest
-```
+## Acknowledgments
 
-The CPU tests run without a NeuronCore. Engine tests use a tiny random model of GLM-5.3-Flash's architecture and need a
-transformers release with `glm5_next`.
+Thanks to the AWS Neuron team for NKI and its documentation, to Z.ai for releasing GLM-5.3-Flash, and to SemiAnalysis
+for AgentX and its public traces. TrnRT includes code derived from other Apache-2.0 projects: see [NOTICE](NOTICE)
+and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## License
 
-Apache License 2.0 (LICENSE). NOTICE and THIRD_PARTY_NOTICES.md list the code this repository derives from.
+[Apache License 2.0](LICENSE).
+
+<p align="center">
+  <br>
+  <a href="https://runanywhere.ai">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="docs/assets/runanywhere-lockup-dark.svg">
+      <source media="(prefers-color-scheme: light)" srcset="docs/assets/runanywhere-lockup-light.svg">
+      <img alt="RunAnywhere" src="docs/assets/runanywhere-lockup-dark.svg" height="32">
+    </picture>
+  </a>
+  <br>
+  <sub>Built by <a href="https://runanywhere.ai">RunAnywhere</a>.</sub>
+</p>
+
+<sub>AWS, Amazon Web Services, Trainium, Inferentia and Neuron are trademarks of Amazon.com, Inc. or its affiliates. The
+AWS logo appears here as published in AWS's Architecture Icons. TrnRT is an independent open-source project, not
+affiliated with or endorsed by Amazon Web Services.</sub>

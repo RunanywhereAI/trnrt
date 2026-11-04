@@ -56,9 +56,17 @@ def kernel_args(q_lat, kc2, rows, bias, rpi):
     kcp = kc2.reshape(kc2.shape[0] // ds.KP, ds.KP * R)
     NI = Np // rpi
     rows_t = rw.to(torch.int32).reshape(NI, rpi, NCH, 128).permute(0, 1, 3, 2).contiguous()
-    bias_t = bs.reshape(NI, rpi, NCH, 128, ds.KP).permute(0, 1, 2, 4, 3).reshape(NI, rpi, NCH * ds.KP * 128).contiguous()
+    bias_t = (
+        bs.reshape(NI, rpi, NCH, 128, ds.KP).permute(0, 1, 2, 4, 3).reshape(NI, rpi, NCH * ds.KP * 128).contiguous()
+    )
     eye = torch.eye(128).to(torch.bfloat16)
-    return dict(q_lat=q.reshape(NI, rpi, H, R).contiguous(), kc=kcp, rows_t=rows_t, bias=bias_t, identb=eye), Np
+    return {
+        "q_lat": q.reshape(NI, rpi, H, R).contiguous(),
+        "kc": kcp,
+        "rows_t": rows_t,
+        "bias": bias_t,
+        "identb": eye,
+    }, Np
 
 
 def _inputs(N, H, R, NS, fp8, seed):
@@ -143,7 +151,8 @@ def test_rows_per_iteration():
 def test_bias_bf16_lines_count_only_in_rev_bb():
     """The bf16-bias branch's lines (BB_TAG) count only in REV_BB, so REV, the rev of every fp32-bias call (the decode
     fallbacks), is the source without them."""
-    src = open(dns.__file__).read()
+    with open(dns.__file__) as f:
+        src = f.read()
     assert sum(ln.endswith(dns.BB_TAG) for ln in src.splitlines()) == 4
     assert dns.REV == dns._kernel_rev(False) != dns.REV_BB == dns._kernel_rev(True)
 
@@ -156,31 +165,45 @@ MINE = (KDIR / "dsa_slots_n_s2.py").read_text()
 
 # the three reads _row_nat rewrites: (served statement, natural-layout statement)
 READS = [
-    ('src=X["rows_t"].ap(pattern=[[NCH, 128], [1, NCH]], offset=k * 128 * NCH,',
-     'src=X["rows_t"].ap(pattern=[[1, 128], [128, NCH]], offset=k * 128 * NCH,'),
-    ('nisa.dma_copy(dst=br, src=X["bias"].ap(pattern=[[T, 1], [1, T]], offset=k * T, scalar_offset=it,\n'
-     '                                                   indirect_dim=0))',
-     'nisa.dma_copy(dst=br.ap(pattern=[[T, 1], [KP * 128, NCH], [128, KP], [1, 128]], offset=0),\n'
-     '                          src=X["bias"].ap(pattern=[[T, 1], [128 * KP, NCH], [1, KP], [KP, 128]], offset=k * T,\n'
-     '                                           scalar_offset=it, indirect_dim=0))'),
-    ('nisa.dma_copy(dst=S, src=X["bias"].ap(pattern=[[0, H], [1, T]], offset=k * T, scalar_offset=it,\n'
-     '                                                  indirect_dim=0))',
-     'nisa.dma_copy(dst=S.ap(pattern=[[T, H], [KP * 128, NCH], [128, KP], [1, 128]], offset=0),\n'
-     '                          src=X["bias"].ap(pattern=[[0, H], [128 * KP, NCH], [1, KP], [KP, 128]], offset=k * T,\n'
-     '                                           scalar_offset=it, indirect_dim=0))'),
+    (
+        'src=X["rows_t"].ap(pattern=[[NCH, 128], [1, NCH]], offset=k * 128 * NCH,',
+        'src=X["rows_t"].ap(pattern=[[1, 128], [128, NCH]], offset=k * 128 * NCH,',
+    ),
+    (
+        (
+            'nisa.dma_copy(dst=br, src=X["bias"].ap(pattern=[[T, 1], [1, T]], offset=k * T, scalar_offset=it,\n'
+            "                                                   indirect_dim=0))"
+        ),
+        (
+            "nisa.dma_copy(dst=br.ap(pattern=[[T, 1], [KP * 128, NCH], [128, KP], [1, 128]], offset=0),\n"
+            '                          src=X["bias"].ap(pattern=[[T, 1], [128 * KP, NCH], [1, KP], [KP, 128]], offset=k * T,\n'
+            "                                           scalar_offset=it, indirect_dim=0))"
+        ),
+    ),
+    (
+        (
+            'nisa.dma_copy(dst=S, src=X["bias"].ap(pattern=[[0, H], [1, T]], offset=k * T, scalar_offset=it,\n'
+            "                                                  indirect_dim=0))"
+        ),
+        (
+            "nisa.dma_copy(dst=S.ap(pattern=[[T, H], [KP * 128, NCH], [128, KP], [1, 128]], offset=0),\n"
+            '                          src=X["bias"].ap(pattern=[[0, H], [128 * KP, NCH], [1, KP], [KP, 128]], offset=k * T,\n'
+            "                                           scalar_offset=it, indirect_dim=0))"
+        ),
+    ),
 ]
 
 
 def _region(src: str) -> str:
     a = src.index("if dsn.dsa_slots_n_kernel is not None:")
-    return src[a:src.index("    dsa_slots_n_s_kernel = None", a)]
+    return src[a : src.index("    dsa_slots_n_s_kernel = None", a)]
 
 
 def _row_nat(slots: str) -> str:
     """dsa_slots._row renamed _row_nat with its three layout reads rewritten (code only), or "" if a read is missing."""
     a = slots.index("    def _row(X, it, k):")
     ends = [x for x in (slots.find("\n    def ", a + 10), slots.find("\n    @nki.jit", a + 10)) if x > 0]
-    r = _code(slots[a:min(ends) + 1]).replace("    def _row(X, it, k):", "    def _row_nat(X, it, k):", 1)
+    r = _code(slots[a : min(ends) + 1]).replace("    def _row(X, it, k):", "    def _row_nat(X, it, k):", 1)
     for old, new in READS:
         if r.count(old) != 1:
             return ""
@@ -193,8 +216,9 @@ def _expected(slots: str, served: str) -> str:
     fallback's bias is fp32), with _row_nat in _row's place."""
     k = "".join(ln for ln in _region(served).splitlines(True) if not ln.rstrip("\n").endswith(dns.BB_TAG))
     k = _code(k)
-    k = k.replace("from .dsa_slots import KTR, _pair, _psum, _row, _sb",
-                  "from .dsa_slots import KTR, _pair, _psum, _sb", 1)
+    k = k.replace(
+        "from .dsa_slots import KTR, _pair, _psum, _row, _sb", "from .dsa_slots import KTR, _pair, _psum, _sb", 1
+    )
     k = k.replace("    KP = ds.KP\n", "    KP = ds.KP\n    VE = nisa.vector_engine\n" + _row_nat(slots) + "\n", 1)
     k = k.replace("NCH = rows_t.shape[3]", "NCH = rows_t.shape[2]", 1)
     return k.replace("_row(X, it, k)", "_row_nat(X, it, k)", 1)
@@ -215,11 +239,15 @@ def test_kernel_is_the_served_kernel_with_the_natural_reads():
 def test_a_planted_change_breaks_the_pin(plant):
     slots, served, mine = SLOTS, SERVED, MINE
     if plant == "rows-left-served":
-        mine = MINE.replace("pattern=[[1, 128], [128, NCH]], offset=k * 128 * NCH", "pattern=[[NCH, 128], [1, NCH]], "
-                            "offset=k * 128 * NCH", 1)
+        mine = MINE.replace(
+            "pattern=[[1, 128], [128, NCH]], offset=k * 128 * NCH",
+            "pattern=[[NCH, 128], [1, NCH]], offset=k * 128 * NCH",
+            1,
+        )
     elif plant == "bias-strides-swapped":  # kp and p read in each other's order
-        mine = MINE.replace("[[T, 1], [128 * KP, NCH], [1, KP], [KP, 128]]", "[[T, 1], [128 * KP, NCH], [KP, KP], "
-                            "[1, 128]]", 1)
+        mine = MINE.replace(
+            "[[T, 1], [128 * KP, NCH], [1, KP], [KP, 128]]", "[[T, 1], [128 * KP, NCH], [KP, KP], [1, 128]]", 1
+        )
     elif plant == "row-drift":  # dsa_slots._row moves, the copy does not
         slots = SLOTS.replace("x = k % 2", "x = (k + 1) % 2", 1)
     else:
@@ -229,30 +257,41 @@ def test_a_planted_change_breaks_the_pin(plant):
 
 
 def test_s2_rev_is_its_own():
-    assert dn2.REV == zlib.crc32(_region(MINE).encode()) ^ dns.REV
+    assert zlib.crc32(_region(MINE).encode()) ^ dns.REV == dn2.REV
     assert dn2.REV not in (dns.REV, dsn.REV)
 
 
 def test_attend_lays_out_naturally_only_for_the_natural_kernel():
     """dsa_slots_n.attend's layouts under _nat are the two plain reshapes; the served permutes otherwise."""
-    f = next(n for n in ast.walk(ast.parse((KDIR / "dsa_slots_n.py").read_text()))
-             if isinstance(n, ast.FunctionDef) and n.name == "attend")
+    f = next(
+        n
+        for n in ast.walk(ast.parse((KDIR / "dsa_slots_n.py").read_text()))
+        if isinstance(n, ast.FunctionDef) and n.name == "attend"
+    )
     br = [n for n in ast.walk(f) if isinstance(n, ast.If) and ast.unparse(n.test) == "_nat(fallback)"]
     assert len(br) == 1
     assert [ast.unparse(s) for s in br[0].body] == [
         "rows_t = rw.to(torch.int32).reshape(NI, rpi, NCH, 128).contiguous()",
-        "bias_t = bs.reshape(NI, rpi, NCH * 128 * KP).contiguous()"]
+        "bias_t = bs.reshape(NI, rpi, NCH * 128 * KP).contiguous()",
+    ]
     assert [ast.unparse(s) for s in br[0].orelse] == [
         "rows_t = rw.to(torch.int32).reshape(NI, rpi, NCH, 128).permute(0, 1, 3, 2).contiguous()",
-        "bias_t = bs.reshape(NI, rpi, NCH, 128, KP).permute(0, 1, 2, 4, 3).reshape(NI, rpi, NCH * KP * 128)"
-        ".contiguous()"]
+        (
+            "bias_t = bs.reshape(NI, rpi, NCH, 128, KP).permute(0, 1, 2, 4, 3).reshape(NI, rpi, NCH * KP * 128)"
+            ".contiguous()"
+        ),
+    ]
 
 
 def test_only_dsa_slots_c_passes_a_fallback_site():
     """dsa_slots_c's fallback is the "c" site; the model's calls (the context-parallel prefill's) pass none."""
+
     def calls(path):
-        return [n for n in ast.walk(ast.parse(path.read_text())) if isinstance(n, ast.Call)
-                and ast.unparse(n.func) == "dsa_slots_n.attend"]
+        return [
+            n
+            for n in ast.walk(ast.parse(path.read_text()))
+            if isinstance(n, ast.Call) and ast.unparse(n.func) == "dsa_slots_n.attend"
+        ]
 
     def fb(c):
         return next((ast.unparse(k.value) for k in c.keywords if k.arg == "fallback"), None)
@@ -267,8 +306,11 @@ def _natural(args: dict, NI: int, rpi: int) -> dict:
     """The served kernel arguments with rows_t and bias back in attend's natural layout (its _nat branch)."""
     rt, bt = args["rows_t"], args["bias"]
     NCH = rt.shape[3]
-    return dict(args, rows_t=rt.permute(0, 1, 3, 2).contiguous(),
-                bias=bt.reshape(NI, rpi, NCH, ds.KP, 128).permute(0, 1, 2, 4, 3).reshape(NI, rpi, -1).contiguous())
+    return dict(
+        args,
+        rows_t=rt.permute(0, 1, 3, 2).contiguous(),
+        bias=bt.reshape(NI, rpi, NCH, ds.KP, 128).permute(0, 1, 2, 4, 3).reshape(NI, rpi, -1).contiguous(),
+    )
 
 
 def test_the_natural_arguments_differ_from_the_served_ones():
@@ -284,7 +326,9 @@ def test_the_natural_arguments_differ_from_the_served_ones():
 
 
 @needs_nki
-@pytest.mark.parametrize("fp8,lse,N,n", [(1, 1, 8, 8), (0, 1, 7, 3), (1, 0, 12, 6)])  # RPI 4: 2/2, 1/2, 2/3 iterations
+@pytest.mark.parametrize(
+    ("fp8", "lse", "N", "n"), [(1, 1, 8, 8), (0, 1, 7, 3), (1, 0, 12, 6)]
+)  # RPI 4: 2/2, 1/2, 2/3 iterations
 def test_split_rows_are_the_whole_kernel(monkeypatch, fp8, lse, N, n):
     """dsa_slots_n_s at grid 2 gives dsa_slots_n's bits, o and lse, over the rows the run-time count covers, fp8 and bf16
     latents, a count below the buffer's rows and an odd row count (padding) included."""
@@ -301,9 +345,9 @@ def test_split_rows_are_the_whole_kernel(monkeypatch, fp8, lse, N, n):
     two = nki.simulate(dns.dsa_slots_n_s_kernel[2])(**kw, rev=dns.REV)
     one, two = (one, two) if lse else ((one,), (two,))
     rows_run = int(it) * rpi  # the rows the run-time count covers (the rest are never written)
-    for a, b in zip(one, two):
-        a = torch.as_tensor(a).reshape(Np, H, -1)[:rows_run]
-        b = torch.as_tensor(b).reshape(Np, H, -1)[:rows_run]
+    for a_out, b_out in zip(one, two):
+        a = torch.as_tensor(a_out).reshape(Np, H, -1)[:rows_run]
+        b = torch.as_tensor(b_out).reshape(Np, H, -1)[:rows_run]
         assert torch.equal(a, b), (fp8, lse, N, n, (a != b).sum().item())
     ref = dsn.emulate(q, kc.float() if not fp8 else kc, rows, bias, 0.05, torch.tensor(n), bool(lse))
     ref = ref[0] if lse else ref
@@ -312,7 +356,7 @@ def test_split_rows_are_the_whole_kernel(monkeypatch, fp8, lse, N, n):
 
 
 @needs_nki
-@pytest.mark.parametrize("fp8,N,n", [(1, 20, 20), (0, 18, 13)])  # RPI 16: one full / one partial + padding
+@pytest.mark.parametrize(("fp8", "N", "n"), [(1, 20, 20), (0, 18, 13)])  # RPI 16: one full / one partial + padding
 def test_bias_bf16_is_the_fp32_bias(monkeypatch, fp8, N, n):
     """The split kernel at grid 2 with the bias in bf16 (a prefill call's, at RPI_PREFILL 16) against the same call in
     fp32: o bit for bit on every row the run-time count covers, fully masked and padded rows included; lse on every row
@@ -353,7 +397,7 @@ def test_bias_bf16_is_the_fp32_bias(monkeypatch, fp8, N, n):
 
 
 @needs_nki
-@pytest.mark.parametrize("fp8,lse,N,n", [(1, 1, 8, 8), (0, 1, 7, 3), (1, 0, 12, 6), (1, 1, 8, 5)])
+@pytest.mark.parametrize(("fp8", "lse", "N", "n"), [(1, 1, 8, 8), (0, 1, 7, 3), (1, 0, 12, 6), (1, 1, 8, 5)])
 def test_natural_layout_kernel_is_the_split_kernel_bit_for_bit(monkeypatch, fp8, lse, N, n):
     import nki
 
@@ -368,9 +412,9 @@ def test_natural_layout_kernel_is_the_split_kernel_bit_for_bit(monkeypatch, fp8,
     nat = nki.simulate(dn2.dsa_slots_n_s_kernel[2])(**_natural(kw, Np // rpi, rpi), rev=dn2.REV)
     served, nat = (served, nat) if lse else ((served,), (nat,))
     rows_run = int(it) * rpi
-    for a, b in zip(served, nat):
-        a = torch.as_tensor(a).reshape(Np, H, -1)[:rows_run]
-        b = torch.as_tensor(b).reshape(Np, H, -1)[:rows_run]
+    for a_out, b_out in zip(served, nat):
+        a = torch.as_tensor(a_out).reshape(Np, H, -1)[:rows_run]
+        b = torch.as_tensor(b_out).reshape(Np, H, -1)[:rows_run]
         assert torch.equal(a.view(torch.int32), b.view(torch.int32)), (fp8, lse, N, n, (a != b).sum().item())
 
 
@@ -397,7 +441,7 @@ def _slots_c_case(N=6, H=8, R=128, NS=256, pools=512, seed=1, dtype=torch.float3
 def test_slots_c_plan():
     """dsa_slots_c.plan: every live slot of a row exactly once in its compacted list (pool row and live tokens), the
     rest row 0 with nv 0, partition-major order; `fits` false past C live slots."""
-    q, kc, rows, bias = _slots_c_case(N=7, NS=640)
+    _q, _kc, rows, bias = _slots_c_case(N=7, NS=640)
     bias[6, :300] = 0.0  # over C
     nv = dsa_slots_c.live_tokens(bias)
     crow, cnv, fits = dsa_slots_c.plan(rows, nv)
@@ -528,17 +572,17 @@ def test_emulate_is_reference_on_its_scores():
     g = torch.Generator().manual_seed(4)
     N, Hi, D, P, keep = 12, 32, 128, 3000, 64
     q = torch.randn(N, Hi, D, generator=g).to(torch.bfloat16)
-    w = torch.randn(N, Hi, generator=g) * Hi ** -0.5
+    w = torch.randn(N, Hi, generator=g) * Hi**-0.5
     pk = torch.randn(P, D, generator=g).to(torch.bfloat16)
     npool = torch.tensor([0, 1, 63, 64, 65, 1500, 2999, 3000, 3000, 700, 9, 2048])
-    pools, cnt, vals = dl.emulate(q, w, pk, npool, keep, 128 ** -0.5)
+    pools, cnt, vals = dl.emulate(q, w, pk, npool, keep, 128**-0.5)
     cand = torch.where(torch.arange(P).view(1, P) < npool.view(N, 1), 0.0, NEG)
-    sc = dl.emulate_scores(q, w, pk, cand, 128 ** -0.5)
+    sc = dl.emulate_scores(q, w, pk, cand, 128**-0.5)
     rp, rc = dsa_long.select_reference(sc, keep)
     assert torch.equal(pools, rp) and torch.equal(cnt, rc) and torch.equal(cnt, npool.clamp(max=keep))
     k = torch.arange(keep).view(1, keep)
     assert torch.equal(vals, torch.where(k < cnt.view(N, 1), sc.gather(1, pools), NEG))
-    ref = dsa_long.scores(q, w, pk, npool, 128 ** -0.5)
+    ref = dsa_long.scores(q, w, pk, npool, 128**-0.5)
     vis = cand == 0
     assert ((ref - sc).abs()[vis] <= 1e-5 * ref[vis].abs().clamp(min=1)).all()  # the model's scores, to fp32 order
 
@@ -580,8 +624,9 @@ def test_value_order():
         pairs = list(zip(b_v[n, :c].tolist(), b_p[n, :c].tolist()))
         assert pairs == sorted(pairs, key=lambda x: (-x[0], x[1]))
         assert (b_p[n, c:] == 0).all() and (b_v[n, c:] < -1e29).all()
-        assert dict(zip(b_p[n, :c].tolist(), b_v[n, :c].tolist())) == dict(zip(a_p[n, :c].tolist(),
-                                                                                a_v[n, :c].tolist()))
+        assert dict(zip(b_p[n, :c].tolist(), b_v[n, :c].tolist())) == dict(
+            zip(a_p[n, :c].tolist(), a_v[n, :c].tolist())
+        )
 
 
 def test_long_pipe_dispatch(monkeypatch):
@@ -608,7 +653,7 @@ def _pipe_inputs(NT, Hi, P, keep, seed):
 
 
 @needs_nki
-@pytest.mark.parametrize("NT,sub,ktall,vorder", [(2, 8, 1, 0), (3, 8, 0, 1), (4, 0, 1, 0)])
+@pytest.mark.parametrize(("NT", "sub", "ktall", "vorder"), [(2, 8, 1, 0), (3, 8, 0, 1), (4, 0, 1, 0)])
 def test_split_tiles_are_the_whole_kernel(monkeypatch, NT, sub, ktall, vorder):
     """dsa_long_pipe_s at grid 2 gives dsa_long_pipe's grid-1 bits, pools and scores, over two-level and one-level
     selection, an odd tile count, value order, both K^T forms and rows with fewer visible pools than keep."""
@@ -620,16 +665,24 @@ def test_split_tiles_are_the_whole_kernel(monkeypatch, NT, sub, ktall, vorder):
     Hi, P, keep = 4, 2048, 64
     assert dl.supported(Hi, 128, P, keep, sub)
     qI, w, pk, npool = _pipe_inputs(NT, Hi, P, keep, seed=NT)
-    kw = dict(dl.kernel_inputs(qI, w, pk, npool), keep=keep, scale=0.088, sub=sub or dl.CH,
-              lsub=(sub or dl.CH).bit_length() - 1, one=int(sub == 0), per_chunk=dlp.PER_CHUNK, ktall=ktall,
-              vorder=vorder)
+    kw = dict(
+        dl.kernel_inputs(qI, w, pk, npool),
+        keep=keep,
+        scale=0.088,
+        sub=sub or dl.CH,
+        lsub=(sub or dl.CH).bit_length() - 1,
+        one=int(sub == 0),
+        per_chunk=dlp.PER_CHUNK,
+        ktall=ktall,
+        vorder=vorder,
+    )
     one = nki.simulate(dlp.dsa_long_pipe_kernel)(**kw, rev=dlp.REV)
     two = nki.simulate(dsa_long_pipe_s.dsa_long_pipe_s_kernel[2])(**kw, rev=dsa_long_pipe_s.REV)
-    for name, a, b in zip(("pools", "scores"), one, two):
-        a, b = torch.as_tensor(a), torch.as_tensor(b)
+    for name, a_out, b_out in zip(("pools", "scores"), one, two):
+        a, b = torch.as_tensor(a_out), torch.as_tensor(b_out)
         assert torch.equal(a, b), (NT, sub, name, (a != b).sum().item())
     pools = torch.as_tensor(two[0]).reshape(NT * 128, keep)
     cnt = npool.clamp(max=keep)
     for r in range(0, NT * 128, 37):  # the tiles hold a selection (sanity, not the claim)
-        got = pools[r, :int(cnt[r])]
+        got = pools[r, : int(cnt[r])]
         assert ((got >= 0) & (got < int(npool[r]))).all(), r

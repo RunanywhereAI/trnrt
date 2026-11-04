@@ -13,7 +13,7 @@ import pytest
 
 pytest.importorskip("transformers.models.glm5_next.modeling_glm5_next")
 
-PS = 4   # tests/test_glm5_next.py engine(): page_size 4, max_prefill_tokens 8
+PS = 4  # tests/test_glm5_next.py engine(): page_size 4, max_prefill_tokens 8
 
 
 def sp(n=12, **kw):
@@ -69,17 +69,17 @@ def two_turns(eng, p1, n1, tail, edit=None):
 def altered(reply):
     """The reply with its third token changed: a replay that differs inside the reply."""
     out = list(reply)
-    out[2] = (out[2] + 1) % 384   # tests/test_glm5_next.py SMALL vocab
+    out[2] = (out[2] + 1) % 384  # tests/test_glm5_next.py SMALL vocab
     return out
 
 
-@pytest.mark.parametrize("p_len", [29, 28])   # unaligned, and ending exactly on a page boundary
+@pytest.mark.parametrize("p_len", [29, 28])  # unaligned, and ending exactly on a page boundary
 def test_a_replayed_reply_resumes_from_the_finish_checkpoint(glm, p_len):
     (p1,), (tail,) = mk(81, (p_len,)), mk(82, (6,))
     eng = eng_(glm)
     try:
         r1, r2, p2 = two_turns(eng, p1, 13, tail)
-        fed = len(p1) + len(r1.output_ids) - 1        # the last sampled token is never fed
+        fed = len(p1) + len(r1.output_ids) - 1  # the last sampled token is never fed
         assert r2.num_cached_tokens == page_floor(fed), (r2.num_cached_tokens, fed)
         assert r2.output_ids == cold(glm, p2, 8)
         assert r1.output_ids == cold(glm, p1, 13)
@@ -96,7 +96,7 @@ def test_a_reply_that_differs_resumes_from_the_prompt_end_checkpoint(glm, p_len)
     (p1,), (tail,) = mk(81, (p_len,)), mk(82, (6,))
     eng = eng_(glm)
     try:
-        r1, r2, p2 = two_turns(eng, p1, 13, tail, edit=altered)
+        _, r2, p2 = two_turns(eng, p1, 13, tail, edit=altered)
         assert r2.num_cached_tokens == page_floor(len(p1) - 1), (r2.num_cached_tokens, len(p1))
         assert r2.output_ids == cold(glm, p2, 8)
         print(f"prompt {len(p1)}: the altered replay resumed at {r2.num_cached_tokens}")
@@ -111,8 +111,9 @@ def test_free_dominated_without_the_anchor_rule_would_lose_the_prompt_end_checkp
 
     (p1,), (tail,) = mk(81, (29,)), mk(82, (6,))
     real = RadixCache.attach_checkpoint
-    monkeypatch.setattr(RadixCache, "attach_checkpoint",
-                        lambda self, ids, n, row, anchor=False: real(self, ids, n, row, anchor=False))
+    monkeypatch.setattr(
+        RadixCache, "attach_checkpoint", lambda self, ids, n, row, anchor=False: real(self, ids, n, row, anchor=False)
+    )
     eng = eng_(glm)
     try:
         _, r2, p2 = two_turns(eng, p1, 13, tail, edit=altered)
@@ -129,9 +130,9 @@ def test_free_dominated_keeps_one_prompt_end_checkpoint_per_path(glm):
     eng = eng_(glm)
     try:
         prompt = p1
-        for tail in [None] + tails:
-            if tail is not None:
-                prompt = prompt + list(r.output_ids) + tail
+        (r,) = eng.generate([prompt], sp(9))
+        for tail in tails:
+            prompt = prompt + list(r.output_ids) + tail
             (r,) = eng.generate([prompt], sp(9))
         anchors = [n for n in _nodes(eng.scheduler.radix) if n.ckpt is not None and n.anchor]
         assert len(anchors) == 1 and _depth(anchors[0]) == page_floor(len(prompt) - 1)

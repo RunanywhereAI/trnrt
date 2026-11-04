@@ -43,7 +43,6 @@ def checkpoint_experts(E=6, H=1024, Im=64, seed=0):
     from trnrt.models.quant import fit_e4m3_max
 
     g = torch.Generator().manual_seed(seed)
-    C = H // 128
 
     def blocks(rows, cols, shard_rows, shard_cols):
         """A [rows, cols] checkpoint weight quantized per 128 x 128 block, its shard and row scales."""
@@ -53,12 +52,12 @@ def checkpoint_experts(E=6, H=1024, Im=64, seed=0):
         cw = codes[shard_rows, shard_cols]
         rs = bs.repeat_interleave(128, 0)[shard_rows]  # [n, k / 128] per row
         if shard_cols.stop - shard_cols.start < 128:  # inside one block: that block's scale
-            rs = rs[:, shard_cols.start // 128:shard_cols.start // 128 + 1]
-        true = cw.float() * rs.repeat_interleave(min(128, cw.shape[1]), 1)[:, :cw.shape[1]]
+            rs = rs[:, shard_cols.start // 128 : shard_cols.start // 128 + 1]
+        true = cw.float() * rs.repeat_interleave(min(128, cw.shape[1]), 1)[:, : cw.shape[1]]
         return fit_e4m3_max(cw, rs, 240.0), true
 
     gus, gss, ds, dss, tgu, td = [], [], [], [], [], []
-    for e in range(E):
+    for _e in range(E):
         (wg, sg), tg = blocks(128, H, slice(0, Im), slice(0, H))  # the rank's gate rows of a 2 x Im block
         (wu, su), tu = blocks(128, H, slice(Im, 2 * Im), slice(0, H))
         (wd, sd), tdd = blocks(H, 128, slice(0, H), slice(0, Im))  # down [H, I]: the rank's Im columns
@@ -100,13 +99,19 @@ def reference(x, topv, topi, w_gu, s_gu, w_down, s_down, lim=None):
     return out
 
 
-@pytest.mark.parametrize("T,E,K,B", [(128, 6, 4, 64), (256, 6, 4, 128), (256, 288, 8, 64), (512, 16, 8, 128)])
+@pytest.mark.parametrize(
+    ("T", "E", "K", "B"), [(128, 6, 4, 64), (256, 6, 4, 128), (256, 288, 8, 64), (512, 16, 8, 128)]
+)
 @pytest.mark.parametrize("skew", [False, True])
 def test_plan_matches_the_reference(T, E, K, B, skew):
     g = torch.Generator().manual_seed(T + E)
     if skew:
-        topi = torch.stack([torch.cat([torch.zeros(1, dtype=torch.long), torch.randperm(E - 1, generator=g)[: K - 1] + 1])
-                            for _ in range(T)])
+        topi = torch.stack(
+            [
+                torch.cat([torch.zeros(1, dtype=torch.long), torch.randperm(E - 1, generator=g)[: K - 1] + 1])
+                for _ in range(T)
+            ]
+        )
     else:
         topi = torch.stack([torch.randperm(E, generator=g)[:K] for _ in range(T)])
     got, want = mp.plan(topi, E, B), mp.plan_reference(topi, E, B)
@@ -118,7 +123,7 @@ def test_plan_matches_the_reference(T, E, K, B, skew):
     # the routing in whole 128-lane tiles; tpos indexes the kernel's [lane in tile, tile] table
     assert len(set(slot.flatten().tolist())) == T * K
     assert torch.equal(bexp[0][(slot // B).long()], topi.to(torch.int32))
-    assert NB == mp.n_blocks(T * K, E, B) and (NB * B) % 128 == 0
+    assert mp.n_blocks(T * K, E, B) == NB and (NB * B) % 128 == 0
     NTL = NB * B // 128
     assert torch.equal(tpos, (slot % 128) * NTL + slot // 128)
 
@@ -143,7 +148,7 @@ def test_plan_fits_the_worst_routing():
     assert torch.equal(bexp[0][(slot // B).long()], topi.to(torch.int32))
 
 
-@pytest.mark.parametrize("act,lim", [(0, None), (1, 10.0), (1, 0.05)])
+@pytest.mark.parametrize(("act", "lim"), [(0, None), (1, 10.0), (1, 0.05)])
 @pytest.mark.parametrize("dq", [False, True])
 def test_emulation_matches_fp32(act, lim, dq):
     ws = experts()
@@ -154,7 +159,7 @@ def test_emulation_matches_fp32(act, lim, dq):
     assert (got - ref).abs().max() <= 0.01 * ref.abs().max()
 
 
-@pytest.mark.parametrize("act,lim", [(0, 0.0), (1, 0.05)])
+@pytest.mark.parametrize(("act", "lim"), [(0, 0.0), (1, 0.05)])
 def test_emulation_is_the_dedupe_arithmetic(act, lim):
     """emulate (one expert at a time) equals moe_dedupe.emulate(pair_bf16=True) (every pair at once)
     up to fp32 summation order."""
@@ -202,8 +207,8 @@ def test_the_loaded_glm_layout():
     assert down is not None and sorted(set(down[1].float().flatten().tolist())) == [1.0, 2.0]
     # the loaded weights dequantize to the checkpoint's values but for halved subnormal codes
     dg, dd = dequant(w_gu, s_gu, torch.float32), dequant_t(w_down, s_down, torch.float32)
-    assert (dg - true_gu).abs().max() <= 2.0 ** -10 * s_gu.max()
-    assert (dd - true_down.transpose(1, 2)).abs().max() <= 2.0 ** -10 * s_down.max()
+    assert (dg - true_gu).abs().max() <= 2.0**-10 * s_gu.max()
+    assert (dd - true_down.transpose(1, 2)).abs().max() <= 2.0**-10 * s_down.max()
     for act, lim in [(0, None), (1, 0.05)]:
         x, topv, topi = routing(24)
         got = mp.emulate(x, topv, topi, blob, act, lim or 0.0).float()
@@ -238,10 +243,19 @@ def test_pack_experts_records_the_prefill_path(fmt):
 
 
 @pytest.mark.skipif(importlib.util.find_spec("nki") is None, reason="needs the NKI package (Neuron venv)")
-@pytest.mark.parametrize("act,lim,skew,B,fmt", [(0, 0.0, False, 64, "dq"), (1, 0.05, True, 64, "dq"),
-                                               (0, 0.0, False, 128, "dq"), (1, 0.05, False, 64, "rows"),
-                                               (0, 0.0, True, 128, "rows"), (1, 0.05, False, 64, "loaded"),
-                                               (0, 0.0, True, 128, "loaded"), (1, 10.0, True, 64, "loaded")])
+@pytest.mark.parametrize(
+    ("act", "lim", "skew", "B", "fmt"),
+    [
+        (0, 0.0, False, 64, "dq"),
+        (1, 0.05, True, 64, "dq"),
+        (0, 0.0, False, 128, "dq"),
+        (1, 0.05, False, 64, "rows"),
+        (0, 0.0, True, 128, "rows"),
+        (1, 0.05, False, 64, "loaded"),
+        (0, 0.0, True, 128, "loaded"),
+        (1, 10.0, True, 64, "loaded"),
+    ],
+)
 def test_nki_simulator_matches_emulation(act, lim, skew, B, fmt, monkeypatch):
     """fmt dq: GLM-format scales (the dequantize-first path); rows: fp32 per-row gate_up scales; loaded:
     GLM-5.3-Flash's experts as the loader leaves them (checkpoint_experts: per-row gate_up scales and
@@ -269,8 +283,10 @@ def test_nki_simulator_matches_emulation(act, lim, skew, B, fmt, monkeypatch):
 
 
 @pytest.mark.skipif(importlib.util.find_spec("nki") is None, reason="needs the NKI package (Neuron venv)")
-@pytest.mark.parametrize("B,fmt,order,nyb", [(128, "loaded", 1, 3), (64, "loaded", 1, 3), (128, "loaded", 1, 0),
-                                             (128, "dq", 1, 2), (64, "rows", 0, 2)])
+@pytest.mark.parametrize(
+    ("B", "fmt", "order", "nyb"),
+    [(128, "loaded", 1, 3), (64, "loaded", 1, 3), (128, "loaded", 1, 0), (128, "dq", 1, 2), (64, "rows", 0, 2)],
+)
 def test_nki_simulator_round_order_and_output_ring(B, fmt, order, nyb, monkeypatch):
     """The order of each pipeline round's instructions (kernel argument ord_; served 1) and the ring of stage C output
     buffers (nyb; served 3) leave the kernel's output as the plain form's (0, 0), bit for bit: the same operations reach

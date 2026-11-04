@@ -48,7 +48,7 @@ _CTX = None
 
 
 class _Ctx:
-    __slots__ = ("pool", "key", "j", "occ", "args")
+    __slots__ = ("args", "j", "key", "occ", "pool")
 
     def __init__(self, pool, key, j):
         self.pool, self.key, self.j = pool, key, j
@@ -77,7 +77,7 @@ class Pool:
 
     def begin(self, name: str, key, bound) -> int | None:
         """Open a call: its slot (None when this call is not pooled), after waiting for the slot's previous call."""
-        global _CTX
+        global _CTX  # noqa: PLW0603  # the call in flight, process-wide: the proxy reads it (tests read it too)
         j = None
         if self.k > 0 and name in self.names:
             n = self.count.get(key, 0)
@@ -130,16 +130,24 @@ class Pool:
         walk(args)
 
     def end(self, key, j: int | None, bound) -> None:
-        global _CTX
+        global _CTX  # noqa: PLW0603  # see begin
         _CTX = None
         if j is not None and bound is not None:
             self.last[(key, j)] = bound.n - 1
 
     def stats(self) -> dict:
-        return {"k": self.k, "names": sorted(self.names), "rank": self.rank, "calls": self.calls, "waits": self.waits,
-                "wait_s": round(self.wait_s, 4), "wait_max_ms": round(1000 * self.wait_max, 3),
-                "reallocs": self.reallocs, "fallback": dict(self.fallback),
-                "slots": {str(k): min(n, self.k) for k, n in list(self.count.items())}}
+        return {
+            "k": self.k,
+            "names": sorted(self.names),
+            "rank": self.rank,
+            "calls": self.calls,
+            "waits": self.waits,
+            "wait_s": round(self.wait_s, 4),
+            "wait_max_ms": round(1000 * self.wait_max, 3),
+            "reallocs": self.reallocs,
+            "fallback": dict(self.fallback),
+            "slots": {str(k): min(n, self.k) for k, n in list(self.count.items())},
+        }
 
 
 class PooledExecutor:

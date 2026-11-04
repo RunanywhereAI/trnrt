@@ -38,6 +38,9 @@ import re
 import shlex
 import subprocess
 import sys
+from contextlib import suppress
+from itertools import pairwise
+from typing import Any
 
 NKI_TARGET = "AwsNeuronCustomNativeKernel"
 _B64 = re.compile(rb"eyJ[A-Za-z0-9+/=]+")
@@ -74,6 +77,7 @@ class Names:
 
 # ---- captures ----
 
+
 def load_capture(root, cache_subdir):
     ranks = {}
     for p in glob.glob(os.path.join(root, "capture", "rank*.json")):
@@ -87,7 +91,9 @@ def load_capture(root, cache_subdir):
 
 def pair(ref_ranks, new_ranks):
     """[(rank, index, ref_key, new_key)], plus problems (rank sets, lengths, one key paired two ways)."""
-    pairs, problems, seen_r, seen_n = [], [], {}, {}
+    pairs, problems = [], []
+    seen_r: dict[str, str] = {}
+    seen_n: dict[str, str] = {}
     if set(ref_ranks) != set(new_ranks):
         problems.append(f"rank sets differ: {sorted(ref_ranks)} vs {sorted(new_ranks)}")
     for r in sorted(set(ref_ranks) & set(new_ranks)):
@@ -105,11 +111,13 @@ def pair_by_signature(ref_ranks, new_ranks, sig_ref, sig_new):
     """As pair(), but each rank's graphs match by input signature (example_inputs.txt) rather than by visit order, with
     visit order breaking ties between graphs that share a signature. For a new tree whose warmup visits buckets in
     another order."""
-    pairs, problems, seen_r, seen_n = [], [], {}, {}
+    pairs, problems = [], []
+    seen_r: dict[str, str] = {}
+    seen_n: dict[str, str] = {}
     if set(ref_ranks) != set(new_ranks):
         problems.append(f"rank sets differ: {sorted(ref_ranks)} vs {sorted(new_ranks)}")
     for r in sorted(set(ref_ranks) & set(new_ranks)):
-        pool = {}
+        pool: dict[Any, list[str]] = {}
         for kb in new_ranks[r]:
             pool.setdefault(sig_new(kb), []).append(kb)
         for i, ka in enumerate(ref_ranks[r]):
@@ -128,6 +136,7 @@ def pair_by_signature(ref_ranks, new_ranks, sig_ref, sig_new):
 
 
 # ---- HLO ----
+
 
 def _decode_bc(bc):
     for m in _B64.finditer(bc):
@@ -159,7 +168,7 @@ def _norm_kernel_config(cfg, names):
         for k in [k for k in klir if "rev" in k.lower()]:
             klir.pop(k)
         cfg["klir_binary"] = klir
-    for k in [k for k in cfg if "rev" == k.lower()]:
+    for k in [k for k in cfg if k.lower() == "rev"]:
         cfg.pop(k)
     return cfg, path
 
@@ -178,10 +187,8 @@ def normalize_hlo(path, names, pb2):
     kernels = []
     entry = m.entry_computation_id
     for fld in ("name", "id", "entry_computation_name", "stack_frame_index", "schedule", "profile_info"):
-        try:
+        with suppress(ValueError):  # a field this proto version does not have
             m.ClearField(fld)
-        except ValueError:  # a field this proto version does not have
-            pass
     m.entry_computation_id = cid.get(entry, -1)
     for i, c in enumerate(m.computations):
         c.name = f"c{i}"
@@ -199,7 +206,9 @@ def normalize_hlo(path, names, pb2):
             for k in list(ins.frontend_attributes.map.keys()):
                 ins.frontend_attributes.map[k] = names.name(ins.frontend_attributes.map[k])
             if ins.opcode == "custom-call" and ins.custom_call_target == NKI_TARGET:
-                cfg = _decode_bc(ins.backend_config if isinstance(ins.backend_config, bytes) else ins.backend_config.encode())
+                cfg = _decode_bc(
+                    ins.backend_config if isinstance(ins.backend_config, bytes) else ins.backend_config.encode()
+                )
                 if cfg is not None:
                     cfg, kpath = _norm_kernel_config(cfg, names)
                     kernels.append((cfg.get("func_name", "?"), kpath))
@@ -218,17 +227,18 @@ def hlo_diff(a, b, pb2, limit=12):
     la, lb = text_format.MessageToString(ma).splitlines(), text_format.MessageToString(mb).splitlines()
     import difflib
 
-    return [l for l in difflib.unified_diff(la, lb, "ref", "new", n=1, lineterm="")][:limit]
+    return list(difflib.unified_diff(la, lb, "ref", "new", n=1, lineterm=""))[:limit]
 
 
 # ---- kernels (.colz) ----
+
 
 def _frame_decoder():
     """A one-frame zstd decoder factory: stdlib compression.zstd (3.14+), else the zstandard module, else None."""
     try:
         from compression import zstd
 
-        return lambda: zstd.ZstdDecompressor()
+        return zstd.ZstdDecompressor
     except ImportError:
         pass
     try:
@@ -254,8 +264,8 @@ def _zstd_frames(payload):
     # zstd CLI fallback: decode each span between magic numbers; the CLI writes the frame, then rejects the container's
     # trailing bytes ("unsupported format"), which is expected here. A magic number inside compressed data is not handled.
     starts = [m.start() for m in re.finditer(re.escape(_ZSTD_MAGIC), payload)] + [len(payload)]
-    for s, e in zip(starts, starts[1:]):
-        p = subprocess.run(["zstd", "-d", "-c", "-q"], input=payload[s:e], capture_output=True)
+    for s, e in pairwise(starts):
+        p = subprocess.run(["zstd", "-d", "-c", "-q"], input=payload[s:e], capture_output=True, check=False)
         if p.returncode != 0 and b"unsupported format" not in p.stderr:
             raise ValueError(f"zstd: {p.stderr[:200]!r}")
         out.append(p.stdout)
@@ -281,7 +291,7 @@ def _json_records(data):
         yield obj
 
 
-_KCACHE = {}
+_KCACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
 
 
 def kernel_digest(path, names):
@@ -309,6 +319,7 @@ def kernel_digest(path, names):
 
 # ---- the rest ----
 
+
 def _read(p):
     try:
         with open(p, "rb") as f:
@@ -330,6 +341,7 @@ def norm_command(txt, mask_key=True):
         args = shlex.split(txt.decode())
     except ValueError:
         return txt
+
     def one(a):
         if "/" not in a or a.startswith("--internal"):
             return a
@@ -361,7 +373,9 @@ def compare_pair(ref_dir, new_dir, names_ref, names_new, pb2, kernels=True):
     if ha != hb:
         diffs.append("hlo")
         notes += hlo_diff(ha, hb, pb2)
-    if norm_command(_read(os.path.join(ref_dir, "command.txt"))) != norm_command(_read(os.path.join(new_dir, "command.txt"))):
+    if norm_command(_read(os.path.join(ref_dir, "command.txt"))) != norm_command(
+        _read(os.path.join(new_dir, "command.txt"))
+    ):
         diffs.append("command")
     ma = norm_meta(_read(os.path.join(ref_dir, ".artifact_metadata_v0.json")))
     mb = norm_meta(_read(os.path.join(new_dir, ".artifact_metadata_v0.json")))
@@ -369,7 +383,7 @@ def compare_pair(ref_dir, new_dir, names_ref, names_new, pb2, kernels=True):
         diffs.append("metadata")
     kernel_diffs = []
     if kernels and len(ka) == len(kb):
-        for (na, pa), (nb, pb) in zip(ka, kb):
+        for (na, pa), (_nb, pb) in zip(ka, kb):
             if not pa or not pb:
                 kernel_diffs.append(f"{na}: binary path missing")
                 continue
@@ -398,43 +412,67 @@ def main(argv=None):
     ap.add_argument("--cache-subdir", default="cache/neuron/compile_cache")
     ap.add_argument("--hlo-proto-path", help="a directory holding hlo_pb2 when libtorch_neuronx_lite is not installed")
     ap.add_argument("--no-kernels", dest="kernels", action="store_false", help="skip the kernel-body comparison")
-    ap.add_argument("--pair-by", choices=("order", "signature"), default="order",
-                    help="pair each rank's graphs by visit order (default) or by input signature")
+    ap.add_argument(
+        "--pair-by",
+        choices=("order", "signature"),
+        default="order",
+        help="pair each rank's graphs by visit order (default) or by input signature",
+    )
     ap.add_argument("--json", help="write per-pair records and the summary here")
     a = ap.parse_args(argv)
     pb2 = hlo_pb2(a.hlo_proto_path)
-    nmap = json.load(open(a.name_map)) if a.name_map else {}
+    nmap = {}
+    if a.name_map:
+        with open(a.name_map) as f:
+            nmap = json.load(f)
     names_ref, names_new = Names([a.ref_package], nmap), Names([a.new_package])
     ref_ranks, ref_cache = load_capture(a.ref_root, a.cache_subdir)
     new_ranks, new_cache = load_capture(a.new_root, a.cache_subdir)
     if a.pair_by == "signature":
-        sig = lambda cache: (lambda k: _read(os.path.join(cache, k, "example_inputs.txt")))
+
+        def sig(cache):
+            return lambda k: _read(os.path.join(cache, k, "example_inputs.txt"))
+
         pairs, problems = pair_by_signature(ref_ranks, new_ranks, sig(ref_cache), sig(new_cache))
     else:
         pairs, problems = pair(ref_ranks, new_ranks)
-    done, records, bad = {}, [], 0
+    done, records = {}, []
     for r, i, ka, kb in pairs:
         if (ka, kb) not in done:
-            done[(ka, kb)] = compare_pair(os.path.join(ref_cache, ka), os.path.join(new_cache, kb), names_ref, names_new,
-                                          pb2, a.kernels)
+            done[(ka, kb)] = compare_pair(
+                os.path.join(ref_cache, ka), os.path.join(new_cache, kb), names_ref, names_new, pb2, a.kernels
+            )
         diffs, notes, kernels = done[(ka, kb)]
-        records.append({"rank": r, "index": i, "ref": ka, "new": kb, "diffs": diffs, "notes": notes, "kernels": kernels})
+        records.append(
+            {"rank": r, "index": i, "ref": ka, "new": kb, "diffs": diffs, "notes": notes, "kernels": kernels}
+        )
     distinct = len(done)
     differ = sorted({(ka, kb) for (ka, kb), (d, _, _) in done.items() if d})
     for ka, kb in differ:
         d, notes, _ = done[(ka, kb)]
         print(f"DIFFER {ka} / {kb}: {', '.join(d)}")
-        for l in notes[:8]:
-            print(f"    {l}")
+        for note in notes[:8]:
+            print(f"    {note}")
     for p in problems:
         print(f"PROBLEM {p}")
     ok = not differ and not problems
-    print(f"GRAPH_EQUIV pairs={len(pairs)} distinct={distinct} differ={len(differ)} problems={len(problems)} "
-          f"verdict={'EQUAL' if ok else 'DIFFER'}")
+    print(
+        f"GRAPH_EQUIV pairs={len(pairs)} distinct={distinct} differ={len(differ)} problems={len(problems)} "
+        f"verdict={'EQUAL' if ok else 'DIFFER'}"
+    )
     if a.json:
         with open(a.json, "w") as f:
-            json.dump({"pairs": records, "problems": problems, "distinct": distinct, "differ": [list(x) for x in differ],
-                       "verdict": "EQUAL" if ok else "DIFFER"}, f, indent=1)
+            json.dump(
+                {
+                    "pairs": records,
+                    "problems": problems,
+                    "distinct": distinct,
+                    "differ": [list(x) for x in differ],
+                    "verdict": "EQUAL" if ok else "DIFFER",
+                },
+                f,
+                indent=1,
+            )
     return 0 if ok else 1
 
 

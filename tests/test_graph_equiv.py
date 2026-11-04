@@ -39,12 +39,25 @@ def _zstd(b):
 
 def write_colz(path, pkg, eps=1e-6, src="/src/a.py"):
     """A kernel binary shaped like the real ones: module JSON, a binary table, instruction records with debug info."""
-    module = {"arch": "gen3", "functions": [{"name": f"{pkg}.kernels.k1.{pkg}_k1_kernel", "origin": "NKI",
-                                             "allocations": [{"name": "x_set", "debug": {"tensor_name": "x"}}]}]}
-    recs = [{"name": "I-0", "opcode": "TensorScalar", "imm": eps, "debug": {"filename": f"{src}", "lineno": 12}},
-            {"name": "I-1", "opcode": "Activation", "func": "exp", "debug": {"filename": f"{src}", "lineno": 30}}]
-    frames = [json.dumps(module).encode(), struct.pack("<4I", 0, len(src), 7, 9),
-              b"".join(json.dumps(r).encode() for r in recs)]
+    module = {
+        "arch": "gen3",
+        "functions": [
+            {
+                "name": f"{pkg}.kernels.k1.{pkg}_k1_kernel",
+                "origin": "NKI",
+                "allocations": [{"name": "x_set", "debug": {"tensor_name": "x"}}],
+            }
+        ],
+    }
+    recs = [
+        {"name": "I-0", "opcode": "TensorScalar", "imm": eps, "debug": {"filename": f"{src}", "lineno": 12}},
+        {"name": "I-1", "opcode": "Activation", "func": "exp", "debug": {"filename": f"{src}", "lineno": 30}},
+    ]
+    frames = [
+        json.dumps(module).encode(),
+        struct.pack("<4I", 0, len(src), 7, 9),
+        b"".join(json.dumps(r).encode() for r in recs),
+    ]
     with open(path, "wb") as f:
         f.write(b"COLZ" + struct.pack("<3I", 1, 0, 0) + b"".join(_zstd(fr) for fr in frames))
 
@@ -52,6 +65,7 @@ def write_colz(path, pkg, eps=1e-6, src="/src/a.py"):
 def write_hlo(path, pkg, kernel_path, dim=8, id_base=100, src="/src/model.py"):
     m = PB2.HloModuleProto(name=f"{pkg}_module.{id_base}", id=id_base, entry_computation_name="main")
     c = m.computations.add(name=f"main.{id_base}", id=id_base + 1)
+
     def ins(name, opcode, dims, operands=(), **kw):
         i = c.instructions.add(name=f"{name}.{id_base}", opcode=opcode, id=id_base + 10 + len(c.instructions), **kw)
         i.shape.element_type = 11  # F32
@@ -61,11 +75,23 @@ def write_hlo(path, pkg, kernel_path, dim=8, id_base=100, src="/src/model.py"):
         i.metadata.source_file = src
         i.metadata.source_line = 40 + len(c.instructions)
         return i
+
     p = ins("p0", "parameter", [dim, 4], parameter_number=0)
-    cfg = {"func_name": f"{pkg}.kernels.k1.{pkg}_k1_kernel", "platform_target": 3, "kernel_format": "colz",
-           "klir_binary": str({"binary": kernel_path, "input_names": ["x"], "output_names": ["o"]}), "grid": 2}
-    k = ins("nki", "custom-call", [dim, 4], [p.id], custom_call_target=G.NKI_TARGET,
-            backend_config=base64.b64encode(json.dumps(cfg).encode()))
+    cfg = {
+        "func_name": f"{pkg}.kernels.k1.{pkg}_k1_kernel",
+        "platform_target": 3,
+        "kernel_format": "colz",
+        "klir_binary": str({"binary": kernel_path, "input_names": ["x"], "output_names": ["o"]}),
+        "grid": 2,
+    }
+    k = ins(
+        "nki",
+        "custom-call",
+        [dim, 4],
+        [p.id],
+        custom_call_target=G.NKI_TARGET,
+        backend_config=base64.b64encode(json.dumps(cfg).encode()),
+    )
     r = ins("add", "add", [dim, 4], [k.id, p.id])
     c.root_id = r.id
     m.entry_computation_id = c.id
@@ -101,7 +127,7 @@ def make_capture(root, pkg, keys, eps=1e-6, dim=8, id_base=100, src="/src"):
             f.write(f"neuronx-cc compile {d}/graph.hlo --target trn2 --output {d}/graph.neff -O2\n")
     os.makedirs(os.path.join(root, "capture"), exist_ok=True)
     with open(os.path.join(root, "capture", "rank0.json"), "w") as f:
-        json.dump({"rank": 0, "keys": {k: "captured" for k in keys}}, f)
+        json.dump({"rank": 0, "keys": dict.fromkeys(keys, "captured")}, f)
 
 
 def run(tmp_path, new_kw):
@@ -109,8 +135,10 @@ def run(tmp_path, new_kw):
     make_capture(ref, REF, ["a" * 32, "b" * 32])
     make_capture(new, "trnrt", ["c" * 32, "d" * 32], id_base=500, src="/other/checkout", **new_kw)
     out = str(tmp_path / "eq.json")
-    rc = G.main([ref, new, "--ref-package", REF, "--json", out] + (["--hlo-proto-path", os.environ["HLO_PB2_PATH"]]
-                                                                     if os.environ.get("HLO_PB2_PATH") else []))
+    rc = G.main(
+        [ref, new, "--ref-package", REF, "--json", out]
+        + (["--hlo-proto-path", os.environ["HLO_PB2_PATH"]] if os.environ.get("HLO_PB2_PATH") else [])
+    )
     return rc, json.load(open(out))
 
 

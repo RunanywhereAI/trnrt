@@ -41,6 +41,7 @@ def client(tmp_path_factory):
     def add(prompt_ids, params, **kw):
         added.append(params)
         return real_add(prompt_ids, params, **kw)
+
     eng.add_request = add
     with TestClient(api.build_app(eng, "test-model")) as c:
         c.engine, c.vocab, c.added = eng, vocab, added
@@ -60,20 +61,32 @@ def test_bad_values_are_400_and_a_running_request_is_untouched(client):
     assert c.engine.scheduler.running, "the long request never started"
     n_added = len(c.added)
     sampled = {"prompt": PROMPT, "max_tokens": 4, "temperature": 1.0}
-    for field, value in (("seed", -1), ("seed", 1.5), ("seed", "abc"), ("seed", 2 ** 63), ("top_k", 2 ** 63),
-                         ("top_k", -5), ("prompt", [c.vocab]), ("prompt", PROMPT + [-1]), ("top_p", 0)):
+    for field, value in (
+        ("seed", -1),
+        ("seed", 1.5),
+        ("seed", "abc"),
+        ("seed", 2**63),
+        ("top_k", 2**63),
+        ("top_k", -5),
+        ("prompt", [c.vocab]),
+        ("prompt", [*PROMPT, -1]),
+        ("top_p", 0),
+    ):
         r = c.post("/v1/completions", json={**sampled, field: value})
         assert r.status_code == 400, (field, value, r.text)
         assert c.get("/health").status_code == 200
-    r = c.post("/v1/completions", content=b'{"prompt": [5, 17], "temperature": NaN}',
-               headers={"content-type": "application/json"})
+    r = c.post(
+        "/v1/completions",
+        content=b'{"prompt": [5, 17], "temperature": NaN}',
+        headers={"content-type": "application/json"},
+    )
     assert r.status_code == 400, r.text
     assert len(c.added) == n_added  # none reached the engine
     th.join(120)
     r = out["r"]
     assert r.status_code == 200, r.text
     assert r.json()["choices"][0]["finish_reason"] == "length" and r.json()["usage"]["completion_tokens"] == 40
-    r = c.post("/v1/completions", json={**sampled, "seed": 7, "top_k": 2 ** 63 - 1})
+    r = c.post("/v1/completions", json={**sampled, "seed": 7, "top_k": 2**63 - 1})
     assert r.status_code == 200 and r.json()["usage"]["completion_tokens"] == 4, r.text
 
 

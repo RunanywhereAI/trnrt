@@ -21,11 +21,24 @@ REPO, REV = "zai-org/GLM-5.3-Flash", "eb9eb208eb0d988989d07a6a12d0fdeb5f52574a"
 
 
 def test_shape_json_takes_every_top_level_json_but_the_index():
-    names = ["config.json", "generation_config.json", "tokenizer.json", "tokenizer_config.json",
-             "model.safetensors.index.json", "model-00001-of-00002.safetensors", "README.md",
-             "inference/config.json", "special_tokens_map.json"]
-    assert capture.shape_json(names) == ["config.json", "generation_config.json", "special_tokens_map.json",
-                                         "tokenizer.json", "tokenizer_config.json"]
+    names = [
+        "config.json",
+        "generation_config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "model.safetensors.index.json",
+        "model-00001-of-00002.safetensors",
+        "README.md",
+        "inference/config.json",
+        "special_tokens_map.json",
+    ]
+    assert capture.shape_json(names) == [
+        "config.json",
+        "generation_config.json",
+        "special_tokens_map.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+    ]
 
 
 def _online() -> bool:

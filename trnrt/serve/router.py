@@ -1,6 +1,6 @@
 """Session-affine router over the data-parallel engines of one host (two tensor-parallel engines on a trn2.48xlarge).
 
-Each worker is a full trnRT server (serve/api.py) on its own NeuronCores, with its own prefix cache.
+Each worker is a full TrnRT server (serve/api.py) on its own NeuronCores, with its own prefix cache.
 
 A request that carries a session id (the body field `session_id`) is routed by its session alone:
 - a known session goes to the worker it was pinned to, ALWAYS, whatever the load. An agent's next turn shares its whole
@@ -67,21 +67,31 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import os
 import time
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+from .. import log
+
+logger = log.get("router")
+
 SESSION_FIELD = "session_id"  # the request body field naming the session (serve/api.py takes it too)
+# TRNRT_ROUTER_LOG_SESSIONS=1, for debugging: a line per new pin and per side request, and the failover and return-home
+# lines, each with the session's id, so a log reader can attribute requests to engines. Off (the default) the router
+# logs no session id, which is the client's own identifier: no line per request, and the failover and return-home lines
+# without it.
+LOG_SESSIONS_ENV = "TRNRT_ROUTER_LOG_SESSIONS"
 SESSION_KEY_CHARS = 4096
 ROUTES = ("/v1/completions", "/v1/chat/completions")
 
 
 class _Node:
-    __slots__ = ("children", "text", "last", "parent")
+    __slots__ = ("children", "last", "parent", "text")
 
-    def __init__(self, text: str = "", parent: "_Node | None" = None):
+    def __init__(self, text: str = "", parent: _Node | None = None):
         self.children: dict[str, _Node] = {}
         self.text = text
         self.last = 0.0
@@ -152,22 +162,48 @@ class PrefixTree:
             self.size = 0
             return
         victim = min(leaves, key=lambda n: n.last)
+        parent = victim.parent
+        if parent is None:  # only the root has none, and the leaves exclude it
+            raise RuntimeError("the prefix tree's root was picked for eviction")
         self.size -= len(victim.text)
-        del victim.parent.children[victim.text[0]]
+        del parent.children[victim.text[0]]
 
 
 class Router:
-    def __init__(self, workers: list[str], cache_threshold: float = 0.5, balance_abs: int = 32,
-                 balance_rel: float = 1.5, max_tree_chars: int = 128_000_000, session_idle_s: float = 1800.0,
-                 clock=time.monotonic, sticky_chars: int = 32_768, down_after: int = 3,
-                 session_ttl_s: float | None = None, max_sessions: int = 100_000):
+    def __init__(
+        self,
+        workers: list[str],
+        cache_threshold: float = 0.5,
+        balance_abs: int = 32,
+        balance_rel: float = 1.5,
+        max_tree_chars: int = 128_000_000,
+        session_idle_s: float = 1800.0,
+        clock=time.monotonic,
+        sticky_chars: int = 32_768,
+        down_after: int = 3,
+        session_ttl_s: float | None = None,
+        max_sessions: int = 100_000,
+        log_sessions: bool | None = None,
+    ):
         self.workers = workers
+        # whether lines name sessions (LOG_SESSIONS_ENV; None: from the environment)
+        self.log_sessions = os.environ.get(LOG_SESSIONS_ENV) == "1" if log_sessions is None else log_sessions
         self.trees = [PrefixTree(max_tree_chars) for _ in workers]
         self.load = [0] * len(workers)
         self.cache_threshold, self.balance_abs, self.balance_rel = cache_threshold, balance_abs, balance_rel
         self.sticky_chars = sticky_chars
-        self.routed = {"sticky": 0, "cache": 0, "balance": 0, "smallest": 0, "session": 0, "new_session": 0,
-                       "failover": 0, "home": 0, "side": 0, "rekey": 0}
+        self.routed = {
+            "sticky": 0,
+            "cache": 0,
+            "balance": 0,
+            "smallest": 0,
+            "session": 0,
+            "new_session": 0,
+            "failover": 0,
+            "home": 0,
+            "side": 0,
+            "rekey": 0,
+        }
         self.session_idle_s, self.clock = session_idle_s, clock
         self.session_ttl_s = session_ttl_s if session_ttl_s is not None else 4 * session_idle_s
         self.max_sessions = max_sessions
@@ -175,11 +211,15 @@ class Router:
         self.seen: dict[str, float] = {}  # session id -> its last request (self.clock)
         self.moved: dict[str, list] = {}  # failed-over session -> [home worker, turns completed on the new one]
         self.keys: dict[str, tuple] = {}  # session id -> its history's key (_session_key: sys_hash, first_hash)
-        self.tentative: set[str] = set()  # sessions pinned by a tool-less request (maybe a side request that came first)
+        self.tentative: set[str] = (
+            set()
+        )  # sessions pinned by a tool-less request (maybe a side request that came first)
         self.up = [True] * len(workers)  # False once down (see note_failure) until /health answers again
         self.fails = [0] * len(workers)  # consecutive soft failures (a slow or failed /health)
         self.down_after = down_after
-        self.kv_used = [None] * len(workers)  # KV pages in use / total, from the worker's /v1/stats; None unknown
+        self.kv_used: list[float | None] = [None] * len(
+            workers
+        )  # KV pages in use / total, from the worker's /v1/stats; None unknown
 
     @staticmethod
     def session_of(body: dict) -> str | None:
@@ -196,8 +236,14 @@ class Router:
 
     def least_loaded(self) -> int:
         """The live worker with the fewest in-flight requests plus pinned active sessions, then the least KV in use."""
-        return min(self._live(), key=lambda i: (self.load[i] + self.active_sessions(i),
-                                                1.0 if self.kv_used[i] is None else self.kv_used[i], i))
+        return min(
+            self._live(),
+            key=lambda i: (
+                self.load[i] + self.active_sessions(i),
+                1.0 if self.kv_used[i] is None else self.kv_used[i],
+                i,
+            ),
+        )
 
     def pick_session(self, sid: str) -> int:
         w = self.sessions.get(sid)
@@ -207,21 +253,27 @@ class Router:
             w = mv[0]
             del self.moved[sid]
             self.routed["home"] += 1
-            print(f"trnrt.router: session {sid!r} back to worker {w} ({self.workers[w]}), up again", flush=True)
+            logger.info("trnrt.router: %s back to worker %s (%s), up again", self._session(sid), w, self.workers[w])
         elif w is not None and self.up[w]:
             self.routed["session"] += 1
         elif w is not None:
             old, w = w, self.least_loaded()
             self.routed["failover"] += 1
             self.moved[sid] = [mv[0] if mv is not None else old, 0]
-            print(f"trnrt.router: session {sid!r} failed over from worker {old} ({self.workers[old]}, down) to worker "
-                  f"{w} ({self.workers[w]})", flush=True)
+            logger.warning(
+                "trnrt.router: %s failed over from worker %s (%s, down) to worker %s (%s)",
+                self._session(sid),
+                old,
+                self.workers[old],
+                w,
+                self.workers[w],
+            )
         else:
             self.prune()  # a new pin: bound the map first (and on every poll), not on every request
             w = self.least_loaded()
             self.routed["new_session"] += 1
-            # one line per pin, the last per session naming its worker: a log reader can attribute requests to engines
-            print(f"trnrt.router: session {sid!r} pinned to worker {w} ({self.workers[w]})", flush=True)
+            if self.log_sessions:  # one line per pin, the last per session naming its worker
+                logger.info("trnrt.router: session %r pinned to worker %s (%s)", sid, w, self.workers[w])
         self.sessions.pop(sid, None)
         self.sessions[sid] = w  # re-inserted: the map's order is least recently used first
         self.seen[sid] = self.clock()
@@ -252,13 +304,20 @@ class Router:
             return self.pick_session(sid)
         self.routed["side"] += 1
         w = self.least_loaded()
-        print(f"trnrt.router: side request of session {sid!r} to worker {w} ({self.workers[w]})", flush=True)
+        if self.log_sessions:
+            logger.info("trnrt.router: side request of session %r to worker %s (%s)", sid, w, self.workers[w])
         return w
+
+    def _session(self, sid: str) -> str:
+        """A log line's name for session `sid`: its id only under LOG_SESSIONS_ENV."""
+        return f"session {sid!r}" if self.log_sessions else "a session"
 
     def turn_done(self, sid: str | None, w: int) -> None:
         """A request of session `sid` completed on worker w: once a failed-over session has a turn on its new worker,
         its context lives there and it stays."""
-        mv = self.moved.get(sid) if sid is not None else None
+        if sid is None:
+            return
+        mv = self.moved.get(sid)
         if mv is not None and self.sessions.get(sid) == w:
             mv[1] += 1
             if mv[0] != w:
@@ -281,7 +340,7 @@ class Router:
 
     def note_ok(self, w: int) -> None:
         if not self.up[w]:
-            print(f"trnrt.router: worker {w} ({self.workers[w]}) is up", flush=True)
+            logger.info("trnrt.router: worker %s (%s) is up", w, self.workers[w])
         self.up[w], self.fails[w] = True, 0
 
     def note_failure(self, w: int, hard: bool) -> None:
@@ -294,11 +353,12 @@ class Router:
 
     def mark_down(self, w: int) -> None:
         if self.up[w]:
-            print(f"trnrt.router: worker {w} ({self.workers[w]}) is down", flush=True)
+            logger.warning("trnrt.router: worker %s (%s) is down", w, self.workers[w])
         self.up[w] = False
 
-    def pick(self, text: str, session: str | None = None, head: int = 0, key: tuple | None = None,
-             tools: bool = False) -> int:
+    def pick(
+        self, text: str, session: str | None = None, head: int = 0, key: tuple | None = None, tools: bool = False
+    ) -> int:
         """The worker for a request. `head`: the length of the text's leading part that every session shares (a chat
         request's system messages, _request_head): a match counts as sticky only past it, so a long shared system
         prompt does not pin every new session to the worker that served the first one. `key`, `tools`: a session
@@ -330,16 +390,22 @@ class Router:
         return w
 
     def status(self) -> str:
-        """"ok" while every worker is up, "degraded" while some are, "down" once none is."""
+        """ "ok" while every worker is up, "degraded" while some are, "down" once none is."""
         n = sum(self.up)
         return "ok" if n == len(self.workers) else "degraded" if n else "down"
 
     def health(self) -> dict:
-        return {"workers": self.workers, "load": self.load, "routed": self.routed, "up": self.up, "fails": self.fails,
-                "kv_used": self.kv_used, "sessions": [sum(1 for i in self.sessions.values() if i == w)
-                                                      for w in range(len(self.workers))],
-                "active_sessions": [self.active_sessions(w) for w in range(len(self.workers))],
-                "sessions_known": len(self.sessions)}
+        return {
+            "workers": self.workers,
+            "load": self.load,
+            "routed": self.routed,
+            "up": self.up,
+            "fails": self.fails,
+            "kv_used": self.kv_used,
+            "sessions": [sum(1 for i in self.sessions.values() if i == w) for w in range(len(self.workers))],
+            "active_sessions": [self.active_sessions(w) for w in range(len(self.workers))],
+            "sessions_known": len(self.sessions),
+        }
 
 
 def _kv_used(stats: dict) -> float | None:
@@ -372,7 +438,7 @@ def _session_key(path: str, body: dict) -> tuple[str, str]:
     characters). Stable while an agent's conversation grows (both parts are the conversation's start); sys_hash differs
     under another system prompt (a title or summary request), first_hash under another conversation start (a
     compaction). No dump of the whole request (~1 MB at 200K tokens)."""
-    h = lambda b: hashlib.sha1(b.encode("utf-8", "replace")).hexdigest()  # noqa: E731
+    h = lambda b: hashlib.sha1(b.encode("utf-8", "replace"), usedforsecurity=False).hexdigest()  # noqa: E731
     if not path.endswith("chat/completions"):
         p = body.get("prompt", "")
         return h(""), h((p if isinstance(p, str) else json.dumps(p))[:SESSION_KEY_CHARS])
@@ -391,13 +457,27 @@ def _request_text(path: str, body: dict) -> str:
     return p if isinstance(p, str) else json.dumps(p)
 
 
+async def _json_object(http: Request) -> dict:
+    """The request's JSON object; 400 for anything else, as each engine answers (serve/api.py, _body). Without this, a
+    malformed body or a JSON array raised inside the proxy and the router answered 500."""
+    try:
+        body = await http.json()
+    except ValueError:  # json.JSONDecodeError and UnicodeDecodeError
+        raise HTTPException(status_code=400, detail="the request body must be a JSON object") from None
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="the request body must be a JSON object")
+    return body
+
+
 def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: float = 5.0) -> FastAPI:
     # A streaming request holds its connection to the worker until the last token, so the pool's connection cap is a cap
     # on requests in flight at every worker together. httpx's default (Limits(max_connections=100), shared by all hosts)
     # held a whole host at 100 requests in flight: the rest waited inside client.send() here, which clients measured as
     # time to first token. So no cap, and a keep-alive expiry that closes idle connections here before an engine does.
-    client = httpx.AsyncClient(timeout=None, limits=httpx.Limits(
-        max_connections=None, max_keepalive_connections=512, keepalive_expiry=30.0))
+    client = httpx.AsyncClient(
+        timeout=None,  # noqa: S113  a stream lives until its last token; the polls and /v1/models set their own timeout
+        limits=httpx.Limits(max_connections=None, max_keepalive_connections=512, keepalive_expiry=30.0),
+    )
 
     async def poll() -> None:
         """Each worker's /health and /v1/stats (KV in use) every `poll_s` seconds, and the session map's pruning. A 200
@@ -433,15 +513,16 @@ def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: floa
             if task is not None:
                 task.cancel()
 
-    app = FastAPI(title="trnRT router", lifespan=lifespan)
+    app = FastAPI(title="TrnRT router", lifespan=lifespan)
 
     @app.get("/health")
     async def health():
         """200 while any worker is up ("ok" or "degraded"), 503 once none is (module docstring)."""
         status = router.status()
         down = [u for u, ok in zip(router.workers, router.up) if not ok]
-        return JSONResponse({"status": status, "down": down, **router.health()},
-                            status_code=503 if status == "down" else 200)
+        return JSONResponse(
+            {"status": status, "down": down, **router.health()}, status_code=503 if status == "down" else 200
+        )
 
     @app.get("/v1/models")
     async def models():
@@ -461,12 +542,17 @@ def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: floa
         raise HTTPException(status_code=503, detail="no engine answered /v1/models")
 
     async def proxy(path: str, http: Request):
-        body = await http.json()
+        body = await _json_object(http)
         sid = router.session_of(body)
         key = _session_key(path, body) if sid is not None else None
         tools = bool(body.get("tools"))
-        w = router.pick(_request_text(path, body) if sid is None else "", session=sid,
-                        head=_request_head(path, body) if sid is None else 0, key=key, tools=tools)
+        w = router.pick(
+            _request_text(path, body) if sid is None else "",
+            session=sid,
+            head=_request_head(path, body) if sid is None else 0,
+            key=key,
+            tools=tools,
+        )
         # An unreachable worker, or one that answers 503 (a failed engine refuses every request before it queues it,
         # serve/api.py): note it, re-pick once (a session fails over if it went down).
         for attempt in (0, 1):
@@ -487,9 +573,14 @@ def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: floa
                 router.load[w] -= 1
                 router.note_failure(w, hard=isinstance(e, httpx.ConnectError))  # refused: a dead port
                 if attempt == 1 or all(not ok for ok in router.up):
-                    raise HTTPException(status_code=503, detail=f"worker {w} unreachable")
-                w = router.pick(_request_text(path, body) if sid is None else "", session=sid,
-                                head=_request_head(path, body) if sid is None else 0, key=key, tools=tools)
+                    raise HTTPException(status_code=503, detail=f"worker {w} unreachable") from e
+                w = router.pick(
+                    _request_text(path, body) if sid is None else "",
+                    session=sid,
+                    head=_request_head(path, body) if sid is None else 0,
+                    key=key,
+                    tools=tools,
+                )
                 continue
             except BaseException:
                 router.load[w] -= 1
@@ -499,8 +590,13 @@ def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: floa
                 router.note_failure(w, hard=True)
                 if attempt == 1 or all(not ok for ok in router.up):
                     return Response(r.content, status_code=503, media_type=r.headers.get("content-type"))
-                w = router.pick(_request_text(path, body) if sid is None else "", session=sid,
-                                head=_request_head(path, body) if sid is None else 0, key=key, tools=tools)
+                w = router.pick(
+                    _request_text(path, body) if sid is None else "",
+                    session=sid,
+                    head=_request_head(path, body) if sid is None else 0,
+                    key=key,
+                    tools=tools,
+                )
                 continue
             break
         if body.get("stream"):
@@ -518,8 +614,9 @@ def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: floa
                     if done and resp.status_code == 200:
                         router.turn_done(sid, ww)
 
-            return StreamingResponse(relay(), status_code=resp.status_code,
-                                     media_type=resp.headers.get("content-type", "text/event-stream"))
+            return StreamingResponse(
+                relay(), status_code=resp.status_code, media_type=resp.headers.get("content-type", "text/event-stream")
+            )
         router.load[w] -= 1
         if r.status_code == 200:
             router.turn_done(sid, w)
@@ -538,15 +635,25 @@ def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: floa
 
 def main() -> None:
     ap = argparse.ArgumentParser(prog="trnrt.serve.router", allow_abbrev=False)
-    ap.add_argument("--worker-urls", required=True,
-                    help="comma list of the engines' base URLs, e.g. http://127.0.0.1:8111,http://127.0.0.1:8112")
-    ap.add_argument("--host", default="0.0.0.0")
+    ap.add_argument(
+        "--worker-urls",
+        required=True,
+        help="comma list of the engines' base URLs, e.g. http://127.0.0.1:8111,http://127.0.0.1:8112",
+    )
+    ap.add_argument("--host", default="0.0.0.0")  # noqa: S104  a server in front of the engines: reachable by design
     ap.add_argument("--port", type=int, default=8000)
+    ap.add_argument(
+        "--timeout-keep-alive",
+        type=int,
+        default=75,
+        help="seconds an idle client connection stays open (above aiohttp's 15 s pool keep-alive)",
+    )
     args = ap.parse_args()
+    log.configure()
     import uvicorn
 
     router = Router([u.rstrip("/") for u in args.worker_urls.split(",") if u])
-    uvicorn.run(build_router_app(router), host=args.host, port=args.port)
+    uvicorn.run(build_router_app(router), host=args.host, port=args.port, timeout_keep_alive=args.timeout_keep_alive)
 
 
 if __name__ == "__main__":

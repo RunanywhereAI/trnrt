@@ -58,7 +58,7 @@ def reference_output_no_eos(prompt, max_new):
     hist = list(prompt)
     for _ in range(max_new):
         hist.append(next_token(hist))
-    return hist[len(prompt):]
+    return hist[len(prompt) :]
 
 
 def check_invariants(sched: Scheduler):
@@ -94,11 +94,9 @@ def run(sched: Scheduler, reqs, max_steps=10_000, check_every=1):
     while sched.has_work():
         plan = sched.schedule()
         assert plan, "scheduler made no progress"
-        tokens = []
-        for s in plan.seqs():
-            # The step "computes" positions [start, end); the next token depends only
-            # on the history up to end, exactly like a real model's last-position logits.
-            tokens.append(next_token(s.req.token_ids[: s.end]) if s.sample else -1)
+        # The step "computes" positions [start, end); the next token depends only
+        # on the history up to end, exactly like a real model's last-position logits.
+        tokens = [next_token(s.req.token_ids[: s.end]) if s.sample else -1 for s in plan.seqs()]
         sched.update(plan, tokens)
         steps += 1
         if steps % check_every == 0:
@@ -110,8 +108,14 @@ def run(sched: Scheduler, reqs, max_steps=10_000, check_every=1):
 def make(num_pages=256, max_seqs=8, budget=16, max_len=512, decode_tokens=256, rows=32):
     pool = PagePool(num_pages)
     radix = RadixCache(pool, PS)
-    cfg = SchedulerConfig(page_size=PS, max_num_seqs=max_seqs, max_prefill_tokens=budget,
-                          max_model_len=max_len, eos_token_ids=(EOS,), admission_decode_tokens=decode_tokens)
+    cfg = SchedulerConfig(
+        page_size=PS,
+        max_num_seqs=max_seqs,
+        max_prefill_tokens=budget,
+        max_model_len=max_len,
+        eos_token_ids=(EOS,),
+        admission_decode_tokens=decode_tokens,
+    )
     sched = Scheduler(cfg, pool, radix)
     sched.states = Rows(rows)
     radix.free_ckpt = sched.states.free_ckpt
@@ -121,8 +125,14 @@ def make(num_pages=256, max_seqs=8, budget=16, max_len=512, decode_tokens=256, r
 def test_outputs_match_reference_with_chunked_prefill():
     sched = make()
     rng = random.Random(0)
-    reqs = [Request(f"r{i}", [rng.randrange(8, VOCAB) for _ in range(rng.randrange(1, 60))],
-                    SamplingParams(max_new_tokens=rng.randrange(1, 40))) for i in range(20)]
+    reqs = [
+        Request(
+            f"r{i}",
+            [rng.randrange(8, VOCAB) for _ in range(rng.randrange(1, 60))],
+            SamplingParams(max_new_tokens=rng.randrange(1, 40)),
+        )
+        for i in range(20)
+    ]
     run(sched, reqs)
     for r in reqs:
         assert r.status is Status.FINISHED
@@ -135,12 +145,12 @@ def test_shared_prefix_resumes_from_the_prompt_end_checkpoint():
     b, sharing those pages, resumes there."""
     sched = make()
     system = list(range(100, 140))  # 10 full pages
-    a = Request("a", system + [9, 10], SamplingParams(max_new_tokens=3))
+    a = Request("a", [*system, 9, 10], SamplingParams(max_new_tokens=3))
     sched.add(a)
     plan = sched.schedule()
     assert [(e.start, e.end, e.mid is not None) for e in plan.prefills] == [(0, 16, False)]
     run(sched, [])
-    b = Request("b", system + [11, 12, 13], SamplingParams(max_new_tokens=3))
+    b = Request("b", [*system, 11, 12, 13], SamplingParams(max_new_tokens=3))
     run(sched, [b])
     assert b.num_cached_tokens == len(system)
     assert b.output_ids == reference_output(b.prompt_ids, 3)
@@ -167,7 +177,7 @@ def test_concurrent_same_prefix_dedups_pages_and_waits_for_the_junction():
     end ahead (the junction with the others); the others wait for it and resume there."""
     sched = make(budget=64)
     system = list(range(200, 232))
-    reqs = [Request(f"c{i}", system + [i + 10], SamplingParams(max_new_tokens=5)) for i in range(4)]
+    reqs = [Request(f"c{i}", [*system, i + 10], SamplingParams(max_new_tokens=5)) for i in range(4)]
     run(sched, reqs)
     for r in reqs:
         assert r.output_ids == reference_output(r.prompt_ids, 5)
@@ -196,8 +206,12 @@ def test_preemption_under_kv_pressure_keeps_outputs_exact():
     the pool overcommits and preemption is forced."""
     sched = make(num_pages=41, max_seqs=8, budget=32, decode_tokens=8)
     rng = random.Random(1)
-    reqs = [Request(f"p{i}", [rng.randrange(8, VOCAB) for _ in range(20)],
-                    SamplingParams(max_new_tokens=100, ignore_eos=True)) for i in range(8)]
+    reqs = [
+        Request(
+            f"p{i}", [rng.randrange(8, VOCAB) for _ in range(20)], SamplingParams(max_new_tokens=100, ignore_eos=True)
+        )
+        for i in range(8)
+    ]
     run(sched, reqs)
     assert sched.num_preemptions > 0
     for r in reqs:
@@ -250,7 +264,9 @@ def test_reserve_admission_overlapped_and_oversized():
     for r in reqs:
         assert r.output_ids == reference_output_no_eos(r.prompt_ids, 100)
     big = make(num_pages=41, max_seqs=8, budget=32, decode_tokens=1000)
-    r = Request("big", [rng.randrange(8, VOCAB) for _ in range(20)], SamplingParams(max_new_tokens=130, ignore_eos=True))
+    r = Request(
+        "big", [rng.randrange(8, VOCAB) for _ in range(20)], SamplingParams(max_new_tokens=130, ignore_eos=True)
+    )
     run(big, [r])  # target 150 tokens = 38 pages of the 40: fits alone
     assert r.output_ids == reference_output_no_eos(r.prompt_ids, 130)
 
@@ -330,8 +346,14 @@ def run_overlapped(sched, reqs, max_steps=20_000):
 
 def test_overlapped_scheduling_gives_identical_outputs():
     rng = random.Random(3)
-    reqs = [Request(f"o{i}", [rng.randrange(8, VOCAB) for _ in range(rng.randrange(1, 50))],
-                    SamplingParams(max_new_tokens=rng.randrange(1, 40))) for i in range(24)]
+    reqs = [
+        Request(
+            f"o{i}",
+            [rng.randrange(8, VOCAB) for _ in range(rng.randrange(1, 50))],
+            SamplingParams(max_new_tokens=rng.randrange(1, 40)),
+        )
+        for i in range(24)
+    ]
     run_overlapped(make(), reqs)
     for r in reqs:
         assert r.output_ids == reference_output(r.prompt_ids, r.params.max_new_tokens), r.rid
@@ -340,8 +362,12 @@ def test_overlapped_scheduling_gives_identical_outputs():
 def test_overlapped_scheduling_under_preemption_pressure():
     sched = make(num_pages=41, max_seqs=8, budget=32, decode_tokens=8)
     rng = random.Random(4)
-    reqs = [Request(f"op{i}", [rng.randrange(8, VOCAB) for _ in range(20)],
-                    SamplingParams(max_new_tokens=100, ignore_eos=True)) for i in range(8)]
+    reqs = [
+        Request(
+            f"op{i}", [rng.randrange(8, VOCAB) for _ in range(20)], SamplingParams(max_new_tokens=100, ignore_eos=True)
+        )
+        for i in range(8)
+    ]
     run_overlapped(sched, reqs)
     assert sched.num_preemptions > 0
     for r in reqs:
@@ -369,14 +395,20 @@ def test_session_turns_survive_pressure_that_evicts_other_prefixes():
     def workload(session):
         sched = make(num_pages=40, max_seqs=2, budget=64)
         convo = list(range(100, 164))  # 16 pages of conversation so far
-        run(sched, [Request("t1", convo, SamplingParams(max_new_tokens=4, ignore_eos=True),
-                            session_id=session)])
+        run(sched, [Request("t1", convo, SamplingParams(max_new_tokens=4, ignore_eos=True), session_id=session)])
         rng = random.Random(1)
         for i in range(6):  # unrelated requests filling the rest of the pool
-            run(sched, [Request(f"x{i}", [rng.randrange(8, VOCAB) for _ in range(56)],
-                                SamplingParams(max_new_tokens=4, ignore_eos=True))])
-        t2 = Request("t2", convo + [9, 10, 11], SamplingParams(max_new_tokens=4, ignore_eos=True),
-                     session_id=session)
+            run(
+                sched,
+                [
+                    Request(
+                        f"x{i}",
+                        [rng.randrange(8, VOCAB) for _ in range(56)],
+                        SamplingParams(max_new_tokens=4, ignore_eos=True),
+                    )
+                ],
+            )
+        t2 = Request("t2", [*convo, 9, 10, 11], SamplingParams(max_new_tokens=4, ignore_eos=True), session_id=session)
         run(sched, [t2])
         assert t2.output_ids == reference_output_no_eos(t2.prompt_ids, 4)
         return t2.num_cached_tokens, sched

@@ -48,7 +48,7 @@ def _inputs(n: int, seed: int, rank: int):
             if kind == "nantail" and cnt > 100:
                 vv[100:cnt] = float("nan")
             vals[a, r] = vv
-            lpa[a, r] = torch.randperm(Pl + 64, generator=g)[:K + 1]  # local pools (some past the table's bound)
+            lpa[a, r] = torch.randperm(Pl + 64, generator=g)[: K + 1]  # local pools (some past the table's bound)
     for r, kind in enumerate(kinds):  # few valid on every rank, a visible (K + 1)-th on one
         if kind == "certshort":
             vals[:, r, 10:] = NEG
@@ -87,8 +87,9 @@ def _reference(vals, cpool, lp, table, npool, pos, Pl: int, rank: int, monkeypat
         return torch.zeros(n, 1, 1), torch.zeros(n, 1)
 
     monkeypatch.setattr(dsa_slots_n, "attend", stand_in)
-    mla._cp_attend_classes(torch.zeros(n, 1, 1), None, pool_row(lp), rows_tail, chosen, tail_own, npool, pos, 1.0, KP,
-                           C, 1024, single=True)
+    mla._cp_attend_classes(
+        torch.zeros(n, 1, 1), None, pool_row(lp), rows_tail, chosen, tail_own, npool, pos, 1.0, KP, C, 1024, single=True
+    )
     monkeypatch.undo()
     return got["rows"].to(torch.int32), got["bias"].float(), fail, rows_tail.view(n), tail_own
 
@@ -111,11 +112,13 @@ def _bits(t):
 def test_emulate_is_mla_chain_bit_for_bit(rank, monkeypatch):
     n = 256
     vals, cpool, lp, table, npool, pos, Pl = _inputs(n, rank, rank)
-    ref_rows, ref_bias, ref_fail, rows_tail, tail_own = _reference(vals, cpool, lp, table, npool, pos, Pl, rank,
-                                                                   monkeypatch)
+    ref_rows, ref_bias, ref_fail, rows_tail, tail_own = _reference(
+        vals, cpool, lp, table, npool, pos, Pl, rank, monkeypatch
+    )
     s, c, nx, sel0, npos = _glue_inputs(vals, cpool, lp, table, npool, pos, rows_tail, tail_own, rank)
-    rows, bias, fail = G.emulate(s, c, nx, sel0, lp, table, rows_tail, tail_own, npos, rank, KEEP, PPL, KP, C,
-                                 dsa_long.TIE_BITS)
+    rows, bias, fail = G.emulate(
+        s, c, nx, sel0, lp, table, rows_tail, tail_own, npos, rank, KEEP, PPL, KP, C, dsa_long.TIE_BITS
+    )
     assert torch.equal(rows, ref_rows)
     assert torch.equal(_bits(bias), _bits(ref_bias))  # +0 / -0 included
     assert torch.equal(fail, ref_fail)
@@ -142,8 +145,9 @@ def test_nki_simulator_grid2_is_mla_chain(rank, monkeypatch):
     monkeypatch.setenv("NEURON_PLATFORM_TARGET_OVERRIDE", "trn2")
     n = 256
     vals, cpool, lp, table, npool, pos, Pl = _inputs(n, rank, rank)
-    ref_rows, ref_bias, ref_fail, rows_tail, tail_own = _reference(vals, cpool, lp, table, npool, pos, Pl, rank,
-                                                                   monkeypatch)
+    ref_rows, ref_bias, ref_fail, rows_tail, tail_own = _reference(
+        vals, cpool, lp, table, npool, pos, Pl, rank, monkeypatch
+    )
     s, c, nx, sel0, npos = _glue_inputs(vals, cpool, lp, table, npool, pos, rows_tail, tail_own, rank)
     oh = (torch.arange(A) == rank).float()
     a = G.kernel_args(s, c, nx, sel0, lp, table, rows_tail, tail_own, npos, oh, KEEP, PPL, KP, C, dsa_long.TIE_BITS)

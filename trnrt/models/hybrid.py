@@ -141,8 +141,8 @@ def final(model, h: torch.Tensor) -> torch.Tensor:
 
 # The KDA shell takes decode steps of at most this many rows; the XLA half runs above. Its per-row recurrence costs
 # ~8.5-10.5 us per row x 34 layers, which a batched recurrence could lift. The engine's --kda-shell-max-rows
-# (EngineConfig.kda_shell_max_rows, set on every rank by engine.build_shard before it builds the shard; 8 served, 12
-# under the batch-12 preset, so every decode step up to 12 rows takes the shell and the split layer).
+# (EngineConfig.kda_shell_max_rows, set on every rank by engine.build_shard before it builds the shard; 8 here and
+# under --preset batch8, 12 served, so every decode step up to 12 rows takes the shell and the split layer).
 KDA_SHELL_MAXB = 8
 
 
@@ -184,8 +184,8 @@ def defers(model, layer, nxt, h, positions, table, bias, state_slot) -> bool:
 
 
 # Decode calls of fewer rows than this take the FFN half (kernels/ffn_half.py): moe_dedupe's pairs kernel's bound. The
-# engine's --ffn-half-below (EngineConfig.ffn_half_below, set by engine.build_shard; 16 served, 17 under the batch-12
-# preset).
+# engine's --ffn-half-below (EngineConfig.ffn_half_below, set by engine.build_shard; 16 here and under --preset
+# batch8, 17 served).
 MOE_HALF_BELOW = 16
 
 

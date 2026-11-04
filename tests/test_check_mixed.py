@@ -1,6 +1,6 @@
-"""tools/check_mixed.py's compare (host only): a run against itself is the bytes gate's PASS (equal N/N, every
-parity figure zero); a divergence at a clear margin FAILS (the gate can fail); the prompts are LONG_TEXT windows 997
-tokens apart, their lengths cycling."""
+"""tools/check_mixed.py's compare (host only): a run against itself passes the byte-for-byte output comparison (equal
+N/N, every parity figure zero); a divergence at a clear margin FAILS (the comparison can fail); the prompts are
+LONG_TEXT windows 997 tokens apart, their lengths cycling."""
 
 from __future__ import annotations
 
@@ -23,8 +23,15 @@ def _run(n_req: int = 3, n_out: int = 6) -> dict:
         ids = [100 + k * 10 + i for i in range(n_out)]
         # top-1 / top-2 logprobs on a 1/8 grid (bf16 logits): the reference's quantum is 0.125
         lps = [[-0.25, [t, t + 1], [-0.25, -0.375 - 0.125 * (i % 3)]] for i, t in enumerate(ids)]
-        reqs.append({"prompt_len": 128 + k, "output_ids": ids, "text": "", "logprobs": lps,
-                     "where": ["prefill chunk"] + ["decode call"] * (n_out - 1)})
+        reqs.append(
+            {
+                "prompt_len": 128 + k,
+                "output_ids": ids,
+                "text": "",
+                "logprobs": lps,
+                "where": ["prefill chunk"] + ["decode call"] * (n_out - 1),
+            }
+        )
     return {"forced": None, "requests": reqs}
 
 
@@ -62,6 +69,8 @@ def test_prompts_are_windows_997_apart():
 
 
 def test_permute_with_turns_is_refused(monkeypatch):
-    monkeypatch.setattr("sys.argv", ["check_mixed.py", "--model", "x", "--out", "o.json", "--turns", "--permute", "reverse"])
+    monkeypatch.setattr(
+        "sys.argv", ["check_mixed.py", "--model", "x", "--out", "o.json", "--turns", "--permute", "reverse"]
+    )
     with pytest.raises(SystemExit, match="not built"):
         CM.main()

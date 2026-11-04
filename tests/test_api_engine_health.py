@@ -47,8 +47,9 @@ def _server(tmp_path):
 
 
 def _completion(c, max_tokens=4):
-    return c.post("/v1/completions", json={"prompt": PROMPT, "max_tokens": max_tokens, "temperature": 0,
-                                           "ignore_eos": True})
+    return c.post(
+        "/v1/completions", json={"prompt": PROMPT, "max_tokens": max_tokens, "temperature": 0, "ignore_eos": True}
+    )
 
 
 def _stream_events(c, max_tokens=200) -> list[dict]:

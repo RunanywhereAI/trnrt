@@ -7,8 +7,9 @@ every host / device guard on the decode path is classified."""
 from __future__ import annotations
 
 import ast
-import re
 import os
+import pathlib
+import re
 import subprocess
 import sys
 import types
@@ -19,8 +20,17 @@ import torch
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SHELL = os.path.join("trnrt", "kernels", "shell.py")
 # serving's import path: python -m trnrt, the server, the engine and its runner, the model code and every kernel module
-SERVING = ("trnrt.__main__", "trnrt.serve.api", "trnrt.engine.engine", "trnrt.engine.model_runner", "trnrt.engine.tp",
-           "trnrt.models.loader", "trnrt.models.decoder", "trnrt.models.hybrid", "trnrt.models.glm5_next")
+SERVING = (
+    "trnrt.__main__",
+    "trnrt.serve.api",
+    "trnrt.engine.engine",
+    "trnrt.engine.model_runner",
+    "trnrt.engine.tp",
+    "trnrt.models.loader",
+    "trnrt.models.decoder",
+    "trnrt.models.hybrid",
+    "trnrt.models.glm5_next",
+)
 REQUIRED = ("trnrt.models.decoder", "trnrt.models.hybrid", "trnrt.engine.engine")
 
 
@@ -29,23 +39,38 @@ def sets_host_sim(src: str, path: str) -> list[int]:
     setattr(x, "HOST_SIM", ...))."""
     out = []
     for n in ast.walk(ast.parse(src)):
-        targets = n.targets if isinstance(n, ast.Assign) else [n.target] if isinstance(n, (ast.AugAssign,
-                                                                                          ast.AnnAssign)) else []
-        for t in targets:
-            if isinstance(t, ast.Attribute) and t.attr == "HOST_SIM":
-                out.append(n.lineno)
-            elif isinstance(t, ast.Name) and t.id == "HOST_SIM" and path != SHELL:
-                out.append(n.lineno)
-        if (isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "setattr" and len(n.args) >= 2
-                and isinstance(n.args[1], ast.Constant) and n.args[1].value == "HOST_SIM"):
+        targets = (
+            n.targets
+            if isinstance(n, ast.Assign)
+            else [n.target]
+            if isinstance(n, (ast.AugAssign, ast.AnnAssign))
+            else []
+        )
+        out.extend(
+            n.lineno
+            for t in targets
+            if (isinstance(t, ast.Attribute) and t.attr == "HOST_SIM")
+            or (isinstance(t, ast.Name) and t.id == "HOST_SIM" and path != SHELL)
+        )
+        if (
+            isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Name)
+            and n.func.id == "setattr"
+            and len(n.args) >= 2
+            and isinstance(n.args[1], ast.Constant)
+            and n.args[1].value == "HOST_SIM"
+        ):
             out.append(n.lineno)
     return out
 
 
 def test_shell_defines_it_once_false():
-    tree = ast.parse(open(os.path.join(ROOT, SHELL)).read())
-    defs = [n for n in tree.body if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "HOST_SIM"
-                                                                       for t in n.targets)]
+    tree = ast.parse(pathlib.Path(ROOT, SHELL).read_text())
+    defs = [
+        n
+        for n in tree.body
+        if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "HOST_SIM" for t in n.targets)
+    ]
     assert len(defs) == 1 and isinstance(defs[0].value, ast.Constant) and defs[0].value.value is False
 
 
@@ -58,7 +83,7 @@ def test_no_source_outside_tests_sets_it():
                     p = os.path.join(d, f)
                     rel = os.path.relpath(p, ROOT)
                     try:
-                        src = open(p).read()
+                        src = pathlib.Path(p).read_text()
                         lines = sets_host_sim(src, rel)
                     except (SyntaxError, UnicodeDecodeError):
                         continue
@@ -68,28 +93,36 @@ def test_no_source_outside_tests_sets_it():
 
 def test_the_scan_finds_a_planted_setter():
     """The positive path: each form a harness (or a slip) would use is found."""
-    for src in ("from trnrt.kernels import shell as SH\nSH.HOST_SIM = True\n", "import x\nx.y.HOST_SIM |= 1\n",
-                "setattr(SH, 'HOST_SIM', True)\n", "HOST_SIM = True\n"):
+    for src in (
+        "from trnrt.kernels import shell as SH\nSH.HOST_SIM = True\n",
+        "import x\nx.y.HOST_SIM |= 1\n",
+        "setattr(SH, 'HOST_SIM', True)\n",
+        "HOST_SIM = True\n",
+    ):
         assert sets_host_sim(src, "trnrt/models/x.py"), src
 
 
 def test_serving_import_path_leaves_it_off():
     env = {k: v for k, v in os.environ.items() if not k.startswith("TRNRT_")}
     env.update(PYTHONPATH=ROOT, TRNRT_HOST_SIM="1", HOST_SIM="1", NEURON_PLATFORM_TARGET_OVERRIDE="trn2")
-    code = ("import importlib, json, os, sys\n"
-            "ok, skipped = [], {}\n"
-            f"for m in {SERVING!r} + tuple('trnrt.kernels.' + f[:-3] for f in sorted(os.listdir('trnrt/kernels'))\n"
-            "                                if f.endswith('.py') and f != '__init__.py'):\n"
-            "    try:\n"
-            "        importlib.import_module(m)\n"
-            "        ok.append(m)\n"
-            "    except ModuleNotFoundError as e:\n"
-            "        if (e.name or '').startswith('trnrt'):\n"
-            "            raise\n"
-            "        skipped[m] = e.name\n"
-            "from trnrt.kernels import shell\n"
-            "print(json.dumps({'host_sim': shell.HOST_SIM, 'ok': ok, 'skipped': skipped}))\n")
-    p = subprocess.run([sys.executable, "-c", code], cwd=ROOT, env=env, capture_output=True, text=True, timeout=600)
+    code = (
+        "import importlib, json, os, sys\n"
+        "ok, skipped = [], {}\n"
+        f"for m in {SERVING!r} + tuple('trnrt.kernels.' + f[:-3] for f in sorted(os.listdir('trnrt/kernels'))\n"
+        "                                if f.endswith('.py') and f != '__init__.py'):\n"
+        "    try:\n"
+        "        importlib.import_module(m)\n"
+        "        ok.append(m)\n"
+        "    except ModuleNotFoundError as e:\n"
+        "        if (e.name or '').startswith('trnrt'):\n"
+        "            raise\n"
+        "        skipped[m] = e.name\n"
+        "from trnrt.kernels import shell\n"
+        "print(json.dumps({'host_sim': shell.HOST_SIM, 'ok': ok, 'skipped': skipped}))\n"
+    )
+    p = subprocess.run(
+        [sys.executable, "-c", code], cwd=ROOT, env=env, capture_output=True, text=True, timeout=600, check=False
+    )
     assert p.returncode == 0, p.stderr[-2000:]
     import json
 
@@ -151,20 +184,21 @@ def test_mhc_pre_follows_it(monkeypatch, fake_launch):
 
     monkeypatch.setattr(mhc_pre, "mhc_pre_kernel", "the mhc_pre kernel")
     T, hc, H = 2, 4, 256
-    O = 2 * hc + hc * hc
+    n_mix = 2 * hc + hc * hc
     g = torch.Generator().manual_seed(1)
-    S, fn = torch.randn(T, hc, H, generator=g).bfloat16(), (0.02 * torch.randn(O, hc * H, generator=g)).bfloat16()
-    base, scale = 0.1 * torch.randn(O, generator=g), 1 + 0.1 * torch.randn(3, generator=g)
+    S, fn = torch.randn(T, hc, H, generator=g).bfloat16(), (0.02 * torch.randn(n_mix, hc * H, generator=g)).bfloat16()
+    base, scale = 0.1 * torch.randn(n_mix, generator=g), 1 + 0.1 * torch.randn(3, generator=g)
     assert not mhc_pre.takes(S.device, T, H, hc, fn.dtype)
     x = mhc_pre.pre(S, fn, base, scale, 20, 1e-6, 1e-5)
     assert len(x) == 3 and fake_launch == []  # the emulation
     monkeypatch.setattr(SH, "HOST_SIM", True)
     assert mhc_pre.takes(S.device, T, H, hc, fn.dtype)
     assert not mhc_pre.takes(S.device, T, H, hc, torch.float32)  # its other conditions still decide
-    x, post, comb = mhc_pre.pre(S, fn, base, scale, 20, 1e-6, 1e-5)
+    x, _post, comb = mhc_pre.pre(S, fn, base, scale, 20, 1e-6, 1e-5)
     assert x.shape == (T, H) and comb.shape == (T, hc, hc)  # the stand-in launch's outputs, not the emulation's
     assert [(k, g, kw["rev"], kw["skf"]) for k, g, kw in fake_launch] == [
-        ("the mhc_pre kernel", 2, mhc_pre.REV, mhc_pre.SK)], fake_launch
+        ("the mhc_pre kernel", 2, mhc_pre.REV, mhc_pre.SK)
+    ], fake_launch
 
 
 # -- every host / device guard on the decode path's files, classified ----------------------------------------------
@@ -220,8 +254,10 @@ def classify_errors(rel: str, src: str, table: dict) -> list[str]:
             continue
         for cls, ln in zip(want, lines):
             if (cls == "flip") != ("HOST_SIM" in ln):
-                bad.append(f"{rel}:{fn}: a {cls} site {'without' if cls == 'flip' else 'reading'} HOST_SIM: {ln.strip()}")
-    for (r, fn) in table:
+                bad.append(
+                    f"{rel}:{fn}: a {cls} site {'without' if cls == 'flip' else 'reading'} HOST_SIM: {ln.strip()}"
+                )
+    for r, fn in table:
         if r == rel and fn not in got:
             bad.append(f"{rel}:{fn}: listed, but has no guard any more (update the table)")
     return bad
@@ -233,7 +269,7 @@ def test_every_guard_is_classified():
     files = sorted({r for r, _ in SITES} | set(glob.glob("trnrt/kernels/dsa_*.py", root_dir=ROOT)))
     bad = []
     for rel in files:
-        bad += classify_errors(rel, open(os.path.join(ROOT, rel)).read(), SITES)
+        bad += classify_errors(rel, pathlib.Path(ROOT, rel).read_text(), SITES)
     assert bad == [], bad
 
 

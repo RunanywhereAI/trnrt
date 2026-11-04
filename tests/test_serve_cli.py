@@ -3,8 +3,11 @@ assertion unless --allow-compile, a cache miss ends start-up with its likely cau
 time and stops them all past --startup-timeout, and the argv serve hands each engine parses there. Fake engine
 processes and a fake /health: nothing is loaded or served."""
 
+import os
 import signal
+import sys
 import time
+from typing import ClassVar
 
 import pytest
 
@@ -13,8 +16,10 @@ pytest.importorskip("uvicorn")
 
 import trnrt.__main__ as cli  # noqa: E402
 
-MISS = ("NEURON_LIBTORCH_ASSERT_CACHE_HIT: compile cache miss for key 0123abcd. All graphs must be pre-compiled when "
-        "assert_cache_hit is enabled.")
+MISS = (
+    "NEURON_LIBTORCH_ASSERT_CACHE_HIT: compile cache miss for key 0123abcd. All graphs must be pre-compiled when "
+    "assert_cache_hit is enabled."
+)
 
 
 def _last(cmd: list[str], flag: str) -> str:
@@ -58,7 +63,7 @@ class FakeEngine:
 
 class FakeHost:
     def __init__(self):
-        self.events, self.engines, self.plan, self.router = [], [], [], None
+        self.events, self.engines, self.plan, self.router, self.router_kw = [], [], [], None, None
 
 
 def _unset(monkeypatch, name):
@@ -86,8 +91,8 @@ def host(monkeypatch):
                 return httpx.Response(e.health())
         raise httpx.ConnectError("connection refused")
 
-    def run(app, host=None, port=None):
-        h.router = app
+    def run(app, host=None, port=None, **kw):
+        h.router, h.router_kw = app, kw
         h.events.append(("router", port))
 
     monkeypatch.setattr(cli.subprocess, "Popen", popen)
@@ -109,6 +114,29 @@ def test_serve_starts_one_engine_at_a_time_with_the_cache_hit_assertion(host):
         assert _last(e.cmd, "--core-base") == str(32 * i) and _last(e.cmd, "--host") == "127.0.0.1"
         assert "--engines" not in e.cmd and "--startup-timeout" not in e.cmd and "--allow-compile" not in e.cmd
         assert e.signals == [signal.SIGTERM]  # the router returned: serve stops its engines
+
+
+def test_serve_gives_the_router_its_keep_alive_and_not_the_engines(host):
+    """uvicorn's default keep-alive (5 s) is under a client pool's (aiohttp: 15 s): the router keeps 75 s by default."""
+    assert cli.cmd_serve(["--model", "m"]) == 0
+    assert host.router_kw["timeout_keep_alive"] == 75
+    host.engines.clear()
+    assert cli.cmd_serve(["--model", "m", "--timeout-keep-alive", "120"]) == 0
+    assert host.router_kw["timeout_keep_alive"] == 120
+    assert all("--timeout-keep-alive" not in e.cmd for e in host.engines)  # serve's own flag: an engine would refuse it
+
+
+def test_router_main_passes_its_keep_alive(monkeypatch):
+    import uvicorn
+
+    from trnrt.serve import router
+
+    got = {}
+    monkeypatch.setattr(uvicorn, "run", lambda app, **kw: got.update(kw))
+    for extra, want in (([], 75), (["--timeout-keep-alive", "5"], 5)):
+        monkeypatch.setattr(sys, "argv", ["router", "--worker-urls", "http://127.0.0.1:9", *extra])
+        router.main()
+        assert got["timeout_keep_alive"] == want
 
 
 def test_allow_compile_turns_the_assertion_off_in_the_engines(host, monkeypatch):
@@ -158,6 +186,17 @@ def test_a_cache_miss_ends_serve_with_its_cause(host):
     assert "exited during start-up (status 1)" in str(e.value.code) and "cache" not in str(e.value.code)
 
 
+def test_serve_reports_an_engine_its_host_refused(host):
+    """An engine whose host checks refused it (engine/start_checks.py) exits with START_REFUSED_STATUS: serve says so,
+    pointing at the engine's own message, and starts nothing after it."""
+    host.plan = [{"ready": 2, "exit_status": cli.START_REFUSED_STATUS}]
+    with pytest.raises(SystemExit) as e:
+        cli.cmd_serve(["--model", "m"])
+    msg = str(e.value.code)
+    assert "engine 0 did not start" in msg and "check of the host refused it" in msg and "cache" not in msg, msg
+    assert len(host.engines) == 1 and host.router is None
+
+
 def test_an_engine_that_dies_while_the_next_starts_ends_serve(host, monkeypatch):
     host.plan = [{"ready": 1}, {"ready": None}]
     fake_get = httpx.get
@@ -175,8 +214,8 @@ def test_an_engine_that_dies_while_the_next_starts_ends_serve(host, monkeypatch)
 
 
 class _FakeLLMEngine:
-    seen_env: list = []
-    cfgs: list = []
+    seen_env: ClassVar[list] = []
+    cfgs: ClassVar[list] = []
     fail = None
 
     def __init__(self, cfg):
@@ -234,8 +273,26 @@ def test_engine_passes_other_failures_through_and_allow_compile_turns_the_assert
         cli.cmd_engine(ENGINE_ARGV)
     engine.fail = None
     assert cli.cmd_engine(ENGINE_ARGV) == 0
-    assert cli.cmd_engine(ENGINE_ARGV + ["--allow-compile"]) == 0
+    assert cli.cmd_engine([*ENGINE_ARGV, "--allow-compile"]) == 0
     assert engine.seen_env == ["1", "1", "0"]
+
+
+def test_an_engine_its_host_refuses_builds_nothing(engine, monkeypatch, capsys):
+    """cmd_engine asks the host checks about its own cores before anything starts: a refusal is printed and ends it
+    with START_REFUSED_STATUS, no engine built and no environment set for one."""
+    from trnrt.engine import start_checks
+
+    asked = []
+
+    def refuse(device, core_base, tp):
+        asked.append((device, core_base, tp))
+        return "the Neuron devices of this engine's cores 32-63 (devices 8, 9) are in use by another process: pid 7"
+
+    monkeypatch.setattr(start_checks, "refusal", refuse)
+    assert cli.cmd_engine(["--model", "m", "--core-base", "32"]) == cli.START_REFUSED_STATUS
+    assert asked == [("neuron", 32, 32)] and engine.cfgs == [] and engine.seen_env == []
+    assert "trnrt engine: not starting: the Neuron devices of this engine's cores 32-63" in capsys.readouterr().err
+    assert cli.CACHE_HIT_ENV not in os.environ  # refused before the engines' environment was set
 
 
 def test_cache_miss_reads_the_chain_and_only_a_miss():
@@ -243,8 +300,12 @@ def test_cache_miss_reads_the_chain_and_only_a_miss():
     assert cli.cache_miss(RuntimeError("x\n" + MISS + "\ny")) == MISS
     assert cli.cache_miss(RuntimeError("compile failed")) is None
     # LNL's refusal of a contradictory environment names the variable but is no miss
-    assert cli.cache_miss(ValueError("NEURON_LIBTORCH_DISABLE_COMPILE_CACHE and NEURON_LIBTORCH_ASSERT_CACHE_HIT "
-                                     "cannot both be set")) is None
+    assert (
+        cli.cache_miss(
+            ValueError("NEURON_LIBTORCH_DISABLE_COMPILE_CACHE and NEURON_LIBTORCH_ASSERT_CACHE_HIT cannot both be set")
+        )
+        is None
+    )
 
 
 @pytest.fixture
@@ -252,6 +313,7 @@ def stand_in(host, engine, monkeypatch):
     """serve's engine commands run in this process: `python -m trnrt engine ARGV` as trnrt.__main__.main(ARGV), with the
     stand-in LLMEngine. An engine that parses its argv starts and answers /health; one that does not exits with
     argparse's status 2."""
+
     def popen(cmd, env=None, preexec_fn=None):
         assert cmd[1:4] == ["-m", "trnrt", "engine"], cmd
         e = FakeEngine(host, cmd, env)
@@ -273,7 +335,7 @@ def test_serve_hands_each_engine_an_argv_it_parses(stand_in):
     assert cli.cmd_serve(["--model", "m", "--device", "cpu", "--port", "9000"]) == 0
     assert [(c.host_cache_gb, c.tp_core_base) for c in stand_in.cfgs] == [(4.0, 0), (4.0, 32)]
     stand_in.cfgs.clear()
-    assert cli.cmd_serve(["--model", "m", "--device", "cpu", "--host-cache-gb", "2", "--host", "0.0.0.0"]) == 0
+    assert cli.cmd_serve(["--model", "m", "--device", "cpu", "--host-cache-gb", "2", "--host", "0.0.0.0"]) == 0  # noqa: S104  an argv; the stand-in binds nothing
     assert [c.host_cache_gb for c in stand_in.cfgs] == [2.0, 2.0]  # a full name still reaches the engines
 
 

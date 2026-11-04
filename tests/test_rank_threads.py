@@ -15,10 +15,19 @@ from trnrt.engine import tp as TP
 
 NODE0 = "0-47,96-143"
 NODE1 = "48-95,144-191"
-LS = [{"neuron_device": d, "nc_count": 4, "logical_neuroncore_config": 2,
-       "cpu_affinity": NODE1 if d < 4 or d >= 12 else NODE0} for d in range(16)]
+LS = [
+    {
+        "neuron_device": d,
+        "nc_count": 4,
+        "logical_neuroncore_config": 2,
+        "cpu_affinity": NODE1 if d < 4 or d >= 12 else NODE0,
+    }
+    for d in range(16)
+]
 ALL = set(range(192))
-HALF_B = set(range(48, 88)) | set(range(144, 184))  # a half-box engine's launch set: node 1's CPUs within the engine set
+HALF_B = set(range(48, 88)) | set(
+    range(144, 184)
+)  # a half-box engine's launch set: node 1's CPUs within the engine set
 
 
 @pytest.fixture
@@ -58,14 +67,17 @@ def test_a_half_box_engine_shares_one_set(affinity, rank):
     assert affinity["mask"] == HALF_B and TP.rank_threads(32) == 2
 
 
-@pytest.mark.parametrize("rank,want_mask,want", [
-    (0, set(range(48, 72)), 24 // 16),   # node 1 & 0-71 = 48-71, ranks 0-15 share it: 1
-    (16, set(range(0, 48)), 48 // 16),   # node 0 & 0-71 = 0-47, ranks 16-31 share it: 3
-])
+@pytest.mark.parametrize(
+    ("rank", "want_mask", "want"),
+    [
+        (0, set(range(48, 72)), 24 // 16),  # node 1 & 0-71 = 48-71, ranks 0-15 share it: 1
+        (16, set(range(48)), 48 // 16),  # node 0 & 0-71 = 0-47, ranks 16-31 share it: 3
+    ],
+)
 def test_pinned_across_two_nodes_counts_each_nodes_ranks(affinity, rank, want_mask, want):
     """Launched on 0-71 at core base 0: each node's 16 ranks split their own node's CPUs. Against world (32) the count would
     read 0 and 1, so the per-set count is what is under test."""
-    affinity["mask"] = set(range(0, 72))
+    affinity["mask"] = set(range(72))
     TP.numa_pin(rank, 0, LS)
     assert affinity["mask"] == want_mask and TP.rank_threads(32) == want
     assert len(want_mask) // 32 != want  # a world-based split gives another answer (control)
@@ -74,12 +86,13 @@ def test_pinned_across_two_nodes_counts_each_nodes_ranks(affinity, rank, want_ma
 def test_an_affinity_matching_no_rank_falls_back_to_world(affinity):
     affinity["mask"] = set(HALF_B)
     TP.numa_pin(20, 32, LS)
-    affinity["mask"] = set(range(0, 64))  # moved after the pin
+    affinity["mask"] = set(range(64))  # moved after the pin
     assert TP.rank_threads(32) == 64 // 32
 
 
 def test_a_failed_listing_counts_all_ranks(monkeypatch, affinity):
     """neuron-ls failing leaves every rank as launched, so all `world` ranks share the launch set."""
+
     def broken():
         raise FileNotFoundError("neuron-ls")
 

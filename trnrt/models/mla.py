@@ -24,7 +24,7 @@ The indexer scores pools of index_kpool consecutive tokens (models/glm5_next.py)
 sum_h w[t, h] relu(q_I[t, h] . k_P[p] / sqrt(Di)), with q_I = wq_b(q latent), each pool key k_P
 the softmax-gated mean of its tokens' keys LayerNorm(wk(x)), and w = weights_proj(x) / sqrt(Hi);
 the query then attends only to the tokens of its index_topk / kpool best pools plus its own
-incomplete pool. Numerics follow transformers v5.18.0 (models/glm5_next/modeling_glm5_next.py):
+incomplete pool. Numerics follow transformers v5.17.0 (models/glm5_next/modeling_glm5_next.py):
 scores in fp32 and no Hadamard rotation or FP8 activation quantisation of q_I / k_I.
 
 On the device every DSA layer is context-parallel (models/dsa_long.py "context parallelism"):
@@ -93,15 +93,15 @@ SEL2_CS = 1
 # (kernels/dsa_shell.py attend); a larger one merges in dsa_long.cp_merge. A decode step of at most
 # LAYER_MK_MAXB rows runs the fused layer calls (kernels/dsa_sat.py, kernels/dsa_satwf.py).
 # LAYER_MK_MAXB is the engine's --dsa-layer-max-rows (EngineConfig.dsa_layer_max_rows, set on every rank by
-# engine.build_shard before it builds the shard; 8 served, 16 under the batch-12 preset).
+# engine.build_shard before it builds the shard; 8 here and under --preset batch8, 16 served).
 SHELL_MAXB = 6
 LAYER_MK_MAXB = 8
 # _cp_scores' kernel scores (kernels/dsa_index.py) of a call of more than CP_INDEX_ROWS rows run as one kernel call
-# per CP_INDEX_ROWS rows, each with its rows' weights, page groups and candidates; 0 (served): one call. Rows are
+# per CP_INDEX_ROWS rows, each with its rows' weights, page groups and candidates; 0 (batch8's): one call. Rows are
 # independent in the kernel, so the scores are the same. Each call builds the kernel's query layout [D, rows Hi] by an
 # XLA transpose of [rows Hi, D], which neuronx-cc lowers as an ordinary transpose at 8 rows but at 16 as a DMA transpose
 # of 16,384 16-byte descriptors per DSA layer. The engine's --dsa-index-rows (EngineConfig.dsa_index_rows, set by
-# build_shard; 8 under the batch-12 preset). Only graphs whose calls reach _cp_scores with more rows move.
+# build_shard; 8 served). Only graphs whose calls reach _cp_scores with more rows move.
 CP_INDEX_ROWS = 0
 
 

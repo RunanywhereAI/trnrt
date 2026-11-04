@@ -19,26 +19,36 @@ import tempfile
 import pytest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_SPEC = json.loads(base64.b64decode(
-    "eyJwYXR0ZXJucyI6IFtbInVwc3RyZWFtIHByb2plY3QgbmFtZSIsICJraWxuIiwgdHJ1ZSwgImF0dHJpYnV0aW9uIl0sIFsi"
-    "dXBzdHJlYW0gb3JnIG5hbWUiLCAiZm94bCIsIHRydWUsICJhdHRyaWJ1dGlvbiJdLCBbImludGVybmFsIGhvc3QiLCAiXFxi"
-    "dHJuMltzYl1cXGIiLCBmYWxzZSwgImhvc3QiXSwgWyJpbnRlcm5hbCBob3N0IiwgIlxcYmNjWzU3XVxcYiIsIGZhbHNlLCAi"
-    "aG9zdCJdLCBbImludGVybmFsIGhvbWUgcGF0aCIsICIvaG9tZS91YnVudHUiLCBmYWxzZSwgInBhdGgiXSwgWyJpbnRlcm5h"
-    "bCBob21lIHBhdGgiLCAiL1VzZXJzL2FtYW4iLCBmYWxzZSwgInBhdGgiXSwgWyJhZ2VudCBuYW1lIiwgIlxcYm1hc3Rlcl9h"
-    "d3NcXGIiLCBmYWxzZSwgImFnZW50Il0sIFsiYWdlbnQgbmFtZSIsICJcXGJyZXNlYXJjaF9hd3NcXGIiLCBmYWxzZSwgImFn"
-    "ZW50Il0sIFsiYWdlbnQgbmFtZSIsICJcXGJkZXZbMTIzXVxcYiIsIGZhbHNlLCAiYWdlbnQiXSwgWyJ0b29sIGRpcmVjdG9y"
-    "eSIsICJcXC5jbGF1ZGUvIiwgZmFsc2UsICJwYXRoIl0sIFsid29ya2luZy1ub3RlcyBkaXJlY3RvcnkiLCAiZGV2L3Byb2dy"
-    "ZXNzIiwgZmFsc2UsICJwYXRoIl0sIFsicmVnaW9uIiwgImh5ZGVyYWJhZCIsIHRydWUsICJyZWdpb24iXSwgWyJyZWdpb24i"
-    "LCAiYXAtc291dGgtMiIsIGZhbHNlLCAicmVnaW9uIl0sIFsicHJpY2UgcGFpZCIsICIoPzwhW1xcZC5dKTEwXFwuMzIoPyFc"
-    "XGQpIiwgZmFsc2UsICJwcmljZSJdLCBbImNyZWRpdHMiLCAiXFxiY3JlZGl0c1xcYiIsIHRydWUsICJjcmVkaXRzIl1dLCAi"
-    "c2FtcGxlcyI6IFsia2lsbiIsICJmb3hsIiwgInRybjJzIiwgImNjNSIsICIvaG9tZS91YnVudHUiLCAiL1VzZXJzL2FtYW4i"
-    "LCAibWFzdGVyX2F3cyIsICJyZXNlYXJjaF9hd3MiLCAiZGV2MSIsICIuY2xhdWRlLyIsICJkZXYvcHJvZ3Jlc3MiLCAiSHlk"
-    "ZXJhYmFkIiwgImFwLXNvdXRoLTIiLCAiMTAuMzIiLCAiY3JlZGl0cyJdfQ=="
-))
-PATTERNS = [(label, re.compile(rx.encode(), re.I if nocase else 0), kind) for label, rx, nocase, kind in _SPEC["patterns"]]
+_SPEC = json.loads(
+    base64.b64decode(
+        "eyJwYXR0ZXJucyI6IFtbInVwc3RyZWFtIHByb2plY3QgbmFtZSIsICJraWxuIiwgdHJ1ZSwgImF0dHJpYnV0aW9uIl0sIFsi"
+        "dXBzdHJlYW0gb3JnIG5hbWUiLCAiZm94bCIsIHRydWUsICJhdHRyaWJ1dGlvbiJdLCBbImludGVybmFsIGhvc3QiLCAiXFxi"
+        "dHJuMltzYl1cXGIiLCBmYWxzZSwgImhvc3QiXSwgWyJpbnRlcm5hbCBob3N0IiwgIlxcYmNjWzU3XVxcYiIsIGZhbHNlLCAi"
+        "aG9zdCJdLCBbImludGVybmFsIGhvbWUgcGF0aCIsICIvaG9tZS91YnVudHUiLCBmYWxzZSwgInBhdGgiXSwgWyJpbnRlcm5h"
+        "bCBob21lIHBhdGgiLCAiL1VzZXJzL2FtYW4iLCBmYWxzZSwgInBhdGgiXSwgWyJhZ2VudCBuYW1lIiwgIlxcYm1hc3Rlcl9h"
+        "d3NcXGIiLCBmYWxzZSwgImFnZW50Il0sIFsiYWdlbnQgbmFtZSIsICJcXGJyZXNlYXJjaF9hd3NcXGIiLCBmYWxzZSwgImFn"
+        "ZW50Il0sIFsiYWdlbnQgbmFtZSIsICJcXGJkZXZbMTIzXVxcYiIsIGZhbHNlLCAiYWdlbnQiXSwgWyJ0b29sIGRpcmVjdG9y"
+        "eSIsICJcXC5jbGF1ZGUvIiwgZmFsc2UsICJwYXRoIl0sIFsid29ya2luZy1ub3RlcyBkaXJlY3RvcnkiLCAiZGV2L3Byb2dy"
+        "ZXNzIiwgZmFsc2UsICJwYXRoIl0sIFsicmVnaW9uIiwgImh5ZGVyYWJhZCIsIHRydWUsICJyZWdpb24iXSwgWyJyZWdpb24i"
+        "LCAiYXAtc291dGgtMiIsIGZhbHNlLCAicmVnaW9uIl0sIFsicHJpY2UgcGFpZCIsICIoPzwhW1xcZC5dKTEwXFwuMzIoPyFc"
+        "XGQpIiwgZmFsc2UsICJwcmljZSJdLCBbImNyZWRpdHMiLCAiXFxiY3JlZGl0c1xcYiIsIHRydWUsICJjcmVkaXRzIl1dLCAi"
+        "c2FtcGxlcyI6IFsia2lsbiIsICJmb3hsIiwgInRybjJzIiwgImNjNSIsICIvaG9tZS91YnVudHUiLCAiL1VzZXJzL2FtYW4i"
+        "LCAibWFzdGVyX2F3cyIsICJyZXNlYXJjaF9hd3MiLCAiZGV2MSIsICIuY2xhdWRlLyIsICJkZXYvcHJvZ3Jlc3MiLCAiSHlk"
+        "ZXJhYmFkIiwgImFwLXNvdXRoLTIiLCAiMTAuMzIiLCAiY3JlZGl0cyJdfQ=="
+    )
+)
+PATTERNS = [
+    (label, re.compile(rx.encode(), re.IGNORECASE if nocase else 0), kind)
+    for label, rx, nocase, kind in _SPEC["patterns"]
+]
 SAMPLES = _SPEC["samples"]
 # NOTICE carries the one attribution line the license requires; only the attribution patterns are exempt there.
 EXEMPT = {"NOTICE": {"attribution"}}
+# Commits whose message predates this scan. History is published unchanged, so these are exempt by full hash, each with
+# the reason; a new commit gets no exemption.
+EXEMPT_COMMITS = {
+    "e47040be9903990aa0f4c6bc18eac686043656cf": "a merge of two working branches, named in its message",
+}
 
 
 def _git(root, *args):
@@ -68,10 +78,12 @@ def scan(root):
             with open(full, "rb") as f:
                 hits += _hits(f.read(), p, EXEMPT.get(p, ()))
     log = _git(root, "log", "--all", "--format=%H%x00%an <%ae>%x00%cn <%ce>%x00%B%x01")
-    for rec in log.split(b"\x01"):
-        rec = rec.strip(b"\n")
+    for raw in log.split(b"\x01"):
+        rec = raw.strip(b"\n")
         if rec:
             sha, rest = rec.split(b"\x00", 1)
+            if sha.decode() in EXEMPT_COMMITS:
+                continue
             hits += _hits(rest, f"commit {sha[:12].decode()}")
     return hits
 
@@ -94,7 +106,9 @@ def test_planted_hits_trip():
     """Positive control: each pattern, planted in a file, a path and a commit message, is reported; NOTICE's exemption
     covers the attribution patterns only."""
     with tempfile.TemporaryDirectory() as d:
-        env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+        env = dict(
+            os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t"
+        )
         subprocess.run(["git", "init", "-q", d], check=True)
         with open(os.path.join(d, "clean.txt"), "w") as f:
             f.write("nothing to see\n")

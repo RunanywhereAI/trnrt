@@ -10,8 +10,10 @@ import graph_equiv as G  # noqa: E402
 
 
 def cmd(root, key, opt="-O2"):
-    return (f"neuronx-cc compile --framework=XLA {root}/cache/neuron/compile_cache/{key}/graph.hlo "
-            f"--output {root}/cache/neuron/compile_cache/{key}/graph_{key}.neff {opt} --target=trn2").encode()
+    return (
+        f"neuronx-cc compile --framework=XLA {root}/cache/neuron/compile_cache/{key}/graph.hlo "
+        f"--output {root}/cache/neuron/compile_cache/{key}/graph_{key}.neff {opt} --target=trn2"
+    ).encode()
 
 
 A = cmd("/data/ref", "01a930a6627b50fddf657b7cd9b2fbd8")

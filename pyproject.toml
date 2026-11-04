@@ -1,25 +1,53 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "trnrt"
 dynamic = ["version"]
-description = "GLM-5.3-Flash inference on AWS Trainium2, with NKI decode megakernels"
-requires-python = ">=3.10"
-license = { file = "LICENSE" }
+description = "LLM inference on AWS Trainium2, with NKI megakernels: an OpenAI-compatible server, 1M-token context and prefix caching"
+readme = "README.md"
+requires-python = ">=3.13"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "RunAnywhere", email = "security@runanywhere.ai" }]
+keywords = ["llm", "inference", "trainium", "aws", "neuron", "nki", "serving", "openai"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
   "numpy",
   "safetensors",
   "tokenizers",
-  "transformers",
+  "torch>=2.11",
+  "transformers>=5.17",
+  "jinja2",
+  "huggingface_hub",
   "fastapi",
   "uvicorn",
   "httpx",
 ]
 
 [project.optional-dependencies]
-test = ["pytest"]
+test = ["pytest>=8", "openai>=1.40", "ml_dtypes"]
+lint = ["ruff==0.17.3", "pre-commit>=4", "mypy==2.4.1"]
+dev = ["trnrt[test,lint]"]
+
+[project.urls]
+Homepage = "https://github.com/RunanywhereAI/trnrt"
+Repository = "https://github.com/RunanywhereAI/trnrt"
+Documentation = "https://github.com/RunanywhereAI/trnrt/tree/main/docs"
+Issues = "https://github.com/RunanywhereAI/trnrt/issues"
+Changelog = "https://github.com/RunanywhereAI/trnrt/blob/main/CHANGELOG.md"
+
+[project.scripts]
+trnrt = "trnrt.__main__:main"
 
 [tool.setuptools.dynamic]
 version = { attr = "trnrt.__version__" }
@@ -29,3 +57,100 @@ include = ["trnrt*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = ["-ra", "--strict-markers", "--strict-config"]
+xfail_strict = true
+
+[tool.ruff]
+target-version = "py313"
+line-length = 120
+extend-exclude = ["build", "dist"]
+
+[tool.ruff.format]
+# Traced code is never reformatted: a moved line can change a kernel's compiled binary, and with it every compile-cache
+# key (AGENTS.md, "Traced code is frozen"). Everything else is formatted.
+exclude = [
+  "trnrt/kernels/**",
+  "trnrt/models/**",
+  "trnrt/engine/model_runner.py",
+  "trnrt/compile/capture.py",
+  "trnrt/config.py",
+  "trnrt/platform.py",
+]
+
+[tool.ruff.lint]
+select = [
+  "E", "W",   # pycodestyle
+  "F",        # pyflakes
+  "I",        # isort
+  "UP",       # pyupgrade (Python 3.13)
+  "B",        # bugbear
+  "S",        # bandit: security
+  "BLE",      # blind except
+  "A",        # shadowed builtins
+  "C4",       # comprehensions
+  "DTZ",      # naive datetimes
+  "T10",      # debugger calls
+  "T20",      # print (allowed only in CLIs, tools and tests: per-file-ignores)
+  "EXE",      # shebangs
+  "ISC",      # implicit string concatenation
+  "ICN",      # import conventions
+  "LOG", "G", # logging
+  "PIE",      # misc lint
+  "PT",       # pytest style
+  "RET",      # returns
+  "SIM",      # simplify
+  "TC",       # type-checking imports
+  "ARG",      # unused arguments
+  "ERA",      # commented-out code
+  "PGH",      # pygrep hooks
+  "PLE", "PLW", # pylint errors and warnings
+  "PERF",     # performance anti-patterns
+  "FURB",     # refurb
+  "FLY",      # f-strings over join
+  "SLOT",     # __slots__ on subclasses of immutables
+  "RUF",      # ruff-specific
+]
+ignore = [
+  "E501",   # line length: the formatter wraps code; long strings and URLs stay whole
+  "B905",   # zip(strict=): truncation is intended where lengths differ; equal-length zips are asserted where it matters
+  "PT018",  # composite assertions: one assert per invariant reads better in numerics tests
+  "S603",   # subprocess with an argument list (never a shell): every call site is reviewed, this rule cannot tell
+  "S607",   # executables found on PATH (git, docker, neuron-ls): intended
+  "TID252", # relative imports inside the package are the convention; tools/graph_equiv.py relies on them
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Traced code (see [tool.ruff.format]): correctness rules only, never an edit that could move a graph.
+"trnrt/kernels/**" = ["E", "W", "I", "UP", "B", "S", "BLE", "A", "C4", "DTZ", "T20", "EXE", "ISC", "ICN", "LOG", "G", "PIE", "PT", "RET", "SIM", "TC", "ARG", "ERA", "PGH", "PLW", "PERF", "FURB", "FLY", "SLOT", "RUF", "F401", "F841"]
+"trnrt/models/**" = ["E", "W", "I", "UP", "B", "S", "BLE", "A", "C4", "DTZ", "T20", "EXE", "ISC", "ICN", "LOG", "G", "PIE", "PT", "RET", "SIM", "TC", "ARG", "ERA", "PGH", "PLW", "PERF", "FURB", "FLY", "SLOT", "RUF", "F841"]
+"trnrt/{engine/model_runner,compile/capture,config,platform}.py" = ["E", "W", "I", "UP", "B", "S", "BLE", "A", "C4", "DTZ", "T20", "EXE", "ISC", "ICN", "LOG", "G", "PIE", "PT", "RET", "SIM", "TC", "ARG", "ERA", "PGH", "PLW", "PERF", "FURB", "FLY", "SLOT", "RUF"]
+# Tests: asserts are pytest's API, stubs keep their callee's signature, seeded randomness is not cryptography, and a
+# tokenizer's unk_token is not a password.
+"tests/**" = ["S101", "S106", "S311", "ARG", "T20"]
+# Command-line programs print their output.
+"tools/**" = ["T20"]
+"docker/**" = ["T20"]
+"trnrt/__main__.py" = ["T20"]
+"trnrt/compile/farm.py" = ["T20"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["trnrt"]
+
+[tool.ruff.lint.flake8-pytest-style]
+fixture-parentheses = false
+
+[tool.mypy]
+python_version = "3.13"
+files = ["trnrt", "tools", "docker"]
+ignore_missing_imports = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_unused_configs = true
+strict_equality = true
+check_untyped_defs = true
+no_implicit_optional = true
+
+# Traced code is frozen (see [tool.ruff.format]); it is not type-checked here.
+[[tool.mypy.overrides]]
+module = ["trnrt.kernels.*", "trnrt.models.*", "trnrt.engine.model_runner", "trnrt.compile.capture", "trnrt.config", "trnrt.platform"]
+ignore_errors = true

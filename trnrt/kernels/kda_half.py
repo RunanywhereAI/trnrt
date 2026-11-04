@@ -24,7 +24,7 @@ Layouts:
 - Programs split HEADS, not rows: at LNC = 2 (grid 2) and nv = 2, program p owns head p. It streams only its head's
   q, k, v and b columns (plus f_a and g_a, which both heads need: duplicated, 2 MB), its conv channels, f_b / g_b rows,
   its recurrent state (disjoint pool bytes: no write race with the other program), and its head's rows of the output
-  projection, over all columns. One NKI program streams ~330 GB/s, XLA ~545 over both (a GEMV probe on trn2), so a
+  projection, over all columns. One NKI program streams 340-400 GB/s, a logical core's two programs 672-708 (trn2), so a
   fused kernel must split its weight bytes, not duplicate them. The output projection contracts over
   both heads: each program writes its fp32 partial ([npg, B, H]) and the caller adds them, then rounds to bf16 (the same
   fp32 sum PSUM would make). The first build exchanged the gated-norm output through shared HBM and a core barrier

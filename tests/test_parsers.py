@@ -7,8 +7,10 @@ import random
 from tests.parser_util import collect
 from trnrt.serve.parsers import StreamParser, parse_full
 
-OUT = ("<think>The user wants weather.</think>Let me check.<tool_call>get_weather<arg_key>city</arg_key>"
-       "<arg_value>Paris</arg_value><arg_key>unit</arg_key><arg_value>c</arg_value></tool_call>")
+OUT = (
+    "<think>The user wants weather.</think>Let me check.<tool_call>get_weather<arg_key>city</arg_key>"
+    "<arg_value>Paris</arg_value><arg_key>unit</arg_key><arg_value>c</arg_value></tool_call>"
+)
 
 
 def test_full_parse_splits_reasoning_content_and_tools():
@@ -60,8 +62,9 @@ def test_streaming_matches_full_parse_for_any_chunking():
         reasoning, content, calls = collect(stream(OUT, chunks[:-1], tools=True, thinking_open=False))
         assert reasoning.strip("\n") == "The user wants weather."
         assert content.strip() == "Let me check."
-        assert [(c["name"], json.loads(c["arguments"])) for c in calls] == [("get_weather", {"city": "Paris",
-                                                                                            "unit": "c"})]
+        assert [(c["name"], json.loads(c["arguments"])) for c in calls] == [
+            ("get_weather", {"city": "Paris", "unit": "c"})
+        ]
         assert "<" not in content
 
 

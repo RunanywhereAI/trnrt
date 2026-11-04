@@ -192,8 +192,9 @@ def test_pooled_selection_is_exact_on_wide_range_scores():
 
 
 def _same_args(a: dict, b: dict) -> bool:
-    return a.keys() == b.keys() and all(torch.equal(a[k], b[k]) if isinstance(a[k], torch.Tensor) else a[k] == b[k]
-                                        for k in a)
+    return a.keys() == b.keys() and all(
+        torch.equal(a[k], b[k]) if isinstance(a[k], torch.Tensor) else a[k] == b[k] for k in a
+    )
 
 
 def test_rowsplit_cuts_a_one_tile_call_into_two_tiles(monkeypatch):
@@ -203,16 +204,23 @@ def test_rowsplit_cuts_a_one_tile_call_into_two_tiles(monkeypatch):
     128 rows) keep their arguments. On a grid-2 kernel the split is the default; on grid 1 there is nothing to split."""
     g = torch.Generator().manual_seed(11)
     # (rows, local pools, pieces, partitions): 8192 / 32768 local pools are the 1024 / 4096 rungs at CP 8
-    for R, P, gp, N in ((2, 8192, 128, 256), (4, 8192, 64, 256), (6, 8192, 32, 192), (8, 8192, 32, 256),
-                        (4, 32768, 64, 256), (8, 4096, 32, 256)):
+    for R, P, gp, N in (
+        (2, 8192, 128, 256),
+        (4, 8192, 64, 256),
+        (6, 8192, 32, 192),
+        (8, 8192, 32, 256),
+        (4, 32768, 64, 256),
+        (8, 4096, 32, 256),
+    ):
         s = torch.randn(R, P, generator=g)
         off = dk.kernel_inputs(s, 512, True, rowsplit=False)
         on = dk.kernel_inputs(s, 512, True, rowsplit=True)
         assert off["g"] == dk.pieces(R, P) and off["tiles"] == dk.TILES and off["sc"].shape[0] <= 128, (R, P)
         assert (on["g"], on["lg"], on["sc"].shape[0], on["tiles"]) == (gp, gp.bit_length() - 1, N, 1), (R, P)
         assert torch.equal(on["sc"].reshape(R, P), s), (R, P)  # the same scores, cut finer
-        assert {k: v for k, v in on.items() if k not in ("sc", "g", "lg", "tiles")} == \
-            {k: v for k, v in off.items() if k not in ("sc", "g", "lg", "tiles")}
+        assert {k: v for k, v in on.items() if k not in ("sc", "g", "lg", "tiles")} == {
+            k: v for k, v in off.items() if k not in ("sc", "g", "lg", "tiles")
+        }
         monkeypatch.setattr(platform, "nki_grid", lambda: 2)
         assert _same_args(dk.kernel_inputs(s, 512, True), on), (R, P)
         monkeypatch.setattr(platform, "nki_grid", lambda: 1)  # grid 1: one program, nothing to split
@@ -237,19 +245,32 @@ def _simulate(grid: int, monkeypatch):
 
 @needs_nki
 @pytest.mark.parametrize("grid", [1, 2], ids=["grid1", "grid2"])
-@pytest.mark.parametrize("rows,n,keep,kind", [
-    (8, 2112, 512, "pooled"), (8, 2112, 512, "integers"), (8, 2112, 512, "zeros"), (8, 2112, 512, "invisible"),
-    (256, 2112, 512, "pooled"), (3, 100, 7, "wide"), (5, 96, 40, "equal"), (8, 2112, 512, "ulps"),
-    (1, 2112, 512, "pooled"), (2, 640, 120, "equal"),
-])
+@pytest.mark.parametrize(
+    ("rows", "n", "keep", "kind"),
+    [
+        (8, 2112, 512, "pooled"),
+        (8, 2112, 512, "integers"),
+        (8, 2112, 512, "zeros"),
+        (8, 2112, 512, "invisible"),
+        (256, 2112, 512, "pooled"),
+        (3, 100, 7, "wide"),
+        (5, 96, 40, "equal"),
+        (8, 2112, 512, "ulps"),
+        (1, 2112, 512, "pooled"),
+        (2, 640, 120, "equal"),
+    ],
+)
 def test_nki_simulator_matches_emulation(rows, n, keep, kind, grid, monkeypatch):
     """The kernel (the served RBITS rounds) selects exactly what the emulation (the 1-bit search's arithmetic)
     selects, on the adversarial score kinds and every output form, on one program and on the served two."""
     monkeypatch.setenv("NEURON_PLATFORM_TARGET_OVERRIDE", "trn2")
     sim = _simulate(grid, monkeypatch)
     g = torch.Generator().manual_seed(rows * 31 + n)
-    s = pooled(rows, n, g, visible=n // 3 if kind == "pooled" and rows == 256 else None) if kind == "pooled" \
+    s = (
+        pooled(rows, n, g, visible=n // 3 if kind == "pooled" and rows == 256 else None)
+        if kind == "pooled"
         else _scores(kind, rows, n, g)
+    )
     if kind == "wide":  # no subnormals (the device may flush them; the simulator need not)
         s = torch.where(s.abs() < 1.2e-38, torch.zeros_like(s), s)
     for vis_only, kp, tail in ((True, 1, False), (False, 1, False), (True, 4, True), (True, 4, False)):

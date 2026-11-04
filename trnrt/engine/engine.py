@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import atexit
 import itertools
+import logging
 import os
 import time
 import weakref
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -17,7 +19,12 @@ from .model_runner import ModelRunner
 from .radix_cache import RadixCache
 from .request import Request, SamplingParams, Status, unsupported
 from .sampler import unpack
-from .scheduler import NeedSync, Scheduler, SchedulerConfig
+from .scheduler import NeedSync, Scheduler, SchedulerConfig, StepPlan
+
+if TYPE_CHECKING:
+    from .host_cache import HostTier
+
+logger = logging.getLogger(__name__)
 
 # Tensor-parallel engines not closed yet, held weakly: close() at exit (stopping the workers) without
 # keeping every engine a process ever made alive. atexit.register(self.close) did, so a test session
@@ -35,6 +42,7 @@ def _close_open() -> None:
 class StepStats:
     """The work the last step() launched (decodes, prefill tokens, and its graph calls by kind) and that step() call's
     wall time. The call that launches a step reads the previous one, so its seconds belong to the previous launch."""
+
     num_decode: int = 0
     num_prefill_tokens: int = 0
     seconds: float = 0.0
@@ -66,21 +74,27 @@ def pool_pages(cfg: EngineConfig, mcfg: ModelConfig) -> int:
     """Pages in the KV pool. The pool is a graph input shape (every layer graph's KV cache), so a capture
     (trnrt/compile/capture.py) must size it exactly as the engine does."""
     from ..models.decoder import kv_heads_per_rank, state_bytes_per_token_rank
-
     from .model_runner import kv_cache_torch_dtype
 
     # KV for one page on ONE rank: each rank holds its attention rank's share of the KV heads
     # (or one replicated head when the attention TP exceeds the head count).
     attn_tp = resolve_attention_tp(mcfg, cfg)
-    page_bytes = (mcfg.kv_bytes_per_token(kv_cache_torch_dtype(cfg)) * cfg.page_size
-                  * kv_heads_per_rank(mcfg.num_kv_heads, attn_tp) // mcfg.num_kv_heads)
-    page_bytes += state_bytes_per_token_rank(mcfg, attn_tp, cfg.dtype,
-                                             kv_cache_torch_dtype(cfg) == torch.float8_e4m3fn) * cfg.page_size
+    page_bytes = (
+        mcfg.kv_bytes_per_token(kv_cache_torch_dtype(cfg))
+        * cfg.page_size
+        * kv_heads_per_rank(mcfg.num_kv_heads, attn_tp)
+        // mcfg.num_kv_heads
+    )
+    page_bytes += (
+        state_bytes_per_token_rank(mcfg, attn_tp, cfg.dtype, kv_cache_torch_dtype(cfg) == torch.float8_e4m3fn)
+        * cfg.page_size
+    )
     # Context-parallel DSA (models/dsa_long.py): a rank holds 1 / cp of every page.
     page_bytes //= _cp_degree(mcfg, attn_tp)
     # A model of linear-attention layers only has no KV: pages then only count positions.
-    return cfg.num_pages or (int(cfg.kv_cache_gb * 2**30 // page_bytes) + 1 if page_bytes
-                             else cfg.max_num_seqs * cfg.max_pages_per_seq + 1)
+    return cfg.num_pages or (
+        int(cfg.kv_cache_gb * 2**30 // page_bytes) + 1 if page_bytes else cfg.max_num_seqs * cfg.max_pages_per_seq + 1
+    )
 
 
 def set_decode_routes(cfg: EngineConfig) -> None:
@@ -94,6 +108,35 @@ def set_decode_routes(cfg: EngineConfig) -> None:
     hybrid.MOE_HALF_BELOW = int(cfg.ffn_half_below)
     mla.LAYER_MK_MAXB = int(cfg.dsa_layer_max_rows)
     mla.CP_INDEX_ROWS = int(cfg.dsa_index_rows)
+
+
+def local_k_counts(model) -> list[float] | None:
+    """The counters of the context-parallel prefill's local-K selection (models/mla.py CP_LOCAL_K: each DSA layer's
+    cp_localk buffer, which the graphs add to) on this rank's row group, summed over the layers: [rows, rows that failed
+    the certificate and were selected again from the whole lists, failed rows past CP_LOCAL_F (not exact)]. None when
+    the model has no such counters (no context-parallel row groups). A device read: it waits for the graphs in flight
+    that write the counters."""
+    tot = None
+    for layer in model.kv_layers():
+        b = getattr(layer, "cp_localk", None)
+        if b is not None:
+            v = b.detach().cpu().double()
+            tot = v if tot is None else tot + v
+    return None if tot is None else tot.tolist()
+
+
+def local_k_report(before: list[float] | None, after: list[float] | None, what: str) -> str | None:
+    """One line on the local-K counters' change over `what` (local_k_counts before and after; before None: from 0).
+    None when the counters are off. The run's selection was exact only if no row went past CP_LOCAL_F."""
+    if after is None:
+        return None
+    from ..models import mla
+
+    rows, failed, past = (a - b for a, b in zip(after, before or [0.0, 0.0, 0.0]))
+    return (
+        f"local-K {what}: {failed:.0f} of {rows:.0f} rows failed the certificate ({failed / max(rows, 1):.2e}), "
+        f"{past:.0f} past CP_LOCAL_F = {mla.CP_LOCAL_F} ({'EXACT' if past == 0 else 'NOT EXACT'})"
+    )
 
 
 def build_shard(cfg: EngineConfig, path: str, num_pages: int, rank: int = 0):
@@ -117,7 +160,7 @@ def build_shard(cfg: EngineConfig, path: str, num_pages: int, rank: int = 0):
         import libtorch_neuronx_lite  # noqa: F401  registers the "neuron" device
 
         if rank == 0:
-            print("trnrt platform", platform.check_runtime(), flush=True)
+            logger.info("trnrt platform %s", platform.check_runtime())
 
         device = torch.device("neuron:0")  # each rank sees exactly one logical NeuronCore
     else:
@@ -140,9 +183,22 @@ def build_shard(cfg: EngineConfig, path: str, num_pages: int, rank: int = 0):
 
     # Weights the checkpoint stores as FP8 stay FP8 on the device (fp32 block scales, dequantized in-graph).
     keep_fp8 = mcfg.quant_block is not None or mcfg.quant_expert_block is not None
-    model = load_model(path, mcfg, cfg.dtype, device, cfg.max_model_len, rank, cfg.tp, group,
-                       keep_fp8=keep_fp8, fp8_max=fp8_e4m3_max(device), vocab_parallel=True,
-                       moe_kernel=cfg.resolved_moe_kernel(), attn_tp=atp, attn_group=attn_group)
+    model = load_model(
+        path,
+        mcfg,
+        cfg.dtype,
+        device,
+        cfg.max_model_len,
+        rank,
+        cfg.tp,
+        group,
+        keep_fp8=keep_fp8,
+        fp8_max=fp8_e4m3_max(device),
+        vocab_parallel=True,
+        moe_kernel=cfg.resolved_moe_kernel(),
+        attn_tp=atp,
+        attn_group=attn_group,
+    )
     if cp_group is not None:
         model.cp_group = cp_group
     runner = ModelRunner(model, mcfg, cfg, num_pages, device, kv_heads=model.nkv, model_path=path)
@@ -154,7 +210,7 @@ class LLMEngine:
         self.cfg = cfg
         self.t_start = time.perf_counter()  # startup_seconds counts from here to the end of warmup()
         self.startup_seconds: float | None = None
-        path = resolve_model_path(cfg.model_path)
+        path = resolve_model_path(cfg.model_path, cfg.model_revision)
         self.model_path = path
         self.mcfg = ModelConfig.from_pretrained(path)
         if cfg.num_layers is not None:
@@ -170,8 +226,10 @@ class LLMEngine:
 
             port = tp.free_port(cfg.tp_core_base if cfg.device == "neuron" else None)
             ctx = mp.get_context("spawn")
-            self._workers = [ctx.Process(target=tp.worker_main, args=(r, cfg, path, num_pages, port), daemon=True)
-                             for r in range(1, cfg.tp)]
+            self._workers = [
+                ctx.Process(target=tp.worker_main, args=(r, cfg, path, num_pages, port), daemon=True)
+                for r in range(1, cfg.tp)
+            ]
             self._tp_saved = tp.process_state()
             try:
                 for w in self._workers:
@@ -195,6 +253,7 @@ class LLMEngine:
         # libtorch_neuronx_lite before transformers, the order every spawned rank and trnrt/compile/capture.py have.
         from transformers import AutoTokenizer
 
+        self.tokenizer: Any  # a transformers tokenizer, or None for token-id-only use
         try:
             self.tokenizer = AutoTokenizer.from_pretrained(path)
         except (OSError, ValueError, TypeError):
@@ -220,14 +279,14 @@ class LLMEngine:
         # the deepest state checkpoint at or below it, checkpoints are written inside prefill chunks and at every page
         # boundary in decode, and a checkpoint a newer one dominates is freed when its path is released.
         if self.runner.state is None:
-            raise ValueError("trnRT serves models with linear-attention layers: this model has no recurrent state")
+            raise ValueError("TrnRT serves models with linear-attention layers: this model has no recurrent state")
         self.scheduler = Scheduler(scfg, self.pool, self.radix)
         self.scheduler.states = self.runner.state  # checkpoint rows of the state pool back the radix nodes
         self.radix.free_ckpt = self.runner.state.free_ckpt
         # Host memory under the radix cache (engine/host_cache.py), per rank: half for state checkpoints, the rest for
         # KV pages. Evicted pages and checkpoints go there (a checkpoint on a running request's path too, when no row is
         # free), and a later hit copies them back.
-        self.host_tier = None
+        self.host_tier: HostTier | None = None
         if cfg.host_cache_gb > 0:
             from .host_cache import HostTier
 
@@ -242,10 +301,12 @@ class LLMEngine:
             self.scheduler.host = self.host_tier
         self._ids = itertools.count()
         self.last_step = StepStats()
-        self._inflight = None  # (plan, launches) of a step whose results are not read yet
+        # (plan, launches) of a step whose results are not read yet
+        self._inflight: tuple[StepPlan, list[Any]] | None = None
 
-    def add_request(self, prompt_ids: list[int], params: SamplingParams, rid: str | None = None,
-                    session_id: str | None = None) -> Request:
+    def add_request(
+        self, prompt_ids: list[int], params: SamplingParams, rid: str | None = None, session_id: str | None = None
+    ) -> Request:
         why = unsupported(params)
         if why:  # before anything is built or queued: the request never reaches a step
             raise ValueError(f"{why} is not supported; send the request without it")
@@ -281,10 +342,26 @@ class LLMEngine:
             self.runner.tp_send = None
         self._stop_workers(0.0)
 
+    def local_k_counts(self) -> list[float] | None:
+        """The local-K selection's counters over this engine's run so far, its warmup included (local_k_counts); None
+        when its model has none. Call it from the thread that steps the engine."""
+        model = getattr(self, "model", None)
+        return None if model is None else local_k_counts(model)
+
     def close(self) -> None:
         """Stop tensor-parallel workers (rank 0 tells them to exit), destroy the process group and
         give this process back the state init_rank changed. Idempotent."""
         runner = getattr(self, "runner", None)
+        if self in _OPEN and runner is not None and runner.tp_send is not None and not self.dead_ranks():
+            # The local-K selection's exactness over the engine's whole run (rank 0's row group), for every engine,
+            # served or driven by a tool: "past CP_LOCAL_F" must be 0. Not after a failure (close_failed, a dead rank):
+            # a step still in flight on a collective with the dead rank would never let the counters be read.
+            try:
+                line = local_k_report(None, self.local_k_counts(), "this engine's run")
+                if line:  # an inexact selection is a correctness signal: never below WARNING
+                    logger.log(logging.WARNING if "NOT EXACT" in line else logging.INFO, "%s", line)
+            except Exception as e:  # noqa: BLE001 - a report, never a reason not to close
+                logger.warning("local-K report failed: %r", e)
         _OPEN.discard(self)
         if runner is not None and getattr(runner, "watchdog", None) is not None:
             runner.watchdog.close()
@@ -305,10 +382,11 @@ class LLMEngine:
 
         self._stop_workers(wait)
         if self._tp_saved is not None:
-            if dist.is_initialized():
-                dist.destroy_process_group()
             from . import tp
 
+            tp.drop_channel()  # the calls' shared-memory channel, when the shutdown call did not close it
+            if dist.is_initialized():
+                dist.destroy_process_group()
             tp.restore_process_state(self._tp_saved)
             self._tp_saved = None
 
@@ -384,11 +462,14 @@ class LLMEngine:
         for s in plan.prefills:
             launches.append(([s], self.runner.prefill(s), "prefill"))
             self._save_states([s])
-        self.last_step = StepStats(len(plan.decodes), sum(s.num_tokens for s in plan.prefills),
-                                   decode_calls=sum(k == "decode" for _, _, k in launches),
-                                   prefill_calls=len(plan.prefills),
-                                   num_restored=sum(s.restore is not None for s in plan.prefills),
-                                   prefill_chunks=len(plan.prefills))
+        self.last_step = StepStats(
+            len(plan.decodes),
+            sum(s.num_tokens for s in plan.prefills),
+            decode_calls=sum(k == "decode" for _, _, k in launches),
+            prefill_calls=len(plan.prefills),
+            num_restored=sum(s.restore is not None for s in plan.prefills),
+            prefill_chunks=len(plan.prefills),
+        )
         return launches
 
     def _restore_states(self, plan) -> None:
@@ -413,9 +494,9 @@ class LLMEngine:
         results: dict[int, int] = {}
         for chunk, out, kind in launches:
             with watchdog.watched(self.runner.watchdog, f"reading back a {kind} call"):
-                dev_out, out = out, out.cpu()
-            self.runner.launch_bound.done_through(dev_out)  # this call and every launch before it are done
-            tokens, lps, top_ids, top_lps = unpack(out, len(chunk))
+                host_out = out.cpu()
+            self.runner.launch_bound.done_through(out)  # this call and every launch before it are done
+            tokens, lps, top_ids, top_lps = unpack(host_out, len(chunk))
             for i, s in enumerate(chunk):
                 results[id(s)] = tokens[i]
                 n = s.req.params.logprobs
@@ -438,7 +519,7 @@ class LLMEngine:
                 continue
             # Only the tail can newly contain a stop string; decode enough of it to cover
             # the longest one plus multi-token characters.
-            tail = self.tokenizer.decode(req.output_ids[-(max(len(x) for x in stops) + 8):])
+            tail = self.tokenizer.decode(req.output_ids[-(max(len(x) for x in stops) + 8) :])
             if any(x in tail for x in stops):
                 self.scheduler.finish_now(req, "stop")
                 done.append(req)

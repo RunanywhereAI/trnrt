@@ -32,9 +32,9 @@ def test_moe_prefill_halves_are_the_whole_kernel(monkeypatch):
     """Lane tiles and combine token tiles split between the programs, Y in shared HBM behind a core
     barrier: the output equals grid 1's bit for bit (GLM-5.3-Flash's loaded expert layout, both block
     sizes)."""
+    from tests.test_moe_prefill import checkpoint_experts, routing
     from trnrt.kernels import moe_dedupe as mdd
     from trnrt.kernels import moe_prefill as mp
-    from tests.test_moe_prefill import checkpoint_experts, routing
 
     monkeypatch.setenv("NEURON_PLATFORM_TARGET_OVERRIDE", "trn2")
     w_gu, s_gu, w_down, s_down = checkpoint_experts()[0]
@@ -55,8 +55,8 @@ def test_moe_prefill_halves_are_the_whole_kernel(monkeypatch):
 def test_moe_dedupe_halves_sum_to_the_whole_kernel(monkeypatch):
     """Blocks of lanes split between the programs and the fp32 partials exchanged by halves of H: within
     the emulation's tolerance of grid 1, the same bits on a second run, and grid 1 itself unchanged."""
-    from trnrt.kernels import moe_dedupe as mdd
     from tests.test_moe_dedupe import experts128
+    from trnrt.kernels import moe_dedupe as mdd
 
     monkeypatch.setenv("NEURON_PLATFORM_TARGET_OVERRIDE", "trn2")
     Hd = 1024
@@ -79,7 +79,7 @@ def test_moe_dedupe_halves_sum_to_the_whole_kernel(monkeypatch):
         assert (two - want).abs().max() <= 0.01 * want.abs().max()
         # bf16 outputs of fp32 sums taken in another order: at most one bf16 step apart, plus an fp32-sized
         # absolute slack for outputs that are near zero by cancellation
-        tol = one.abs() * 2.0 ** -7 + one.abs().max() * 2.0 ** -20
+        tol = one.abs() * 2.0**-7 + one.abs().max() * 2.0**-20
         assert ((two - one).abs() <= tol).all(), (two - one).abs().max()
 
 
@@ -88,8 +88,8 @@ def test_moe_pairs_halves_sum_to_the_whole_kernel(monkeypatch):
     """The decode pairs kernel (calls under PAIRS_BELOW tokens) with its pair groups
     split between the programs and the fp32 partials exchanged by halves of the columns: within the emulation's
     tolerance of grid 1, one bf16 step of grid 1, the same bits on a second run; spl 0 at grid 2 is grid 1 exactly."""
-    from trnrt.kernels import moe_dedupe as mdd
     from tests.test_moe_dedupe import experts128
+    from trnrt.kernels import moe_dedupe as mdd
 
     monkeypatch.setenv("NEURON_PLATFORM_TARGET_OVERRIDE", "trn2")
     Hd = 1024
@@ -102,14 +102,18 @@ def test_moe_pairs_halves_sum_to_the_whole_kernel(monkeypatch):
         topv = (torch.rand(T, 8, generator=g) + 0.1).bfloat16()
         args = mdd.pairs_inputs(x, topv, topi, blob, act=1, limit=10.0)
         assert args["spl"] == 1
-        run = lambda grid, **kw: mdd.from_pairs(torch.as_tensor(_sim(mdd.pairs_kernel(), grid, **dict(args, **kw))),
-                                                torch.float32)  # noqa: E731
+
+        def run(grid, *, base_args=args, **kw):
+            return mdd.from_pairs(
+                torch.as_tensor(_sim(mdd.pairs_kernel(), grid, **dict(base_args, **kw))), torch.float32
+            )
+
         one, two, again = run(1), run(2), run(2)
         want = mdd.emulate_pairs(x, topv, topi, blob, 1, 10.0).float()
         assert torch.equal(two, again), T
         assert (one - want).abs().max() <= 0.01 * want.abs().max(), T
         assert (two - want).abs().max() <= 0.01 * want.abs().max(), T
-        tol = one.abs() * 2.0 ** -7 + one.abs().max() * 2.0 ** -20  # as the dedupe kernel's split, above
+        tol = one.abs() * 2.0**-7 + one.abs().max() * 2.0**-20  # as the dedupe kernel's split, above
         assert ((two - one).abs() <= tol).all(), (T, (two - one).abs().max())
         assert torch.equal(run(2, spl=0), one), T  # unsplit at grid 2: the old instruction stream
 
@@ -118,8 +122,8 @@ def test_moe_pairs_halves_sum_to_the_whole_kernel(monkeypatch):
 def test_delta_rule_heads_split_is_the_whole_kernel(monkeypatch):
     """Each program runs its own heads: o and the final states equal grid 1's bit for bit (two and four heads a
     rank, at the model's unit group and the default)."""
-    from trnrt.kernels import delta_rule as dr
     from tests.test_kda import inputs
+    from trnrt.kernels import delta_rule as dr
 
     monkeypatch.setenv("NEURON_PLATFORM_TARGET_OVERRIDE", "trn2")
     for H, ug in ((2, 6), (4, 6), (4, None)):

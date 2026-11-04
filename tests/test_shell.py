@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import pathlib
 import tempfile
 
 import numpy as np
@@ -17,7 +18,7 @@ from trnrt.kernels import shell as SH
 def test_program_units_split_evenly_or_refuse():
     assert [SH.program_units(2, 2, p) for p in (0, 1)] == [(0, 1), (1, 1)]
     assert SH.program_units(8, 1, 0) == (0, 8)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="3 units do not split evenly over 2 programs"):
         SH.program_units(3, 2, 0)
 
 
@@ -62,9 +63,9 @@ def test_kernel_rev_follows_the_source_between_its_markers():
         f.write("head\n# BEGIN\nbody 1\n# END\ntail\n")
     try:
         r1 = SH.kernel_rev(f.name, "# BEGIN", "# END")
-        open(f.name, "w").write("head 2\n# BEGIN\nbody 1\n# END\ntail 2\n")
+        pathlib.Path(f.name).write_text("head 2\n# BEGIN\nbody 1\n# END\ntail 2\n")
         assert SH.kernel_rev(f.name, "# BEGIN", "# END") == r1  # outside the markers: the same rev
-        open(f.name, "w").write("head\n# BEGIN\nbody 2\n# END\ntail\n")
+        pathlib.Path(f.name).write_text("head\n# BEGIN\nbody 2\n# END\ntail\n")
         assert SH.kernel_rev(f.name, "# BEGIN", "# END") != r1
     finally:
         os.unlink(f.name)
@@ -106,8 +107,12 @@ def test_the_nki_helpers_in_the_simulator(monkeypatch):
 
 
 def test_packed_layout_is_aligned_disjoint_and_in_order():
-    shapes = {"wp": ((2, 4, 300), torch.bfloat16), "dtb": ((2, 128, 1), torch.float32),
-              "outT": ((128, 2, 8), torch.bfloat16), "o_norm": ((128,), torch.float32)}
+    shapes = {
+        "wp": ((2, 4, 300), torch.bfloat16),
+        "dtb": ((2, 128, 1), torch.float32),
+        "outT": ((128, 2, 8), torch.bfloat16),
+        "o_norm": ((128,), torch.float32),
+    }
     lay = SH.packed_layout(shapes)
     assert set(lay) == {torch.bfloat16, torch.float32}
     n, idx = lay[torch.bfloat16]

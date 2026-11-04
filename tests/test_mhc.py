@@ -46,6 +46,7 @@ def _bf(t):
 
 # -- mhc_mix: the output streams ----------------------------------------------------------------------------------
 
+
 def mix_case(T: int, H: int, seed: int = 0):
     g = torch.Generator().manual_seed(seed)
     post = 2 * torch.sigmoid(torch.randn(T, HC, generator=g))
@@ -78,15 +79,22 @@ def test_mix_takes_on_a_device_within_its_shapes():
 
 
 @needs_nki
-@pytest.mark.parametrize("T,H", [(1, 256), (4, 256), (4, 4096), (8, 4096)])
+@pytest.mark.parametrize(("T", "H"), [(1, 256), (4, 256), (4, 4096), (8, 4096)])
 def test_mix_simulator_equals_emulation(T, H, monkeypatch):
     import nki
 
     monkeypatch.setenv("NEURON_PLATFORM_TARGET_OVERRIDE", "trn2")
     post, comb, y, S = mix_case(T, H, seed=T + H)
-    got = np.asarray(nki.simulate(mm.mhc_mix_kernel)(
-        post=post.numpy().astype(np.float32), comb=comb.reshape(T, HC * HC).numpy().astype(np.float32), y=_bf(y),
-        S=_bf(S.reshape(T, HC * H)), hc=HC, rev=mm.REV))
+    got = np.asarray(
+        nki.simulate(mm.mhc_mix_kernel)(
+            post=post.numpy().astype(np.float32),
+            comb=comb.reshape(T, HC * HC).numpy().astype(np.float32),
+            y=_bf(y),
+            S=_bf(S.reshape(T, HC * H)),
+            hc=HC,
+            rev=mm.REV,
+        )
+    )
     got = torch.from_numpy(got.astype(np.float32))
     want = mm.emulate(post, comb, y, S).float()
     assert torch.equal(got, want), (got - want).abs().max()
@@ -99,12 +107,23 @@ def test_mix_parser_takes_the_kernel(T):
     from nki.compiler.frontend import FrontendKind, source_to_mlir
 
     H, z = 4096, np.zeros
-    assert str(source_to_mlir(mm.mhc_mix_kernel, post=z((T, HC), np.float32), comb=z((T, HC * HC), np.float32),
-                              y=z((T, H), ml_dtypes.bfloat16), S=z((T, HC * H), ml_dtypes.bfloat16), hc=HC, rev=mm.REV,
-                              target="trn2", frontend=FrontendKind.PARSER))
+    assert str(
+        source_to_mlir(
+            mm.mhc_mix_kernel,
+            post=z((T, HC), np.float32),
+            comb=z((T, HC * HC), np.float32),
+            y=z((T, H), ml_dtypes.bfloat16),
+            S=z((T, HC * H), ml_dtypes.bfloat16),
+            hc=HC,
+            rev=mm.REV,
+            target="trn2",
+            frontend=FrontendKind.PARSER,
+        )
+    )
 
 
 # -- mhc_pre: the hyper-connection before a block ------------------------------------------------------------------
+
 
 def stand_in(T: int = 5, H: int = 256, seed: int = 1):
     """A layer under GLM-5.3-Flash's released comb prior (0 on the diagonal, -8 off it), fn in the model dtype (bf16,
@@ -113,7 +132,7 @@ def stand_in(T: int = 5, H: int = 256, seed: int = 1):
     hy = types.SimpleNamespace(hc=HC, hc_eps=EPS, sinkhorn_iters=ITERS, family="glm5_next")
     model = types.SimpleNamespace(cfg=types.SimpleNamespace(hybrid=hy, rms_norm_eps=RMS_EPS, hidden_size=H))
     base = torch.randn(HC * (2 + HC), generator=g) * 0.1
-    base[2 * HC:] = (torch.full((HC, HC), -8.0) + 8.0 * torch.eye(HC)).reshape(-1)
+    base[2 * HC :] = (torch.full((HC, HC), -8.0) + 8.0 * torch.eye(HC)).reshape(-1)
     fn = (torch.randn(HC * (2 + HC), HC * H, generator=g) * 3.0 / (HC * H) ** 0.5).bfloat16()
     scale = torch.tensor([1.0, 0.5, 2.0])
     layer = types.SimpleNamespace(hc_attn_fn=fn, hc_attn_base=base, hc_attn_scale=scale)
@@ -162,24 +181,36 @@ def test_pre_takes_on_a_device_within_its_shapes():
 def _sim_pre(T: int, H: int, seed: int, sig: int = mp.SIGMOID, skf: int = mp.SK):
     import nki
 
-    model, layer, S = stand_in(T, H, seed)
+    _model, layer, S = stand_in(T, H, seed)
     x, post, comb = nki.simulate(mp.mhc_pre_kernel)(
-        S=_bf(S.reshape(T, HC * H)), fn=_bf(layer.hc_attn_fn), base=layer.hc_attn_base.numpy().astype(np.float32),
-        scale=layer.hc_attn_scale.numpy().astype(np.float32), hc=HC, iters=ITERS, eps=EPS, rms_eps=RMS_EPS, sig=sig,
-        rev=mp.REV, skf=skf)
-    got = (torch.from_numpy(np.asarray(x).astype(np.float32)), torch.from_numpy(np.asarray(post)),
-           torch.from_numpy(np.asarray(comb)).view(T, HC, HC))
+        S=_bf(S.reshape(T, HC * H)),
+        fn=_bf(layer.hc_attn_fn),
+        base=layer.hc_attn_base.numpy().astype(np.float32),
+        scale=layer.hc_attn_scale.numpy().astype(np.float32),
+        hc=HC,
+        iters=ITERS,
+        eps=EPS,
+        rms_eps=RMS_EPS,
+        sig=sig,
+        rev=mp.REV,
+        skf=skf,
+    )
+    got = (
+        torch.from_numpy(np.asarray(x).astype(np.float32)),
+        torch.from_numpy(np.asarray(post)),
+        torch.from_numpy(np.asarray(comb)).view(T, HC, HC),
+    )
     return got, mp.emulate(*pre_args(layer, S))
 
 
 @needs_nki
-@pytest.mark.parametrize("T,H", [(1, 256), (4, 256), (4, 4096), (8, 4096)])
+@pytest.mark.parametrize(("T", "H"), [(1, 256), (4, 256), (4, 4096), (8, 4096)])
 def test_pre_simulator_matches_emulation(T, H, monkeypatch):
     """x: the kernel differs from the host's in its last fp32 bits (summation order, the scalar engine's functions),
     so an x differs where the hc-term sum cancels (|x| far below the terms) or sits at a bf16 rounding boundary: within
     one bf16 ulp of x plus 1e-6 of the terms' magnitude. comb: well inside the gap one Sinkhorn round makes."""
     monkeypatch.setenv("NEURON_PLATFORM_TARGET_OVERRIDE", "trn2")
-    model, layer, S = stand_in(T, H, T + H)
+    _model, layer, S = stand_in(T, H, T + H)
     (x, post, comb), (wx, wpost, wcomb) = _sim_pre(T, H, seed=T + H)
     ulp = (x.bfloat16().view(torch.int16).int() - wx.view(torch.int16).int()).abs()
     terms = S.float().abs().sum(1)
@@ -188,7 +219,7 @@ def test_pre_simulator_matches_emulation(T, H, monkeypatch):
     assert (post - wpost).abs().max() <= 1e-6
     err = (comb - wcomb).abs().max().item()
     a = list(pre_args(layer, S))
-    gap = min((mp.emulate(*(a[:4] + [n] + a[5:]))[2] - wcomb).abs().max().item() for n in (ITERS - 1, ITERS + 1))
+    gap = min((mp.emulate(*([*a[:4], n, *a[5:]]))[2] - wcomb).abs().max().item() for n in (ITERS - 1, ITERS + 1))
     assert err <= 1e-5 and err < gap / 100, (err, gap)
 
 
@@ -198,20 +229,34 @@ def test_sinkhorn_eps_in_the_reduce(T, monkeypatch):
     """The served Sinkhorn (skf 1: the + eps inside the reduce, by an eps row and column, 3 instructions a half-round
     instead of 4) is the plain form (skf 0) bit for bit in the simulator, whose reduce adds in order. x and post are
     computed before the Sinkhorn and never move. The positive control: the two forms must trace differently."""
-    from nki.compiler.frontend import FrontendKind, source_to_mlir
     import ml_dtypes
+    from nki.compiler.frontend import FrontendKind, source_to_mlir
 
     monkeypatch.setenv("NEURON_PLATFORM_TARGET_OVERRIDE", "trn2")
     (x0, p0, c0), _ = _sim_pre(T, 256, seed=T + 7, skf=0)
     (x1, p1, c1), _ = _sim_pre(T, 256, seed=T + 7, skf=1)
     assert torch.equal(c1, c0) and torch.equal(x1, x0) and torch.equal(p1, p0)
-    O, z = HC * (2 + HC), np.zeros
+    n_mix, z = HC * (2 + HC), np.zeros
 
     def adds(skf, frontend):
-        m = str(source_to_mlir(mp.mhc_pre_kernel, S=z((T, HC * 4096), ml_dtypes.bfloat16),
-                               fn=z((O, HC * 4096), ml_dtypes.bfloat16), base=z((O,), np.float32),
-                               scale=z((3,), np.float32), hc=HC, iters=ITERS, eps=EPS, rms_eps=RMS_EPS, sig=mp.SIGMOID,
-                               rev=mp.REV, skf=skf, target="trn2", frontend=frontend))
+        m = str(
+            source_to_mlir(
+                mp.mhc_pre_kernel,
+                S=z((T, HC * 4096), ml_dtypes.bfloat16),
+                fn=z((n_mix, HC * 4096), ml_dtypes.bfloat16),
+                base=z((n_mix,), np.float32),
+                scale=z((3,), np.float32),
+                hc=HC,
+                iters=ITERS,
+                eps=EPS,
+                rms_eps=RMS_EPS,
+                sig=mp.SIGMOID,
+                rev=mp.REV,
+                skf=skf,
+                target="trn2",
+                frontend=frontend,
+            )
+        )
         return m.count("nisa.tensor_scalar_arith")
 
     for fe in (FrontendKind.PARSER, FrontendKind.TRACER):
@@ -224,18 +269,34 @@ def test_pre_parser_takes_the_kernel(T):
     import ml_dtypes
     from nki.compiler.frontend import FrontendKind, source_to_mlir
 
-    H, z, O = 4096, np.zeros, HC * (2 + HC)
-    assert str(source_to_mlir(mp.mhc_pre_kernel, S=z((T, HC * H), ml_dtypes.bfloat16),
-                              fn=z((O, HC * H), ml_dtypes.bfloat16), base=z((O,), np.float32), scale=z((3,), np.float32),
-                              hc=HC, iters=ITERS, eps=EPS, rms_eps=RMS_EPS, sig=mp.SIGMOID, rev=mp.REV, skf=mp.SK,
-                              target="trn2", frontend=FrontendKind.PARSER))
+    H, z, n_mix = 4096, np.zeros, HC * (2 + HC)
+    assert str(
+        source_to_mlir(
+            mp.mhc_pre_kernel,
+            S=z((T, HC * H), ml_dtypes.bfloat16),
+            fn=z((n_mix, HC * H), ml_dtypes.bfloat16),
+            base=z((n_mix,), np.float32),
+            scale=z((3,), np.float32),
+            hc=HC,
+            iters=ITERS,
+            eps=EPS,
+            rms_eps=RMS_EPS,
+            sig=mp.SIGMOID,
+            rev=mp.REV,
+            skf=mp.SK,
+            target="trn2",
+            frontend=FrontendKind.PARSER,
+        )
+    )
 
 
 # -- the pre broadcast on chip (pre_body, front_body) --------------------------------------------------------------
 
 SHELL_BC = [  # shell.mhc_pre_h's broadcast, as it reads there
-    "nisa.affine_select(dst=D, pattern=[[1, T], [0, hc]], channel_multiplier=-1, offset=0, on_true_tile=pre.ap(pattern="
-    "[[hc, T], [0, T], [1, hc]], offset=0), on_false_value=0.0, cmp_op=nl.equal)",
+    (
+        "nisa.affine_select(dst=D, pattern=[[1, T], [0, hc]], channel_multiplier=-1, offset=0, on_true_tile=pre.ap(pattern="
+        "[[hc, T], [0, T], [1, hc]], offset=0), on_false_value=0.0, cmp_op=nl.equal)"
+    ),
     "nisa.nc_matmul(dst=pbp, stationary=ones_t, moving=D, accumulate=False)",
     "nisa.tensor_copy(dst=pb, src=pbp, engine=nisa.vector_engine)",
 ]
@@ -256,15 +317,23 @@ def pbc_errors(src: str, fname: str, flag: str) -> list[str]:
     f = _fn(src, fname)
     on, off = _ifs(f, flag), _ifs(f, f"not {flag}")
     bad = []
-    if len(on) != 1 or not on[0].orelse or [ast.unparse(s) for s in on[0].orelse] != ["nisa.dma_copy(dst=pscr, src=pre)"]:
+    if (
+        len(on) != 1
+        or not on[0].orelse
+        or [ast.unparse(s) for s in on[0].orelse] != ["nisa.dma_copy(dst=pscr, src=pre)"]
+    ):
         return [f"{fname}: no single `if {flag}:` with the pscr write as its else"]
     calls = [ast.unparse(s.value) for s in on[0].body if isinstance(s, ast.Expr)]
     if [c for c in calls if not c.startswith("nisa.memset")] != SHELL_BC:
         bad.append(f"{fname}: the broadcast is not shell's: {calls}")
     offs = [[ast.unparse(s) for s in i.body] for i in off]
-    if offs != [["pscr = nl.ndarray((T, hc), dtype=f32, buffer=nl.private_hbm)"],
-                ["pb = nl.ndarray((P, T, hc), dtype=f32, buffer=nl.sbuf)",
-                 "nisa.dma_copy(dst=pb, src=pscr.ap(pattern=[[0, P], [hc, T], [1, hc]], offset=0))"]]:
+    if offs != [
+        ["pscr = nl.ndarray((T, hc), dtype=f32, buffer=nl.private_hbm)"],
+        [
+            "pb = nl.ndarray((P, T, hc), dtype=f32, buffer=nl.sbuf)",
+            "nisa.dma_copy(dst=pb, src=pscr.ap(pattern=[[0, P], [hc, T], [1, hc]], offset=0))",
+        ],
+    ]:
         bad.append(f"{fname}: the round trip's pscr statements moved: {offs}")
     return bad
 
@@ -289,15 +358,16 @@ def test_the_broadcast_is_served_and_folded_into_both_revs():
 
 
 def test_the_broadcast_pins_fail_on_planted_sources():
-    assert pbc_errors(PSRC.replace("channel_multiplier=-1, offset=0,\n", "channel_multiplier=1, offset=0,\n", 1),
-                      "pre_body", "PBC")
+    assert pbc_errors(
+        PSRC.replace("channel_multiplier=-1, offset=0,\n", "channel_multiplier=1, offset=0,\n", 1), "pre_body", "PBC"
+    )
     assert pbc_errors(PSRC.replace("moving=D, accumulate=False)", "moving=D, accumulate=True)", 1), "pre_body", "PBC")
     assert not same_pbc_block(PSRC, SSRC.replace("on_false_value=0.0,", "on_false_value=1.0,", 1))
 
 
 @needs_nki
 @pytest.mark.parametrize("kernel", ["pre", "split"])
-@pytest.mark.parametrize("T,nan", [(1, False), (4, False), (4, True), (8, True)])
+@pytest.mark.parametrize(("T", "nan"), [(1, False), (4, False), (4, True), (8, True)])
 def test_the_broadcast_is_bit_equal_to_the_round_trip_in_the_simulator(kernel, T, nan, monkeypatch):
     """x, post and comb with the on-chip broadcast against the HBM round trip it replaced, bit for bit (NaN bits
     included) at H 256. A NaN element stands for a stream a warmup's zero inputs make NaN."""
@@ -310,9 +380,18 @@ def test_the_broadcast_is_bit_equal_to_the_round_trip_in_the_simulator(kernel, T
         if nan:
             S = S.clone()
             S[min(1, T - 1), 1, 5] = float("nan")
-        kw = dict(S=_bf(S.reshape(T, HC * 256)), fn=_bf(layer.hc_attn_fn),
-                  base=layer.hc_attn_base.numpy().astype(np.float32), scale=layer.hc_attn_scale.numpy().astype(np.float32),
-                  hc=HC, iters=ITERS, eps=EPS, rms_eps=RMS_EPS, sig=mp.SIGMOID, skf=mp.SK)
+        kw = {
+            "S": _bf(S.reshape(T, HC * 256)),
+            "fn": _bf(layer.hc_attn_fn),
+            "base": layer.hc_attn_base.numpy().astype(np.float32),
+            "scale": layer.hc_attn_scale.numpy().astype(np.float32),
+            "hc": HC,
+            "iters": ITERS,
+            "eps": EPS,
+            "rms_eps": RMS_EPS,
+            "sig": mp.SIGMOID,
+            "skf": mp.SK,
+        }
         if kernel == "pre":
             out = nki.simulate(mp.mhc_pre_kernel)(rev=mp.REV, **kw)
         else:
@@ -331,13 +410,20 @@ def test_the_broadcast_is_bit_equal_to_the_round_trip_in_the_simulator(kernel, T
 
 # -- mhc_split: the front and the Sinkhorn pieces ------------------------------------------------------------------
 
+
 def _nisa_calls(src: str, names: set[str]) -> dict[str, list[str]]:
     """The nisa.* calls of each named function, in source order, as normalised source text."""
     out = {}
     for f in ast.walk(ast.parse(src)):
         if isinstance(f, ast.FunctionDef) and f.name in names:
-            calls = [n for n in ast.walk(f) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
-                     and isinstance(n.func.value, ast.Name) and n.func.value.id == "nisa"]
+            calls = [
+                n
+                for n in ast.walk(f)
+                if isinstance(n, ast.Call)
+                and isinstance(n.func, ast.Attribute)
+                and isinstance(n.func.value, ast.Name)
+                and n.func.value.id == "nisa"
+            ]
             calls.sort(key=lambda n: (n.lineno, n.col_offset))
             out[f.name] = [ast.unparse(n) for n in calls]
     return out
@@ -363,7 +449,7 @@ def test_split_chunks_partition_the_half_rounds(chunks):
 
 @pytest.mark.parametrize("chunks", [0, 40])
 def test_split_chunks_out_of_range_refused(chunks):
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=rf"chunks {chunks} not in \[1, 39\]"):
         MS.chunk_bounds(20, chunks)
 
 
@@ -384,11 +470,19 @@ def test_split_emulation_is_mhc_pres():
 # front_body's statements that change (None: dropped), in front_body's order; everything else is the same text
 NAMED = [
     ("O = fn.shape[0]", "O = fn.shape[2]"),
-    ("wk = nl.ndarray((P, O, NJ), dtype=bf16, buffer=nl.sbuf)", "wkj = nl.ndarray((P, NJ, O), dtype=bf16, buffer=nl.sbuf)"),
-    ("nisa.dma_copy(dst=wk, src=fn.ap(pattern=[[NJ, P], [F, O], [1, NJ]], offset=0))", "nisa.dma_copy(dst=wkj, src=fn)"),
+    (
+        "wk = nl.ndarray((P, O, NJ), dtype=bf16, buffer=nl.sbuf)",
+        "wkj = nl.ndarray((P, NJ, O), dtype=bf16, buffer=nl.sbuf)",
+    ),
+    (
+        "nisa.dma_copy(dst=wk, src=fn.ap(pattern=[[NJ, P], [F, O], [1, NJ]], offset=0))",
+        "nisa.dma_copy(dst=wkj, src=fn)",
+    ),
     ("wkj = nl.ndarray((P, NJ, O), dtype=bf16, buffer=nl.sbuf)", None),
-    ("nisa.tensor_copy(dst=wkj, src=wk.ap(pattern=[[O * NJ, P], [1, NJ], [NJ, O]], offset=0), engine=nisa.vector_engine)",
-     None),
+    (
+        "nisa.tensor_copy(dst=wkj, src=wk.ap(pattern=[[O * NJ, P], [1, NJ], [NJ, O]], offset=0), engine=nisa.vector_engine)",
+        None,
+    ),
 ]
 
 
@@ -404,7 +498,7 @@ def _fnj_pin_errors(split: str, fnj: str) -> list:
         if len(i) != 1:
             bad.append(f"front_body: {old!r} {len(i)} times")
             continue
-        want[i[0]:i[0] + 1] = [] if new is None else [new]
+        want[i[0] : i[0] + 1] = [] if new is None else [new]
     got = _stmts(_fn(fnj, "front_body_fnj"))
     if got != want:
         bad.append(f"front_body_fnj differs from front_body beyond the named lines ({len(got)} vs {len(want)})")
@@ -412,7 +506,7 @@ def _fnj_pin_errors(split: str, fnj: str) -> list:
 
 
 def _ap(pattern, offset, env, counts):
-    pat, base = eval(pattern, {}, env), eval(offset, {}, env)
+    pat, base = eval(pattern, {}, env), eval(offset, {}, env)  # noqa: S307  # the kernel source's own pattern text over a fixed numeric env, no untrusted input
     assert [c for _, c in pat] == counts
     idx = torch.tensor(base)
     for k, (stride, n) in enumerate(pat):
@@ -424,18 +518,21 @@ def _ap(pattern, offset, env, counts):
 
 def _fnj_layout_errors(split: str) -> list:
     """fn_j(fn) against front_body's two steps: wk = fn's k-layout read, wkj = wk's j-major read."""
-    calls = {ast.unparse(c.func) + ":" + ast.unparse(next(k.value for k in c.keywords if k.arg == "dst")): c
-             for c in ast.walk(_fn(split, "front_body")) if isinstance(c, ast.Call)
-             and ast.unparse(c.func) in ("nisa.dma_copy", "nisa.tensor_copy")
-             and any(k.arg == "dst" for k in c.keywords)}
+    calls = {
+        ast.unparse(c.func) + ":" + ast.unparse(next(k.value for k in c.keywords if k.arg == "dst")): c
+        for c in ast.walk(_fn(split, "front_body"))
+        if isinstance(c, ast.Call)
+        and ast.unparse(c.func) in ("nisa.dma_copy", "nisa.tensor_copy")
+        and any(k.arg == "dst" for k in c.keywords)
+    }
     src_ap = lambda c: next(k.value for k in c.keywords if k.arg == "src")  # noqa: E731
     ld, cp = src_ap(calls["nisa.dma_copy:wk"]), src_ap(calls["nisa.tensor_copy:wkj"])
     kw = lambda a: {k.arg: ast.unparse(k.value) for k in a.keywords}  # noqa: E731
-    O, NJ = 24, 128
-    env = dict(P=P, O=O, NJ=NJ, F=P * NJ)
-    fn = torch.arange(O * P * NJ, dtype=torch.int64).view(O, P * NJ)
-    wk = fn.reshape(-1)[_ap(kw(ld)["pattern"], kw(ld)["offset"], env, [P, O, NJ]).reshape(-1)].view(P, O, NJ)
-    wkj = wk.reshape(-1)[_ap(kw(cp)["pattern"], kw(cp)["offset"], env, [P, NJ, O]).reshape(-1)].view(P, NJ, O)
+    n_mix, NJ = 24, 128
+    env = {"P": P, "O": n_mix, "NJ": NJ, "F": P * NJ}
+    fn = torch.arange(n_mix * P * NJ, dtype=torch.int64).view(n_mix, P * NJ)
+    wk = fn.reshape(-1)[_ap(kw(ld)["pattern"], kw(ld)["offset"], env, [P, n_mix, NJ]).reshape(-1)].view(P, n_mix, NJ)
+    wkj = wk.reshape(-1)[_ap(kw(cp)["pattern"], kw(cp)["offset"], env, [P, NJ, n_mix]).reshape(-1)].view(P, NJ, n_mix)
     return [] if torch.equal(MF.fn_j(fn), wkj) else ["fn_j is not front_body's j-major operand"]
 
 
@@ -466,7 +563,9 @@ def test_a_planted_change_breaks_a_fnj_pin(plant):
         assert FSRC.count(old) == 1
         assert _fnj_pin_errors(SSRC, FSRC.replace(old, ""))
     elif plant == "split-drift":  # the k-layout body changes; the copy does not follow
-        old = "        nisa.tensor_scalar(dst=cx, data=x, op0=nl.multiply, operand0=65537.0, engine=nisa.vector_engine)\n"
+        old = (
+            "        nisa.tensor_scalar(dst=cx, data=x, op0=nl.multiply, operand0=65537.0, engine=nisa.vector_engine)\n"
+        )
         assert SSRC.count(old) == 1
         assert _fnj_pin_errors(SSRC.replace(old, old.replace("65537.0", "65536.0")), FSRC)
     else:  # front_body's re-layout read a different way: fn_j no longer its operand
@@ -500,7 +599,7 @@ def _fnj_inputs(T: int):
     base = (0.1 * rng.standard_normal(O_GLM)).astype(np.float32)
     comb = np.full((HC, HC), -8.0, np.float32)
     np.fill_diagonal(comb, 0.0)
-    base[2 * HC:] = comb.reshape(-1)
+    base[2 * HC :] = comb.reshape(-1)
     scale = (1.0 + 0.1 * rng.standard_normal(3)).astype(np.float32)
     bf = ml_dtypes.bfloat16
     return S.astype(bf), fn.astype(bf), base, scale
@@ -532,8 +631,9 @@ def _sim_front(monkeypatch, kernel, S, fn, base, scale):
         k = kernel
     else:
         k = kernel[2]
-    outs = nki.simulate(k)(S=S, fn=fn, base=base, scale=scale, hc=HC, iters=ITERS, eps=1e-6, rms_eps=1e-6,
-                           sig=mp.SIGMOID, skf=mp.SK)
+    outs = nki.simulate(k)(
+        S=S, fn=fn, base=base, scale=scale, hc=HC, iters=ITERS, eps=1e-6, rms_eps=1e-6, sig=mp.SIGMOID, skf=mp.SK
+    )
     return [np.asarray(o) for o in outs]
 
 
@@ -566,6 +666,7 @@ def test_fnj_wrong_layout_fails(monkeypatch, name):
     """The mutation: the bitwise check above is not vacuous at these shapes."""
     S, fn, base, scale = _fnj_inputs(4)
     ref = _sim_front(monkeypatch, _k_front_k, S, fn, base, scale)
-    got = _sim_front(monkeypatch, _k_front_fnj, S, _bf(WRONG[name](torch.from_numpy(fn.astype(np.float32)))), base,
-                     scale)
+    got = _sim_front(
+        monkeypatch, _k_front_fnj, S, _bf(WRONG[name](torch.from_numpy(fn.astype(np.float32)))), base, scale
+    )
     assert not _same(ref, got)[1], f"{name}: post passed the bitwise check"

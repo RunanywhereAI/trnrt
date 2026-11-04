@@ -32,3 +32,33 @@ for credit, not because their licenses require it.
 GLM-5.3-Flash (`zai-org/GLM-5.3-Flash` on Hugging Face) is released under the MIT license; its weights are downloaded at run
 time and are not part of this repository. The AWS Neuron SDK (neuronx-cc, NKI, the Neuron runtime) is installed separately
 under AWS's terms.
+
+## License texts
+
+### GLM-5.3-Flash files (`tests/fixtures/GLM-5.3-Flash-config.json`, `tests/fixtures/GLM-5.3-Flash-chat_template.jinja`)
+
+From `LICENSE` of zai-org/GLM-5.3-Flash at revision eb9eb208eb0d988989d07a6a12d0fdeb5f52574a:
+
+```
+MIT License
+
+Copyright (c) 2026 Z.AI Co., Ltd
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```

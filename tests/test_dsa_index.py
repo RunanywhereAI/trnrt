@@ -17,7 +17,7 @@ def case(B=2, pages=128, seed=0):
     pkc = (torch.randn(npg, PPP * D, generator=g) * 0.5).to(torch.bfloat16)
     table = (torch.randperm(npg - 1, generator=g)[: B * pages].view(B, pages) + 1).to(torch.int32)
     q = (torch.randn(B, HI, D, generator=g) * 0.1).to(torch.bfloat16)
-    w = torch.randn(B, HI, generator=g) * D ** -0.5
+    w = torch.randn(B, HI, generator=g) * D**-0.5
     cand = torch.zeros(B, pages * PPP)
     cand[:, -3:] = dsa_index.NEG_INF
     return q, w, pkc, table, cand
@@ -45,7 +45,7 @@ def test_page_groups_layout():
     ppg = dsa_index.page_groups(table)
     assert ppg.shape == (128, 2, 2) and ppg.dtype == torch.int32
     assert torch.equal(ppg[5, 1], table[1, 10:12]) and torch.equal(ppg.permute(1, 0, 2).reshape(2, -1), table)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="needs a multiple of 128"):
         dsa_index.page_groups(table[:, :200])
 
 
@@ -61,9 +61,22 @@ def test_nki_simulator_matches_the_host(B, monkeypatch):
     qT = q.reshape(B * HI, D).t().contiguous()
     wb = w.float().repeat(1, 4).unsqueeze(1).expand(B, 128, 4 * HI).contiguous()
     eye = torch.eye(128).to(torch.bfloat16)
-    got = torch.as_tensor(nki.simulate(dsa_index.dsa_index_kernel)(
-        qT=qT, wb=wb, pkc=pkc, ppg=ppg, cand=cand, identb=eye, rev=dsa_index.REV, dge=dsa_index.DGE, spl=1,
-        nr=dsa_index.NR, qr=dsa_index.QR, dbg=0)).float()
+    got = torch.as_tensor(
+        nki.simulate(dsa_index.dsa_index_kernel)(
+            qT=qT,
+            wb=wb,
+            pkc=pkc,
+            ppg=ppg,
+            cand=cand,
+            identb=eye,
+            rev=dsa_index.REV,
+            dge=dsa_index.DGE,
+            spl=1,
+            nr=dsa_index.NR,
+            qr=dsa_index.QR,
+            dbg=0,
+        )
+    ).float()
     ok = want > -1e29
     assert ((got - want).abs()[ok].max() / want[ok].abs().max()).item() < 1e-5
     assert ((got < -1e29) == ~ok).all()

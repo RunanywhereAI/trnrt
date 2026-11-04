@@ -21,17 +21,21 @@ the 63 executions the runtime queues), so the default leaves two orders of magni
 
 Not a licence to turn off the runtime's per-execution barrier (NEURON_RT_DISABLE_EXECUTION_BARRIER=1, which
 vllm-neuron 0.24 sets): without it a collective mismatch returns silently wrong numbers, and ranks alternating a
-world-collective graph with an attention-group one under host jitter deadlock. trnRT leaves it on.
+world-collective graph with an attention-group one under host jitter deadlock. TrnRT leaves it on.
 """
 
 from __future__ import annotations
 
 import collections
+import logging
 import os
-import sys
 import threading
 import time
 from contextlib import contextmanager
+
+from .. import log
+
+logger = logging.getLogger(__name__)
 
 EXIT_HANG = 86  # the process exit code of a rank the watchdog ended
 DEFAULT_TIMEOUT_S = 300.0
@@ -73,8 +77,15 @@ class ExecWatchdog:
         try:
             yield
         except BaseException as e:  # an error raised by the runtime inside a watched section: say where we were
-            print(f"EXEC WATCHDOG rank {self.rank}: {type(e).__name__} in {what}; {self._calls()}",
-                  file=sys.stderr, flush=True)
+            log.always(
+                logger,
+                logging.ERROR,
+                "EXEC WATCHDOG rank %s: %s in %s; %s",
+                self.rank,
+                type(e).__name__,
+                what,
+                self._calls(),
+            )
             raise
         finally:
             with self._lock:
@@ -90,9 +101,11 @@ class ExecWatchdog:
         return "last calls (oldest first): " + "; ".join(f"{n} {k} ({now - t:.1f} s ago)" for t, n, k in items)
 
     def report(self, what: str, dt: float) -> str:
-        return (f"EXEC WATCHDOG rank {self.rank}: {what} blocked for {dt:.0f} s (TRNRT_EXEC_TIMEOUT_S="
-                f"{self.timeout:g}); a rank that stopped taking part in the calls leaves the others waiting in "
-                f"their collectives: compare the ranks' call lists. {self._calls()}")
+        return (
+            f"EXEC WATCHDOG rank {self.rank}: {what} blocked for {dt:.0f} s (TRNRT_EXEC_TIMEOUT_S="
+            f"{self.timeout:g}); a rank that stopped taking part in the calls leaves the others waiting in "
+            f"their collectives: compare the ranks' call lists. {self._calls()}"
+        )
 
     def close(self) -> None:
         """Stop the checking thread (idempotent)."""
@@ -107,7 +120,7 @@ class ExecWatchdog:
             dt = time.monotonic() - sec[1]
             if dt > self.timeout:
                 self.fired = True
-                print(self.report(sec[0], dt), file=sys.stderr, flush=True)
+                log.always(logger, logging.ERROR, "%s", self.report(sec[0], dt))  # then the process ends: never lose it
                 self._exit(EXIT_HANG)
                 return
 

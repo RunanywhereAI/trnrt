@@ -16,22 +16,49 @@ TRNRT_TEST_NETWORK=1; skipped unless the tokenizer files and chat_template.jinja
 from __future__ import annotations
 
 import json
+from typing import ClassVar
 
 import pytest
 
-from trnrt.serve.parsers import StreamParser, parse_full, template_messages
 from tests.parser_util import check_streaming
+from trnrt.serve.parsers import StreamParser, parse_full, template_messages
 
 REPO, REV = "zai-org/GLM-5.3-Flash", "eb9eb208eb0d988989d07a6a12d0fdeb5f52574a"
 TOOLS = [
-    {"type": "function", "function": {"name": "read", "description": "Read a file", "parameters": {
-        "type": "object", "properties": {"filePath": {"type": "string"}, "offset": {"type": "integer"},
-                                         "limit": {"type": "integer"}}, "required": ["filePath"]}}},
-    {"type": "function", "function": {"name": "bash", "description": "Run a command", "parameters": {
-        "type": "object", "properties": {"command": {"type": "string"}, "timeout": {"type": "integer"},
-                                         "env": {"type": "object"}}, "required": ["command"]}}},
+    {
+        "type": "function",
+        "function": {
+            "name": "read",
+            "description": "Read a file",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filePath": {"type": "string"},
+                    "offset": {"type": "integer"},
+                    "limit": {"type": "integer"},
+                },
+                "required": ["filePath"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "description": "Run a command",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"},
+                    "timeout": {"type": "integer"},
+                    "env": {"type": "object"},
+                },
+                "required": ["command"],
+            },
+        },
+    },
 ]
-KW = dict(tools=True, tool_defs=TOOLS)
+KW = {"tools": True, "tool_defs": TOOLS}
 
 
 NEEDS = ("tokenizer.json", "tokenizer_config.json", "chat_template.jinja")  # the tokenizer and the chat template
@@ -50,8 +77,10 @@ def tok():
             hf_hub_download(REPO, f, revision=REV)
         missing = []
     if missing:  # a partial cache (another test fetched only the config) renders no template: skip, not fail
-        pytest.skip(f"{REPO}@{REV[:12]}: {', '.join(missing)} not in the local Hugging Face cache "
-                    "(TRNRT_TEST_NETWORK=1 fetches them)")
+        pytest.skip(
+            f"{REPO}@{REV[:12]}: {', '.join(missing)} not in the local Hugging Face cache "
+            "(TRNRT_TEST_NETWORK=1 fetches them)"
+        )
     try:
         tok = AutoTokenizer.from_pretrained(REPO, revision=REV, local_files_only=True)
     except (OSError, ValueError) as e:  # e.g. "Couldn't instantiate the backend tokenizer": an older tokenizers
@@ -64,28 +93,49 @@ def tok():
 def agent_body(arguments_as) -> dict:
     """An agent's second turn: system, the user's task, the assistant's two calls (arguments as the OpenAI
     string, or as given), their results, and the next instruction."""
-    calls = [("call_1", "read", {"filePath": "src/app.py", "limit": 20}),
-             ("call_2", "bash", {"command": "pytest -q tests/test_app.py", "env": {"CI": "1"}})]
-    return {"model": "glm", "stream": True, "tools": TOOLS, "messages": [
-        {"role": "system", "content": "You are a coding agent, an interactive CLI tool."},
-        {"role": "user", "content": "Fix the failing test in tests/test_app.py."},
-        {"role": "assistant", "content": None, "tool_calls": [
-            {"id": i, "type": "function", "function": {"name": n, "arguments": arguments_as(a)}} for i, n, a in calls]},
-        {"role": "tool", "tool_call_id": "call_1", "content": "def add(a, b):\n    return a - b\n"},
-        {"role": "tool", "tool_call_id": "call_2", "content": "FAILED tests/test_app.py::test_add"},
-        {"role": "user", "content": "Go on."}]}
+    calls = [
+        ("call_1", "read", {"filePath": "src/app.py", "limit": 20}),
+        ("call_2", "bash", {"command": "pytest -q tests/test_app.py", "env": {"CI": "1"}}),
+    ]
+    return {
+        "model": "glm",
+        "stream": True,
+        "tools": TOOLS,
+        "messages": [
+            {"role": "system", "content": "You are a coding agent, an interactive CLI tool."},
+            {"role": "user", "content": "Fix the failing test in tests/test_app.py."},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {"id": i, "type": "function", "function": {"name": n, "arguments": arguments_as(a)}}
+                    for i, n, a in calls
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "def add(a, b):\n    return a - b\n"},
+            {"role": "tool", "tool_call_id": "call_2", "content": "FAILED tests/test_app.py::test_add"},
+            {"role": "user", "content": "Go on."},
+        ],
+    }
 
 
 def test_template_messages_follows_vllms_rules():
-    raw = [{"role": "user", "content": "hi"},
-           {"role": "assistant", "content": None, "tool_calls": [
-               {"id": "a", "type": "function", "function": {"name": "f", "arguments": '{"x": 1}'}},
-               {"id": "b", "type": "function", "function": {"name": "g", "arguments": {"y": 2}}},
-               {"id": "c", "type": "function", "function": {"name": "h", "arguments": ""}},
-               {"id": "d", "type": "function", "function": {"name": "i", "arguments": None}},
-               {"id": "e", "type": "function", "function": {"name": "j", "arguments": '{"cut": "off'}},
-               {"id": "f", "type": "function", "function": {"name": "k", "arguments": "[1, 2]"}}]},
-           {"role": "assistant", "content": "done", "tool_calls": []}]
+    raw = [
+        {"role": "user", "content": "hi"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": "a", "type": "function", "function": {"name": "f", "arguments": '{"x": 1}'}},
+                {"id": "b", "type": "function", "function": {"name": "g", "arguments": {"y": 2}}},
+                {"id": "c", "type": "function", "function": {"name": "h", "arguments": ""}},
+                {"id": "d", "type": "function", "function": {"name": "i", "arguments": None}},
+                {"id": "e", "type": "function", "function": {"name": "j", "arguments": '{"cut": "off'}},
+                {"id": "f", "type": "function", "function": {"name": "k", "arguments": "[1, 2]"}},
+            ],
+        },
+        {"role": "assistant", "content": "done", "tool_calls": []},
+    ]
     before = json.dumps(raw)
     out = template_messages(raw)
     assert [tc["function"]["arguments"] for tc in out[1]["tool_calls"]] == [{"x": 1}, {"y": 2}, {}, {}, {}, {}]
@@ -100,14 +150,18 @@ def test_the_agents_second_turn_renders_in_glm53s_template(tok):
     from trnrt.serve.api import chat_prompt
 
     body = agent_body(json.dumps)
-    with pytest.raises(Exception, match="items"):   # the raw history: string arguments have no .items()
+    with pytest.raises(Exception, match="items"):  # the raw history: string arguments have no .items()
         tok.apply_chat_template(body["messages"], tools=TOOLS, add_generation_prompt=True, tokenize=False)
     ids, parse = chat_prompt(tok, body)
     text = tok.decode(ids)
-    assert ("<tool_call>read<arg_key>filePath</arg_key><arg_value>src/app.py</arg_value><arg_key>limit</arg_key>"
-            "<arg_value>20</arg_value></tool_call>") in text
-    assert ("<tool_call>bash<arg_key>command</arg_key><arg_value>pytest -q tests/test_app.py</arg_value>"
-            '<arg_key>env</arg_key><arg_value>{"CI": "1"}</arg_value></tool_call>') in text
+    assert (
+        "<tool_call>read<arg_key>filePath</arg_key><arg_value>src/app.py</arg_value><arg_key>limit</arg_key>"
+        "<arg_value>20</arg_value></tool_call>"
+    ) in text
+    assert (
+        "<tool_call>bash<arg_key>command</arg_key><arg_value>pytest -q tests/test_app.py</arg_value>"
+        '<arg_key>env</arg_key><arg_value>{"CI": "1"}</arg_value></tool_call>'
+    ) in text
     assert "<|observation|><tool_response>def add(a, b):" in text and "test_add</tool_response>" in text
     assert text.endswith("<|assistant|><think>") and '"name": "read"' in text  # the tools listed in the system turn
     assert parse["thinking_open"] and parse["tools"] and parse["tool_defs"] == TOOLS
@@ -117,20 +171,36 @@ def test_the_agents_second_turn_renders_in_glm53s_template(tok):
 def _template_turn(tok) -> str:
     """The assistant turn the template writes for reasoning, text and two calls, as the model would emit it after the
     generation prompt's `<think>`: the rendered history's assistant part from `<think>` on, without that tag."""
-    msgs = [{"role": "user", "content": "Fix it."},
-            {"role": "assistant", "content": "Reading the file first.", "reasoning_content": "The test fails on add.",
-             "tool_calls": [{"id": "c1", "type": "function", "function": {
-                 "name": "read", "arguments": {"filePath": "src/app.py", "offset": 1, "limit": 40}}},
-                 {"id": "c2", "type": "function", "function": {
-                     "name": "bash", "arguments": {"command": "ls -la src", "env": {"LC_ALL": "C"}}}}]}]
+    msgs = [
+        {"role": "user", "content": "Fix it."},
+        {
+            "role": "assistant",
+            "content": "Reading the file first.",
+            "reasoning_content": "The test fails on add.",
+            "tool_calls": [
+                {
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "read", "arguments": {"filePath": "src/app.py", "offset": 1, "limit": 40}},
+                },
+                {
+                    "id": "c2",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": {"command": "ls -la src", "env": {"LC_ALL": "C"}}},
+                },
+            ],
+        },
+    ]
     text = tok.apply_chat_template(msgs, tools=TOOLS, tokenize=False)
-    turn = text[text.rindex("<|assistant|>") + len("<|assistant|>"):]
+    turn = text[text.rindex("<|assistant|>") + len("<|assistant|>") :]
     assert turn.startswith("<think>")
-    return turn[len("<think>"):].rstrip("\n")
+    return turn[len("<think>") :].rstrip("\n")
 
 
-WANT = [("read", {"filePath": "src/app.py", "offset": 1, "limit": 40}),
-        ("bash", {"command": "ls -la src", "env": {"LC_ALL": "C"}})]
+WANT = [
+    ("read", {"filePath": "src/app.py", "offset": 1, "limit": 40}),
+    ("bash", {"command": "ls -la src", "env": {"LC_ALL": "C"}}),
+]
 
 
 def _calls(msg: dict) -> list:
@@ -151,7 +221,9 @@ def test_the_servers_detokenizer_keeps_every_tag(tok):
 
     out = _template_turn(tok)
     ids = tok(out, add_special_tokens=False)["input_ids"]
-    assert {154842, 154843, 154844, 154847, 154848, 154849, 154850} <= set(ids)  # </think> and the tool tags, one id each
+    assert {154842, 154843, 154844, 154847, 154848, 154849, 154850} <= set(
+        ids
+    )  # </think> and the tool tags, one id each
     d, sp, deltas = _Detok(tok), StreamParser(thinking_open=True, **KW), []
     for n, i in enumerate(ids):
         last = n == len(ids) - 1
@@ -185,23 +257,31 @@ def test_a_template_that_knows_developer_keeps_it():
     from trnrt.serve.api import template_knows_developer
 
     msgs = [{"role": "developer", "content": "x"}]
-    assert template_messages(msgs) == msgs                            # off unless asked
+    assert template_messages(msgs) == msgs  # off unless asked
     assert template_messages(msgs, developer_to_system=True) == [{"role": "system", "content": "x"}]
-    assert msgs == [{"role": "developer", "content": "x"}]            # the request's own dicts are not changed
+    assert msgs == [{"role": "developer", "content": "x"}]  # the request's own dicts are not changed
 
     class Tok:
-        chat_template = "{% for m in messages %}{% if m.role == 'developer' %}<dev>{{ m.content }}{% endif %}{% endfor %}"
+        chat_template = (
+            "{% for m in messages %}{% if m.role == 'developer' %}<dev>{{ m.content }}{% endif %}{% endfor %}"
+        )
 
     class Named:
-        chat_template = {"default": "{{ messages }}", "tool_use": "{% if m.role == 'developer' %}{% endif %}"}
+        chat_template: ClassVar[dict[str, str]] = {
+            "default": "{{ messages }}",
+            "tool_use": "{% if m.role == 'developer' %}{% endif %}",
+        }
 
     class Prose:  # mentions the word, has no branch for the role: its developer turn would vanish
-        chat_template = ("You are a coding assistant for a developer.{% for m in messages %}{% if m.role == 'user' %}"
-                         "{{ m.content }}{% endif %}{% endfor %}")
+        chat_template = (
+            "You are a coding assistant for a developer.{% for m in messages %}{% if m.role == 'user' %}"
+            "{{ m.content }}{% endif %}{% endfor %}"
+        )
 
     class Listed:
-        chat_template = "{% for m in messages %}{% if message['role'] in ['system', \"developer\"] %}{% endif %}{% endfor %}"
+        chat_template = (
+            "{% for m in messages %}{% if message['role'] in ['system', \"developer\"] %}{% endif %}{% endfor %}"
+        )
 
     assert template_knows_developer(Tok()) and template_knows_developer(Named()) and template_knows_developer(Listed())
     assert not template_knows_developer(Prose())
-

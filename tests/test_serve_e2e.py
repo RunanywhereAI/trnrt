@@ -14,6 +14,7 @@ end-of-sequence token, so the served engines write the call as text and stop aft
 alone: no token the prompts contain is renamed.
 """
 
+import contextlib
 import json
 import os
 import signal
@@ -28,21 +29,70 @@ import torch
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 VOCAB = 384  # tests/test_glm5_next.py SMALL
 GEN = 3  # the token the chat template ends a prompt with (its generation prompt), and starts an assistant turn with
-CALL = ["<tool_call>", "get_weather", "<arg_key>", "city", "</arg_key>", "<arg_value>", "Paris", "</arg_value>",
-        "</tool_call>"]
-TOOLS = [{"type": "function", "function": {"name": "get_weather", "parameters": {
-    "type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}]
+CALL = [
+    "<tool_call>",
+    "get_weather",
+    "<arg_key>",
+    "city",
+    "</arg_key>",
+    "<arg_value>",
+    "Paris",
+    "</arg_value>",
+    "</tool_call>",
+]
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]},
+        },
+    }
+]
 # Each message's content as is, an assistant turn opened by the generation prompt's token, and the generation prompt
 # last: a turn's prompt is a prefix of the next turn's.
-TEMPLATE = ("{%- for m in messages -%}{%- if m.role == 'assistant' -%}t3 {% endif -%}"
-            "{%- if m.content -%}{{ m.content }} {% endif -%}{%- endfor -%}"
-            "{%- if add_generation_prompt -%}t3{%- endif -%}")
+TEMPLATE = (
+    "{%- for m in messages -%}{%- if m.role == 'assistant' -%}t3 {% endif -%}"
+    "{%- if m.content -%}{{ m.content }} {% endif -%}{%- endfor -%}"
+    "{%- if add_generation_prompt -%}t3{%- endif -%}"
+)
 # The engine arguments on CPU: fp32, pages of 4 tokens, one 64-token prefill bucket, decode batches of 1 and 2.
-CPU_ARGS = ["--device", "cpu", "--dtype", "float32", "--tp", "1", "--page-size", "4", "--max-model-len", "256",
-            "--max-num-seqs", "2", "--max-prefill-tokens", "64", "--decode-buckets", "1,2", "--prefill-buckets", "64",
-            "--page-buckets", "64", "--prefill-page-buckets", "64", "--prefill-page-min-rows", "0",
-            "--kv-cache-gb", "0.02", "--kv-cache-dtype", "auto", "--state-checkpoints", "8", "--host-cache-gb", "0",
-            "--moe-kernel", "xla"]
+CPU_ARGS = [
+    "--device",
+    "cpu",
+    "--dtype",
+    "float32",
+    "--tp",
+    "1",
+    "--page-size",
+    "4",
+    "--max-model-len",
+    "256",
+    "--max-num-seqs",
+    "2",
+    "--max-prefill-tokens",
+    "64",
+    "--decode-buckets",
+    "1,2",
+    "--prefill-buckets",
+    "64",
+    "--page-buckets",
+    "64",
+    "--prefill-page-buckets",
+    "64",
+    "--prefill-page-min-rows",
+    "0",
+    "--kv-cache-gb",
+    "0.02",
+    "--kv-cache-dtype",
+    "auto",
+    "--state-checkpoints",
+    "8",
+    "--host-cache-gb",
+    "0",
+    "--moe-kernel",
+    "xla",
+]
 START_S = 150.0  # the router answering /health, both engines up
 
 
@@ -62,7 +112,7 @@ def _scripted_prompt(engine_args: list[str]) -> tuple[list[int], list[int]]:
         eng.warmup()
         for seed in range(40):
             user = torch.randint(4, VOCAB, (23,), generator=torch.Generator().manual_seed(seed)).tolist()
-            out = eng.generate([user + [GEN]], SamplingParams(max_new_tokens=10, ignore_eos=True))[0].output_ids
+            out = eng.generate([[*user, GEN]], SamplingParams(max_new_tokens=10, ignore_eos=True))[0].output_ids
             if len(set(out)) == 10 and not set(out) & (set(user) | {GEN, 0}):
                 return user, out
     finally:
@@ -153,9 +203,26 @@ def test_serve_end_to_end_on_cpu(tmp_path):
     log_path = tmp_path / "serve.log"
     env = dict(os.environ, PYTHONPATH=ROOT, HF_HUB_OFFLINE="1", TRNRT_START_LOCK=str(tmp_path / "start-lock"))
     with open(log_path, "wb") as log:
-        proc = subprocess.Popen([sys.executable, "-m", "trnrt", "serve", *engine_args, "--port", str(port),
-                                 "--host", "127.0.0.1", "--served-model-name", "glm"],
-                                cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "trnrt",
+                "serve",
+                *engine_args,
+                "--port",
+                str(port),
+                "--host",
+                "127.0.0.1",
+                "--served-model-name",
+                "glm",
+            ],
+            cwd=ROOT,
+            env=env,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
 
     def tail() -> str:
         return log_path.read_text(errors="replace")[-4000:]
@@ -175,9 +242,18 @@ def test_serve_end_to_end_on_cpu(tmp_path):
 
         client = openai.OpenAI(base_url=base + "/v1", api_key="none", max_retries=0, timeout=60)
         first = [{"role": "user", "content": _words(user)}]
-        chunks = list(client.chat.completions.create(
-            model="glm", messages=first, tools=TOOLS, stream=True, temperature=0, max_tokens=16,
-            stream_options={"include_usage": True}, extra_body={"session_id": "agent-1"}))
+        chunks = list(
+            client.chat.completions.create(
+                model="glm",
+                messages=first,
+                tools=TOOLS,
+                stream=True,
+                temperature=0,
+                max_tokens=16,
+                stream_options={"include_usage": True},
+                extra_body={"session_id": "agent-1"},
+            )
+        )
         calls, content, finish = {}, "", None
         for ch in chunks:
             for c in ch.choices:
@@ -193,13 +269,24 @@ def test_serve_end_to_end_on_cpu(tmp_path):
         assert content.strip() == "" and finish == "tool_calls", (content, finish)
         assert chunks[-1].usage is not None and chunks[-1].usage.prompt_tokens == len(user) + 1, chunks[-1].usage
 
-        second = first + [
-            {"role": "assistant", "content": None, "tool_calls": [{"id": calls[0]["id"], "type": "function",
-                                                                   "function": {"name": "get_weather",
-                                                                                "arguments": calls[0]["arguments"]}}]},
-            {"role": "tool", "tool_call_id": calls[0]["id"], "content": _words(tool)}]
-        r = client.chat.completions.create(model="glm", messages=second, tools=TOOLS, temperature=0, max_tokens=4,
-                                           extra_body={"session_id": "agent-1"})
+        second = [
+            *first,
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": calls[0]["id"],
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": calls[0]["arguments"]},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": calls[0]["id"], "content": _words(tool)},
+        ]
+        r = client.chat.completions.create(
+            model="glm", messages=second, tools=TOOLS, temperature=0, max_tokens=4, extra_body={"session_id": "agent-1"}
+        )
         assert r.usage.prompt_tokens == len(user) + 1 + len(tool) + 1, r.usage  # turn 1, the tool result, t3
         cached = r.usage.prompt_tokens_details.cached_tokens
         assert 0 < cached <= len(user) + 1, (r.usage, tail())  # resumed from turn 1's prompt-end checkpoint
@@ -215,8 +302,6 @@ def test_serve_end_to_end_on_cpu(tmp_path):
             time.sleep(0.1)
         assert [p for p in kids if _alive(p)] == [], tail()
     finally:  # whatever failed, nothing it started outlives the test (serve and its engines share its process group)
-        try:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
             os.killpg(proc.pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
         proc.wait(10)

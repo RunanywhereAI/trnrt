@@ -74,13 +74,13 @@ def test_pack_places_the_kernel_operands():
     o1, o2, o3 = mdd._offsets(H)
     e, p, c, o = 2, 37, 3, 101
     sg = blob[e, :, o2:o3].contiguous().view(torch.bfloat16)  # [o, c]
-    w = blob[e, p, c * 128 + o:c * 128 + o + 1].view(FP8).float() * sg[o, c].float()
+    w = blob[e, p, c * 128 + o : c * 128 + o + 1].view(FP8).float() * sg[o, c].float()
     assert w == ws[0][e, o, c * 128 + p].float() * ws[1][e, o, (c * 128 + p) // 32].float()
     q, h = 64 + 5, 77  # second half of H on partitions 64..127
     hh = H // 2 + h  # its output column
     cp, pp = (hh % (H // 2)) // 128, hh % 128
     sd = blob[e, :, o3:].contiguous().view(torch.bfloat16)  # [p, (c', half)]
-    wd = blob[e, q, o1 + h:o1 + h + 1].view(FP8).float() * sd[pp, 2 * cp + 1].float()
+    wd = blob[e, q, o1 + h : o1 + h + 1].view(FP8).float() * sd[pp, 2 * cp + 1].float()
     assert wd == ws[2][e, 5, hh].float() * ws[3][e, 5 // 32, hh].float()
 
 
@@ -93,8 +93,9 @@ def test_rebase_moves_the_tile_scale_inside_e4m3():
         k = torch.tensor([[[0, -spread, -spread, -spread]]])
         if ok:
             out, K = mdd._rebase(w, k, "t")
-            assert torch.equal(out.float() * torch.exp2(K.float()).view(1, 1, 1, 1),
-                               w.float() * torch.exp2(k.float()).unsqueeze(-1))
+            assert torch.equal(
+                out.float() * torch.exp2(K.float()).view(1, 1, 1, 1), w.float() * torch.exp2(k.float()).unsqueeze(-1)
+            )
         else:
             with pytest.raises(ValueError, match="too far apart"):
                 mdd._rebase(w, k, "t")
@@ -135,9 +136,9 @@ def check_plan(topv, topi, E, L):
     return real
 
 
-@pytest.mark.parametrize("T,L", [(1, 1), (3, 1), (4, 2), (16, 2), (32, 4), (64, 4), (128, 8)])
+@pytest.mark.parametrize(("T", "L"), [(1, 1), (3, 1), (4, 2), (16, 2), (32, 4), (64, 4), (128, 8)])
 def test_plan_assigns_every_pair_one_lane(T, L):
-    x, topv, topi = routing(T)
+    _x, topv, topi = routing(T)
     real = check_plan(topv, topi, 256, L)
     assert real >= len(set(topi.reshape(-1).tolist()))
 
@@ -177,7 +178,7 @@ def test_emulated_kernel_matches_fp32(T):
 
 
 @pytest.mark.skipif(importlib.util.find_spec("nki") is None, reason="needs the NKI package (Neuron venv)")
-@pytest.mark.parametrize("T,L", [(2, 1), (7, 2), (5, 4)])
+@pytest.mark.parametrize(("T", "L"), [(2, 1), (7, 2), (5, 4)])
 def test_nki_simulator_matches_emulation(T, L, monkeypatch):
     import nki
 
@@ -192,7 +193,9 @@ def test_nki_simulator_matches_emulation(T, L, monkeypatch):
     topi[0, 0] = 127
     topv = (torch.rand(T, 8, generator=g) + 0.1).bfloat16()
     args = mdd.kernel_inputs(x, topv, topi, blob, lanes=L)
-    st = {k: args.pop(k) for k in ("lanes", "group", "ring", "slots", "block", "keep", "act", "limit", "alpha", "debug")}
+    st = {
+        k: args.pop(k) for k in ("lanes", "group", "ring", "slots", "block", "keep", "act", "limit", "alpha", "debug")
+    }
     out = nki.simulate(mdd.kernel())(**args, **st)
     got = torch.as_tensor(out).float()
     want = mdd.emulate(x, topv, topi, blob).float()
@@ -206,8 +209,9 @@ def fake_model(E=6):
 
     m = DecoderForCausalLM.__new__(DecoderForCausalLM)
     torch.nn.Module.__init__(m)
-    m.cfg = types.SimpleNamespace(hidden_size=H, num_experts=E, num_experts_per_tok=4, routed_scaling_factor=1.0,
-                                  norm_topk_prob=True)
+    m.cfg = types.SimpleNamespace(
+        hidden_size=H, num_experts=E, num_experts_per_tok=4, routed_scaling_factor=1.0, norm_topk_prob=True
+    )
     m.dtype, m.moe_inter = torch.bfloat16, 64
     return m
 
@@ -248,8 +252,12 @@ def experts128(seed=0, e=6, h=H):
     def fp8(*s):  # finite e4m3 bytes (exponent bit 3 clear)
         return (torch.randint(0, 256, s, dtype=torch.uint8, generator=g) & 0xBF).view(FP8)
 
-    return (fp8(e, 128, h), torch.rand(e, 128, h // 128, generator=g) * 0.02 + 0.005, fp8(e, 64, h),
-            torch.rand(e, 1, h, generator=g) * 0.02 + 0.005)
+    return (
+        fp8(e, 128, h),
+        torch.rand(e, 128, h // 128, generator=g) * 0.02 + 0.005,
+        fp8(e, 64, h),
+        torch.rand(e, 1, h, generator=g) * 0.02 + 0.005,
+    )
 
 
 def test_pack_takes_128_block_fp8_scales_as_they_are():
@@ -275,14 +283,16 @@ def reference_act(x, topv, topi, w_gu, s_gu, w_down, s_down, act, limit):
     return out
 
 
-@pytest.mark.parametrize("act,limit", [(1, 10.0), (1, 0.05), (2, 7.0), (2, 0.05)])
+@pytest.mark.parametrize(("act", "limit"), [(1, 10.0), (1, 0.05), (2, 7.0), (2, 0.05)])
 @pytest.mark.parametrize("which", [experts, experts128])
 def test_emulated_activations_match_fp32(act, limit, which):
     ws = which()
     x, topv, topi = routing(5, K=4, E=6)
     ref = reference_act(x, topv, topi, *ws, act, limit)
-    for got in (mdd.emulate(x, topv, topi, mdd.pack(*ws), act, limit),
-                mdd.emulate_pairs(x, topv, topi, mdd.pack(*ws), act, limit)):
+    for got in (
+        mdd.emulate(x, topv, topi, mdd.pack(*ws), act, limit),
+        mdd.emulate_pairs(x, topv, topi, mdd.pack(*ws), act, limit),
+    ):
         assert (got.float() - ref).abs().max() <= 0.01 * ref.abs().max()
 
 
@@ -291,19 +301,21 @@ def test_glu_forms():
 
     g, u = torch.tensor([-20.0, 0.5, 30.0]), torch.tensor([-30.0, 0.25, 20.0])
     assert torch.equal(mdd.glu(g, u, 0), F.silu(g) * u)
-    assert torch.equal(mdd.glu(g, u, 1, 10.0), F.silu(torch.tensor([-20.0, 0.5, 10.0])) * torch.tensor([-10.0, 0.25, 10.0]))
+    assert torch.equal(
+        mdd.glu(g, u, 1, 10.0), F.silu(torch.tensor([-20.0, 0.5, 10.0])) * torch.tensor([-10.0, 0.25, 10.0])
+    )
     gc, uc = torch.tensor([-20.0, 0.5, 7.0]), torch.tensor([-7.0, 0.25, 7.0])
     assert torch.equal(mdd.glu(g, u, 2, 7.0), (uc + 1) * (gc * torch.sigmoid(gc * 1.702)))
 
 
 def test_plan_over_288_experts():
-    x, topv, topi = routing(32, E=288, seed=5)
+    _x, topv, topi = routing(32, E=288, seed=5)
     topi[0, :2] = torch.tensor([287, 257])  # ids past 256
     check_plan(topv, topi, 288, 4)
 
 
 @pytest.mark.skipif(importlib.util.find_spec("nki") is None, reason="needs the NKI package (Neuron venv)")
-@pytest.mark.parametrize("act,limit", [(1, 0.02), (2, 0.02)])
+@pytest.mark.parametrize(("act", "limit"), [(1, 0.02), (2, 0.02)])
 def test_nki_simulator_activations_128_blocks_and_160_experts(act, limit, monkeypatch):
     """The dedupe kernel (16 tokens, lanes 2) and the per-pair kernel (3 tokens) on fp32 128-block
     scales, clamped activations whose limit bites, 160 experts (a partial tile of 128)."""
@@ -316,13 +328,16 @@ def test_nki_simulator_activations_128_blocks_and_160_experts(act, limit, monkey
     g = torch.Generator().manual_seed(6)
     for T in (16, 3):
         x = torch.randn(T, 4096, generator=g).bfloat16()
-        topi = torch.stack([torch.cat([torch.randperm(10, generator=g)[:6], torch.tensor([150, 159])])
-                            for _ in range(T)])
+        topi = torch.stack(
+            [torch.cat([torch.randperm(10, generator=g)[:6], torch.tensor([150, 159])]) for _ in range(T)]
+        )
         topv = (torch.rand(T, 8, generator=g) + 0.1).bfloat16()
         if T >= mdd.PAIRS_BELOW:
             args = mdd.kernel_inputs(x, topv, topi, blob, lanes=2, act=act, limit=limit)
-            st = {k: args.pop(k) for k in ("lanes", "group", "ring", "slots", "block", "keep", "act", "limit", "alpha",
-                                           "debug")}
+            st = {
+                k: args.pop(k)
+                for k in ("lanes", "group", "ring", "slots", "block", "keep", "act", "limit", "alpha", "debug")
+            }
             got = torch.as_tensor(nki.simulate(mdd.kernel())(**args, **st)).float()
             want = mdd.emulate(x, topv, topi, blob, act, limit).float()
         else:
@@ -344,18 +359,35 @@ def test_clamped_moe_reads_a_128_block_tile_blob_exactly():
     m = fake_model()
     w_gu, s_gu, w_down, s_down = experts128()
     router = torch.randn(6, H, generator=torch.Generator().manual_seed(9)).bfloat16()
-    nat = types.SimpleNamespace(moe_blob=False, down_t=True, w_gu=w_gu, w_gu_scale=s_gu, w_down=w_down,
-                                w_down_scale=s_down, router=router, router_bias=None)
-    tiles = types.SimpleNamespace(moe_blob=True, moe_tiles=True, w_blob=mdd.pack(w_gu, s_gu, w_down, s_down),
-                                  router=router, router_bias=None)
+    nat = types.SimpleNamespace(
+        moe_blob=False,
+        down_t=True,
+        w_gu=w_gu,
+        w_gu_scale=s_gu,
+        w_down=w_down,
+        w_down_scale=s_down,
+        router=router,
+        router_bias=None,
+    )
+    tiles = types.SimpleNamespace(
+        moe_blob=True, moe_tiles=True, w_blob=mdd.pack(w_gu, s_gu, w_down, s_down), router=router, router_bias=None
+    )
     x = routing(5, K=4, E=6)[0]
     a = hybrid._moe_clamped(m, nat, x, 0.05)
     b = hybrid._moe_clamped(m, tiles, x, 0.05)
     assert torch.equal(a, b)
 
 
-@pytest.mark.parametrize("T,want", [(512, [("v10", 512)]), (320, [("v10", 320)]), (64, [("v8", 64)]),
-                                    (200, [("v8", 128), ("v8", 72)]), (300, [("v8", 128), ("v8", 128), ("v8", 44)])])
+@pytest.mark.parametrize(
+    ("T", "want"),
+    [
+        (512, [("v10", 512)]),
+        (320, [("v10", 320)]),
+        (64, [("v8", 64)]),
+        (200, [("v8", 128), ("v8", 72)]),
+        (300, [("v8", 128), ("v8", 128), ("v8", 44)]),
+    ],
+)
 def test_dispatch_v10_for_257_to_512_tokens(T, want, monkeypatch):
     """moe_dedupe takes ONE moe_dedupe_v10 call for 257 to 512 tokens (a 512-row prefill chunk: GLM-5.3-Flash's 288
     experts, top-8, 768 slots), v8's 128-token calls otherwise: below 257 tokens (the 129-256-token form is not carried)
@@ -374,6 +406,7 @@ def test_dispatch_v10_for_257_to_512_tokens(T, want, monkeypatch):
                 seen.append(("v10" if self.k == "k10" else "v8", a["x"].shape[0]))
                 assert a["rev"] == (mdd.REV10 if self.k == "k10" else mdd.REV)
                 return a["x"]
+
             return call
 
     hop = types.ModuleType("libtorch_neuronx_lite.nki.nki_hop")

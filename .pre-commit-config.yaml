@@ -1,0 +1,38 @@
+# pre-commit run --all-files   (CI runs exactly this; `make lint` too)
+# The formatter and linter skip traced code (trnrt/kernels, trnrt/models and the modules listed in pyproject.toml):
+# a moved line there can change its compiled graphs. See AGENTS.md.
+default_install_hook_types: [pre-commit]
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-added-large-files
+        args: [--maxkb=1024]
+      - id: check-ast
+      - id: check-case-conflict
+      - id: check-merge-conflict
+      - id: check-symlinks
+      - id: check-toml
+      - id: check-yaml
+      - id: debug-statements
+      - id: detect-private-key
+      - id: end-of-file-fixer
+        exclude: &traced ^trnrt/(kernels|models)/
+      - id: mixed-line-ending
+        args: [--fix=lf]
+        exclude: *traced
+      - id: trailing-whitespace
+        exclude: *traced
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.17.3
+    hooks:
+      - id: ruff-check
+      - id: ruff-format
+  - repo: local
+    hooks:
+      - id: check-docs
+        name: Markdown links resolve; CLAUDE.md links to AGENTS.md
+        entry: python tools/check_docs.py
+        language: python
+        pass_filenames: false
+        files: \.(md|svg)$|^CLAUDE\.md$

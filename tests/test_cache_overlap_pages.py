@@ -34,12 +34,23 @@ PS = 4
 class Moves:
     """The host cache's copies (engine/host_cache.py), as bookkeeping only."""
 
-    def kv_save(self, slot, page): pass
-    def kv_load(self, slot, page): pass
-    def kv_drop(self, slot): pass
-    def state_save(self, slot, row): pass
-    def state_load(self, slot, row): pass
-    def state_drop(self, slot): pass
+    def kv_save(self, slot, page):
+        pass
+
+    def kv_load(self, slot, page):
+        pass
+
+    def kv_drop(self, slot):
+        pass
+
+    def state_save(self, slot, row):
+        pass
+
+    def state_load(self, slot, row):
+        pass
+
+    def state_drop(self, slot):
+        pass
 
 
 class Rows:
@@ -94,8 +105,9 @@ def check(s: Scheduler) -> None:
 def scheduler(num_pages=64, seats=8, budget=16, rows=8, host=None) -> Scheduler:
     pool = PagePool(num_pages)
     radix = RadixCache(pool, PS)
-    cfg = SchedulerConfig(page_size=PS, max_num_seqs=seats, max_prefill_tokens=budget, max_model_len=400,
-                          admission_decode_tokens=8)
+    cfg = SchedulerConfig(
+        page_size=PS, max_num_seqs=seats, max_prefill_tokens=budget, max_model_len=400, admission_decode_tokens=8
+    )
     s = Scheduler(cfg, pool, radix)
     s.states = Rows(rows)
     radix.free_ckpt = s.states.free_ckpt
@@ -133,8 +145,10 @@ def test_a_prefill_committed_after_the_next_decode_advanced_never_puts_a_placeho
     s.commit(p1, tokens(p1))
     check(s)
     # the prompt-end checkpoint (12, anchor), and step 2's decode checkpoint (16), whose page step 1 gave the tree
-    assert sorted((d, n.anchor) for n in nodes(s.radix) if n.ckpt is not None for d in [_depth(n)]) == \
-        [(12, True), (16, False)]
+    assert sorted((d, n.anchor) for n in nodes(s.radix) if n.ckpt is not None for d in [_depth(n)]) == [
+        (12, True),
+        (16, False),
+    ]
     s.commit(p2, tokens(p2))
     check(s)
     while r.status is Status.RUNNING:
@@ -173,8 +187,9 @@ def run(seed, num_pages=60, host=(40, 6), rows=8, seats=8, budget=16, abort_p=0.
         h = history.get(sid)
         h = (list(sys_prompt) if h is None else h) + [rng.randrange(1, 500) for _ in range(rng.randrange(1, 30))]
         n[0] += 1
-        req = Request(f"r{n[0]}", h, SamplingParams(max_new_tokens=rng.randrange(1, 14), ignore_eos=True),
-                      session_id=sid)
+        req = Request(
+            f"r{n[0]}", h, SamplingParams(max_new_tokens=rng.randrange(1, 14), ignore_eos=True), session_id=sid
+        )
         s.add(req)
         live[req.rid] = (sid, req)
 
@@ -222,8 +237,15 @@ def run(seed, num_pages=60, host=(40, 6), rows=8, seats=8, budget=16, abort_p=0.
     return s
 
 
-@pytest.mark.parametrize("kw", [dict(), dict(num_pages=40, host=(30, 6)), dict(num_pages=80, rows=4, host=(40, 3)),
-                                dict(num_pages=50, budget=8, abort_p=0.05)])
+@pytest.mark.parametrize(
+    "kw",
+    [
+        {},
+        {"num_pages": 40, "host": (30, 6)},
+        {"num_pages": 80, "rows": 4, "host": (40, 3)},
+        {"num_pages": 50, "budget": 8, "abort_p": 0.05},
+    ],
+)
 def test_served_configuration_under_pressure_keeps_every_page_owned_once(kw):
     hits = offloaded = 0
     for seed in range(6):

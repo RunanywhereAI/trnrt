@@ -22,8 +22,14 @@ from trnrt.engine.scheduler import Scheduler, SchedulerConfig
 def make(max_seqs: int, max_running: int | None, budget: int = 16):
     pool = PagePool(256)
     radix = RadixCache(pool, PS)
-    cfg = SchedulerConfig(page_size=PS, max_num_seqs=max_seqs, max_prefill_tokens=budget, max_model_len=512,
-                          eos_token_ids=(EOS,), max_running=max_running)
+    cfg = SchedulerConfig(
+        page_size=PS,
+        max_num_seqs=max_seqs,
+        max_prefill_tokens=budget,
+        max_model_len=512,
+        eos_token_ids=(EOS,),
+        max_running=max_running,
+    )
     sched = Scheduler(cfg, pool, radix)
     sched.states = Rows(32)
     radix.free_ckpt = sched.states.free_ckpt
@@ -62,7 +68,7 @@ def test_uncapped_the_burst_fills_the_seats():
     assert all(r.status is Status.FINISHED for r in reqs)
 
 
-@pytest.mark.parametrize("seats,cap,want", [(4, 1, 1), (4, 4, 4), (4, 9, 4), (16, 12, 12)])
+@pytest.mark.parametrize(("seats", "cap", "want"), [(4, 1, 1), (4, 4, 4), (4, 9, 4), (16, 12, 12)])
 def test_the_cap_is_the_lesser_of_the_cap_and_the_seats(seats, cap, want):
     """A burst of more requests than seats, with a prefill budget that admits them all in one step."""
     _, most, _, _ = burst(make(seats, cap, budget=1024), n=seats + 2)

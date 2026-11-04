@@ -56,7 +56,17 @@ class Metrics:
         self.finished: dict[str, int] = {}
         self.ttft = Histogram()
         self.tpot = Histogram()
-        self.e2e = Histogram(LATENCY_BUCKETS + (81.92, 163.84))
+        self.e2e = Histogram((*LATENCY_BUCKETS, 81.92, 163.84))
+        # The local-K selection's counters (LLMEngine.local_k_counts) as the engine thread last read them, and whether
+        # a render asked for them since. They are device buffers the graphs write, so only the engine thread reads
+        # them, and only while it is idle (serve/api.py EngineLoop): a scrape shows the counts of the last idle moment
+        # after the scrape before it.
+        self.local_k: list[float] | None = None
+        self.local_k_wanted = False
+
+    def set_local_k(self, counts: list[float] | None) -> None:
+        with self.lock:
+            self.local_k, self.local_k_wanted = counts, False
 
     def on_finish(self, req) -> None:
         with self.lock:
@@ -78,15 +88,20 @@ class Metrics:
         s = engine.scheduler
         used, usable = kv_pages(engine)
         lines = [
-            "# TYPE trnrt:num_requests_running gauge", f"trnrt:num_requests_running {len(s.running)}",
-            "# TYPE trnrt:num_requests_waiting gauge", f"trnrt:num_requests_waiting {len(s.waiting)}",
-            "# TYPE trnrt:kv_cache_usage_perc gauge", f"trnrt:kv_cache_usage_perc {used / usable:.6f}",
-            "# TYPE trnrt:num_preemptions_total counter", f"trnrt:num_preemptions_total {s.num_preemptions}",
+            "# TYPE trnrt:num_requests_running gauge",
+            f"trnrt:num_requests_running {len(s.running)}",
+            "# TYPE trnrt:num_requests_waiting gauge",
+            f"trnrt:num_requests_waiting {len(s.waiting)}",
+            "# TYPE trnrt:kv_cache_usage_perc gauge",
+            f"trnrt:kv_cache_usage_perc {used / usable:.6f}",
+            "# TYPE trnrt:num_preemptions_total counter",
+            f"trnrt:num_preemptions_total {s.num_preemptions}",
         ]
         lines += startup_lines(engine)
         with self.lock:
             lines += [
-                "# TYPE trnrt:prompt_tokens_total counter", f"trnrt:prompt_tokens_total {self.prompt_tokens}",
+                "# TYPE trnrt:prompt_tokens_total counter",
+                f"trnrt:prompt_tokens_total {self.prompt_tokens}",
                 "# TYPE trnrt:generation_tokens_total counter",
                 f"trnrt:generation_tokens_total {self.generation_tokens}",
                 "# TYPE trnrt:prefix_cache_queries_total counter",
@@ -95,14 +110,35 @@ class Metrics:
                 f"trnrt:prefix_cache_hits_total {self.prefix_cache_hits}",
                 "# TYPE trnrt:request_success_total counter",
             ]
-            lines += [f'trnrt:request_success_total{{finished_reason="{k}"}} {v}'
-                      for k, v in sorted(self.finished.items())]
-            for name, h in (("trnrt:time_to_first_token_seconds", self.ttft),
-                            ("trnrt:time_per_output_token_seconds", self.tpot),
-                            ("trnrt:e2e_request_latency_seconds", self.e2e)):
+            lines += [
+                f'trnrt:request_success_total{{finished_reason="{k}"}} {v}' for k, v in sorted(self.finished.items())
+            ]
+            for name, h in (
+                ("trnrt:time_to_first_token_seconds", self.ttft),
+                ("trnrt:time_per_output_token_seconds", self.tpot),
+                ("trnrt:e2e_request_latency_seconds", self.e2e),
+            ):
                 lines.append(f"# TYPE {name} histogram")
                 lines += h.lines(name)
+            lines += local_k_lines(self.local_k)
+            self.local_k_wanted = True
         return "\n".join(lines) + "\n"
+
+
+def local_k_lines(counts: list[float] | None) -> list[str]:
+    """The context-parallel prefill's local-K selection (models/mla.py CP_LOCAL_K; engine.local_k_counts), over the
+    engine's run so far, its warmup included, on rank 0's row group: rows selected, rows that failed the certificate
+    (selected again from every rank's whole list), and failed rows past CP_LOCAL_F, whose selection was not exact (0 on
+    an exact run). None (an engine without the counters, or none read yet): no lines."""
+    if counts is None:
+        return []
+    out = []
+    for name, v in zip(
+        ("trnrt:dsa_local_k_rows_total", "trnrt:dsa_local_k_failed_rows_total", "trnrt:dsa_local_k_inexact_rows_total"),
+        counts,
+    ):
+        out += [f"# TYPE {name} counter", f"{name} {v:.0f}"]
+    return out
 
 
 def _bucket(key) -> str:
@@ -123,8 +159,10 @@ def startup_lines(engine) -> list[str]:
     if getattr(engine, "startup_seconds", None) is not None:
         out += ["# TYPE trnrt:startup_time_seconds gauge", f"trnrt:startup_time_seconds {engine.startup_seconds:.3f}"]
     if getattr(engine, "load_seconds", None) is not None:
-        out += ["# TYPE trnrt:model_load_time_seconds gauge",
-                f"trnrt:model_load_time_seconds {engine.load_seconds:.3f}"]
+        out += [
+            "# TYPE trnrt:model_load_time_seconds gauge",
+            f"trnrt:model_load_time_seconds {engine.load_seconds:.3f}",
+        ]
     model = getattr(engine, "model", None)
     if model is not None and hasattr(model, "parameters"):
         n = sum(p.numel() * p.element_size() for p in model.parameters())

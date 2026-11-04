@@ -2,7 +2,7 @@
 half inside a bigger kernel (the fused DSA layer's). They call this, so they run the served code.
 
 ffn_half_body is kernels/ffn_half_pb.py ffn_half_kernel's body statement for statement, with the kernel's arguments
-less `rev`; tests/test_ffn_half_shared.py pins it to the served source, AST for AST, and plants changes that must break
+less `rev`; tests/test_ffn_half.py pins it to the served source, AST for AST, and plants changes that must break
 the pin. It allocates its outputs (shared HBM) as the kernel does, so a caller gets the kernel's outputs as its own
 intermediates. The pieces it calls (SH.mix_in_h, MS.front_body, _norm_xc, half_body_pb) are the served module's
 objects, imported, not copied, so ffn_half_pb's forms act here exactly as there.

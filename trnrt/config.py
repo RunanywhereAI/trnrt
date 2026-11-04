@@ -38,6 +38,8 @@ class EngineConfig:
     admission. Only the shapes and sizes below vary, with the decode kernel routes' row caps (graph structure, like
     the shapes) and the admission cap max_running (host only)."""
     model_path: str
+    # With a Hugging Face repo id as model_path: the commit (or branch, tag) to download (None: the default branch).
+    model_revision: str | None = None
     device: str = "cpu"  # "cpu" or "neuron"
     dtype: torch.dtype = torch.bfloat16
     # "auto" stores KV in the model dtype; "fp8" in float8 e4m3 (vLLM / SGLang --kv-cache-dtype fp8), halving the KV
@@ -89,8 +91,9 @@ class EngineConfig:
     max_running: int | None = None
     # The decode kernel routes' row caps (engine.build_shard sets them on every rank before the shard is built, so the
     # ranks of an engine and of a capture trace the same routes). Each one decides which graph a decode step of a given
-    # row count traces, so a change needs a new capture. The defaults are the served configuration's (decode steps of
-    # up to 8 rows); the batch-12 preset (trnrt/__main__.py PRESETS) raises them for steps of up to 12 rows.
+    # row count traces, so a change needs a new capture. The defaults here are the model modules' own import-time caps,
+    # for decode steps of up to 8 rows (--preset batch8); the command line's defaults, the served configuration
+    # (trnrt/__main__.py), raise them for steps of up to 12 rows: 12, 16, 17 and 8.
     # - kda_shell_max_rows (models/hybrid.py KDA_SHELL_MAXB): a KDA layer's decode attention block runs as the KDA
     #   shell's kernel at most this many rows, the XLA half above.
     # - dsa_layer_max_rows (models/mla.py LAYER_MK_MAXB): a DSA layer's decode attention block and FFN half run as the

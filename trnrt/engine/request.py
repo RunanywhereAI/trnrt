@@ -5,8 +5,10 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import TYPE_CHECKING
 
-from .radix_cache import RadixNode
+if TYPE_CHECKING:
+    from .radix_cache import RadixNode
 
 
 @dataclass(frozen=True)

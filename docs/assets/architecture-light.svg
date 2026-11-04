@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640" role="img" aria-labelledby="title desc">
+<title id="title">TrnRT architecture</title>
+<desc id="desc">Clients reach a session-affine router on port 8000, which sends each session to one of two engines. Each engine is tensor-parallel over 32 logical NeuronCores on 8 Trainium2 chips and runs a scheduler, a prefix cache with a host-memory tier, and NKI megakernels. Offline, on any x86_64 host, five steps (shapes, decisions, capture, compile, strip) build the compile cache the engines load at start-up.</desc>
+<defs><linearGradient id="ra" x1="6" y1="6" x2="38.8354" y2="35.7082" gradientUnits="userSpaceOnUse"><stop stop-color="#FF6900"/><stop offset="1" stop-color="#FB2C36"/></linearGradient><radialGradient id="glow" cx="0.5" cy="0.5" r="0.5"><stop offset="0" stop-color="#ff6900" stop-opacity="0.12"/><stop offset="1" stop-color="#ff6900" stop-opacity="0"/></radialGradient><pattern id="dots" width="24" height="24" patternUnits="userSpaceOnUse"><circle cx="2" cy="2" r="1.1" fill="#10182b" fill-opacity="0.07"/></pattern></defs>
+<defs><marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#10182b" fill-opacity="0.55"/></marker></defs>
+<rect width="1280" height="640" rx="24" fill="#fbfaf8"/>
+<rect width="1280" height="640" rx="24" fill="url(#dots)"/>
+<rect x="0.5" y="0.5" width="1279" height="639" rx="23.5" fill="none" stroke="#10182b" stroke-opacity="0.1"/>
+<text x="48" y="64" font-family="'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="15" font-weight="500" fill="#10182b" fill-opacity="1" text-anchor="start" letter-spacing="2.4">SERVING  ·  ONE trn2.48xlarge</text>
+<rect x="48" y="100" width="220" height="92" rx="16" fill="#ffffff" stroke="#10182b" stroke-opacity="0.12" stroke-width="1.5"/>
+<text x="158" y="140" font-family="'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="22" font-weight="600" fill="#10182b" fill-opacity="1.0" text-anchor="middle" letter-spacing="0">Clients</text>
+<text x="158" y="168" font-family="'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15" font-weight="400" fill="#10182b" fill-opacity="0.65" text-anchor="middle" letter-spacing="0">OpenAI-compatible API</text>
+<line x1="268" y1="146" x2="338" y2="146" stroke="#10182b" stroke-opacity="0.45" stroke-width="1.5" marker-end="url(#arr)"/>
+<rect x="340" y="100" width="250" height="92" rx="16" fill="#ffffff" stroke="#ff6900" stroke-opacity="0.85" stroke-width="1.5"/>
+<text x="465" y="140" font-family="'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="22" font-weight="600" fill="#10182b" fill-opacity="1.0" text-anchor="middle" letter-spacing="0">Router  :8000</text>
+<text x="465" y="168" font-family="'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15" font-weight="400" fill="#10182b" fill-opacity="0.65" text-anchor="middle" letter-spacing="0">session-affine, prefix-aware</text>
+<line x1="590" y1="146" x2="662" y2="146" stroke="#10182b" stroke-opacity="0.45" stroke-width="1.5" marker-end="url(#arr)"/>
+<rect x="664" y="84" width="568" height="124" rx="16" fill="#ffffff" stroke="#10182b" stroke-opacity="0.12" stroke-width="1.5"/>
+<text x="692" y="124" font-family="'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="21" font-weight="600" fill="#10182b" fill-opacity="1.0" text-anchor="start" letter-spacing="0">Engine 0  :8001</text>
+<text x="1204" y="124" font-family="'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" font-weight="400" fill="#10182b" fill-opacity="0.6" text-anchor="end" letter-spacing="0">TP 32  ·  NeuronCores 0-31  ·  8 chips</text>
+<rect x="692" y="148" width="95" height="36" rx="18" fill="#f4f2ee" stroke="#10182b" stroke-opacity="0.12"/>
+<text x="739.5" y="172" font-family="'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15" font-weight="500" fill="#10182b" fill-opacity="0.85" text-anchor="middle" letter-spacing="0">scheduler</text>
+<rect x="799" y="148" width="230" height="36" rx="18" fill="#f4f2ee" stroke="#10182b" stroke-opacity="0.12"/>
+<text x="914.0" y="172" font-family="'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15" font-weight="500" fill="#10182b" fill-opacity="0.85" text-anchor="middle" letter-spacing="0">prefix cache + host tier</text>
+<rect x="1041" y="148" width="149" height="36" rx="18" fill="#f4f2ee" stroke="#10182b" stroke-opacity="0.12"/>
+<text x="1115.5" y="172" font-family="'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15" font-weight="500" fill="#10182b" fill-opacity="0.85" text-anchor="middle" letter-spacing="0">NKI megakernels</text>
+<line x1="590" y1="146" x2="662" y2="294" stroke="#10182b" stroke-opacity="0.45" stroke-width="1.5" marker-end="url(#arr)"/>
+<rect x="664" y="232" width="568" height="124" rx="16" fill="#ffffff" stroke="#10182b" stroke-opacity="0.12" stroke-width="1.5"/>
+<text x="692" y="272" font-family="'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="21" font-weight="600" fill="#10182b" fill-opacity="1.0" text-anchor="start" letter-spacing="0">Engine 1  :8002</text>
+<text x="1204" y="272" font-family="'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" font-weight="400" fill="#10182b" fill-opacity="0.6" text-anchor="end" letter-spacing="0">TP 32  ·  NeuronCores 32-63  ·  8 chips</text>
+<rect x="692" y="296" width="95" height="36" rx="18" fill="#f4f2ee" stroke="#10182b" stroke-opacity="0.12"/>
+<text x="739.5" y="320" font-family="'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15" font-weight="500" fill="#10182b" fill-opacity="0.85" text-anchor="middle" letter-spacing="0">scheduler</text>
+<rect x="799" y="296" width="230" height="36" rx="18" fill="#f4f2ee" stroke="#10182b" stroke-opacity="0.12"/>
+<text x="914.0" y="320" font-family="'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15" font-weight="500" fill="#10182b" fill-opacity="0.85" text-anchor="middle" letter-spacing="0">prefix cache + host tier</text>
+<rect x="1041" y="296" width="149" height="36" rx="18" fill="#f4f2ee" stroke="#10182b" stroke-opacity="0.12"/>
+<text x="1115.5" y="320" font-family="'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15" font-weight="500" fill="#10182b" fill-opacity="0.85" text-anchor="middle" letter-spacing="0">NKI megakernels</text>
+<line x1="48" y1="402" x2="1232" y2="402" stroke="#10182b" stroke-opacity="0.08"/>
+<text x="48" y="448" font-family="'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="15" font-weight="500" fill="#10182b" fill-opacity="1" text-anchor="start" letter-spacing="2.4">COMPILE  ·  ANY x86_64 HOST, NO NEURONCORE NEEDED</text>
+<rect x="48" y="480" width="172" height="96" rx="16" fill="#ffffff" stroke="#10182b" stroke-opacity="0.12" stroke-width="1.5"/>
+<text x="70" y="520" font-family="'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="19" font-weight="600" fill="#10182b" fill-opacity="1.0" text-anchor="start" letter-spacing="0">1  shapes</text>
+<text x="70" y="550" font-family="'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#10182b" fill-opacity="0.62" text-anchor="start" letter-spacing="0">config + headers</text>
+<line x1="220" y1="528" x2="238" y2="528" stroke="#10182b" stroke-opacity="0.45" stroke-width="1.5" marker-end="url(#arr)"/>
+<rect x="240" y="480" width="172" height="96" rx="16" fill="#ffffff" stroke="#10182b" stroke-opacity="0.12" stroke-width="1.5"/>
+<text x="262" y="520" font-family="'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="19" font-weight="600" fill="#10182b" fill-opacity="1.0" text-anchor="start" letter-spacing="0">2  decisions</text>
+<text x="262" y="550" font-family="'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#10182b" fill-opacity="0.62" text-anchor="start" letter-spacing="0">MoE packing</text>
+<line x1="412" y1="528" x2="430" y2="528" stroke="#10182b" stroke-opacity="0.45" stroke-width="1.5" marker-end="url(#arr)"/>
+<rect x="432" y="480" width="172" height="96" rx="16" fill="#ffffff" stroke="#10182b" stroke-opacity="0.12" stroke-width="1.5"/>
+<text x="454" y="520" font-family="'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="19" font-weight="600" fill="#10182b" fill-opacity="1.0" text-anchor="start" letter-spacing="0">3  capture</text>
+<text x="454" y="550" font-family="'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#10182b" fill-opacity="0.62" text-anchor="start" letter-spacing="0">every graph, 32 ranks</text>
+<line x1="604" y1="528" x2="622" y2="528" stroke="#10182b" stroke-opacity="0.45" stroke-width="1.5" marker-end="url(#arr)"/>
+<rect x="624" y="480" width="172" height="96" rx="16" fill="#ffffff" stroke="#10182b" stroke-opacity="0.12" stroke-width="1.5"/>
+<text x="646" y="520" font-family="'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="19" font-weight="600" fill="#10182b" fill-opacity="1.0" text-anchor="start" letter-spacing="0">4  compile</text>
+<text x="646" y="550" font-family="'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#10182b" fill-opacity="0.62" text-anchor="start" letter-spacing="0">neuronx-cc</text>
+<line x1="796" y1="528" x2="814" y2="528" stroke="#10182b" stroke-opacity="0.45" stroke-width="1.5" marker-end="url(#arr)"/>
+<rect x="816" y="480" width="172" height="96" rx="16" fill="#ffffff" stroke="#10182b" stroke-opacity="0.12" stroke-width="1.5"/>
+<text x="838" y="520" font-family="'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="19" font-weight="600" fill="#10182b" fill-opacity="1.0" text-anchor="start" letter-spacing="0">5  strip</text>
+<text x="838" y="550" font-family="'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#10182b" fill-opacity="0.62" text-anchor="start" letter-spacing="0">drop debug info</text>
+<line x1="988" y1="528" x2="1006" y2="528" stroke="#10182b" stroke-opacity="0.45" stroke-width="1.5" marker-end="url(#arr)"/>
+<rect x="1008" y="480" width="224" height="96" rx="16" fill="#ffffff" stroke="#ff6900" stroke-opacity="0.85" stroke-width="1.5"/>
+<text x="1120.0" y="520" font-family="'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="19" font-weight="600" fill="#10182b" fill-opacity="1.0" text-anchor="middle" letter-spacing="0">compile cache</text>
+<text x="1120.0" y="550" font-family="'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" font-weight="400" fill="#10182b" fill-opacity="0.62" text-anchor="middle" letter-spacing="0">loaded at start-up</text>
+<path d="M1120.0 480 V 372 H 948 V 358" fill="none" stroke="#ff6900" stroke-opacity="0.7" stroke-width="1.5" stroke-dasharray="5 6" marker-end="url(#arr)"/>
+</svg>

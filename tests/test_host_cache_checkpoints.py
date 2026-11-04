@@ -25,9 +25,9 @@ import torch
 pytest.importorskip("transformers.models.glm5_next.modeling_glm5_next")
 
 NEW = 8
-B = 40   # past the model's index_topk 16: the sparse attention regime
-PS = 4   # tests/test_glm5_next.py engine(): page_size 4
-HOST = 0.05   # GiB per rank: ample for the tiny model's rows and pages
+B = 40  # past the model's index_topk 16: the sparse attention regime
+PS = 4  # tests/test_glm5_next.py engine(): page_size 4
+HOST = 0.05  # GiB per rank: ample for the tiny model's rows and pages
 
 
 @pytest.fixture(scope="module")
@@ -64,14 +64,14 @@ class PrefillSpy:
         orig = runner.prefill
 
         def wrap(s, *a, _orig=orig):
-            for x in (s if isinstance(s, list) else [s]):
+            for x in s if isinstance(s, list) else [s]:
                 self.starts.append((x.req.rid, x.start, x.end))
             return _orig(s, *a)
 
         runner.prefill = wrap
 
 
-POISON = 3.0   # finite: harmless where a read is masked (a page's unwritten tail), wrong anywhere it is not
+POISON = 3.0  # finite: harmless where a read is masked (a page's unwritten tail), wrong anywhere it is not
 
 
 def _poison(eng, rad) -> None:
@@ -111,7 +111,11 @@ def _run(path, first, second, mode: str, **kw):
         (req,) = eng.generate([second], sp)
         counts = None
         if hit:
-            counts = dict(ckpts_saved=tier.ckpts_saved, ckpts_restored=tier.ckpts_restored, pages_restored=tier.restored)
+            counts = {
+                "ckpts_saved": tier.ckpts_saved,
+                "ckpts_restored": tier.ckpts_restored,
+                "pages_restored": tier.restored,
+            }
         return list(req.output_ids), [x[0] for x in req.logprobs], [x for q, x, _ in spy.starts if q == req.rid], counts
     finally:
         eng.close()

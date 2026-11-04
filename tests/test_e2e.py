@@ -33,12 +33,28 @@ pytest.importorskip("transformers.models.glm5_next.modeling_glm5_next")
 glm = pytest.importorskip("tests.test_glm5_next")
 httpx = pytest.importorskip("httpx")
 
-CHAIN = ["ASSISTANT", "<tool_call>", "get_weather", "<arg_key>", "city", "</arg_key>", "<arg_value>", "Paris",
-         "</arg_value>", "</tool_call>"]
-TOOLS = [{"type": "function", "function": {"name": "get_weather", "description": "the weather in a city",
-                                           "parameters": {"type": "object",
-                                                          "properties": {"city": {"type": "string"}},
-                                                          "required": ["city"]}}}]
+CHAIN = [
+    "ASSISTANT",
+    "<tool_call>",
+    "get_weather",
+    "<arg_key>",
+    "city",
+    "</arg_key>",
+    "<arg_value>",
+    "Paris",
+    "</arg_value>",
+    "</tool_call>",
+]
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "the weather in a city",
+            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]},
+        },
+    }
+]
 PROMPT = " ".join(f"t{i}" for i in range(5, 41))  # 36 words: the prompt spans several 4-token pages
 
 
@@ -141,15 +157,25 @@ def stack(tmp_path_factory):
 
 
 def _body(session: str, stream: bool = False) -> dict:
-    return {"model": "glm", "messages": [{"role": "user", "content": PROMPT}], "tools": TOOLS, "temperature": 0,
-            "max_tokens": 16, "session_id": session, "stream": stream,
-            **({"stream_options": {"include_usage": True}} if stream else {})}
+    return {
+        "model": "glm",
+        "messages": [{"role": "user", "content": PROMPT}],
+        "tools": TOOLS,
+        "temperature": 0,
+        "max_tokens": 16,
+        "session_id": session,
+        "stream": stream,
+        **({"stream_options": {"include_usage": True}} if stream else {}),
+    }
 
 
 def _served(url: str) -> float:
     """Requests the engine finished, over every finish reason (one labelled line each)."""
-    return sum(float(line.split()[-1]) for line in httpx.get(url + "/metrics").text.splitlines()
-               if line.startswith("trnrt:request_success_total{"))
+    return sum(
+        float(line.split()[-1])
+        for line in httpx.get(url + "/metrics").text.splitlines()
+        if line.startswith("trnrt:request_success_total{")
+    )
 
 
 def test_tool_call_prefix_hit_and_both_engines(stack):
@@ -171,9 +197,7 @@ def test_tool_call_prefix_hit_and_both_engines(stack):
     events = []
     with client.stream("POST", "/v1/chat/completions", json=_body("s2", stream=True)) as r:
         assert r.status_code == 200
-        for line in r.iter_lines():
-            if line.startswith("data: "):
-                events.append(line[len("data: "):])
+        events.extend(line[len("data: ") :] for line in r.iter_lines() if line.startswith("data: "))
     assert events[-1] == "[DONE]"
     chunks = [json.loads(e) for e in events[:-1]]
     name, args, finish = None, "", None

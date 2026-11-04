@@ -69,7 +69,7 @@ class _Moves:
         self.log = []
 
     def __getattr__(self, name):
-        return lambda *a: self.log.append((name,) + a)
+        return lambda *a: self.log.append((name, *a))
 
 
 def test_lookup_and_find_ckpt_take_the_chain():

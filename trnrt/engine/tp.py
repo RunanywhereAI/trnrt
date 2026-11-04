@@ -2,7 +2,9 @@
 
 One process per rank; rank 0 runs the scheduler and the API, ranks > 0 replay every graph
 call rank 0 makes (ModelRunner.serve), so all ranks execute identical graphs on identical
-inputs and meet at the same in-graph collectives. Host-side coordination is gloo.
+inputs and meet at the same in-graph collectives. Host-side coordination is gloo; rank 0's
+calls reach the other ranks through a shared-memory channel (ShmChannel below; TRNRT_TP_SHM=0
+sends them over gloo instead).
 
 On Neuron each rank sees exactly one NeuronCore (NEURON_RT_VISIBLE_CORES) and all ranks
 share one CCOM bootstrap endpoint (NEURON_RT_ROOT_COMM_ID), the arrangement vllm-neuron's
@@ -13,16 +15,23 @@ never collide (libtorch_neuronx_lite defaults the CCOM root to MASTER_PORT other
 
 from __future__ import annotations
 
-import datetime
+import contextlib
+import datetime as dt
 import errno
+import logging
 import os
 import socket
+from typing import Any
 
 import torch.distributed as dist
 
+from ..log import configure as configure_logging
+
+logger = logging.getLogger(__name__)
+
 # Ranks > 0 wait in a broadcast while rank 0 compiles a new bucket, which can take tens of
 # minutes for a large model; the default 30-minute gloo timeout would kill a healthy job.
-TIMEOUT = datetime.timedelta(hours=4)
+TIMEOUT = dt.timedelta(hours=4)
 
 
 def port_free(p: int) -> bool:
@@ -31,7 +40,8 @@ def port_free(p: int) -> bool:
     address, and a long-lived process collects them (a test session held two dozen gloo listeners
     on the host's address, free_port probing 127.0.0.1 returned one of them, and rank 0's TCPStore
     bind failed)."""
-    families = [(socket.AF_INET, "0.0.0.0")] + ([(socket.AF_INET6, "::")] if socket.has_ipv6 else [])
+    # every interface (S104), as rank 0's TCPStore binds
+    families = [(socket.AF_INET, "0.0.0.0")] + ([(socket.AF_INET6, "::")] if socket.has_ipv6 else [])  # noqa: S104
     for fam, host in families:
         try:
             with socket.socket(fam) as s:
@@ -69,11 +79,13 @@ def free_port(core_base: int | None = None) -> int:
         for p in range(b.start, b.stop - 1, 2):
             if port_free(p) and port_free(p + 1):
                 return p
-        raise RuntimeError(f"no free port pair in core base {core_base}'s band {b.start}-{b.stop - 1}: another job on "
-                           f"the same cores, or its sockets still in TIME_WAIT")
+        raise RuntimeError(
+            f"no free port pair in core base {core_base}'s band {b.start}-{b.stop - 1}: another job on "
+            f"the same cores, or its sockets still in TIME_WAIT"
+        )
     for _ in range(50):
         with socket.socket() as a:
-            a.bind(("0.0.0.0", 0))
+            a.bind(("0.0.0.0", 0))  # noqa: S104  # every interface, as rank 0's TCPStore will
             p = a.getsockname()[1]
         if port_free(p) and port_free(p + 1):
             return p
@@ -88,8 +100,11 @@ _ENV_KEYS = ("MASTER_ADDR", "MASTER_PORT", "NEURON_RT_VISIBLE_CORES", "NEURON_RT
 def process_state() -> dict:
     import torch
 
-    return {"env": {k: os.environ.get(k) for k in _ENV_KEYS}, "threads": torch.get_num_threads(),
-            "affinity": os.sched_getaffinity(0) if hasattr(os, "sched_getaffinity") else None}
+    return {
+        "env": {k: os.environ.get(k) for k in _ENV_KEYS},
+        "threads": torch.get_num_threads(),
+        "affinity": os.sched_getaffinity(0) if hasattr(os, "sched_getaffinity") else None,
+    }
 
 
 def restore_process_state(saved: dict) -> None:
@@ -101,8 +116,9 @@ def restore_process_state(saved: dict) -> None:
         else:
             os.environ[k] = v
     torch.set_num_threads(saved["threads"])
-    if saved.get("affinity") is not None and os.sched_getaffinity(0) != saved["affinity"]:  # numa_pin's, on rank 0
-        os.sched_setaffinity(0, saved["affinity"])
+    # numa_pin's, on rank 0
+    if saved.get("affinity") is not None and os.sched_getaffinity(0) != saved["affinity"]:  # type: ignore[attr-defined, unused-ignore]  # Linux-only: mypy elsewhere has no os.sched_*affinity
+        os.sched_setaffinity(0, saved["affinity"])  # type: ignore[attr-defined, unused-ignore]  # Linux-only: mypy elsewhere has no os.sched_*affinity
 
 
 # NUMA pinning (host side only: no graph reads it): each device rank runs on the CPUs of its NeuronCore's NUMA node,
@@ -128,8 +144,9 @@ def neuron_devices() -> list[dict]:
     import subprocess
 
     exe = shutil.which("neuron-ls") or "/opt/aws/neuron/bin/neuron-ls"
-    return json.loads(subprocess.run([exe, "--json-output"], capture_output=True, text=True, timeout=60,
-                                     check=True).stdout)
+    return json.loads(
+        subprocess.run([exe, "--json-output"], capture_output=True, text=True, timeout=60, check=True).stdout
+    )
 
 
 def numa_cpus(core: int, devices: list[dict], lnc: int | None = None) -> set[int] | None:
@@ -156,24 +173,23 @@ _PIN: dict | None = None
 def numa_pin(rank: int, core_base: int, devices: list[dict] | None = None) -> set[int] | None:
     """Pin the calling thread, and so every thread it starts after, to pin_mask of logical core core_base + rank
     (the runtime's NEURON_LOGICAL_NC_CONFIG when set, else neuron-ls's). Returns the mask, or None."""
-    global _PIN
-    import sys
-
+    global _PIN  # noqa: PLW0603  # what the last pin saw, process-wide state that rank_threads reads (tests reset it)
     _PIN = None
     lnc = os.environ.get("NEURON_LOGICAL_NC_CONFIG")
-    launched = os.sched_getaffinity(0)
+    launched = os.sched_getaffinity(0)  # type: ignore[attr-defined, unused-ignore]  # Linux-only: mypy elsewhere has no os.sched_*affinity
     try:
         devs = neuron_devices() if devices is None else devices
         mask = pin_mask(core_base + rank, devs, launched, int(lnc) if lnc else None)
     except (OSError, ValueError, KeyError, RuntimeError) as e:  # neuron-ls missing or failing: run as launched
-        print(f"NUMA pin: rank {rank} not pinned ({type(e).__name__}: {e})", file=sys.stderr, flush=True)
+        logger.warning("NUMA pin: rank %s not pinned (%s: %s)", rank, type(e).__name__, e)
         return None
     _PIN = {"core_base": core_base, "devices": devs, "launched": set(launched), "lnc": int(lnc) if lnc else None}
     if mask is None:
-        print(f"NUMA pin: rank {rank} not pinned (no CPU of core {core_base + rank}'s node in the launch "
-              f"mask)", file=sys.stderr, flush=True)
+        logger.warning(
+            "NUMA pin: rank %s not pinned (no CPU of core %s's node in the launch mask)", rank, core_base + rank
+        )
         return None
-    os.sched_setaffinity(0, mask)
+    os.sched_setaffinity(0, mask)  # type: ignore[attr-defined, unused-ignore]  # Linux-only: mypy elsewhere has no os.sched_*affinity
     return mask
 
 
@@ -194,8 +210,11 @@ def rank_threads(world: int) -> int:
     sharers = world
     if _PIN is not None:
         p = _PIN
-        sharers = sum(1 for r in range(world)
-                      if (pin_mask(p["core_base"] + r, p["devices"], p["launched"], p["lnc"]) or p["launched"]) == mine)
+        sharers = sum(
+            1
+            for r in range(world)
+            if (pin_mask(p["core_base"] + r, p["devices"], p["launched"], p["lnc"]) or p["launched"]) == mine
+        )
         sharers = sharers or world  # the affinity moved since numa_pin: no rank's mask is it, so assume all
     return max(1, len(mine) // sharers)
 
@@ -223,8 +242,9 @@ def init_rank(rank: int, world: int, port: int) -> None:
     # rank finds. A process that imported it before starting an engine had a patched rank 0 and unpatched workers,
     # and the gloo mesh never formed (measured: a tp=2 CPU engine hung). The port here is chosen by this module.
     try:
-        c10d.init_process_group("gloo", rank=rank, world_size=world, init_method=f"tcp://127.0.0.1:{port}",
-                                timeout=TIMEOUT)
+        c10d.init_process_group(
+            "gloo", rank=rank, world_size=world, init_method=f"tcp://127.0.0.1:{port}", timeout=TIMEOUT
+        )
     except BaseException:
         if not dist.is_initialized():
             c10d._world.group_count = count
@@ -250,17 +270,214 @@ def attention_group(world: int, attn_tp: int):
     return mine
 
 
+# Rank 0's calls to the other ranks (host only: no graph or cache key reads any of this) go through a shared-memory
+# channel unless TRNRT_TP_SHM=0 (rank 0's environment). Every rank of a tensor-parallel engine runs on this one host.
+# dist.broadcast_object_list pickles a call, then runs two gloo collectives (its size, then its bytes) over TCP: about
+# 3 ms per decode step at 1-4 rows (measured; flat in rows, so latency, not bytes), on the critical path while every
+# rank's device idles. Rank 0 writes the pickled call and a sequence number into the segment; each worker polls the
+# number (spinning, then backing off), copies the call and acknowledges it, and rank 0 overwrites the payload only once
+# every worker has acknowledged the last one. A call larger than the segment goes through broadcast_object_list in its
+# turn. The first call announces the segment's name over gloo, so the workers need no setting of their own; None (the
+# shutdown) closes it. The segment is TRNRT_TP_SHM_BYTES (64 MiB) in /dev/shm, one per engine.
+SHM = os.environ.get("TRNRT_TP_SHM", "1") != "0"
+SHM_BYTES = int(os.environ.get("TRNRT_TP_SHM_BYTES", str(64 << 20)))
+_SHM_HELLO = "__trnrt_tp_shm__"
+# The open channel of this process ("ch"), and whether creating one failed in this engine ("failed": its calls then go
+# over gloo, as with TRNRT_TP_SHM=0).
+_CH: dict = {"ch": None, "failed": False}
+# A waiting party asks whether its peer is still there about once a second once it has backed off to 1 ms sleeps.
+_ALIVE_EVERY = 1000
+
+
+class ShmChannel:
+    """One writer (rank 0), world - 1 readers, on a multiprocessing.shared_memory segment: header [seq, length, mode,
+    capacity], one acknowledged seq per rank, then the payload. mode 1: the payload holds the call; mode 2: the call
+    follows by broadcast_object_list (too large for the segment). The capacity is the creator's request, written into
+    the header: the OS may map more (macOS rounds a segment up to its 16 KiB page), and every party must agree."""
+
+    HDR = 64
+
+    def __init__(self, shm, world: int, rank: int, owner: bool, nbytes: int = 0):
+        import numpy as np
+
+        self.shm, self.world, self.rank, self.owner = shm, world, rank, owner
+        # numpy arrays over the segment, None once the channel is closed (close, drop_channel): a party still waiting
+        # then fails instead of reading an unmapped segment
+        self.ctl: Any = np.ndarray((4,), dtype=np.uint64, buffer=shm.buf, offset=0)
+        self.acks: Any = np.ndarray((world,), dtype=np.uint64, buffer=shm.buf, offset=self.HDR)
+        self.off = self.HDR + -(-8 * world // 64) * 64
+        if owner:
+            self.ctl[3] = max(0, nbytes - self.off)
+        self.cap = int(self.ctl[3])
+        # every party starts at 0: a fresh segment's first call is seq 1. A reader that took the segment's current seq
+        # when it attached would skip a call written before it attached (the writer announces the segment, then
+        # writes its first call at once) and never acknowledge it: the writer would wait on it forever.
+        self.seen = 0
+
+    @classmethod
+    def create(cls, world: int, nbytes: int = 0) -> ShmChannel:
+        from multiprocessing import shared_memory
+
+        nbytes = nbytes or SHM_BYTES
+        shm = shared_memory.SharedMemory(create=True, size=nbytes)
+        if shm.buf is None:
+            raise RuntimeError("a new shared-memory segment has no buffer")
+        shm.buf[: cls.HDR + 8 * world] = bytes(cls.HDR + 8 * world)
+        return cls(shm, world, 0, True, nbytes)
+
+    @classmethod
+    def attach(cls, name: str, world: int, rank: int) -> ShmChannel:
+        from multiprocessing import resource_tracker, shared_memory
+
+        # A reader never touches the resource tracker: the creator registers the segment and unlinks it. The engine's
+        # ranks share the creator's tracker, whose registry holds a name ONCE, so a reader's register-then-unregister
+        # (the usual fix for Python < 3.13 tracking every attach) dropped the creator's entry, every later unregister
+        # raised KeyError in the tracker, and a killed rank 0 then leaked the segment. Python >= 3.13: track=False;
+        # 3.12: register is a no-op during the open.
+        try:
+            shm = shared_memory.SharedMemory(name=name, track=False)
+        except TypeError:
+            real = resource_tracker.register
+            resource_tracker.register = lambda *_a, **_k: None
+            try:
+                shm = shared_memory.SharedMemory(name=name)
+            finally:
+                resource_tracker.register = real
+        return cls(shm, world, rank, False)
+
+    @staticmethod
+    def _wait(cond, gone=None) -> None:
+        """Until cond(). Once the wait has backed off to 1 ms sleeps, gone() (a reader's: whether rank 0's process has
+        exited) is asked about once a second, and raises when it answers yes: over gloo a worker's broadcast fails once
+        rank 0's connection drops, and a worker left polling the segment of a dead rank 0 would hold its NeuronCore for
+        good."""
+        import time
+
+        n = 0
+        while not cond():
+            n += 1
+            if n > 2000:  # ~0.5 ms of spinning, then back off: idle workers do not hold a core each
+                time.sleep(5e-5 if n < 20000 else 1e-3)
+                if gone is not None and n >= 20000 and n % _ALIVE_EVERY == 0 and gone():
+                    raise RuntimeError("tensor-parallel rank 0 exited: this rank stops")
+
+    def _acked(self, seq: int) -> bool:
+        """Whether every reader has acknowledged call `seq`. Raises once drop_channel closed the channel under a send
+        still waiting (a rank had died): that send then fails instead of waiting forever."""
+        acks = self.acks
+        if acks is None:
+            raise RuntimeError("the tensor-parallel channel was closed while rank 0 waited for the other ranks")
+        return all(int(acks[r]) >= seq for r in range(1, self.world))
+
+    def send(self, msg) -> None:
+        import pickle
+
+        seq = self.seen
+        self._wait(lambda: self._acked(seq))
+        data = pickle.dumps(msg, protocol=pickle.HIGHEST_PROTOCOL)
+        big = len(data) > self.cap
+        if not big:
+            self.shm.buf[self.off : self.off + len(data)] = data
+        self.ctl[1] = len(data)
+        self.ctl[2] = 2 if big else 1
+        self.seen = seq + 1
+        self.ctl[0] = seq + 1  # last: a reader that sees it sees the payload, length and mode
+        if big:
+            dist.broadcast_object_list([msg], src=0)
+
+    def recv(self):
+        import pickle
+
+        self._wait(lambda: int(self.ctl[0]) > self.seen, _parent_gone)
+        self.seen += 1
+        n, mode = int(self.ctl[1]), int(self.ctl[2])
+        data = bytes(self.shm.buf[self.off : self.off + n]) if mode == 1 else None
+        self.acks[self.rank] = self.seen
+        if mode == 2:
+            box = [None]
+            dist.broadcast_object_list(box, src=0)
+            return box[0]
+        if data is None:
+            raise RuntimeError(f"a shared-memory call in unknown mode {mode}")
+        return pickle.loads(data)  # noqa: S301  # rank 0 of this engine wrote it, the trust of broadcast_object_list
+
+    def close(self) -> None:
+        self.ctl = self.acks = None
+        self.shm.close()
+        if self.owner:
+            self.shm.unlink()
+
+
+def _parent_gone() -> bool:
+    """In a spawned worker (multiprocessing.parent_process: rank 0, the engine's process): whether rank 0 has exited.
+    False in a process with no parent process record (rank 0 itself, a test's reader threads)."""
+    import multiprocessing
+
+    p = multiprocessing.parent_process()
+    return p is not None and not p.is_alive()
+
+
 def send(msg) -> None:
-    dist.broadcast_object_list([msg], src=0)
+    ch = _CH["ch"]
+    if ch is None and SHM and not _CH["failed"] and msg is not None and dist.get_world_size() > 1:
+        try:
+            ch = ShmChannel.create(dist.get_world_size())
+        except (OSError, ValueError) as e:  # no usable /dev/shm: nothing was announced yet, so the calls go over gloo
+            _CH["failed"] = True
+            logger.warning(
+                "trnrt: no shared-memory channel for the tensor-parallel calls (%s: %s); they go "
+                "over gloo, which is slower (TRNRT_TP_SHM=0 chooses gloo from the start)",
+                type(e).__name__,
+                e,
+            )
+        else:
+            _CH["ch"] = ch
+            dist.broadcast_object_list([(_SHM_HELLO, ch.shm.name)], src=0)
+    if ch is None:
+        dist.broadcast_object_list([msg], src=0)
+        return
+    ch.send(msg)
+    if msg is None:
+        ch._wait(lambda: ch._acked(ch.seen))  # every rank has read it
+        ch.close()
+        _CH["ch"] = None
 
 
 def recv():
+    ch = _CH["ch"]
+    if ch is not None:
+        msg = ch.recv()
+        if msg is None:
+            ch.close()
+            _CH["ch"] = None
+        return msg
     box = [None]
     dist.broadcast_object_list(box, src=0)
-    return box[0]
+    msg = box[0]
+    if isinstance(msg, tuple) and len(msg) == 2 and msg[0] == _SHM_HELLO:
+        _CH["ch"] = ShmChannel.attach(msg[1], dist.get_world_size(), dist.get_rank())
+        return recv()
+    return msg
+
+
+def drop_channel() -> None:
+    """Rank 0, when its engine stops: forget and unlink a channel the shutdown call did not close (an engine whose rank
+    failed, or that failed to start), so that the next engine of this process opens its own. A send still waiting for
+    a dead rank's acknowledgement then raises instead of waiting forever. A no-op after a normal close.
+
+    The mapping is not closed here: that send's thread may be reading the header at this moment, and numpy views do
+    not hold the buffer, so unmapping under it would crash the process. The mapping goes with the channel's last
+    reference (that thread's, once its send has raised)."""
+    ch, _CH["ch"], _CH["failed"] = _CH["ch"], None, False
+    if ch is None:
+        return
+    ch.ctl = ch.acks = None
+    with contextlib.suppress(OSError):  # already gone
+        ch.shm.unlink()
 
 
 def worker_main(rank: int, cfg, path: str, num_pages: int, port: int) -> None:
+    configure_logging()  # a spawned process starts with no logging configuration
     if cfg.device == "neuron":
         neuron_env(rank, port, cfg.tp_core_base)
     init_rank(rank, cfg.tp, port)

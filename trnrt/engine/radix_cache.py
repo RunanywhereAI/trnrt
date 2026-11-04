@@ -35,16 +35,20 @@ import heapq
 import itertools
 from collections import OrderedDict
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
-from .kv_pool import PagePool
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from .kv_pool import PagePool
 
 
 @dataclass(eq=False)
 class RadixNode:
     key: list[int] = field(default_factory=list)
     pages: list[int] = field(default_factory=list)
-    parent: "RadixNode | None" = None
-    children: dict[tuple[int, ...], "RadixNode"] = field(default_factory=dict)
+    parent: RadixNode | None = None
+    children: dict[tuple[int, ...], RadixNode] = field(default_factory=dict)
     lock_ref: int = 0
     last_access: int = 0
     # Session registrations whose path runs through this node, and those ending here.
@@ -82,15 +86,15 @@ class RadixCache:
         # Called with (token path, index of the leaf's first page, its pages, its checkpoint row or
         # None) before an evicted leaf's pages are freed: the host cache (engine/host_cache.py)
         # keeps them.
-        self.offload = None
+        self.offload: Callable[[list[int], int, list[int], int | None], None] | None = None
         # Recurrent-state checkpoints: free_ckpt(row) returns a row to the state pool;
         # offload_ckpt(token path, row) keeps its state in the host cache first. With offload_ckpt
         # set, evict_checkpoints may also take a checkpoint on a running request's path.
-        self.free_ckpt = None
-        self.offload_ckpt = None
+        self.free_ckpt: Callable[[int], None] | None = None
+        self.offload_ckpt: Callable[[list[int], int], None] | None = None
         # offload_ckpt_hash(h, row) (the host cache's, wired beside offload_ckpt): the same by the path's last page hash,
         # which path_hash keeps per node, so a checkpoint eviction needn't rebuild and rehash the path.
-        self.offload_ckpt_hash = None
+        self.offload_ckpt_hash: Callable[[int, int], None] | None = None
         self.num_ckpts = 0
         self.num_dominated_freed = 0
         self.num_running_offloaded = 0
@@ -118,7 +122,8 @@ class RadixCache:
         """
         ps = self.page_size
         limit = len(ids) // ps if max_pages is None else min(max_pages, len(ids) // ps)
-        node, pages, i = self.root, [], 0
+        node, i = self.root, 0
+        pages: list[int] = []
         now = next(self._clock)
         node.last_access = now
         while len(pages) < limit:
@@ -153,7 +158,8 @@ class RadixCache:
             session_refs=child.session_refs,  # registrations stay on the deeper node
         )
         parent = child.parent
-        assert parent is not None
+        if parent is None:
+            raise RuntimeError("the root has no edge to split")
         parent.children[tuple(upper.key[:ps])] = upper
         child.key = child.key[n_pages * ps :]
         child.pages = child.pages[n_pages:]
@@ -273,7 +279,7 @@ class RadixCache:
         node.sessions.discard(sid)
         self._add_refs(node, -1)
 
-    def _is_ancestor(self, a: RadixNode, b: RadixNode) -> bool:
+    def _is_ancestor(self, a: RadixNode, b: RadixNode | None) -> bool:
         """a is b or on b's path to the root."""
         while b is not None:
             if b is a:
@@ -281,7 +287,7 @@ class RadixCache:
             b = b.parent
         return False
 
-    def _add_refs(self, node: RadixNode, d: int) -> None:
+    def _add_refs(self, node: RadixNode | None, d: int) -> None:
         while node is not None and node is not self.root:
             node.session_refs += d
             node = node.parent
@@ -405,12 +411,14 @@ class RadixCache:
         checkpoint attaches at commit, after the step that wrote it, and a restore copy launched earlier runs before
         any later write to the reused row. Each such checkpoint costs one device-to-host row copy unless the host
         already holds it."""
-        locked = keep is not None and self.offload_ckpt is not None
+        keep_rows = (
+            keep if self.offload_ckpt is not None else None
+        )  # a locked node's checkpoint may go: it is offloaded
         heap, stack = [], [self.root]
         while stack:
             node = stack.pop()
             stack.extend(node.children.values())
-            if node.ckpt is not None and (node.lock_ref == 0 or (locked and node.ckpt not in keep)):
+            if node.ckpt is not None and (node.lock_ref == 0 or (keep_rows is not None and node.ckpt not in keep_rows)):
                 heap.append((self._key(node), id(node), node))
         heapq.heapify(heap)
         freed = 0
@@ -425,7 +433,8 @@ class RadixCache:
         """The host cache's page-hash chain at the end of node's root-to-node path (host_cache.HostTier.hashes(path)[-1]),
         cached on each node of the path as it is computed: a node's path end never moves (_split keeps the node as the
         deeper half and creates the upper one), so each key is hashed once. None if a key is not whole pages."""
-        ps, todo, n = self.page_size, [], node
+        ps, todo = self.page_size, []
+        n: RadixNode | None = node
         while n is not None and n is not self.root and n.__dict__.get("_hend") is None:
             todo.append(n)
             n = n.parent
@@ -435,23 +444,26 @@ class RadixCache:
             if len(k) % ps:
                 return None
             for j in range(0, len(k), ps):
-                h = hash((h, tuple(k[j:j + ps])))
+                h = hash((h, tuple(k[j : j + ps])))
             m.__dict__["_hend"] = h
         return h
 
     def _drop_ckpt(self, node: RadixNode, offload: bool) -> None:
-        h = self.path_hash(node) if offload and self.offload_ckpt is not None and self.offload_ckpt_hash is not None \
-            else None
-        if h is not None:
-            self.offload_ckpt_hash(h, node.ckpt)
-        elif offload and self.offload_ckpt is not None:
-            keys, n = [], node
+        row = node.ckpt
+        if row is None:
+            raise ValueError("the node has no checkpoint to drop")
+        offloader, hasher = self.offload_ckpt, self.offload_ckpt_hash
+        if offload and offloader is not None and hasher is not None and (h := self.path_hash(node)) is not None:
+            hasher(h, row)
+        elif offload and offloader is not None:
+            keys: list[list[int]] = []
+            n: RadixNode | None = node
             while n is not None and n is not self.root:
                 keys.append(n.key)
                 n = n.parent
-            self.offload_ckpt([t for k in reversed(keys) for t in k], node.ckpt)
+            offloader([t for k in reversed(keys) for t in k], row)
         if self.free_ckpt is not None:
-            self.free_ckpt(node.ckpt)
+            self.free_ckpt(row)
         node.ckpt, node.anchor = None, False
         self.num_ckpts -= 1
 

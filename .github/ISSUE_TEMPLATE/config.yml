@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/RunanywhereAI/trnrt/security/advisories/new
+    about: Report privately; see SECURITY.md.
+  - name: Deployment guide and troubleshooting
+    url: https://github.com/RunanywhereAI/trnrt/blob/main/docs/DEPLOY.md
+    about: What each step needs, start-up checks and what they report.

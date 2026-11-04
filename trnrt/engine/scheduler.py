@@ -42,10 +42,15 @@ import bisect
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
-from .kv_pool import PagePool
-from .radix_cache import RadixCache
 from .request import Request, Status
+
+if TYPE_CHECKING:
+    from .host_cache import HostTier
+    from .kv_pool import PagePool
+    from .radix_cache import RadixCache
+    from .state_pool import StatePool
 
 PENDING = -1  # placeholder for a token sampled by a step whose results are not read yet
 
@@ -104,7 +109,7 @@ def page_chain(req: Request, ps: int) -> list[int]:
     if not st[4]:
         chain, n, h = st[2], st[1], st[2][-1] if st[2] else 0
         while n + ps <= len(tok):
-            page = tuple(tok[n:n + ps])
+            page = tuple(tok[n : n + ps])
             if -1 in page:  # a placeholder: the chain stops here until the next rebuild
                 st[4] = True
                 break
@@ -142,7 +147,7 @@ def shared_pages_req(a: Request, b: Request, ps: int, limit: int) -> int:
     if m == n:
         return n
     k = m  # the first m pages are shared; the rest by slices
-    while k < n and ta[k * ps:(k + 1) * ps] == tb[k * ps:(k + 1) * ps]:
+    while k < n and ta[k * ps : (k + 1) * ps] == tb[k * ps : (k + 1) * ps]:
         k += 1
     return k
 
@@ -188,8 +193,8 @@ class Scheduler:
         # Set by the engine before the first schedule(): the state pool whose checkpoint rows back the
         # radix nodes (engine/state_pool.StatePool: alloc_ckpt / free_ckpt), and the host cache under the
         # radix cache (engine/host_cache.HostTier), when one is configured.
-        self.states = None
-        self.host = None
+        self._states: StatePool | None = None
+        self.host: HostTier | None = None
         # Set by an overlapping engine while a launched step's results are unread.
         self.in_flight = False
         self.waiting: deque[Request] = deque()
@@ -199,6 +204,16 @@ class Scheduler:
         self.ckpt_mid_placed = 0
         self.ckpt_mid_skipped = 0
         self._new_pending: list = []  # (request, pending checkpoint) the current plan created
+
+    @property
+    def states(self) -> StatePool:
+        if self._states is None:
+            raise RuntimeError("the scheduler has no state pool: set Scheduler.states before the first schedule()")
+        return self._states
+
+    @states.setter
+    def states(self, pool: StatePool) -> None:
+        self._states = pool
 
     # -- public API ---------------------------------------------------------------
 
@@ -265,11 +280,11 @@ class Scheduler:
                 self._cache(req)  # share a prefill chunk's full pages right away
                 continue
             at = s.end  # index of the placeholder
-            tok = int(tok)
-            req.token_ids[at] = tok
+            sampled = int(tok)
+            req.token_ids[at] = sampled
             if req.first_token_time is None:
                 req.first_token_time = now
-            reason = self._finish_reason(req, tok, length=at + 1)
+            reason = self._finish_reason(req, sampled, length=at + 1)
             if reason is not None:
                 # Drop placeholders of steps launched after this one, and count only KV
                 # that belongs to tokens the request keeps.
@@ -492,8 +507,7 @@ class Scheduler:
             if other.is_decoding or other.status is not Status.RUNNING:
                 continue
             j = self._shared_with(req, other)
-            if j > other.num_computed and j not in other.ckpt_targets \
-                    and all(p != j for p, _, _ in other.ckpt_pending):
+            if j > other.num_computed and j not in other.ckpt_targets and all(p != j for p, _, _ in other.ckpt_pending):
                 bisect.insort(other.ckpt_targets, j)
 
     def _prefix_in_progress(self, req: Request) -> bool:
@@ -516,8 +530,9 @@ class Scheduler:
                 continue
             if best is None:  # what req resumes from now (its checkpoint match)
                 ps = self.cfg.page_size
-                best = self.radix.match_checkpoint(req.token_ids, max_pages=self._prompt_pages(req, ps))[0] \
-                    .num_pages * ps
+                best = (
+                    self.radix.match_checkpoint(req.token_ids, max_pages=self._prompt_pages(req, ps))[0].num_pages * ps
+                )
             if max(soon) > best:
                 return True
         return False
@@ -568,13 +583,16 @@ class Scheduler:
         checkpoint, so this restores the pages up to the deepest host checkpoint past the device one
         (none: nothing): copied into fresh device pages and inserted into the tree, then that
         checkpoint into a fresh row of the state pool. Returns the new match."""
+        host = self.host
+        if host is None:
+            raise RuntimeError("_restore needs the host cache")
         ids, ps = req.token_ids, self.cfg.page_size
         full = self.radix.match_prefix(ids, max_pages=kv_pages)
-        chain = page_chain(req, ps) if getattr(self.host, "ps", None) == ps else None  # the host cache's own hashes
-        slots = self.host.lookup(ids, kv_pages, limit, chain=chain)
-        ck = self.host.find_ckpt(ids, match.num_pages + 1, kv_pages + len(slots), chain=chain)
+        chain = page_chain(req, ps) if getattr(host, "ps", None) == ps else None  # the host cache's own hashes
+        slots = host.lookup(ids, kv_pages, limit, chain=chain)
+        ck = host.find_ckpt(ids, match.num_pages + 1, kv_pages + len(slots), chain=chain)
         keep = max(0, ck[0] - kv_pages) if ck is not None else 0
-        self.host.unpin(slots[keep:])
+        host.unpin(slots[keep:])
         slots = slots[:keep]
         if ck is None:
             return match, kv_pages
@@ -585,9 +603,9 @@ class Scheduler:
                     self.radix.evict(len(slots) - self.pool.num_free)
                 pages = self.pool.alloc(len(slots))
                 if pages is None:
-                    self.host.unpin(slots)
+                    host.unpin(slots)
                     return match, kv_pages
-                self.host.load(slots, pages)
+                host.load(slots, pages)
                 n = kv_pages + len(slots)
                 res = self.radix.insert(ids[: n * ps], list(full.pages) + pages)
                 for mine, tree in zip(pages, res.pages[kv_pages:]):
@@ -595,7 +613,7 @@ class Scheduler:
                         self.pool.free([mine])
             row = self._alloc_ckpt()
             if row is not None:
-                self.host.load_ckpt(ck[1], row)
+                host.load_ckpt(ck[1], row)
                 if not self.radix.attach_checkpoint(ids, ck[0], row):
                     self.states.free_ckpt(row)
         finally:
@@ -660,8 +678,9 @@ class Scheduler:
                 pos, row, decode = item
                 if pos > n_full * ps:
                     keep.append(item)
-                elif not self.radix.attach_checkpoint(req.token_ids, pos // ps, row,
-                                                      anchor=not decode and pos == prompt_end):
+                elif not self.radix.attach_checkpoint(
+                    req.token_ids, pos // ps, row, anchor=not decode and pos == prompt_end
+                ):
                     self.states.free_ckpt(row)  # another request's checkpoint got there first
             req.ckpt_pending = keep
 
@@ -670,8 +689,12 @@ class Scheduler:
         for _, row, _ in req.ckpt_pending:  # past the KV the request keeps: never valid
             self.states.free_ckpt(row)
         req.ckpt_pending, req.ckpt_targets, req.ckpt_restore = [], [], None
-        if (status is Status.FINISHED and req.session_id is not None and req.node is not None
-                and req.finish_reason != "abort"):
+        if (
+            status is Status.FINISHED
+            and req.session_id is not None
+            and req.node is not None
+            and req.finish_reason != "abort"
+        ):
             self.radix.session_register(req.session_id, req.session_gen, req.node)
         tail = req.pages[self._cacheable(req) // self.cfg.page_size :]  # what _cache did not take
         if tail:

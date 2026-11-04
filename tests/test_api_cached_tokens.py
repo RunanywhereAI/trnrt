@@ -82,8 +82,9 @@ def test_cached_tokens_in_usage_cold_then_hit(client):
     cached = u2["prompt_tokens_details"]["cached_tokens"]
     assert cached == h2 - h1, "usage must report the engine's own hit for the request"
     ps = c.engine.cfg.page_size
-    assert 0 < cached <= len(first) + len(reply) and cached % ps == 0, \
+    assert 0 < cached <= len(first) + len(reply) and cached % ps == 0, (
         "the next turn resumes from the checkpoint the first left at its last page boundary"
+    )
 
 
 def test_streaming_usage_chunk_only_when_asked(client):
@@ -99,13 +100,14 @@ def test_streaming_usage_chunk_only_when_asked(client):
         return [json.loads(ln[6:]) for ln in lines if ln != "data: [DONE]"], lines[-1]
 
     h1 = _hits(c)
-    evs, last = stream({"prompt": second, "max_tokens": 3, "temperature": 0, "stream": True,
-                        "stream_options": {"include_usage": True}})
+    evs, last = stream(
+        {"prompt": second, "max_tokens": 3, "temperature": 0, "stream": True, "stream_options": {"include_usage": True}}
+    )
     h2 = _hits(c)
     assert last == "data: [DONE]"
     tail = evs[-1]
     assert tail["choices"] == [] and tail["usage"]["completion_tokens"] == 3
     assert tail["usage"]["prompt_tokens_details"]["cached_tokens"] == h2 - h1 > 0
     assert all("usage" not in e for e in evs[:-1])
-    evs, _ = stream({"prompt": second + [5], "max_tokens": 3, "temperature": 0, "stream": True})
+    evs, _ = stream({"prompt": [*second, 5], "max_tokens": 3, "temperature": 0, "stream": True})
     assert all("usage" not in e for e in evs)

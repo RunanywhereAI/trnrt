@@ -2,6 +2,7 @@
 concurrent streams."""
 
 import random
+import sys
 
 import pytest
 
@@ -41,6 +42,7 @@ def test_router_spreads_unrelated_requests_and_respects_load():
     assert r.pick("anything") == 1 and r.routed["balance"] == 1
 
 
+@pytest.mark.skipif(sys.platform == "darwin", reason="130 connections at once exceed macOS's listen backlog of 128")
 def test_router_does_not_cap_streams_in_flight():
     """Every concurrent stream reaches a worker: the router's connection pool is not a cap on requests in flight
     (httpx's default, 100 connections shared by every worker, held a whole host at 100 in flight and queued the rest
@@ -87,8 +89,10 @@ def test_router_does_not_cap_streams_in_flight():
 
         ports = [free_port() for _ in range(3)]
         apps = [worker, worker, build_router_app(Router([f"http://127.0.0.1:{p}" for p in ports[:2]]))]
-        servers = [uvicorn.Server(uvicorn.Config(a, host="127.0.0.1", port=p, log_level="warning"))
-                   for a, p in zip(apps, ports)]
+        servers = [
+            uvicorn.Server(uvicorn.Config(a, host="127.0.0.1", port=p, log_level="warning"))
+            for a, p in zip(apps, ports)
+        ]
         tasks = [asyncio.create_task(s.serve()) for s in servers]
         try:
             while not all(s.started for s in servers):
@@ -104,7 +108,7 @@ def test_router_does_not_cap_streams_in_flight():
                 calls = asyncio.gather(*(one(i) for i in range(n)))
                 try:
                     await asyncio.wait_for(release.wait(), timeout=20)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     release.set()  # let the streams that did arrive finish, then report how many there were
                 lasts = await calls
             assert lasts == ["data: [DONE]"] * n
@@ -187,8 +191,9 @@ def _stub_worker(i: int, chat_status: int = 200):
         if app.state.status != 200:
             raise HTTPException(status_code=app.state.status, detail="engine failed: rank 3 exited")
         if body.get("stream"):
+
             async def stream():
-                yield ('data: {"choices": [{"delta": {"content": "w%d"}}]}\n\n' % i).encode()
+                yield ('data: {"choices": [{"delta": {"content": "w' + str(i) + '"}}]}\n\n').encode()
                 yield b"data: [DONE]\n\n"
 
             return StreamingResponse(stream(), media_type="text/event-stream")
@@ -221,8 +226,9 @@ def test_router_health_and_models_follow_the_workers():
     async def main() -> None:
         ports = [_free_port() for _ in range(3)]
         router = Router([f"http://127.0.0.1:{p}" for p in ports[:2]])
-        servers, tasks = await _start([(_stub_worker(0), ports[0]), (_stub_worker(1), ports[1]),
-                                       (build_router_app(router, poll_s=0), ports[2])])
+        servers, tasks = await _start(
+            [(_stub_worker(0), ports[0]), (_stub_worker(1), ports[1]), (build_router_app(router, poll_s=0), ports[2])]
+        )
         base = f"http://127.0.0.1:{ports[2]}"
         try:
             async with httpx.AsyncClient(timeout=30) as c:
@@ -248,6 +254,35 @@ def test_router_health_and_models_follow_the_workers():
     asyncio.run(main())
 
 
+@pytest.mark.parametrize("path", ["/v1/chat/completions", "/v1/completions"])
+@pytest.mark.parametrize("body", [b"{not json", b"[1, 2]", b'"text"', b"null", b"true", b"3", b"", b"\xff\xfe"])
+def test_a_body_that_is_not_a_json_object_is_answered_400_and_reaches_no_worker(path, body):
+    """The router refuses a malformed body, or JSON that is not an object, with 400, as each engine does, instead of
+    raising inside the proxy (500). No worker sees the request."""
+    import asyncio
+
+    import httpx
+
+    from trnrt.serve.router import build_router_app
+
+    async def main() -> None:
+        ports = [_free_port() for _ in range(2)]
+        router, worker = Router([f"http://127.0.0.1:{ports[0]}"]), _stub_worker(0)
+        servers, tasks = await _start([(worker, ports[0]), (build_router_app(router, poll_s=0), ports[1])])
+        try:
+            async with httpx.AsyncClient(timeout=30) as c:
+                r = await c.post(
+                    f"http://127.0.0.1:{ports[1]}{path}", content=body, headers={"Content-Type": "application/json"}
+                )
+                assert r.status_code == 400, r.text
+                assert r.json()["detail"] == "the request body must be a JSON object"
+                assert router.load == [0] and worker.state.chats == 0
+        finally:
+            await _stop(servers, tasks)
+
+    asyncio.run(main())
+
+
 @pytest.mark.parametrize("stream", [False, True])
 def test_a_503_from_a_request_marks_its_worker_down_and_the_request_goes_to_another(stream):
     """A failed engine answers every request 503 (its /health too, but the poller is off here): the router marks it down
@@ -264,13 +299,19 @@ def test_a_503_from_a_request_marks_its_worker_down_and_the_request_goes_to_anot
         ports = [_free_port() for _ in range(3)]
         router = Router([f"http://127.0.0.1:{p}" for p in ports[:2]])
         failed, live = _stub_worker(0, chat_status=503), _stub_worker(1)
-        servers, tasks = await _start([(failed, ports[0]), (live, ports[1]),
-                                       (build_router_app(router, poll_s=0), ports[2])])
+        servers, tasks = await _start(
+            [(failed, ports[0]), (live, ports[1]), (build_router_app(router, poll_s=0), ports[2])]
+        )
         base = f"http://127.0.0.1:{ports[2]}"
 
         def body(sid: str, **kw) -> dict:
-            return {"model": "glm", "stream": stream, "session_id": sid,
-                    "messages": [{"role": "user", "content": sid}], **kw}
+            return {
+                "model": "glm",
+                "stream": stream,
+                "session_id": sid,
+                "messages": [{"role": "user", "content": sid}],
+                **kw,
+            }
 
         async def ask(c, b) -> tuple[int, str]:
             r = await c.post(base + "/v1/chat/completions", json=b)

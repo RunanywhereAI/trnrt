@@ -58,6 +58,7 @@ def _checkpoint_states(eng, prompt, n_pages, monkeypatch):
         if ok:
             rows[n] = row
         return ok
+
     monkeypatch.setattr(RadixCache, "attach_checkpoint", spy)
     try:
         eng.generate([prompt], sp(2))
@@ -65,12 +66,15 @@ def _checkpoint_states(eng, prompt, n_pages, monkeypatch):
         monkeypatch.setattr(RadixCache, "attach_checkpoint", real)
     assert n_pages in rows, (n_pages, rows)
     row = rows[n_pages]
-    return [(layer.rec_state[row].clone(), layer.conv_state[row].clone()) for layer in eng.runner.model.layers
-            if isinstance(layer.spec, LinearSpec)]
+    return [
+        (layer.rec_state[row].clone(), layer.conv_state[row].clone())
+        for layer in eng.runner.model.layers
+        if isinstance(layer.spec, LinearSpec)
+    ]
 
 
 # One chunk holds the whole prompt, so its last page boundary is strictly inside the chunk.
-WIDE = dict(max_prefill_tokens=64)
+WIDE = {"max_prefill_tokens": 64}
 
 
 def test_the_in_chunk_checkpoint_is_bit_equal_to_one_a_chunk_ends_at(glm, monkeypatch):
@@ -78,7 +82,7 @@ def test_the_in_chunk_checkpoint_is_bit_equal_to_one_a_chunk_ends_at(glm, monkey
     to 25 ULP from the second KDA layer on, and with equal rows the two are bit-equal there too, as on Apple's BLAS. The
     cause is the row count, at engine level; which operation rounds by it is not identified (a plain fp32 GEMM and
     sigmoid at 28, 29 and 32 rows are bit-equal on that host)."""
-    (p,) = mk(91, (29,))   # last page boundary 28
+    (p,) = mk(91, (29,))  # last page boundary 28
     ends = eng_(glm, max_prefill_tokens=28, prefill_token_buckets=(32,))  # chunk 1 ends at 28, as 32 rows
     try:
         want = _checkpoint_states(ends, p, 7, monkeypatch)

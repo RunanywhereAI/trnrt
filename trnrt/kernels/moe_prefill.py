@@ -33,7 +33,7 @@ Kernel (moe_prefill_kernel), all control static:
    scale of the gate rows and of the up rows, each 64-column half one vector op with a per-partition
    scalar) and accumulated over the tiles of h in PSUM (`dq`: GLM-5.3-Flash at tp=32), or as stored
    with one PSUM partial per tile scaled per row o on the vector engine and summed in fp32 (any
-   per-row tile scales: bf16 ones of MiMo-V2.6-Flash, fp32 ones of other ranks); g rounded to bf16
+   per-row tile scales: bf16 re-based MXFP4 ones, fp32 ones of other ranks); g rounded to bf16
    (moe_dedupe's arithmetic); the up rows folded onto the gate rows by a 0/1 matmul (both halves of
    the partitions get both); a = glu(gate, up) (silu, or GLM-5.3-Flash's clamped silu) in fp32,
    rounded to bf16; y = a W_down on the fp8 down weights as stored (their two H halves on partitions

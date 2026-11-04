@@ -2,7 +2,7 @@
 in k-layout (k = p NJ + j) and re-lays it out to [P, NJ, O] on the vector engine on every call (786 KB, ~2.7 us);
 front_body_fnj takes fn_j's copy of it, made once at load (models/hybrid.py: hc_ffn_fnj), and DMAs it straight into that
 operand (each partition's NJ O elements one contiguous HBM run). The same values in the same SBUF tile, so the same
-bits. front_body_fnj is front_body statement for statement but that one named divergence (tests/test_mhc_fnj.py pins
+bits. front_body_fnj is front_body statement for statement but that one named divergence (tests/test_mhc.py pins
 it). mhc_split rebinds its front_body to this one and folds REV."""
 
 from __future__ import annotations

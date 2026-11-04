@@ -1,0 +1,22 @@
+name: Model request
+description: Ask for a model family, or a new instance type, to be supported
+labels: ["model"]
+body:
+  - type: input
+    id: model
+    attributes:
+      label: Model
+      description: Hugging Face repo id and revision
+      placeholder: org/model @ <commit>
+    validations:
+      required: true
+  - type: input
+    id: instance
+    attributes:
+      label: Target instance
+      placeholder: trn2.48xlarge
+  - type: textarea
+    id: why
+    attributes:
+      label: Workload
+      description: Context length, concurrency and latency targets you need.

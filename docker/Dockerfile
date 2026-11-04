@@ -1,9 +1,9 @@
-# trnRT on the AWS Neuron vLLM inference image: Neuron SDK 2.32 (neuronx-cc 2.27), Python 3.13, Ubuntu 24.04.
+# TrnRT on the AWS Neuron vLLM inference image: Neuron SDK 2.32 (neuronx-cc 2.27), Python 3.13, Ubuntu 24.04.
 #
-# The base already holds everything trnRT imports (torch, libtorch-neuronx-lite, nki, neuronx-cc, transformers,
+# The base already holds everything TrnRT imports (torch, libtorch-neuronx-lite, nki, neuronx-cc, transformers,
 # tokenizers, safetensors, huggingface_hub, fastapi, uvicorn, pydantic, pytest) but one: its transformers (5.15.0)
 # predates the glm5_next architecture. So this layer pins transformers 5.17.0 and tokenizers 0.23.3 (the versions the
-# tests run with), installs trnRT without dependencies, and checks every Neuron piece before the build may finish
+# tests run with), installs TrnRT without dependencies, and checks every Neuron piece before the build may finish
 # (docker/check_image.py).
 #
 # Build from the root of this repository:
@@ -22,7 +22,7 @@ ARG BASE_DIGEST
 ARG TRNRT_VERSION
 ARG TRNRT_REVISION
 
-LABEL org.opencontainers.image.title="trnRT" \
+LABEL org.opencontainers.image.title="TrnRT" \
       org.opencontainers.image.description="GLM-5.3-Flash inference on AWS Trainium2" \
       org.opencontainers.image.licenses="Apache-2.0" \
       org.opencontainers.image.version="${TRNRT_VERSION}" \
@@ -32,7 +32,7 @@ LABEL org.opencontainers.image.title="trnRT" \
 
 COPY . /opt/trnrt
 
-# --no-deps: nothing else trnRT imports is missing from the base; --no-build-isolation: build with the base's own
+# --no-deps: nothing else TrnRT imports is missing from the base; --no-build-isolation: build with the base's own
 # setuptools instead of fetching one; --no-cache-dir: no pip cache in the layer.
 RUN test -n "${TRNRT_VERSION}" && test -n "${TRNRT_REVISION}" \
     || { echo "build with --build-arg TRNRT_VERSION=... --build-arg TRNRT_REVISION=..." >&2; exit 1; } \
@@ -45,7 +45,7 @@ RUN test -n "${TRNRT_VERSION}" && test -n "${TRNRT_REVISION}" \
 ENV TRNRT_VERSION=${TRNRT_VERSION}
 WORKDIR /opt/trnrt
 EXPOSE 8000
-# The base's health check probes its own server on 8080; trnRT's router listens on --port (8000 by default) and
+# The base's health check probes its own server on 8080; TrnRT's router listens on --port (8000 by default) and
 # answers GET /health there.
 HEALTHCHECK NONE
 ENTRYPOINT ["python", "-m", "trnrt"]

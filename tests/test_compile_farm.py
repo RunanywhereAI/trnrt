@@ -23,13 +23,19 @@ import torch
 FP8 = torch.float8_e4m3fn
 KEY = "66437b3432fb818ccebad2e5a8628757"
 # An LNL command.txt for a trn2 graph at LNC 2.
-COMMAND = (f"/usr/local/bin/neuronx-cc compile /cache/neuron/compile_cache/{KEY}/graph.hlo "
-           f"--framework XLA --target trn2 --output /cache/neuron/compile_cache/{KEY}/graph_{KEY}.neff "
-           f"--logfile /cache/neuron/compile_cache/{KEY}/log-neuron-cc.txt "
-           "--logical-nc-config=2 -O2 --model-type=transformer "
-           "'--internal-hlo2tensorizer-options=--experimental-unsafe-fp8e4m3fn-as-fp8e4m3'")
-ARGS = ["--logical-nc-config=2", "-O2", "--model-type=transformer",
-        "--internal-hlo2tensorizer-options=--experimental-unsafe-fp8e4m3fn-as-fp8e4m3"]
+COMMAND = (
+    f"/usr/local/bin/neuronx-cc compile /cache/neuron/compile_cache/{KEY}/graph.hlo "
+    f"--framework XLA --target trn2 --output /cache/neuron/compile_cache/{KEY}/graph_{KEY}.neff "
+    f"--logfile /cache/neuron/compile_cache/{KEY}/log-neuron-cc.txt "
+    "--logical-nc-config=2 -O2 --model-type=transformer "
+    "'--internal-hlo2tensorizer-options=--experimental-unsafe-fp8e4m3fn-as-fp8e4m3'"
+)
+ARGS = [
+    "--logical-nc-config=2",
+    "-O2",
+    "--model-type=transformer",
+    "--internal-hlo2tensorizer-options=--experimental-unsafe-fp8e4m3fn-as-fp8e4m3",
+]
 
 
 def needs(*modules):
@@ -49,6 +55,7 @@ MODELS = needs("trnrt.models.loader", "trnrt.models.decoder", "trnrt.kernels.moe
 
 # -- the compile step -------------------------------------------------------------------------------
 
+
 def test_parse_command_keeps_only_the_compiler_args():
     from trnrt.compile.farm import compiler_command, parse_command
 
@@ -57,7 +64,7 @@ def test_parse_command_keeps_only_the_compiler_args():
     assert args == ARGS
     cmd = compiler_command("neuronx-cc", "/c/k/graph.hlo", target, "/c/k/graph_k.neff", "/c/k/log", args)
     assert parse_command(" ".join(cmd)) == (target, args)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="not a neuronx-cc compile command"):
         parse_command("neuronx-cc list-operators --framework XLA")
     with pytest.raises(ValueError, match="no --target"):
         parse_command("neuronx-cc compile g.hlo --framework XLA -O2")
@@ -71,18 +78,31 @@ def _hlo_with_kernels(path, cfgs):
     path.write_bytes(blob)
 
 
+# A klir binary path as the compiler writes it into the HLO (the default NKI cache directory); it is only read as a
+# string here, never opened.
+K2_BINARY = "/var/tmp/nki-intermediate-cache/none/k2.colz"  # noqa: S108  # recorded path, no file is created
+
+
 def test_kernel_refs_reads_backend_configs_inside_binary_hlo(tmp_path):
     from trnrt.compile.farm import kernel_refs, missing_kernels
 
     present = tmp_path / "kernel_a.colz"
     present.write_bytes(b"x")
     hlo = tmp_path / "graph.hlo"
-    _hlo_with_kernels(hlo, [{"func_name": "trnrt.kernels.moe_dedupe.moe_dedupe", "kernel_format": "colz",
-                             "klir_binary": {"binary": str(present)}},
-                            {"func_name": "k2", "klir_binary": {"binary": "/var/tmp/nki-intermediate-cache/none/k2.colz"}},
-                            {"func_name": "no binary here"}])
-    assert kernel_refs(str(hlo)) == {str(present), "/var/tmp/nki-intermediate-cache/none/k2.colz"}
-    assert missing_kernels(str(hlo)) == ["/var/tmp/nki-intermediate-cache/none/k2.colz"]
+    _hlo_with_kernels(
+        hlo,
+        [
+            {
+                "func_name": "trnrt.kernels.moe_dedupe.moe_dedupe",
+                "kernel_format": "colz",
+                "klir_binary": {"binary": str(present)},
+            },
+            {"func_name": "k2", "klir_binary": {"binary": K2_BINARY}},
+            {"func_name": "no binary here"},
+        ],
+    )
+    assert kernel_refs(str(hlo)) == {str(present), K2_BINARY}
+    assert missing_kernels(str(hlo)) == [K2_BINARY]
 
 
 def test_entry_args_reads_command_txt(tmp_path):
@@ -94,7 +114,7 @@ def test_entry_args_reads_command_txt(tmp_path):
 
 # A stand-in for neuronx-cc: checks the command line it gets, writes a NEFF to --output and a log to
 # --logfile, or fails as told by the HLO's first bytes.
-FAKE_CC = r'''
+FAKE_CC = r"""
 import sys
 a = sys.argv[1:]
 assert a[0] == "compile" and a[2:6] == ["--framework", "XLA", "--target", "trn2"], a
@@ -105,7 +125,7 @@ if hlo.startswith(b"FAIL"):
     sys.stderr.write("[NCC_TEST] made to fail\n")
     sys.exit(70)
 open(out, "wb").write(b"NEFF" + hlo + " ".join(a[6 + 4:]).encode())
-'''
+"""
 
 
 def _fake_cc(tmp_path):
@@ -121,8 +141,9 @@ def _captured(root, key, hlo=b"hlo", command=None):
     d.mkdir(parents=True)
     (d / "graph.hlo").write_bytes(hlo)
     (d / ".artifact_metadata_v0.json").write_text(json.dumps({"cache_key": key}))
-    (d / "command.txt").write_text(command or COMMAND.replace(f"/cache/neuron/compile_cache/{KEY}", str(d))
-                                   .replace(KEY, key))
+    (d / "command.txt").write_text(
+        command or COMMAND.replace(f"/cache/neuron/compile_cache/{KEY}", str(d)).replace(KEY, key)
+    )
     return d
 
 
@@ -180,8 +201,22 @@ def test_compile_command_line_compiles_the_pending_entries(tmp_path, capsys):
     for k in keys:
         _captured(root, k, f"hlo-{k}".encode())
     (tmp_path / "keys.json").write_text(json.dumps({k: [0, 1] for k in keys[:2]}))
-    assert farm.main(["compile", "--out", str(tmp_path / "out"), "--neuronx-cc", cc, "--workers", "2",
-                      "--keys-file", str(tmp_path / "keys.json")]) == 0
+    assert (
+        farm.main(
+            [
+                "compile",
+                "--out",
+                str(tmp_path / "out"),
+                "--neuronx-cc",
+                cc,
+                "--workers",
+                "2",
+                "--keys-file",
+                str(tmp_path / "keys.json"),
+            ]
+        )
+        == 0
+    )
     assert [cache.is_complete(str(root / k)) for k in keys] == [True, True, False]
     summary = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
     assert summary["entries"] == 2 and summary["failed"] == 0
@@ -276,7 +311,7 @@ def test_host_mem_available_reads_meminfo(tmp_path):
 # A stand-in for neuronx-cc that takes a while and notes how many compiles run at once: each holds a file under
 # LIVE while it runs and logs "<key> <files there>" as it starts. An HLO starting OOM kills itself with SIGKILL, as
 # the OOM killer would, the first time (OOM-ALWAYS: every time).
-SLOW_CC = r'''
+SLOW_CC = r"""
 import os, signal, sys, time
 a = sys.argv[1:]
 out, live = a[a.index("--output") + 1], LIVE
@@ -291,7 +326,7 @@ if hlo.startswith(b"OOM") and (hlo == b"OOM-ALWAYS" or not os.path.exists(out + 
     open(out + ".killed", "w").close()
     os.kill(os.getpid(), signal.SIGKILL)
 open(out, "wb").write(b"NEFF")
-'''
+"""
 
 
 def _slow_cc(tmp_path):
@@ -308,7 +343,7 @@ def _starts(log):
     return [(k, int(n)) for k, n in (x.split() for x in log.read_text().splitlines())]
 
 
-@pytest.mark.parametrize("avail_gb,most", [(0.5, 1), (2.5, 2), (None, 6)])
+@pytest.mark.parametrize(("avail_gb", "most"), [(0.5, 1), (2.5, 2), (None, 6)])
 def test_compiles_start_only_while_host_memory_admits_them(tmp_path, avail_gb, most):
     """At 1 GB per compile, MemAvailable 2.5 GB admits two at once and 0.5 GB one (with nothing running one starts
     anyway); every entry compiles. The control: with MemAvailable unknown, --workers alone limits them, and the
@@ -319,8 +354,15 @@ def test_compiles_start_only_while_host_memory_admits_them(tmp_path, avail_gb, m
     cc, log = _slow_cc(tmp_path)
     ds = [str(_captured(tmp_path / "cc", c * 32, b"hlo" * (i + 1))) for i, c in enumerate("abcdef")]
     G = 2**30
-    rs = compile_entries(ds, 8, str(tmp_path), cc, mem_per_compile=G, poll_seconds=0.05,
-                         mem_available=lambda: None if avail_gb is None else int(avail_gb * G))
+    rs = compile_entries(
+        ds,
+        8,
+        str(tmp_path),
+        cc,
+        mem_per_compile=G,
+        poll_seconds=0.05,
+        mem_available=lambda: None if avail_gb is None else int(avail_gb * G),
+    )
     assert sorted(r.key for r in rs if r.ok) == sorted(cache.key_of(d) for d in ds)
     assert all(cache.is_complete(d) for d in ds)
     seen = max(n for _, n in _starts(log))
@@ -357,9 +399,16 @@ def test_a_compile_the_oom_killer_took_runs_once_more_alone(tmp_path, capsys):
     assert farm.main(["compile", "--out", str(tmp_path / "out"), "--neuronx-cc", cc, "--workers", "4"]) == 1
     rows = [json.loads(x) for x in capsys.readouterr().out.splitlines() if x.startswith("{")]
     tries = [(r["key"], r["attempt"], r["ok"], r["oom_killed"]) for r in rows if "key" in r]
-    assert sorted(tries) == sorted([("a" * 32, 1, False, True), ("a" * 32, 2, True, False),
-                                    ("b" * 32, 1, False, True), ("b" * 32, 2, False, True),
-                                    ("c" * 32, 1, True, False), ("d" * 32, 1, True, False)])
+    assert sorted(tries) == sorted(
+        [
+            ("a" * 32, 1, False, True),
+            ("a" * 32, 2, True, False),
+            ("b" * 32, 1, False, True),
+            ("b" * 32, 2, False, True),
+            ("c" * 32, 1, True, False),
+            ("d" * 32, 1, True, False),
+        ]
+    )
     assert sorted(t[:2] for t in tries[-2:]) == [("a" * 32, 2), ("b" * 32, 2)]  # after the others
     starts = _starts(log)
     assert len(starts) == 6 and sorted(starts[-2:]) == [("a" * 32, 1), ("b" * 32, 1)]  # alone
@@ -380,6 +429,7 @@ def test_oom_killed_reads_neuronx_cc_own_report():
 
 
 # -- the shape directory ----------------------------------------------------------------------------
+
 
 def _st_file(path, tensors: dict, metadata=None):
     """A safetensors file written by hand (8-byte header length, JSON header, data), so the test needs
@@ -402,25 +452,40 @@ def test_shape_dir_holds_every_header_and_the_json_files(tmp_path):
 
     ckpt = tmp_path / "ckpt"
     ckpt.mkdir()
-    _st_file(ckpt / "model-00001-of-00002.safetensors",
-             {"model.embed_tokens.weight": torch.zeros(8, 4, dtype=torch.bfloat16),
-              "model.layers.0.mlp.experts.0.down_proj.weight": torch.zeros(4, 2, dtype=FP8)}, {"format": "pt"})
-    _st_file(ckpt / "model-00002-of-00002.safetensors",
-             {"model.layers.0.mlp.experts.0.down_proj.weight_scale_inv": torch.ones(1, 1),
-              "model.norm.weight": torch.ones(4, dtype=torch.bfloat16)})
+    _st_file(
+        ckpt / "model-00001-of-00002.safetensors",
+        {
+            "model.embed_tokens.weight": torch.zeros(8, 4, dtype=torch.bfloat16),
+            "model.layers.0.mlp.experts.0.down_proj.weight": torch.zeros(4, 2, dtype=FP8),
+        },
+        {"format": "pt"},
+    )
+    _st_file(
+        ckpt / "model-00002-of-00002.safetensors",
+        {
+            "model.layers.0.mlp.experts.0.down_proj.weight_scale_inv": torch.ones(1, 1),
+            "model.norm.weight": torch.ones(4, dtype=torch.bfloat16),
+        },
+    )
     for fn in ("config.json", "generation_config.json", "tokenizer_config.json", "model.safetensors.index.json"):
         (ckpt / fn).write_text("{}")
     (ckpt / "README.md").write_text("x")
     shapes = tmp_path / "shapes"
     capture.write_shape_dir(str(ckpt), str(shapes))
-    assert sorted(os.listdir(shapes)) == sorted(["config.json", "generation_config.json", "tokenizer_config.json",
-                                                 capture.HEADERS])
+    assert sorted(os.listdir(shapes)) == sorted(
+        ["config.json", "generation_config.json", "tokenizer_config.json", capture.HEADERS]
+    )
     index = json.loads((shapes / capture.HEADERS).read_text())
-    assert index == capture.header_index(str(ckpt)) == {
-        "model.embed_tokens.weight": ["BF16", [8, 4]],
-        "model.layers.0.mlp.experts.0.down_proj.weight": ["F8_E4M3", [4, 2]],
-        "model.layers.0.mlp.experts.0.down_proj.weight_scale_inv": ["F32", [1, 1]],
-        "model.norm.weight": ["BF16", [4]]}
+    assert (
+        index
+        == capture.header_index(str(ckpt))
+        == {
+            "model.embed_tokens.weight": ["BF16", [8, 4]],
+            "model.layers.0.mlp.experts.0.down_proj.weight": ["F8_E4M3", [4, 2]],
+            "model.layers.0.mlp.experts.0.down_proj.weight_scale_inv": ["F32", [1, 1]],
+            "model.norm.weight": ["BF16", [4]],
+        }
+    )
     assert capture.moe_prefixes(index) == ["model.layers.0."]
     with pytest.raises(FileNotFoundError):
         capture.header_index(str(shapes))
@@ -450,48 +515,102 @@ def test_moe_prefixes_reads_both_namings_and_sorts_by_layer():
 
 # -- GLM-5.3-Flash-shaped fixtures ------------------------------------------------------------------
 
+
 def glm_config(layers=4, experts=4, hidden=256, moe_intermediate=128, dense_mlps=3):
     """config.json of zai-org/GLM-5.3-Flash cut to `layers` layers, few heads and experts and small widths;
     everything else as published: KDA layers with a DSA (MLA) layer every fourth, the first `dense_mlps` MLPs
     dense, sigmoid routing with a correction bias and one shared expert, mHC, FP8 in 128 x 128 blocks."""
     types_ = ["linear_attention" if i % 4 != 3 else "deepseek_sparse_attention" for i in range(layers)]
-    t = dict(attention_bias=False, eos_token_id=[1], pad_token_id=0, first_k_dense_replace=dense_mlps, hc_eps=1e-6,
-             hc_mult=4, hc_sinkhorn_iters=20, head_dim=0, hidden_act="silu", hidden_size=hidden, index_head_dim=128,
-             index_kpool=4, index_kpool_always_select_tail=True, index_kpool_compress=True, index_n_heads=32,
-             index_topk=2048, index_share_for_mtp_iteration=True, indexer_rope_interleave=True, intermediate_size=256,
-             kv_lora_rank=512, linear_attn_config=dict(
-                 num_heads=4, gate_lower_bound=-5.0, head_dim=128, short_conv_kernel_size=4,
-                 kda_layers=[i for i, x in enumerate(types_) if x == "linear_attention"],
-                 full_attn_layers=[i for i, x in enumerate(types_) if x != "linear_attention"]),
-             layer_types=types_, mlp_layer_types=["dense"] * min(dense_mlps, layers) + ["sparse"] * (layers - dense_mlps),
-             indexer_types=["full"] * layers, max_position_embeddings=1024, mhc=True, mla_use_nope=True,
-             model_type="glm5_next_text", moe_intermediate_size=moe_intermediate, moe_router_dtype="float32",
-             n_group=1, n_routed_experts=experts, n_shared_experts=1, norm_topk_prob=True, num_attention_heads=4,
-             num_experts_per_tok=2, num_hidden_layers=layers, num_key_value_heads=4, num_nextn_predict_layers=0,
-             q_lora_rank=1536, qk_head_dim=256, qk_nope_head_dim=256, qk_rope_head_dim=0, rms_norm_eps=1e-5,
-             routed_scaling_factor=2.5, scoring_func="sigmoid", swiglu_limit=10.0, tie_word_embeddings=False,
-             topk_group=1, topk_method="noaux_tc", v_head_dim=256, vocab_size=384)
-    return {"architectures": ["Glm5NextForConditionalGeneration"], "model_type": "glm5_next", "text_config": t,
-            "quantization_config": {"activation_scheme": "dynamic", "fmt": "e4m3", "quant_method": "fp8",
-                                    "weight_block_size": [128, 128]}}
+    t = {
+        "attention_bias": False,
+        "eos_token_id": [1],
+        "pad_token_id": 0,
+        "first_k_dense_replace": dense_mlps,
+        "hc_eps": 1e-6,
+        "hc_mult": 4,
+        "hc_sinkhorn_iters": 20,
+        "head_dim": 0,
+        "hidden_act": "silu",
+        "hidden_size": hidden,
+        "index_head_dim": 128,
+        "index_kpool": 4,
+        "index_kpool_always_select_tail": True,
+        "index_kpool_compress": True,
+        "index_n_heads": 32,
+        "index_topk": 2048,
+        "index_share_for_mtp_iteration": True,
+        "indexer_rope_interleave": True,
+        "intermediate_size": 256,
+        "kv_lora_rank": 512,
+        "linear_attn_config": {
+            "num_heads": 4,
+            "gate_lower_bound": -5.0,
+            "head_dim": 128,
+            "short_conv_kernel_size": 4,
+            "kda_layers": [i for i, x in enumerate(types_) if x == "linear_attention"],
+            "full_attn_layers": [i for i, x in enumerate(types_) if x != "linear_attention"],
+        },
+        "layer_types": types_,
+        "mlp_layer_types": ["dense"] * min(dense_mlps, layers) + ["sparse"] * (layers - dense_mlps),
+        "indexer_types": ["full"] * layers,
+        "max_position_embeddings": 1024,
+        "mhc": True,
+        "mla_use_nope": True,
+        "model_type": "glm5_next_text",
+        "moe_intermediate_size": moe_intermediate,
+        "moe_router_dtype": "float32",
+        "n_group": 1,
+        "n_routed_experts": experts,
+        "n_shared_experts": 1,
+        "norm_topk_prob": True,
+        "num_attention_heads": 4,
+        "num_experts_per_tok": 2,
+        "num_hidden_layers": layers,
+        "num_key_value_heads": 4,
+        "num_nextn_predict_layers": 0,
+        "q_lora_rank": 1536,
+        "qk_head_dim": 256,
+        "qk_nope_head_dim": 256,
+        "qk_rope_head_dim": 0,
+        "rms_norm_eps": 1e-5,
+        "routed_scaling_factor": 2.5,
+        "scoring_func": "sigmoid",
+        "swiglu_limit": 10.0,
+        "tie_word_embeddings": False,
+        "topk_group": 1,
+        "topk_method": "noaux_tc",
+        "v_head_dim": 256,
+        "vocab_size": 384,
+    }
+    return {
+        "architectures": ["Glm5NextForConditionalGeneration"],
+        "model_type": "glm5_next",
+        "text_config": t,
+        "quantization_config": {
+            "activation_scheme": "dynamic",
+            "fmt": "e4m3",
+            "quant_method": "fp8",
+            "weight_block_size": [128, 128],
+        },
+    }
 
 
 LAYER = 3  # the first MoE layer of glm_config
 PRE = f"model.layers.{LAYER}."
 
 
-def glm_expert_checkpoint(path, refit: bool, E=4, H=256, I=128):
+def glm_expert_checkpoint(path, refit: bool, E=4, H=256, INTER=128):
     """config.json (glm_config) and layer LAYER's router and routed experts stored as zai-org/GLM-5.3-Flash
     stores them: under model.language_model., one tensor per expert and projection, FP8 e4m3fn with 128 x 128
     block scales (weight_scale_inv). refit: codes up to 448 (the checkpoint's range), so models/quant.fit_e4m3_max
     halves some rows for trn2's 240."""
     os.makedirs(path, exist_ok=True)
     with open(os.path.join(path, "config.json"), "w") as f:
-        json.dump(glm_config(experts=E, hidden=H, moe_intermediate=I), f)
+        json.dump(glm_config(experts=E, hidden=H, moe_intermediate=INTER), f)
     g = torch.Generator().manual_seed(7)
     t, pre = {}, f"model.language_model.layers.{LAYER}.mlp."
     for e in range(E):
-        for proj, (n, k) in (("gate_proj", (I, H)), ("up_proj", (I, H)), ("down_proj", (H, I))):
+        for proj, (n, k) in (("gate_proj", (INTER, H)), ("up_proj", (INTER, H)), ("down_proj", (H, INTER))):
             w = torch.randn(n, k, generator=g) * 0.02
             s = w.abs().view(n // 128, 128, k // 128, 128).amax((1, 3)) / (448.0 if refit else 200.0)
             t[f"{pre}experts.{e}.{proj}.weight"] = (w / s.repeat_interleave(128, 0).repeat_interleave(128, 1)).to(FP8)
@@ -533,7 +652,7 @@ def checkpoint_experts(E=6, H=1024, Im=64, seed=0):
         cw = codes[shard_rows, shard_cols]
         rs = bs.repeat_interleave(128, 0)[shard_rows]  # [n, k / 128] per row
         if shard_cols.stop - shard_cols.start < 128:  # inside one block: that block's scale
-            rs = rs[:, shard_cols.start // 128:shard_cols.start // 128 + 1]
+            rs = rs[:, shard_cols.start // 128 : shard_cols.start // 128 + 1]
         return fit_e4m3_max(cw, rs, 240.0)
 
     gus, gss, ds, dss = [], [], [], []
@@ -549,6 +668,7 @@ def checkpoint_experts(E=6, H=1024, Im=64, seed=0):
 
 
 # -- the header checkpoint and the load-time decisions (need the model loader) ------------------------
+
 
 @pytest.fixture
 def restore_capture_env():
@@ -576,8 +696,13 @@ def restore_capture(monkeypatch):
     from trnrt.kernels import moe_prefill as mp
     from trnrt.models import decoder, loader
 
-    for obj, name in ((loader._Checkpoint, "__init__"), (loader, "_load_experts"),
-                      (decoder.DecoderLayer, "pack_experts"), (mp, "check_blob"), (mp, "down_factors")):
+    for obj, name in (
+        (loader._Checkpoint, "__init__"),
+        (loader, "_load_experts"),
+        (decoder.DecoderLayer, "pack_experts"),
+        (mp, "check_blob"),
+        (mp, "down_factors"),
+    ):
         monkeypatch.setattr(obj, name, getattr(obj, name))
     for obj in (loader._Checkpoint, mp):  # the install guards: absent again afterwards
         monkeypatch.setattr(obj, "_trnrt_capture", False, raising=False)
@@ -625,7 +750,7 @@ def test_decide_one_expert_at_a_time_matches_the_whole_blob(fmt):
         ws[3][5, 0, 7] *= 2
     whole = mdd.pack(*ws)
     want = (mp.check_blob(whole, 1024), mp.down_factors(whole, 1024) is not None)
-    got = capture.decide((mdd.pack(*(w[e:e + 1] for w in ws)) for e in range(6)), 1024)
+    got = capture.decide((mdd.pack(*(w[e : e + 1] for w in ws)) for e in range(6)), 1024)
     assert got[:2] == want
     assert got[2] == {"glm": 6, "glm-rows": 6, "glm-down": 6, "loaded": 1}[fmt]
 
@@ -648,14 +773,23 @@ def test_layer_decisions_match_the_loaded_layer(tmp_path, refit):
     got = capture._layer_decisions(str(tmp_path), None, PRE, 2, [0, 1], 240.0)
     for r in (0, 1):
         z = lambda *s, dt=torch.float32: torch.zeros(*s, dtype=dt)  # noqa: E731
-        layer = types.SimpleNamespace(router=z(4, 256, dt=torch.bfloat16), down_t=True, router_bias=z(4),
-                                      router_logit_bias=None, w_gu=z(4, 128, 256, dt=FP8), w_gu_scale=z(4, 128, 2),
-                                      w_down=z(4, 64, 256, dt=FP8), w_down_scale=z(4, 1, 256))
+        layer = types.SimpleNamespace(
+            router=z(4, 256, dt=torch.bfloat16),
+            down_t=True,
+            router_bias=z(4),
+            router_logit_bias=None,
+            w_gu=z(4, 128, 256, dt=FP8),
+            w_gu_scale=z(4, 128, 2),
+            w_down=z(4, 64, 256, dt=FP8),
+            w_down_scale=z(4, 1, 256),
+        )
         loader._load_experts(layer, loader._Checkpoint(str(tmp_path)), PRE, cfg, r, 2, torch.bfloat16, 240.0)
         blob = mdd.pack(layer.w_gu, layer.w_gu_scale, layer.w_down, layer.w_down_scale)
         d = got[capture.decision_key(240.0, 2, r, PRE)]
-        assert (d["moe_prefill_dq"], d["moe_prefill_down"]) == (mp.check_blob(blob, 256),
-                                                                 mp.down_factors(blob, 256) is not None)
+        assert (d["moe_prefill_dq"], d["moe_prefill_down"]) == (
+            mp.check_blob(blob, 256),
+            mp.down_factors(blob, 256) is not None,
+        )
         assert (d["moe_prefill_dq"], d["moe_prefill_down"]) == ((False, True) if refit else (True, False))
         assert d["experts_read"] == (1 if refit else 4)
 
@@ -690,8 +824,9 @@ def test_capture_replays_the_decisions_and_refuses_without_them(tmp_path, monkey
     rec = {"decisions": {key: {"moe_prefill_dq": False, "moe_prefill_down": True}}, "path": "x"}
 
     def zeros_layer():
-        return types.SimpleNamespace(pack_tiles=True, **{n: torch.zeros_like(t) for n, t in zip(
-            names, checkpoint_experts())})
+        return types.SimpleNamespace(
+            pack_tiles=True, **{n: torch.zeros_like(t) for n, t in zip(names, checkpoint_experts())}
+        )
 
     fake = zeros_layer()
     capture._PENDING[0] = (fake, rec, key)
@@ -709,6 +844,7 @@ def test_capture_replays_the_decisions_and_refuses_without_them(tmp_path, monkey
 
 # -- the capture ------------------------------------------------------------------------------------
 
+
 def test_capture_refuses_arguments_the_engine_does_not_take(tmp_path, monkeypatch, restore_capture_env):
     """engine_config drops an argument it does not know (the server hands it its own too), so capture refuses one,
     and an abbreviation, before it builds anything; the engine's own arguments pass."""
@@ -725,9 +861,11 @@ def test_capture_refuses_arguments_the_engine_does_not_take(tmp_path, monkeypatc
     def engine_config(argv):
         raise AssertionError(f"engine_config({argv}) ran")
 
-    for argv, named in ((["--model", "m", "--decode-bucket", "1,2"], "--decode-bucket 1,2"),
-                        (["--model", "m", "--tp", "2", "--prefill-bukets", "2048"], "--prefill-bukets 2048"),
-                        (["--model", "m", "--engines", "2", "--port", "8000"], "--engines 2 --port 8000")):
+    for argv, named in (
+        (["--model", "m", "--decode-bucket", "1,2"], "--decode-bucket 1,2"),
+        (["--model", "m", "--tp", "2", "--prefill-bukets", "2048"], "--prefill-bukets 2048"),
+        (["--model", "m", "--engines", "2", "--port", "8000"], "--engines 2 --port 8000"),
+    ):
         with pytest.raises(SystemExit, match=re.escape(f"not engine arguments: {named}.")):
             farm.main(["capture", "--out", str(out), "--", *argv], engine_config=engine_config)
     farm.check_engine_args(["--model", "m", "--tp", "2", "--decode-buckets=1,2", "--kv-cache-dtype", "fp8"])
@@ -771,13 +909,26 @@ def test_capture_stops_when_rank_0_fails(tmp_path, monkeypatch):
 
 # -- the capture itself (needs libtorch_neuronx_lite) -------------------------------------------------
 
+
 def tiny_engine_config(argv):
     """engine_config for the capture test: the serve arguments are --model alone."""
     from trnrt.config import EngineConfig
 
-    return EngineConfig(model_path=argv[argv.index("--model") + 1], device="neuron", dtype=torch.bfloat16, tp=2,
-                        page_size=8, kv_cache_dtype="fp8", kv_cache_gb=0.01, max_num_seqs=2, max_model_len=64,
-                        max_prefill_tokens=8, decode_batch_buckets=(2,), prefill_token_buckets=(8,), page_buckets=(2,))
+    return EngineConfig(
+        model_path=argv[argv.index("--model") + 1],
+        device="neuron",
+        dtype=torch.bfloat16,
+        tp=2,
+        page_size=8,
+        kv_cache_dtype="fp8",
+        kv_cache_gb=0.01,
+        max_num_seqs=2,
+        max_model_len=64,
+        max_prefill_tokens=8,
+        decode_batch_buckets=(2,),
+        prefill_token_buckets=(8,),
+        page_buckets=(2,),
+    )
 
 
 @needs("libtorch_neuronx_lite", "transformers.models.glm5_next", "trnrt.engine.model_runner", "trnrt.models.loader")
@@ -794,9 +945,19 @@ def test_capture_tp2_writes_one_entry_per_graph(tmp_path, restore_capture_env):
     # hidden a multiple of 512, pages of kpool x cp = 8 tokens and an FP8 KV cache (tiny_engine_config), as served.
     c = glm_config(dense_mlps=4, hidden=512)
     c.pop("quantization_config")
-    model = tf.Glm5NextForConditionalGeneration(tf.Glm5NextConfig(
-        text_config=c["text_config"], vision_config=dict(depth=1, hidden_size=32, intermediate_size=64, num_heads=2,
-                                                         out_hidden_size=256, projection_intermediate_size=64)))
+    model = tf.Glm5NextForConditionalGeneration(
+        tf.Glm5NextConfig(
+            text_config=c["text_config"],
+            vision_config={
+                "depth": 1,
+                "hidden_size": 32,
+                "intermediate_size": 64,
+                "num_heads": 2,
+                "out_hidden_size": 256,
+                "projection_intermediate_size": 64,
+            },
+        )
+    )
     model.save_pretrained(str(ckpt), safe_serialization=True)
     assert farm.main(["shapes", str(ckpt), "--out", str(out)]) == 0
     assert farm.main(["capture", "--out", str(out), "--", "--model", str(ckpt)], engine_config=tiny_engine_config) == 0

@@ -24,7 +24,7 @@ import torch
 
 pytest.importorskip("transformers.models.glm5_next.modeling_glm5_next")
 
-from tests.test_host_cache_checkpoints import B, HOST, NEW, PrefillSpy, _engine, _poison, _prompts, _reference  # noqa: E402
+from tests.test_host_cache_checkpoints import HOST, NEW, B, PrefillSpy, _engine, _poison, _prompts, _reference
 
 
 @pytest.fixture(scope="module")
@@ -52,7 +52,7 @@ def _run(path, first, second, mode: str, flush: bool = False, **kw):
         if hit:
             eng.generate([first], sp)
             rad, tier = eng.radix, eng.host_tier
-            counts = dict(running_offloaded=rad.num_running_offloaded, saved_before=tier.ckpts_saved)
+            counts = {"running_offloaded": rad.num_running_offloaded, "saved_before": tier.ckpts_saved}
             if flush:
                 rad.evict_checkpoints(rad.num_ckpts)
                 counts["host_ckpts"] = len(tier.ckpts)
@@ -114,14 +114,15 @@ def _two_at_once(path, ref, vocab):
     g = torch.Generator().manual_seed(77)
     p1, p2 = (torch.randint(0, vocab, (B,), generator=g).tolist() for _ in range(2))
     a1, a2, x, y = (torch.randint(0, vocab, (n,), generator=g).tolist() for n in (3, 3, 4, 4))
-    eng = _engine(path, max_prefill_tokens=B, max_model_len=128, max_num_seqs=2, host_cache_gb=HOST,
-                  state_checkpoints=1)
+    eng = _engine(
+        path, max_prefill_tokens=B, max_model_len=128, max_num_seqs=2, host_cache_gb=HOST, state_checkpoints=1
+    )
     try:
         sp = SamplingParams(max_new_tokens=NEW, ignore_eos=True, logprobs=1)
-        eng.generate([p1 + a1], sp)   # prompt end at B: each leaves its b checkpoint
+        eng.generate([p1 + a1], sp)  # prompt end at B: each leaves its b checkpoint
         eng.generate([p2 + a2], sp)
         rad = eng.radix
-        rad.evict_checkpoints(rad.num_ckpts)   # every checkpoint to the host: the row is free
+        rad.evict_checkpoints(rad.num_ckpts)  # every checkpoint to the host: the row is free
         _poison(eng, rad)
         reqs = [eng.add_request(p1 + x, sp), eng.add_request(p2 + y, sp)]
         eng.step()
@@ -132,9 +133,11 @@ def _two_at_once(path, ref, vocab):
         for tag, r in zip("XY", reqs):
             want, lp_ref = _reference(ref, list(r.prompt_ids) + list(r.output_ids), len(r.prompt_ids))
             lp = torch.tensor([v[0] for v in r.logprobs])
-            out[tag] = (list(r.output_ids) == want,
-                        (lp - lp_ref.gather(1, torch.tensor(r.output_ids).unsqueeze(1))[:, 0]).abs().max().item(),
-                        r.num_cached_tokens)
+            out[tag] = (
+                list(r.output_ids) == want,
+                (lp - lp_ref.gather(1, torch.tensor(r.output_ids).unsqueeze(1))[:, 0]).abs().max().item(),
+                r.num_cached_tokens,
+            )
         return out
     finally:
         eng.close()
@@ -149,8 +152,9 @@ def test_a_row_a_request_has_yet_to_copy_from_stays(glm, monkeypatch, keep):
     path, ref, vocab = glm
     if keep == "ignored":
         real = RadixCache.evict_checkpoints
-        monkeypatch.setattr(RadixCache, "evict_checkpoints",
-                            lambda self, n, keep=None: real(self, n, None if keep is None else set()))
+        monkeypatch.setattr(
+            RadixCache, "evict_checkpoints", lambda self, n, keep=None: real(self, n, None if keep is None else set())
+        )
     out = _two_at_once(path, ref, vocab)
     print(f"\n  keep {keep}: X (tokens equal, max |dlogprob|, cached) {out['X']}, Y {out['Y']}")
     assert out["X"][2] == B, "X resumes from its restored checkpoint"
