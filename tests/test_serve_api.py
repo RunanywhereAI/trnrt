@@ -592,3 +592,38 @@ def test_a_client_that_disconnects_aborts_its_request(stream):
         th.join(timeout=30)
         for lp in [lp for lp in api._LOOPS if lp.engine is eng]:
             lp.stop()
+
+
+def test_the_checkpoints_generation_config_sets_the_sampling_defaults(serve, tmp_path):
+    """A request that sets no temperature or top_p samples at the checkpoint's generation_config.json values
+    (GLM-5.3-Flash's: temperature 1.0, top_p 0.95), as vLLM does by default; it sampled at top_p 1.0. A request's own
+    values win; a value out of range in the file is not used; no file, the server's defaults (1.0, 1.0)."""
+    from fastapi.testclient import TestClient
+
+    from trnrt.serve import api
+
+    msgs = {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 2}
+
+    def params_with(gen: dict | None, body: dict, path: str = "/v1/chat/completions"):
+        d = tmp_path / str(len(list(tmp_path.iterdir())))
+        d.mkdir()
+        if gen is not None:
+            (d / "generation_config.json").write_text(json.dumps(gen))
+        eng = ScriptedEngine(PLAIN)
+        eng.model_path = str(d)
+        with TestClient(api.build_app(eng, "glm")) as c:
+            r = c.post(path, json=body)
+            assert r.status_code == 200, r.text
+        for lp in [lp for lp in api._LOOPS if lp.engine is eng]:
+            lp.stop()
+        p = eng.added[-1].params
+        return p.temperature, p.top_p, p.top_k, p.min_p
+
+    glm = {"eos_token_id": [1], "temperature": 1.0, "top_p": 0.95, "do_sample": True}
+    assert params_with(glm, msgs) == (1.0, 0.95, 0, 0.0)
+    assert params_with(glm, {"prompt": [1], "max_tokens": 2}, "/v1/completions") == (1.0, 0.95, 0, 0.0)
+    assert params_with(glm, {**msgs, "top_p": 0.5, "temperature": 0}) == (0.0, 0.5, 0, 0.0)
+    assert params_with(glm, {**msgs, "top_p": None}) == (1.0, 0.95, 0, 0.0)  # null: unset
+    assert params_with({"temperature": 0.6, "top_k": 20, "min_p": 0.05}, msgs) == (0.6, 1.0, 20, 0.05)
+    assert params_with({"top_p": 0, "temperature": -1, "top_k": "x"}, msgs) == (1.0, 1.0, 0, 0.0)
+    assert params_with(None, msgs) == (1.0, 1.0, 0, 0.0)
