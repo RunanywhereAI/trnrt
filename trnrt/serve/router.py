@@ -68,6 +68,7 @@ import contextlib
 import hashlib
 import json
 import os
+import threading
 import time
 
 import httpx
@@ -220,6 +221,11 @@ class Router:
         self.kv_used: list[float | None] = [None] * len(
             workers
         )  # KV pages in use / total, from the worker's /v1/stats; None unknown
+        # The prefix trees are matched and inserted in worker threads (pick_off_loop): the threading lock guards the
+        # trees, the asyncio lock orders the requests from match to insert.
+        self._trees_lock = threading.Lock()
+        self._pick_lock: asyncio.Lock | None = None
+        self._pick_loop: asyncio.AbstractEventLoop | None = None
 
     @staticmethod
     def session_of(body: dict) -> str | None:
@@ -365,8 +371,41 @@ class Router:
         request's _session_key and whether it sends tools (pick_keyed)."""
         if session is not None:
             return self.pick_keyed(session, key, tools)
+        w = self._decide(text, head, self._matches(text))
+        with self._trees_lock:
+            self.trees[w].insert(text)
+        return w
+
+    async def pick_off_loop(
+        self, text: str, session: str | None = None, head: int = 0, key: tuple | None = None, tools: bool = False
+    ) -> int:
+        """pick, with the prefix trees' match and insert in a worker thread: both walk the request text character by
+        character in Python, 35 ms at 0.14 MB of text and ~300 ms at 1.1 MB (~250K tokens), which on the event loop
+        stalled every stream the router relays. The decision itself stays on the event loop, with the rest of the
+        router's state. One request at a time, in arrival order (_pick_lock), from its match to its insert: the routing
+        is pick's, request for request. A session request touches no tree and is picked at once."""
+        if session is not None:
+            return self.pick_keyed(session, key, tools)
+        loop = asyncio.get_running_loop()
+        if self._pick_lock is None or self._pick_loop is not loop:  # an asyncio lock serves one event loop
+            self._pick_lock, self._pick_loop = asyncio.Lock(), loop
+        async with self._pick_lock:
+            matches = await asyncio.to_thread(self._matches, text)
+            w = self._decide(text, head, matches)
+            await asyncio.to_thread(self._insert, w, text)
+        return w
+
+    def _matches(self, text: str) -> list[int]:
+        with self._trees_lock:
+            return [t.match(text) for t in self.trees]
+
+    def _insert(self, w: int, text: str) -> None:
+        with self._trees_lock:  # a cancelled request's thread may still be running when the next request's starts
+            self.trees[w].insert(text)
+
+    def _decide(self, text: str, head: int, matches: list[int]) -> int:
+        """The sessionless policy (the module docstring), from each worker's tree match."""
         live = self._live()
-        matches = [t.match(text) for t in self.trees]
         best = max(live, key=lambda i: (matches[i], -self.load[i]))
         lo, hi = min(self.load), max(self.load)
         if matches[best] >= head + self.sticky_chars:
@@ -386,7 +425,6 @@ class Router:
             # worker that receives a request is pruned back below the other one's size, so it wins the next request
             # too, and only the balance rule (an imbalance over balance_abs) ever sends one elsewhere.
             w = min(live, key=lambda i: (self.load[i], self.trees[i].size))
-        self.trees[w].insert(text)
         return w
 
     def status(self) -> str:
@@ -455,6 +493,10 @@ def _request_text(path: str, body: dict) -> str:
         return json.dumps(body.get("messages", []), ensure_ascii=False)
     p = body.get("prompt", "")
     return p if isinstance(p, str) else json.dumps(p)
+
+
+def _request_text_head(path: str, body: dict) -> tuple[str, int]:
+    return _request_text(path, body), _request_head(path, body)
 
 
 async def _json_object(http: Request) -> dict:
@@ -546,13 +588,13 @@ def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: floa
         sid = router.session_of(body)
         key = _session_key(path, body) if sid is not None else None
         tools = bool(body.get("tools"))
-        w = router.pick(
-            _request_text(path, body) if sid is None else "",
-            session=sid,
-            head=_request_head(path, body) if sid is None else 0,
-            key=key,
-            tools=tools,
-        )
+        # The request's text (json.dumps of its messages, ~6 ms at 1 MB) is computed off the event loop too.
+        text, head = await asyncio.to_thread(_request_text_head, path, body) if sid is None else ("", 0)
+
+        async def pick() -> int:
+            return await router.pick_off_loop(text, session=sid, head=head, key=key, tools=tools)
+
+        w = await pick()
         # An unreachable worker, or one that answers 503 (a failed engine refuses every request before it queues it,
         # serve/api.py): note it, re-pick once (a session fails over if it went down).
         for attempt in (0, 1):
@@ -574,13 +616,7 @@ def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: floa
                 router.note_failure(w, hard=isinstance(e, httpx.ConnectError))  # refused: a dead port
                 if attempt == 1 or all(not ok for ok in router.up):
                     raise HTTPException(status_code=503, detail=f"worker {w} unreachable") from e
-                w = router.pick(
-                    _request_text(path, body) if sid is None else "",
-                    session=sid,
-                    head=_request_head(path, body) if sid is None else 0,
-                    key=key,
-                    tools=tools,
-                )
+                w = await pick()
                 continue
             except BaseException:
                 router.load[w] -= 1
@@ -590,13 +626,7 @@ def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: floa
                 router.note_failure(w, hard=True)
                 if attempt == 1 or all(not ok for ok in router.up):
                     return Response(r.content, status_code=503, media_type=r.headers.get("content-type"))
-                w = router.pick(
-                    _request_text(path, body) if sid is None else "",
-                    session=sid,
-                    head=_request_head(path, body) if sid is None else 0,
-                    key=key,
-                    tools=tools,
-                )
+                w = await pick()
                 continue
             break
         if body.get("stream"):
