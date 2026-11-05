@@ -379,6 +379,59 @@ _NEUTRAL: dict[str, tuple[object, ...]] = {
 }
 
 
+# Every top-level request field the server knows: read (above and in chat_prompt), refused unless neutral (_NEUTRAL),
+# or accepted and ignored because it never changes the output: `model` (one model is served), `user`,
+# `safety_identifier`, `metadata`, `store`, `service_tier` and `prompt_cache_key` (OpenAI bookkeeping and hints, which
+# OpenAI SDKs and agent harnesses send by default). Any other field is refused with a 400 naming it, never ignored: an
+# unknown field (`prediction`, `modalities`, `audio`, a typo) used to be answered 200 as if it had been applied.
+_IGNORED = frozenset({"model", "user", "safety_identifier", "metadata", "store", "service_tier", "prompt_cache_key"})
+_READ = frozenset(
+    {
+        "session_id",
+        "stream",
+        "stream_options",
+        "max_tokens",
+        "temperature",
+        "top_p",
+        "top_k",
+        "min_p",
+        "seed",
+        "stop",
+        "stop_token_ids",
+        "ignore_eos",
+        "logprobs",
+        "repetition_penalty",
+        "frequency_penalty",
+        "presence_penalty",
+        "thinking_token_budget",
+        "response_format",
+        "max_completion_tokens",
+    }
+)
+# Read by one endpoint only: the other would ignore them.
+_CHAT_ONLY = frozenset(
+    {
+        "messages",
+        "tools",
+        "tool_choice",
+        "parallel_tool_calls",
+        "chat_template_kwargs",
+        "reasoning_effort",
+        "top_logprobs",
+    }
+)
+_COMPLETION_ONLY = frozenset({"prompt"})
+_KNOWN = {
+    True: _IGNORED | _READ | _NEUTRAL.keys() | _CHAT_ONLY,
+    False: _IGNORED | _READ | _NEUTRAL.keys() | _COMPLETION_ONLY,
+}
+
+
+def _unknown(body: dict, chat: bool) -> list[str]:
+    """The request's top-level fields this endpoint does not know (_KNOWN), sorted."""
+    return sorted(k for k in body if k not in _KNOWN[chat])
+
+
 def _refused(body: dict) -> list[str]:
     out = [k for k, neutral in _NEUTRAL.items() if body.get(k) not in neutral]
     rf = body.get("response_format")
@@ -438,6 +491,12 @@ def _flag(body: dict, key: str, default: bool = False) -> bool:
 def _params(body: dict, default_max: int, chat: bool, vocab: int) -> SamplingParams:
     """A request's sampling. Every field is checked here, before the request is queued: 400 for a value of the wrong
     type or out of range, and the default for a null. default_max is used when the request sets no max_tokens."""
+    unknown = _unknown(body, chat)
+    if unknown:
+        raise _bad(
+            f"unknown field{'s' if len(unknown) > 1 else ''} {', '.join(unknown)}: not supported by this server, "
+            f"which refuses a field it would otherwise ignore; send the request without it"
+        )
     asked = _refused(body)
     if asked:
         raise _bad(f"not supported: {', '.join(asked)}")

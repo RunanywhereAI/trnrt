@@ -38,6 +38,9 @@ curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -
 - Not supported, answered with 400: repetition, frequency and presence penalties, guided decoding (`response_format`
   other than text, `tool_choice` `"required"` or a named tool), prompt logprobs and thinking budgets. Every graph
   samples on the device, and these need host inputs no served graph takes.
+- An unknown request field is answered with 400 naming it, never ignored. So is a field of the other endpoint
+  (`prompt` on a chat request, `messages` or `tools` on a completion). `model`, `user`, `safety_identifier`,
+  `metadata`, `store`, `service_tier` and `prompt_cache_key` are accepted and do not change the output.
 - Status codes: 400 for a request that cannot be served as sent (a field of the wrong type or out of range, a prompt
   longer than the context, a chat template variable the template never reads); 500 for an error inside the engine;
   503 once the engine has failed, with the reason on `/health`.

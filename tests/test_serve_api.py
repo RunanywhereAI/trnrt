@@ -592,3 +592,44 @@ def test_a_client_that_disconnects_aborts_its_request(stream):
         th.join(timeout=30)
         for lp in [lp for lp in api._LOOPS if lp.engine is eng]:
             lp.stop()
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"bogus_field": 1},
+        {"top_a": 0.3},
+        {"prediction": {"type": "content", "content": "x"}},
+        {"modalities": ["audio"]},
+        {"audio": {"voice": "x"}},
+        {"web_search_options": {}},
+        {"max_token": 5},  # a typo of max_tokens
+    ],
+)
+def test_an_unknown_field_is_refused_with_a_400_that_names_it(serve, extra):
+    """AGENTS.md invariant 7: a field the server does not know was answered 200 as if it had been applied. Now 400,
+    naming the field; no request reaches the engine. The fields an SDK sends by default (SDK_CHAT, SDK_COMPLETION)
+    are still served (test_an_sdk_request_with_every_neutral_field_is_served)."""
+    client, eng = serve(PLAIN)
+    (name,) = extra
+    for path, base in (
+        ("/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}]}),
+        ("/v1/completions", {"prompt": [1]}),
+    ):
+        r = client.post(path, json={**base, "max_tokens": 2, **extra})
+        assert r.status_code == 400 and name in r.json()["detail"] and "unknown" in r.json()["detail"], r.text
+    assert eng.added == []
+
+
+def test_a_field_of_the_other_endpoint_is_refused(serve):
+    """`prompt` on a chat request, `messages` or `tools` on a completion: the endpoint would ignore them."""
+    client, eng = serve(PLAIN)
+    msgs = [{"role": "user", "content": "hi"}]
+    r = client.post("/v1/chat/completions", json={"messages": msgs, "prompt": "x"})
+    assert r.status_code == 400 and "prompt" in r.json()["detail"], r.text
+    for extra in ({"messages": msgs}, {"tools": TOOLS}, {"reasoning_effort": "low"}):
+        r = client.post("/v1/completions", json={"prompt": [1], **extra})
+        assert r.status_code == 400 and next(iter(extra)) in r.json()["detail"], r.text
+    assert eng.added == []
+    for extra in ({"user": "u"}, {"model": "glm"}, {"metadata": {"a": "b"}}, {"prompt_cache_key": "k"}):
+        assert client.post("/v1/chat/completions", json={"messages": msgs, "max_tokens": 2, **extra}).status_code == 200
