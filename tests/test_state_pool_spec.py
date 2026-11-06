@@ -1,5 +1,5 @@
 """engine/state_pool.py, speculative seats, on the host: the row layout, which seat a request takes, the plain-to-speculative move, the verify's current
-row, rows held back while an overlapped step may still touch them, and reclaim of non-running holders.
+row, and reclaim of non-running holders.
 
 The layout the shipped cap-12 configuration relies on: 12 seats of which 4 are speculative (k 2: 3 rows each) and 8 plain (1 row each), 12 checkpoint rows,
 the scratch row and the zero row: 1 + 4 x 3 + 8 + 12 + 1 = 34 rows."""
@@ -124,21 +124,15 @@ def test_a_move_finds_no_seat_when_the_kind_is_full_and_reclaims_a_non_running_h
     assert moved is not None and sp.is_spec(r) and not sp.holds(holders[1])
 
 
-def test_released_rows_are_held_back_while_an_overlapped_step_may_touch_them():
+def test_release_gives_the_seat_back_to_its_own_kind_and_a_stranger_is_a_no_op():
     sp = _pool(rows=2, spec_seats=1, ckpt=0)
     a, b = _req("a"), _req("b")
-    ra, rb = sp.rows_of(a), sp.rows_of(b)
-    assert ra == [1, 2, 3] and rb == [4]
-    sp.hold = True
+    assert sp.rows_of(a) == [1, 2, 3] and sp.rows_of(b) == [4]
     sp.release(a)
     sp.release(b)
-    assert sp._free == [] and sp._pfree == []  # nothing is reusable yet
-    with pytest.raises(RuntimeError, match="exhausted"):
-        sp.rows_of(_req("c"))
-    sp.release_cooling()
     assert sp._free == [[1, 2, 3]] and sp._pfree == [[4]]
-    sp.hold = False
-    sp.release(_req("never-held"))  # releasing a stranger is a no-op
+    sp.release(_req("never-held"))
+    assert not sp.holds(a)
 
 
 def test_a_non_running_holder_is_reclaimed_when_the_free_lists_are_empty():

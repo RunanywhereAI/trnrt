@@ -86,10 +86,6 @@ class StatePool:
         base = 1 + seats * rows_per_req  # plain seats (mixed_seats): one row each, after the speculative seats
         self._pfree: list[list[int]] = [[base + j] for j in range(rows - seats - 1, -1, -1)]
         self._held: dict[str, list] = {}  # rid -> [rows, current index, request]
-        # hold: released rows wait in _cooling until release_cooling() (kv_pool.PagePool.hold, for the same reason: an
-        # overlapped step may still be reading or writing them).
-        self.hold = False
-        self._cooling: list[list[int]] = []
         self._ckpt_free = list(range(self.zero_row - 1, n_run, -1))
 
     def pools(self) -> list[torch.Tensor]:
@@ -163,14 +159,8 @@ class StatePool:
         new = free.pop()
         src = held[0][held[1]]
         self._held[req.rid] = [new, 0, req]
-        self._give_back(held[0])
+        self._list(held[0]).append(held[0])
         return src, new[0]
-
-    def _give_back(self, rs: list[int]) -> None:
-        if self.hold:
-            self._cooling.append(rs)
-        else:
-            self._list(rs).append(rs)
 
     def row(self, req) -> int:
         """The request's current row: the one its next call reads and (outside verify) writes."""
@@ -185,12 +175,7 @@ class StatePool:
     def release(self, req) -> None:
         held = self._held.pop(req.rid, None)
         if held is not None:
-            self._give_back(held[0])
-
-    def release_cooling(self) -> None:
-        for rs in self._cooling:
-            self._list(rs).append(rs)
-        self._cooling.clear()
+            self._list(held[0]).append(held[0])
 
     def alloc_ckpt(self) -> int | None:
         return self._ckpt_free.pop() if self._ckpt_free else None
