@@ -23,6 +23,7 @@
 | `trnrt/engine/scheduler.py` | Continuous batching, chunked prefill and prefix-cache restores. |
 | `trnrt/engine/model_runner.py` | Pads each step into a compiled bucket and runs its graph. |
 | `trnrt/engine/radix_cache.py`, `kv_pool.py`, `host_cache.py`, `state_pool.py` | The prefix cache: a radix tree over FP8 KV pages, the page pool, the host-memory tier, and linear-attention state rows. |
+| `trnrt/engine/spec_async.py`, `spec_synth.py` | Speculative decoding: the per-request board of device-side state the next step reads (accepted count, newest token, positions, state row, drafts), and the benchmark mode's synthetic acceptance. |
 | `trnrt/engine/tp.py` | Tensor parallelism. Rank 0 drives, the other ranks follow, through shared memory or gloo. |
 | `trnrt/engine/start_checks.py`, `start_lock.py`, `watchdog.py` | Host checks before start, one engine starting at a time, and turning a device hang into a clean exit. |
 | `trnrt/models/` | GLM-5.3-Flash: the decoder, KDA linear attention, DSA sparse attention, mHC, the MoE, and FP8 loading. |
