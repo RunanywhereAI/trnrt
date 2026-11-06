@@ -22,6 +22,8 @@ requests per engine.
 | `--dsa-layer-max-rows` | 16 | DSA layers' decode attention and FFN as one fused kernel up to this many rows |
 | `--ffn-half-below` | 17 | decode FFN blocks as one fused kernel below this many rows |
 | `--dsa-index-rows` | 8 | the DSA indexer's decode scores in kernel calls of at most this many rows (0: one call) |
+| `--dense-half-skip-rows` | 2 | the decode row counts at which a dense MLP layer runs as the XLA graph instead of the dense half's kernel |
+| `--sp-gather`, `--sp-gather-tp-experts`, `--dsa-sel2g` | xla, off, off | the sequence-parallel all-gather of a decode block's output as the NKI kernel, over the experts' tensor-parallel group, and the DSA layer's two-stage selection in one kernel (the page ladder with a 3072-page rung needs it) |
 
 The seats, the bucket ladders, the pool sizes, the page size and the decode kernel routes are graph shapes: changing
 any of them needs a new capture. `--preset batch12` names this configuration: it is accepted, and changes nothing.
@@ -66,12 +68,47 @@ arrival order. It changes no graph, so it runs on the compile cache of the confi
 docker run ... trnrt serve --model /model --port 8000 --preset batch8 --max-running 4   # the mounts and variables of DEPLOY.md, step 4
 ```
 
+## Speculative decoding: the `mtp-*` presets
+
+The model's own multi-token-prediction (MTP) layer drafts 2 tokens a step and the target model verifies them in the next
+step, with the accepted count, the newest token, the positions and the drafts kept on the device, so a step is scheduled
+before the previous one is read back. [AGENTX.md](AGENTX.md) has the commands. Four presets name the configurations
+that were measured:
+
+| Preset | Decode batch | Speculation | Page buckets (decode; verify and MTP) | Host cache |
+|---|---|---|---|---|
+| `mtp-always` | up to 8 (buckets 1,2,4,6,8) | at every batch size | 1024,4096 | 4 GB |
+| `mtp-batch8` | up to 8 (1,2,4,6,8) | while at most 4 requests decode | 1024,3072,4096; 1024,4096 | 4 GB |
+| `mtp-batch12` | up to 12 (1,2,4,8,12) | while at most 4 decode | 1024,3072,4096; 1024,4096 | 8 GB |
+| `mtp-batch24` | up to 24, 32 seats (1,2,4,16,24) | while at most 4 decode | 1024,3072,4096; 1024,4096 | 12 GB |
+
+Above its limit a dynamic preset steps every request with the plain decode graph (the idea of vLLM's
+`num_speculative_tokens_per_batch_size`: no drafts above a batch size, here with hysteresis), and its plain steps still write the MTP layer's KV, so a return to
+speculation finds it complete. `--host-cache-gb` is host only: `mtp-batch12 --host-cache-gb 12` is the same graphs with a
+larger prefix-cache tier. The presets' speculation arguments:
+
+| Argument | Preset value | |
+|---|---|---|
+| `--spec-method`, `--spec-k` | mtp, 2 | speculative decoding with the model's MTP layer, drafts per step |
+| `--spec-max-batch`, `--spec-hysteresis` | 4, 1 (`mtp-always`: 0) | speculate while at most this many requests decode; once plain, speculate again at this many fewer |
+| `--spec-bucket-max`, `--plain-bucket-min` | 4, 4 (`mtp-batch24`: 4, 16) | the verify family's graphs only at decode buckets up to this, the plain decode graphs only from this |
+| `--spec-page-buckets` | 1024,4096 | the page buckets of every graph the MTP layer or a verify runs in |
+| `--mtp-chunk-q`, `--mtp-fill-rows` | 64, 1024 | the MTP pass over a prefill chunk takes the prefill form from 64 rows, in calls of at most 1024 |
+| `--mtp-kv-only`, `--dyn-mtp-kv` | on, on (`mtp-always`: off, off) | KV-only windows for the MTP pass over a chunk, and the MTP layer's KV written by plain decode steps |
+| `--state-seats`, `--state-spec-seats` | 8, unset (`mtp-batch12`: 12, 4; `mtp-batch24`: 24, 4) | recurrent-state seats, and how many of them hold the 3 rows a verify writes |
+| `--spec-synth-al` | unset | the benchmark mode of [AGENTX.md](AGENTX.md#benchmark-mode) |
+
+Like every row of the first table, these are graph shapes: an argument other than a preset's changes the graphs and
+needs its own capture. The `mtp-*` presets also set `TRNRT_DMA_HW=1` ([Environment variables](#environment-variables)),
+which changes the kernels' DMA form. A speculative engine serves temperature and top-p sampling as the plain engine does (verification
+is the rejection sampler's, so the output distribution is unchanged), and refuses the requests the plain engine refuses.
+
 ## Supported scope
 
-The supported configurations are the default (batch 12), `--preset batch8`, and either of them with a lower
-`--max-running` (batch 4: `--preset batch8 --max-running 4`). Larger decode batches, and values of
-`--kda-shell-max-rows`, `--dsa-layer-max-rows`, `--ffn-half-below` and `--dsa-index-rows` other than those of these two
-configurations, are not supported.
+The supported configurations are the default (batch 12), `--preset batch8`, the four `mtp-*` presets, and any of them
+with a lower `--max-running` (batch 4: `--preset batch8 --max-running 4`). Larger decode batches, and values of
+`--kda-shell-max-rows`, `--dsa-layer-max-rows`, `--ffn-half-below`, `--dsa-index-rows` and the speculation arguments
+other than those of these configurations, are not supported.
 
 ## Environment variables
 
@@ -81,6 +118,8 @@ Set them on the server's container (`docker run -e NAME=value ...`); its engines
 |---|---|---|
 | `TRNRT_TP_SHM` | on | each engine's rank 0 hands every graph call to its other ranks through a shared-memory segment; `0` sends them over gloo (TCP) instead, as happens anyway, with a warning, when /dev/shm is unusable |
 | `TRNRT_TP_SHM_BYTES` | 67108864 (64 MiB) | that segment's size, one segment per engine in /dev/shm; a larger call goes over gloo |
+| `TRNRT_SPEC_SYNTH_AL` | unset | the benchmark mode's mean acceptance length when `--spec-synth-al` is not given ([AGENTX.md](AGENTX.md#benchmark-mode)); needs a speculative preset |
+| `TRNRT_DMA_HW` | unset; `1` under an `mtp-*` preset | `1`: the kernels' static DMA helpers issue their DMAs in hardware DGE, as every build behind the published MTP numbers did. The kernels read it when they are imported (some bind the helper by name, and every kernel folds its source into its key then), so it is an environment variable, not a flag. `trnrt engine`, `trnrt serve` and `trnrt compile capture` set it for an `mtp-*` preset before they import the kernels, and a value already in the environment wins. Any other entry point has to set it itself. It changes the compiled graphs, so capture with the value you serve with |
 | `TRNRT_SKIP_DEVICE_CHECK` | unset | `1`: start without checking that the engine's Neuron devices are free |
 | `TRNRT_SKIP_HOST_MEM_CHECK` | unset | `1`: start without checking the host's free contiguous memory |
 | `TRNRT_LOG_LEVEL` | `INFO` | the level of the server's, engines' and router's log messages, on stderr (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |

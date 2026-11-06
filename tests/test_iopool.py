@@ -80,6 +80,7 @@ def runner(k: int, pieces: int = 2, rank: int = 0):
         tp_send=None,
         _decode=decode,
         _prefill=None,
+        _spec_fns={},
         compile_seconds={},
         exec_counts={},
         watchdog=None,
@@ -298,6 +299,27 @@ def test_calls_not_named_are_not_pooled():
     assert j is None and iopool._CTX is None
     pool.end(("prefill", 1024), j, None)
     assert pool.calls == 0
+
+
+def test_a_speculative_engine_pools_every_call_of_its_blind_step_and_only_those():
+    plain = iopool.pool_names(False)
+    assert plain == {"decode"} == iopool.POOL_NAMES
+    spec = iopool.pool_names(True)
+    assert plain < spec and "mtp_kv" not in spec
+    for name in ("verify", "spec_prep", "spec_post", "mtp", "mtp_post", "mtp_board", "spec_ckpt", "spec_init"):
+        assert name in spec, name
+    assert iopool.pool_names(True, kv_only=True) == spec | {"mtp_kv"}
+    assert iopool.pool_names(False, kv_only=True) == plain  # the window graph exists only with speculation
+    pool = iopool.Pool(k=2, names=spec)
+    for name in sorted(spec):
+        assert pool.begin(name, (name, 1), None) == 0, name
+        pool.end((name, 1), 0, None)
+    assert pool.begin("prefill", ("prefill", 512), None) is None and pool.begin("copy", ("copy", 4), None) is None
+
+
+def test_the_pool_remembers_whether_warmup_fills_every_slot():
+    assert iopool.Pool(k=4).warm is False
+    assert iopool.Pool(k=4, warm=True).warm is True
 
 
 @needs_runner

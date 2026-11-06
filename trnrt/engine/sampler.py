@@ -27,6 +27,9 @@ The graph returns ONE fp32 tensor per call, so a step is a single device-to-host
     out[:, 1]          its logprob
     out[:, 2:2+N]      top-N token ids
     out[:, 2+N:2+2N]   top-N logprobs
+
+A speculative verify (verify_sample) returns VERIFY_COLS columns per row instead: y, accept, r, then the raw logprobs of
+y, r and the draft, then the top N ids and logprobs.
 """
 
 from __future__ import annotations
@@ -200,6 +203,74 @@ def sample_candidates(
     token_lp = tok - lse
     top_lp = vals[:, :N] - lse
     return torch.cat([token.unsqueeze(1), token_lp, idx[:, :N], top_lp], dim=1)
+
+
+VERIFY_COLS = 6 + 2 * NUM_TOP_LOGPROBS
+
+
+def verify_sample(
+    logits: torch.Tensor,
+    temperature: torch.Tensor,
+    top_p: torch.Tensor,
+    top_k: torch.Tensor,
+    min_p: torch.Tensor,
+    noise: torch.Tensor,
+    u_accept: torch.Tensor,
+    draft: torch.Tensor,
+) -> torch.Tensor:
+    """Speculative verification for one draft token per row (R = B x Q rows).
+
+    Row i scores the draft for the NEXT position, d = draft[i], under the request's own
+    sampling distribution p (temperature, top-k, top-p, min-p over the K candidates):
+    accept with probability p(d) (greedy rows: d == argmax), else the replacement is a
+    sample from p with d removed. For a deterministic proposal, such as the MTP head's greedy draft,
+    this is exactly the rejection sampler vLLM uses, so the output distribution is unchanged.
+
+    Columns: y (sample from p, the bonus token after a fully accepted draft), accept,
+    r (replacement), raw logprobs of y, r and d, then top-N ids and logprobs.
+    """
+    K = noise.shape[1]
+    N = NUM_TOP_LOGPROBS
+    lse = logsumexp_large(logits)
+    vals, idx = topk_large(logits, max(K, N))
+    cv, ci = vals[:, :K], idx[:, :K]
+    t = torch.clamp(temperature, min=1e-5).unsqueeze(1)
+    probs = torch.softmax(cv / t, dim=-1)
+    cum = torch.cumsum(probs, dim=-1)
+    rank = torch.arange(K, device=logits.device).unsqueeze(0)
+    keep = (cum - probs) < top_p.unsqueeze(1)
+    keep = keep & ((rank < top_k.unsqueeze(1)) | (top_k.unsqueeze(1) <= 0))
+    keep = keep & (probs >= min_p.unsqueeze(1) * probs[:, :1])
+    keep = keep | (rank == 0)
+    kept = torch.where(keep, probs, 0.0)
+    kept = kept / kept.sum(dim=-1, keepdim=True)
+    greedy = ci[:, 0]
+    is_d = ci == draft.unsqueeze(1)
+    p_d = (kept * is_d.float()).sum(dim=-1)
+    sampling = temperature > 0
+    accept = torch.where(sampling, u_accept < p_d, draft == greedy)
+    gumbel = -torch.log(-torch.log(torch.clamp(noise, 1e-10, 1.0 - 1e-7)))
+    scores = torch.where(keep, torch.log(kept) + gumbel, -1e30)
+    pick = lambda sc: torch.argmax(_selectable(sc), -1, keepdim=True).clamp(0, K - 1)  # noqa: E731
+    y = torch.where(sampling, torch.gather(ci, 1, pick(scores)).squeeze(1), greedy)
+    rscores = torch.where(is_d, -1e30, scores)
+    rsampled = torch.gather(ci, 1, pick(rscores)).squeeze(1)
+    greedy_r = torch.where(draft == greedy, ci[:, 1], greedy)
+    r = torch.where(sampling, rsampled, greedy_r)
+    lp = lambda tok: torch.gather(logits, 1, tok.unsqueeze(1)) - lse  # noqa: E731
+    return torch.cat(
+        [
+            y.unsqueeze(1).float(),
+            accept.unsqueeze(1).float(),
+            r.unsqueeze(1).float(),
+            lp(y),
+            lp(r),
+            lp(draft),
+            idx[:, :N].float(),
+            vals[:, :N] - lse,
+        ],
+        dim=1,
+    )
 
 
 def unpack(out, n: int):

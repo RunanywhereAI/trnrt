@@ -265,3 +265,21 @@ def satwf(*args, comb_a, **kw):  # noqa: F811
     from . import dsa_satwfc
 
     return dsa_satwfc.dispatch(_satwf_served)(*args, comb_a=comb_a, **kw)
+
+
+# The P3072 decode page bucket (SEL2G; the engine sets it on every rank from EngineConfig.dsa_sel2g before the shard is
+# built): a decode call whose score tile is not whole 128-column chunks (dsa_sel2g.takes: P3072's NT 192) takes
+# dsa_satwfg's kernel, whose selection is dsa_sel2g's (sel2 with its compaction at any tile width). Off, satwf is the
+# function above, so no other call's graph moves. Read at call time; tools/make_satwf_sel2g.py cuts this block from the
+# copies it generates.
+SEL2G = False
+_satwf_pre_sel2g = satwf
+
+
+def satwf(*args, **kw):  # noqa: F811
+    if SEL2G:  # the block table is sat_args' fourth argument (models/mla.py passes it positionally)
+        from . import dsa_satwfg, dsa_sel2g
+
+        if dsa_sel2g.takes(args[3] if len(args) > 3 else kw["table"]):
+            return dsa_satwfg.satwf(*args, **kw)
+    return _satwf_pre_sel2g(*args, **kw)
