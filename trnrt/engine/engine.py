@@ -678,7 +678,6 @@ class LLMEngine:
         out, res = outs
         with watchdog.watched(self.runner.watchdog, "reading back a blind verify"):
             out, res = out.cpu(), res.cpu()
-        self.runner.launch_bound.done_through(outs[0])  # this call and every launch before it are done
         Q = 1 + self.cfg.spec_k
         N = NUM_TOP_LOGPROBS
         k = self.cfg.spec_k
