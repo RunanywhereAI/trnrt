@@ -59,7 +59,7 @@ itself; `configure()` then adds no second handler. Hang reports reach stderr eit
 
 | Workflow | Runs | On |
 |---|---|---|
-| `ci.yml` | pre-commit (ruff lint and format, file checks, doc links); mypy; the CPU suite; package build and `twine check`; Dockerfile lint | every push to `main` and every PR |
+| `ci.yml` | pre-commit (ruff lint and format, file checks, doc links); mypy; the CPU suite; package build and `twine check`; Dockerfile lint | every push to `main` or `dev`, and every PR |
 | CodeQL (GitHub's default setup, extended query suite) | security analysis of the Python and the workflows | every push and PR to `main`, weekly |
 | `release.yml` | build, check and attach the sdist and wheel to a GitHub release; PyPI when enabled | a `vX.Y.Z` tag that matches `trnrt.__version__` |
 
