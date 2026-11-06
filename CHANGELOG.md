@@ -8,7 +8,7 @@ and versions follow [Semantic Versioning](https://semver.org/). Rebuild the comp
 ### Added
 
 - MTP speculative decoding with GLM-5.3-Flash's own MTP layer: 2 draft tokens a step, verified by the target in the next
-  step, scheduled before the previous step is read back. Presets `mtp-batch2`, `mtp-batch8`, `mtp-batch12` and
+  step, scheduled before the previous step is read back. Presets `mtp-always`, `mtp-batch8`, `mtp-batch12` and
   `mtp-batch24` ([docs/CONFIGURATION.md](docs/CONFIGURATION.md)), a dynamic mode that speculates only while few requests
   decode, and `trnrt:spec_decode_*` metrics. A benchmark mode (`--spec-synth-al`) reproduces InferenceX's synthetic
   acceptance; it is off by default ([docs/AGENTX.md](docs/AGENTX.md)).
