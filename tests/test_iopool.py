@@ -80,6 +80,7 @@ def runner(k: int, pieces: int = 2, rank: int = 0):
         tp_send=None,
         _decode=decode,
         _prefill=None,
+        _spec_fns={},
         compile_seconds={},
         exec_counts={},
         watchdog=None,
