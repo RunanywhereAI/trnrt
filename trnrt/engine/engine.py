@@ -102,16 +102,22 @@ def pool_pages(cfg: EngineConfig, mcfg: ModelConfig) -> int:
 
 
 def set_decode_routes(cfg: EngineConfig) -> None:
-    """The decode kernel routes' row caps of `cfg` (EngineConfig.kda_shell_max_rows, dsa_layer_max_rows, ffn_half_below,
-    dsa_index_rows) into the model modules that read them when a graph is traced. Every rank's build_shard calls it
-    before building its shard (an engine's ranks and a capture's alike: each rank is its own process, given the
-    EngineConfig), so they all trace the same routes; it sets every cap, so an engine never inherits another's."""
+    """The decode kernel routes of `cfg` (the row caps kda_shell_max_rows, dsa_layer_max_rows, ffn_half_below and
+    dsa_index_rows, the dense MLP's skipped row counts, and the routes sp_gather, sp_gather_tp_experts and dsa_sel2g) into
+    the modules that read them when a graph is traced. Every rank's build_shard calls it before building its shard (an
+    engine's ranks and a capture's alike: each rank is its own process, given the EngineConfig), so they all trace the same
+    routes; it sets every one, so an engine never inherits another's."""
+    from ..kernels import dense_half, dsa_satwf, sp_gather
     from ..models import hybrid, mla
 
     hybrid.KDA_SHELL_MAXB = int(cfg.kda_shell_max_rows)
     hybrid.MOE_HALF_BELOW = int(cfg.ffn_half_below)
     mla.LAYER_MK_MAXB = int(cfg.dsa_layer_max_rows)
     mla.CP_INDEX_ROWS = int(cfg.dsa_index_rows)
+    sp_gather.MODE = cfg.sp_gather
+    sp_gather.TP_EXPERTS = cfg.sp_gather_tp_experts
+    dsa_satwf.SEL2G = cfg.dsa_sel2g
+    dense_half.SKIP_T = frozenset(cfg.dense_half_skip_rows)
 
 
 def local_k_counts(model) -> list[float] | None:
