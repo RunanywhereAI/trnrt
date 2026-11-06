@@ -99,7 +99,8 @@ larger prefix-cache tier. The presets' speculation arguments:
 | `--spec-synth-al` | unset | the benchmark mode of [AGENTX.md](AGENTX.md#benchmark-mode) |
 
 Like every row of the first table, these are graph shapes: an argument other than a preset's changes the graphs and
-needs its own capture. A speculative engine serves temperature and top-p sampling as the plain engine does (verification
+needs its own capture. The `mtp-*` presets also set `TRNRT_DMA_HW=1` ([Environment variables](#environment-variables)),
+which changes the kernels' DMA form. A speculative engine serves temperature and top-p sampling as the plain engine does (verification
 is the rejection sampler's, so the output distribution is unchanged), and refuses the requests the plain engine refuses.
 
 ## Supported scope
@@ -118,6 +119,7 @@ Set them on the server's container (`docker run -e NAME=value ...`); its engines
 | `TRNRT_TP_SHM` | on | each engine's rank 0 hands every graph call to its other ranks through a shared-memory segment; `0` sends them over gloo (TCP) instead, as happens anyway, with a warning, when /dev/shm is unusable |
 | `TRNRT_TP_SHM_BYTES` | 67108864 (64 MiB) | that segment's size, one segment per engine in /dev/shm; a larger call goes over gloo |
 | `TRNRT_SPEC_SYNTH_AL` | unset | the benchmark mode's mean acceptance length when `--spec-synth-al` is not given ([AGENTX.md](AGENTX.md#benchmark-mode)); needs a speculative preset |
+| `TRNRT_DMA_HW` | unset; `1` under an `mtp-*` preset | `1`: the kernels' static DMA helpers issue their DMAs in hardware DGE, as every build behind the published MTP numbers did. The kernels read it when they are imported (some bind the helper by name, and every kernel folds its source into its key then), so it is an environment variable, not a flag. `trnrt engine`, `trnrt serve` and `trnrt compile capture` set it for an `mtp-*` preset before they import the kernels, and a value already in the environment wins. Any other entry point has to set it itself. It changes the compiled graphs, so capture with the value you serve with |
 | `TRNRT_SKIP_DEVICE_CHECK` | unset | `1`: start without checking that the engine's Neuron devices are free |
 | `TRNRT_SKIP_HOST_MEM_CHECK` | unset | `1`: start without checking the host's free contiguous memory |
 | `TRNRT_LOG_LEVEL` | `INFO` | the level of the server's, engines' and router's log messages, on stderr (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
