@@ -102,6 +102,23 @@ def state_bytes_per_token_rank(cfg: ModelConfig, atp: int, dtype: torch.dtype, k
 # takes one moe_dedupe_v10 call.
 MOE_PREFILL_MIN_TOKENS = 600
 
+# Multi-token prediction (DecoderForCausalLM's MTP passes; the engine sets both on every rank from its EngineConfig
+# before it builds the shard). Both are read at trace time, so a graph is one form or the other and its compile key with
+# it; at their defaults no graph moves.
+# MTP_CHUNK_Q: an MTP pass of one sequence with at least this many rows (an after-prefill window) takes the main
+# prefill's chunk form (prep_extend_chunk: table [P], a context-parallel DSA layer's chunk path) instead of verify_rows'
+# one decode row per position with a copy of the whole table each, which measured 227 ms (P1024) / 313 ms (P4096) for a
+# 1,024-row window against ~3.5 ms for the same rows in the main prefill layer. Set it above the largest k + 1: at
+# B = 1 a verify-sized pass would take it too. 0: off (served: 64).
+MTP_CHUNK_Q = 0
+# DYN_MTP_KV: a plain decode step also writes the MTP layer's KV for its rows, as a speculative step's MTP pass does.
+# An engine that steps its requests with the plain decode graph above a batch size (speculation off there) needs it,
+# or the drafts after a plain stretch attend latents and indexer keys nobody wrote. "1": the write half only
+# (models/mla.py write_kv_only: latent, indexer key, pool keys); "full": the whole MTP layer (its attention's own
+# writes; the reference "1" is pinned against); "0": off. The target's computation is unchanged: the writes come after
+# its sampling and touch only the MTP layer's caches.
+DYN_MTP_KV = "0"
+
 
 # Sequence-parallel residual streams for prefill: between the layers of a prefill chunk every
 # tensor-parallel rank holds only its own 1 / tp of the rows of the [R, hc * H] streams instead of all
@@ -860,6 +877,8 @@ class DecoderForCausalLM(nn.Module):
         h, attn = self.prep_decode(input_ids, positions, block_table, context_lens, board, read_slot)
         h = self._run_layers(h, positions, slot_mapping, attn, state_slot)
         out = self.post_decode(h, temperature, top_p, top_k, min_p, noise, board, write_slot, bitmask, penalties)
+        if DYN_MTP_KV != "0" and getattr(self, "mtp", None) is not None:  # after the target's sampling
+            self._mtp_kv_decode(out, h, positions, slot_mapping, attn)
         return self._draft_out(out, h)
 
     # -- prefill: one sequence x C tokens ---------------------------------------------
@@ -901,6 +920,184 @@ class DecoderForCausalLM(nn.Module):
         out = self.post_prefill(h, last_index, temperature, top_p, top_k, min_p, noise, board, write_slot,
                                 bitmask, penalties, plp_targets)
         return self._draft_out(out, h)
+
+    # -- speculative verify: B sequences x Q positions ----------------------------------
+
+    def prep_extend(self, input_ids, positions, block_table, swa_table=None, swa_first=None):
+        """input_ids / positions [B, Q], block_table [B, P]: the token embedding of the B Q rows (b-major) and the
+        attention inputs, each row seeing its sequence's keys up to its own position (bias [B, 1, 1, Q, L], or the
+        long path's placeholder). swa_table / swa_first: the engine's calling convention (None)."""
+        B, Q = input_ids.shape
+        if self.long_ctx(block_table.shape[1] * self.page_size):  # models/dsa_long.py: no [B, Q, L] visibility
+            return self._embed(input_ids.reshape(B * Q)), self._long_attn(block_table, (B, 1, 1, Q))
+        j = torch.arange(block_table.shape[1] * self.page_size, device=block_table.device).view(1, 1, -1)
+        pos = positions.unsqueeze(-1)
+        attn = self._attn_inputs(j <= pos, block_table, (B, 1, 1, Q))
+        return self._embed(input_ids.reshape(B * Q)), attn
+
+    def prep_verify(self, input_ids, positions, block_table, swa_table=None, swa_first=None, ngram_ids=None):
+        """prep_extend with the model's own input hidden state (the hyper-connection streams), for forward_extend."""
+        h, attn = self.prep_extend(input_ids, positions, block_table, swa_table, swa_first)
+        h = self._hidden_in(input_ids.reshape(-1))
+        return h, attn
+
+    def post_extend(self, h, temperature, top_p, top_k, min_p, noise, u_accept, draft):
+        """Every row's verification of its draft (engine/sampler.py verify_sample): [B Q, VERIFY_COLS]."""
+        from ..engine.sampler import verify_sample
+
+        hn = self._final(h)
+        return verify_sample(self._head(hn), temperature, top_p, top_k, min_p, noise, u_accept, draft)
+
+    def forward_extend(self, input_ids, positions, block_table, slot_mapping,
+                       temperature, top_p, top_k, min_p, noise, u_accept, draft,
+                       swa_table=None, swa_first=None, state_slot=None, ngram_ids=None):
+        """The speculative verify call. input_ids / positions / slot_mapping [B, Q], draft [B Q]; per-row sampling
+        parameters [B Q]; noise [B Q, K]. Every position is scored: returns [B Q, VERIFY_COLS] (and, with the MTP
+        layer, the final hidden states the MTP pass drafts from).
+
+        state_slot [B, 1 + Q]: each sequence's state row to read, then the rows that receive its state after each of
+        the Q positions, so a partly rejected draft continues from the state after its last accepted position
+        (models/linear_attn.py verify_scan)."""
+        h, attn = self.prep_verify(input_ids, positions, block_table, swa_table, swa_first, ngram_ids)
+        h = self._run_layers(h, positions.reshape(-1), slot_mapping.reshape(-1), attn, state_slot)
+        out = self.post_extend(h, temperature, top_p, top_k, min_p, noise, u_accept, draft)
+        return self._draft_out(out, h)
+
+    # -- the MTP layer's draft passes ---------------------------------------------------
+
+    def _mtp_chunk(self, B: int, Q: int, block_table, swa_table) -> bool:
+        """Whether an MTP pass over input_ids [B, Q] takes the prefill form (MTP_CHUNK_Q); static per graph."""
+        return bool(MTP_CHUNK_Q) and B == 1 and Q >= MTP_CHUNK_Q and Q >= 2 and swa_table is None
+
+    def prep_extend_chunk(self, input_ids, positions, block_table):
+        """prep_extend of ONE sequence's rows as forward_prefill's prep_prefill builds them: block_table [1, P] -> [P],
+        the chunk form's bias (the long path's placeholder of rank 4, not the verify batch's of rank 5), the embedding
+        of the rows (_mtp_chunk)."""
+        B, Q = input_ids.shape
+        tab = block_table[0]
+        if self.long_ctx(tab.shape[0] * self.page_size):
+            attn = self._long_attn(tab, (1, 1, Q))
+        else:
+            j = torch.arange(tab.shape[0] * self.page_size, device=tab.device).unsqueeze(0)
+            pos = positions.reshape(-1).unsqueeze(1)
+            attn = self._attn_inputs(j <= pos, tab, (1, 1, Q))
+        return self._embed(input_ids.reshape(Q)), attn
+
+    def forward_mtp(self, input_ids, positions, block_table, slot_mapping, hsrc, hidx, last_index, src_norm,
+                    swa_table=None, swa_first=None):
+        """One MTP pass over B rows x Q positions, in the target's positions (vLLM's EAGLE / MTP convention): row b
+        position j takes input_ids[b, j], the token AFTER that position, and hsrc[hidx[b, j]], the hidden state of the
+        model (or of the previous MTP pass) AT that position; its KV goes to slot_mapping[b, j]. Returns [B, 1] fp32
+        greedy drafts from position last_index[b] and the MTP hidden there [B, H], which seeds the next pass."""
+        return self._mtp_pass(input_ids, positions, block_table, slot_mapping, hsrc, hidx, last_index, src_norm,
+                              swa_table, swa_first, target=True)
+
+    def _mtp_pass(self, input_ids, positions, block_table, slot_mapping, hsrc, hidx, last_index, src_norm,
+                  swa_table=None, swa_first=None, target=False, sp_onehot=None):
+        """forward_mtp. GLM-5.3-Flash's MTP layer (vLLM v0.30.0 deepseek_mtp.py, SGLang v0.5.21 deepseek_nextn.py):
+        x = eh_proj(cat(enorm(embed(token after p)), hnorm(h_p))), y = the plain decoder layer (pooled-DSA MLA, MoE +
+        shared expert) on x, draft = argmax(lm_head(shared_head.norm(y))), with the target's embedding and lm_head
+        (the checkpoint's MTP layer stores neither). h_p is the target's last hidden state after its final norm (target:
+        hsrc holds the target's streams, collapsed and normed by hybrid.final), or a previous pass's y after
+        shared_head.norm (src_norm). The layer's latent and indexer key are one more KV layer in the shared page pool
+        (kv_layers), written for every position the pass computes, which is how the later passes and the next step see
+        them. Its later passes run their own indexer: index_share_for_mtp_iteration is not implemented, so drafts can
+        differ from vLLM's there (never the tokens: verification keeps the target's). sp_onehot: hsrc holds only this
+        rank's rows of a sequence-parallel prefill chunk, and hidx indexes the chunk's rows in full."""
+        cfg = self.cfg
+        B, Q = input_ids.shape
+        if self._mtp_chunk(B, Q, block_table, swa_table):  # the after-prefill rows in the main prefill's form
+            e, attn = self.prep_extend_chunk(input_ids, positions, block_table)
+        else:
+            e, attn = self.prep_extend(input_ids, positions, block_table, swa_table, swa_first)
+        # hsrc holds UNNORMALISED hidden states (the target's last layer output, or the previous MTP pass's) and
+        # src_norm is their final norm: returning normed states from the post graphs made neuronx-cc 2.27 fail with
+        # NCC_IBIR243 on the tp=32 verify graph.
+        if sp_onehot is not None:  # every rank's rows of the chunk's final hidden state, as post_prefill gathers them
+            h_prev = self._sp_gather(self._final(hsrc), sp_onehot).index_select(0, hidx.reshape(-1))
+        else:
+            h_prev = hsrc.index_select(0, hidx.reshape(-1))
+            if target:  # the target's streams, collapsed and normed (models/hybrid.py final)
+                h_prev = self._final(h_prev)
+            else:
+                h_prev = rms_norm(h_prev, src_norm, cfg.rms_norm_eps)
+        x = F.linear(torch.cat([rms_norm(e, self.mtp_enorm, cfg.rms_norm_eps),
+                                rms_norm(h_prev, self.mtp_hnorm, cfg.rms_norm_eps)], dim=-1), self.mtp_eh)
+        bias, table = attn[None]
+        rows = torch.arange(B, device=input_ids.device) * Q + last_index
+        x = self._layer(self.mtp, x, positions.reshape(-1), slot_mapping.reshape(-1), table, bias)
+        xl = x.index_select(0, rows)
+        hm = rms_norm(xl, self.mtp_norm, cfg.rms_norm_eps)
+        _, top = topk_large(self._head(hm), 1)
+        return top[:, :1].float(), xl
+
+    def forward_mtp_k(self, input_ids, positions, block_table, slot_mapping, hsrc, hidx, last_index, src_norm,
+                      pos_rest=None, slot_rest=None, swa_table=None, swa_first=None, swa_rest=None,
+                      swa_first_rest=None, sp_onehot=None):
+        """forward_mtp, then k - 1 more single-position passes in the SAME graph, each fed the previous pass's draft
+        and MTP hidden. pos_rest / slot_rest [B, k - 1] are the later passes' positions and KV slots, known on the host
+        in advance (swa_rest / swa_first_rest: the engine's calling convention, None). One graph instead of k matters
+        on multi-chip TP, where every graph execution holding a cross-chip collective costs about 5 ms at tp=32.
+        Returns [B, k] fp32 drafts and the last pass's MTP hidden. sp_onehot: as _mtp_pass's."""
+        draft, xl = self._mtp_pass(input_ids, positions, block_table, slot_mapping, hsrc, hidx, last_index, src_norm,
+                                   swa_table, swa_first, target=True, sp_onehot=sp_onehot)
+        if pos_rest is None:
+            return draft, xl
+        B = draft.shape[0]
+        rows = torch.arange(B, device=draft.device).view(B, 1)
+        zero = torch.zeros(B, dtype=last_index.dtype, device=draft.device)
+        drafts = [draft]
+        for s in range(pos_rest.shape[1]):
+            draft, xl = self._mtp_pass(draft.long(), pos_rest[:, s : s + 1], block_table, slot_rest[:, s : s + 1],
+                                       xl, rows, zero, self.mtp_norm)
+            drafts.append(draft)
+        return torch.cat(drafts, dim=1), xl
+
+    def mtp_kv_takes(self, Q: int, P: int) -> bool:
+        """Whether an after-prefill window of Q rows over a table of P pages can be KV-only (forward_mtp_kv): exactly
+        the windows that take _mtp_chunk's prefill form at B = 1. Static per graph (the runner asks it when it builds a
+        window's key)."""
+        return bool(MTP_CHUNK_Q) and Q >= MTP_CHUNK_Q and Q >= 2 and self.mtp is not None and self.mtp.plain
+
+    def forward_mtp_kv(self, input_ids, positions, block_table, slot_mapping, hsrc, hidx, src_norm, sp_onehot=None):
+        """A KV-ONLY after-prefill MTP window: the MTP layer's KV of the window's rows and nothing else. input_ids
+        [1, Q] (the tokens AFTER the rows' positions: prompt tokens, no sampled one), positions / slot_mapping [1, Q],
+        block_table [1, P], hsrc the prefill call's hidden stash with hidx [Q] its rows. x is _mtp_pass's, statement for
+        statement up to the layer; the layer's attention input is rms_norm(x, in_norm) as _layer builds it, and
+        models/mla.py write_kv_only stores what the layer's attention would have stored from it (latent, indexer key,
+        pool keys). No attention, MoE, head or later draft pass: the KV of a position depends on its own input alone,
+        so a window's KV equals the full pass's. Returns a [1, 1] slice of the normed input (a graph needs an output;
+        the writes are in place on the cache)."""
+        cfg = self.cfg
+        B, Q = input_ids.shape
+        tab = block_table[0]  # prep_extend_chunk's: one sequence's table [P], the prefill form
+        e = self._embed(input_ids.reshape(Q))
+        if sp_onehot is not None:  # every rank's rows of the chunk's final hidden state, as post_prefill gathers them
+            h_prev = self._sp_gather(self._final(hsrc), sp_onehot).index_select(0, hidx.reshape(-1))
+        else:
+            h_prev = self._final(hsrc.index_select(0, hidx.reshape(-1)))  # the target's streams, collapsed and normed
+        x = F.linear(torch.cat([rms_norm(e, self.mtp_enorm, cfg.rms_norm_eps),
+                                rms_norm(h_prev, self.mtp_hnorm, cfg.rms_norm_eps)], dim=-1), self.mtp_eh)
+        xa = rms_norm(x, self.mtp.in_norm, cfg.rms_norm_eps)
+        _mla.write_kv_only(self, self.mtp, xa, positions.reshape(-1), slot_mapping.reshape(-1), tab)
+        return xa[:1, :1].float()
+
+    def _mtp_kv_decode(self, out, h, positions, slot_mapping, attn) -> None:
+        """The MTP layer's cache writes for a plain decode batch's rows (DYN_MTP_KV): _mtp_pass's first-pass input for
+        the target's position p (token p + 1 = the row's sampled token, out[:, 0]; hidden = the target's final(h_p)),
+        then the layer's write half only ("1") or the whole layer ("full", its output unused)."""
+        eps = self.cfg.rms_norm_eps
+        e = self._embed(out[:, 0].long())
+        hp = self._final(h)
+        x = F.linear(torch.cat([rms_norm(e, self.mtp_enorm, eps), rms_norm(hp, self.mtp_hnorm, eps)], dim=-1),
+                     self.mtp_eh)
+        bias, table = attn[None]
+        p, sl = positions.reshape(-1), slot_mapping.reshape(-1)
+        if DYN_MTP_KV == "full":
+            self._layer(self.mtp, x, p, sl, table, bias)
+            return
+        xn = rms_norm(x, self.mtp.in_norm, eps)
+        _mla.write_kv_only(self, self.mtp, xn, p, sl, table)
 
     def _draft_out(self, out, h):
         """A target graph's output, plus its last hidden state h when the model drafts with the MTP layer (the runner
