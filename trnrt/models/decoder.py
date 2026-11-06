@@ -70,10 +70,11 @@ def heads_fit(spec, atp: int) -> bool:
     return spec.num_heads % atp == 0
 
 
-def attention_tp(cfg: ModelConfig, tp: int, requested: int | None = None) -> int:
+def attention_tp(cfg: ModelConfig, tp: int, requested: int | None = None, mtp: bool = False) -> int:
     """The tensor-parallel degree of the token mixers: `requested` when given (it must divide tp and fit
-    every mixer's heads), else the largest divisor of tp that every mixer of the model can split."""
-    specs = list(layer_specs(cfg))
+    every mixer's heads), else the largest divisor of tp that every mixer of the model (and the MTP layer's, with
+    mtp) can split."""
+    specs = list(layer_specs(cfg)) + ([cfg.mtp_spec] if mtp and cfg.mtp_spec is not None else [])
     if requested is not None:
         bad = [s for s in specs if not heads_fit(s, requested)]
         if requested < 1 or tp % requested or bad:
@@ -132,7 +133,8 @@ def moe_prefill_down(layer):
 class DecoderLayer(nn.Module):
     def __init__(self, cfg: ModelConfig, spec: AttnSpec | LinearSpec, dtype: torch.dtype, tp: int, tp_rank: int,
                  moe: bool, index: int = 0, keep_fp8: bool = False, prefix: str | None = None,
-                 moe_kernel: str = "xla", attn_tp: int | None = None, attn_rank: int | None = None):
+                 moe_kernel: str = "xla", attn_tp: int | None = None, attn_rank: int | None = None,
+                 plain: bool = False):
         """tp / tp_rank shard the MLP (dense or experts); attn_tp / attn_rank (default: the same) shard the
         token mixer's heads. keep_fp8: weights the checkpoint quantizes stay FP8 (with fp32 block scales, see
         models/quant.py) and are dequantized inside the graph right before their matmul. moe_kernel "nki":
@@ -221,7 +223,11 @@ class DecoderLayer(nn.Module):
             dense_half.register(self, cfg, I)  # the dense FFN half's blob, decode-only
         self.k_cache: torch.Tensor | None = None  # [num_pages * page_size, nkv, Dk]
         self.v_cache: torch.Tensor | None = None  # [num_pages * page_size, nkv, Dv]
-        _hybrid.init_layer(self, cfg, spec, index, tp, p)  # the hyper-connection streams' parameters
+        # A plain layer (GLM-5.3-Flash's MTP layer) has none of the hyper-connection streams' parameters and runs as an
+        # ordinary residual block (DecoderForCausalLM._layer).
+        self.plain = plain
+        if not plain:
+            _hybrid.init_layer(self, cfg, spec, index, tp, p)  # the hyper-connection streams' parameters
 
     def pack_experts(self) -> None:
         """Replace w_gu, w_gu_scale, w_down, w_down_scale (filled, on the host) by w_blob, the layout of
@@ -268,9 +274,10 @@ class DecoderForCausalLM(nn.Module):
 
     def __init__(self, cfg: ModelConfig, dtype: torch.dtype, max_positions: int,
                  tp_rank: int = 0, tp_size: int = 1, tp_group=None, keep_fp8: bool = False,
-                 vocab_parallel: bool = False, moe_kernel: str = "xla", attn_tp: int | None = None, attn_group=None):
+                 vocab_parallel: bool = False, moe_kernel: str = "xla", attn_tp: int | None = None, attn_group=None,
+                 mtp: bool = False):
         """attn_tp: the attention TP (None: attention_tp's default), which must equal tp_size; attn_group
-        is then the tensor-parallel group."""
+        is then the tensor-parallel group. mtp: build the multi-token-prediction layer (speculative decoding)."""
         super().__init__()
         self.keep_fp8 = keep_fp8
         if cfg.intermediate_size % tp_size:
@@ -278,7 +285,7 @@ class DecoderForCausalLM(nn.Module):
         self.cfg = cfg
         self.dtype = dtype
         self.tp_rank, self.tp_size, self.tp_group = tp_rank, tp_size, tp_group
-        self.attn_tp = attention_tp(cfg, tp_size, attn_tp)
+        self.attn_tp = attention_tp(cfg, tp_size, attn_tp, mtp=mtp)
         if self.attn_tp != tp_size:
             raise NotImplementedError(f"attention TP {self.attn_tp} below tp={tp_size}")
         self.attn_rank = tp_rank
@@ -306,6 +313,21 @@ class DecoderForCausalLM(nn.Module):
             None if cfg.tie_word_embeddings
             else nn.Parameter(torch.empty(self.vocab_rows, cfg.hidden_size, dtype=dtype), requires_grad=False)
         )
+        # Multi-token prediction (models/mtp.py): one MTP layer, applied recursively for k drafts:
+        # x = eh_proj(cat(enorm(embed(next token)), hnorm(previous hidden))), the layer (MLA, DSA, MoE; no
+        # hyper-connections), its final norm and the shared lm_head. It owns one more KV cache (kv_layers()). Built only
+        # with mtp, so a model served without speculation keeps every graph.
+        self.mtp = None
+        if mtp:
+            if not cfg.mtp_layers:
+                raise ValueError("the checkpoint has no MTP layers (num_nextn_predict_layers)")
+            H = cfg.hidden_size
+            self.mtp = DecoderLayer(cfg, cfg.mtp_spec, dtype, tp_size, tp_rank, moe=cfg.mtp_moe, keep_fp8=keep_fp8,
+                                    prefix=cfg.mtp_prefix, moe_kernel=moe_kernel, attn_tp=self.attn_tp,
+                                    attn_rank=self.attn_rank, plain=cfg.hybrid is not None)
+            self.mtp_enorm, self.mtp_hnorm, self.mtp_norm = (
+                nn.Parameter(torch.empty(H, dtype=dtype), requires_grad=False) for _ in range(3))
+            self.mtp_eh = nn.Parameter(torch.empty(H, 2 * H, dtype=dtype), requires_grad=False)
         self.window = None  # no sliding-window layers
         self.page_size = 0
         self.fp8_max = None
@@ -367,8 +389,10 @@ class DecoderForCausalLM(nn.Module):
                 self.register_buffer("cp_row_onehot", g3.to(device), persistent=False)
 
     def kv_layers(self) -> list:
-        """Every layer with a KV cache. Linear-attention layers hold a recurrent state instead (state_layers)."""
-        return [l for l in self.layers if not isinstance(l.spec, LinearSpec)]
+        """Every layer with a KV cache, the MTP layer last. Linear-attention layers hold a recurrent state instead
+        (state_layers)."""
+        layers = [l for l in self.layers if not isinstance(l.spec, LinearSpec)]
+        return layers + ([self.mtp] if getattr(self, "mtp", None) is not None else [])
 
     def state_layers(self) -> list:
         """Layers whose per-sequence state is a fixed-size recurrent state (linear attention)."""
@@ -695,8 +719,17 @@ class DecoderForCausalLM(nn.Module):
 
     def _layer(self, layer, h, positions, slot_mapping, table, bias, state_slot=None, **mixin):
         """state_slot: each sequence's row in the recurrent-state pool, read by linear-attention layers
-        (models/linear_attn.py); attention layers ignore it. mixin: hybrid.layer's pend / defer (_run_layers)."""
-        return _hybrid.layer(self, layer, h, positions, slot_mapping, table, bias, state_slot, **mixin)
+        (models/linear_attn.py); attention layers ignore it. mixin: hybrid.layer's pend / defer (_run_layers). A plain
+        layer (the MTP layer: no hyper-connections) runs as an ordinary residual block: its MLA attention, then its MLP
+        as the hybrid's (the clamped SwiGLU MoE)."""
+        if not getattr(layer, "plain", False):
+            return _hybrid.layer(self, layer, h, positions, slot_mapping, table, bias, state_slot, **mixin)
+        if mixin:
+            raise ValueError(f"hybrid.layer's {sorted(mixin)} reached a layer with no hyper-connections")
+        eps = self.cfg.rms_norm_eps
+        x = rms_norm(h, layer.in_norm, eps)
+        h = h + self._attn_all_reduce(_mla.attention(self, layer, x, positions, slot_mapping, table, bias))
+        return h + _hybrid._mlp(self, layer, rms_norm(h, layer.post_norm, eps))
 
     def long_ctx(self, L: int) -> bool:
         """Whether a bucket of L keys runs every attention layer's long-context path (models/dsa_long.py; static
@@ -826,7 +859,8 @@ class DecoderForCausalLM(nn.Module):
         sliding-window layers, no n-gram embedding): None."""
         h, attn = self.prep_decode(input_ids, positions, block_table, context_lens, board, read_slot)
         h = self._run_layers(h, positions, slot_mapping, attn, state_slot)
-        return self.post_decode(h, temperature, top_p, top_k, min_p, noise, board, write_slot, bitmask, penalties)
+        out = self.post_decode(h, temperature, top_p, top_k, min_p, noise, board, write_slot, bitmask, penalties)
+        return self._draft_out(out, h)
 
     # -- prefill: one sequence x C tokens ---------------------------------------------
 
@@ -864,8 +898,14 @@ class DecoderForCausalLM(nn.Module):
         piecewise prefill (prep_prefill, group_fn, post_prefill)."""
         h, attn = self.prep_prefill(input_ids, positions, block_table)
         h = self._run_layers(h, positions, slot_mapping, attn, state_slot)
-        return self.post_prefill(h, last_index, temperature, top_p, top_k, min_p, noise, board, write_slot,
-                                 bitmask, penalties, plp_targets)
+        out = self.post_prefill(h, last_index, temperature, top_p, top_k, min_p, noise, board, write_slot,
+                                bitmask, penalties, plp_targets)
+        return self._draft_out(out, h)
+
+    def _draft_out(self, out, h):
+        """A target graph's output, plus its last hidden state h when the model drafts with the MTP layer (the runner
+        keeps it on the device for the MTP pass); out alone otherwise, so a model without speculation keeps its graphs."""
+        return (out, h) if getattr(self, "mtp", None) is not None else out
 
     # -- reference: logits for a whole sequence, no cache (tests only) -----------------
 
