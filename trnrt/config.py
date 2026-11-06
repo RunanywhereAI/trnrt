@@ -106,6 +106,44 @@ class EngineConfig:
     dsa_layer_max_rows: int = 8
     ffn_half_below: int = 16
     dsa_index_rows: int = 0
+    # - dense_half_skip_rows (kernels/dense_half.py SKIP_T): the decode row counts a dense MLP layer runs as the XLA graph
+    #   instead of the dense half's kernel.
+    dense_half_skip_rows: tuple[int, ...] = (2,)
+    # Speculative decoding (engine/spec_async.py): the model's own MTP layer drafts spec_k tokens a step, the target
+    # verifies them in the next step's call, and the accepted count, the newest token, the positions and the drafts stay
+    # on the device, so a step is scheduled before the previous one is read back. None: plain decoding.
+    spec_method: str | None = None
+    spec_k: int = 2  # drafts per step: a verify call is 1 + spec_k rows a sequence
+    # Benchmark mode (engine/spec_synth.py): the accepted draft count of every verify is drawn from a schedule whose mean
+    # acceptance length (1 + the accepted drafts a step) is this value, in [1, spec_k + 1], instead of the draft head's
+    # own. Verification stays real; accepted positions still take their drafts. For comparing serving throughput at a
+    # published acceptance length, not for quality. The command line reads TRNRT_SPEC_SYNTH_AL when --spec-synth-al is absent.
+    spec_synth_al: float | None = None
+    # Dynamic speculation (vLLM's speculative_disable_by_batch_size, with hysteresis): while at most this many requests
+    # decode they speculate, above it every decode step is the plain graph (0: always speculate). Once plain, speculation
+    # returns when at most spec_max_batch - spec_hysteresis requests decode. A flip drains the step in flight.
+    spec_max_batch: int = 0
+    spec_hysteresis: int = 1
+    # With dynamic speculation, the decode buckets each step family is warmed and picked at: the verify family (verify,
+    # the speculative board graphs, the draft pass) only at buckets of at most spec_bucket_max, the plain decode only at
+    # buckets of at least plain_bucket_min (a smaller batch is padded up). 0: every bucket.
+    spec_bucket_max: int = 0
+    plain_bucket_min: int = 0
+    # The page buckets of every graph the MTP layer or a verify runs in (None: page_buckets). Its largest is theirs.
+    spec_page_buckets: tuple[int, ...] | None = None
+    # The MTP pass over a prefill chunk fills the draft layer's KV: in calls of at most this many rows (None: one call
+    # of the chunk's bucket), taking the main layers' prefill form from mtp_chunk_q rows on (0: never), and, with
+    # mtp_kv_only, a window that holds no row of the last position writes only the draft layer's KV.
+    mtp_fill_rows: int | None = None
+    mtp_chunk_q: int = 0
+    mtp_kv_only: bool = False
+    # A plain decode step (dynamic speculation) writes the draft layer's KV for its rows, as a speculative step's draft
+    # pass does, so a request that returns to speculation finds no holes in it.
+    dyn_mtp_kv: bool = False
+    # The recurrent-state pool sized apart from max_num_seqs: state_seats seats (None: max_num_seqs), of which
+    # state_spec_seats hold 1 + spec_k rows each (the ones that speculate) and the rest one row (None: all of them).
+    state_seats: int | None = None
+    state_spec_seats: int | None = None
 
     def __post_init__(self):
         if self.max_running is not None and self.max_running < 1:
@@ -115,6 +153,50 @@ class EngineConfig:
                 raise ValueError(f"{name}={getattr(self, name)}: at least 1")
         if self.dsa_index_rows < 0:
             raise ValueError(f"dsa_index_rows={self.dsa_index_rows}: 0 (one call) or more")
+        if self.spec_method not in (None, "mtp"):
+            raise ValueError(f"spec_method={self.spec_method!r}: only 'mtp' (or None) is served")
+        if self.spec_method is None:
+            if self.spec_synth_al is not None:
+                raise ValueError("spec_synth_al (--spec-synth-al, or TRNRT_SPEC_SYNTH_AL) needs spec_method 'mtp'")
+            for name in ("spec_page_buckets", "mtp_fill_rows", "state_spec_seats"):
+                if getattr(self, name) is not None:
+                    raise ValueError(f"{name} needs spec_method 'mtp'")
+            for name in ("spec_max_batch", "spec_bucket_max", "plain_bucket_min", "mtp_chunk_q", "mtp_kv_only",
+                         "dyn_mtp_kv"):
+                if getattr(self, name):
+                    raise ValueError(f"{name} needs spec_method 'mtp'")
+        else:
+            if self.spec_k < 1:
+                raise ValueError(f"spec_k={self.spec_k}: at least 1")
+            if self.page_size & (self.page_size - 1):
+                raise ValueError(f"speculative decoding needs a power-of-two page size, not {self.page_size}")
+            if self.spec_synth_al is not None and not 1.0 <= self.spec_synth_al <= self.spec_k + 1:
+                raise ValueError(f"spec_synth_al={self.spec_synth_al}: in [1, spec_k + 1] = [1, {self.spec_k + 1}]")
+            if self.spec_max_batch < 0 or self.spec_hysteresis < 0:
+                raise ValueError("spec_max_batch and spec_hysteresis: 0 or more")
+            if (self.spec_bucket_max or self.plain_bucket_min) and not self.spec_max_batch:
+                raise ValueError("spec_bucket_max and plain_bucket_min need spec_max_batch (dynamic speculation)")
+            if self.state_spec_seats is not None and not self.spec_max_batch:
+                raise ValueError("state_spec_seats needs spec_max_batch (dynamic speculation)")
+            if self.dyn_mtp_kv and not self.spec_max_batch:
+                raise ValueError("dyn_mtp_kv needs spec_max_batch (dynamic speculation)")
+            if self.mtp_kv_only and not self.mtp_chunk_q:
+                raise ValueError("mtp_kv_only needs mtp_chunk_q (the chunk form of the draft layer's windows)")
+            if self.mtp_fill_rows is not None and self.mtp_fill_rows < 1:
+                raise ValueError(f"mtp_fill_rows={self.mtp_fill_rows}: a positive row count, or None")
+        if self.state_seats is not None:
+            cap = self.max_running or self.max_num_seqs
+            if self.state_seats < cap:
+                raise ValueError(
+                    f"state_seats={self.state_seats} is below the running cap {cap} (max_running, else max_num_seqs): "
+                    f"a running request must hold its state rows")
+            if self.state_seats > self.max_num_seqs:
+                raise ValueError(f"state_seats={self.state_seats} above max_num_seqs={self.max_num_seqs}")
+        if self.state_spec_seats is not None and not self.spec_max_batch <= self.state_spec_seats <= (
+                self.state_seats or self.max_num_seqs):
+            raise ValueError(
+                f"state_spec_seats={self.state_spec_seats} must cover spec_max_batch {self.spec_max_batch} and fit the "
+                f"{self.state_seats or self.max_num_seqs} seats")
 
     def resolved_moe_kernel(self) -> str:
         return self.moe_kernel or ("nki" if self.device in ("neuron", "meta") else "xla")
