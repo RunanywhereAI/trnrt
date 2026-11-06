@@ -27,6 +27,7 @@ for credit, not because their licenses require it.
 | KDA chunked prefill (the per-chunk quantities of the delta-rule recurrence) | flash-linear-attention, `fla/ops/kda/chunk_fwd.py` (`chunk_kda_fwd`), https://github.com/fla-org/flash-linear-attention | MIT |
 | Radix prefix cache | SGLang's RadixAttention, https://github.com/sgl-project/sglang | Apache-2.0 |
 | Synthetic acceptance (`trnrt/engine/spec_synth.py`): the minimum-variance schedule of accepted draft counts and the conditional-rate rejection walk | vLLM's synthetic rejection sampler, pull request 40662, https://github.com/vllm-project/vllm | Apache-2.0 |
+| One state slot per speculative position of a linear-attention layer, the next step reading the slot of the last accepted token (`trnrt/engine/state_pool.py`) | vLLM v0.30.0, `vllm/v1/attention/backends/gdn_attn.py`, https://github.com/vllm-project/vllm | Apache-2.0 |
 | GLM tool-call and reasoning parsing behaviour (cross-checked against vLLM's, above) | SGLang v0.5.21 (commit e00930c5489053f26d86b179cee0d087f846acbb): `python/sglang/srt/function_call/glm4_moe_detector.py`, `python/sglang/srt/parser/reasoning_parser.py` | Apache-2.0 |
 
 ## Models and services this code works with
