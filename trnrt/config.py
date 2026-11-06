@@ -127,9 +127,10 @@ class EngineConfig:
     # own. Verification stays real; accepted positions still take their drafts. For comparing serving throughput at a
     # published acceptance length, not for quality. The command line reads TRNRT_SPEC_SYNTH_AL when --spec-synth-al is absent.
     spec_synth_al: float | None = None
-    # Dynamic speculation (vLLM's speculative_disable_by_batch_size, with hysteresis): while at most this many requests
-    # decode they speculate, above it every decode step is the plain graph (0: always speculate). Once plain, speculation
-    # returns when at most spec_max_batch - spec_hysteresis requests decode. A flip drains the step in flight.
+    # Dynamic speculation (the idea of vLLM's num_speculative_tokens_per_batch_size: no drafts above a batch size, here with
+    # hysteresis): while at most this many requests decode they speculate, above it every decode step is the plain graph
+    # (0: always speculate). Once plain, speculation returns when at most spec_max_batch - spec_hysteresis requests decode.
+    # A flip drains the step in flight.
     spec_max_batch: int = 0
     spec_hysteresis: int = 1
     # With dynamic speculation, the decode buckets each step family is warmed and picked at: the verify family (verify,
