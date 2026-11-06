@@ -111,13 +111,17 @@ Context for every number in the table:
 - **Acceptance:** synthetic, at InferenceX's golden acceptance length for 2 draft tokens, 2.519 tokens a step: InferenceX's
   method for speculative decoding, reproduced by the benchmark mode ([AGENTX.md](AGENTX.md#benchmark-mode)). Drafting and
   verification run for real; which positions count as accepted is drawn. The text of such a run is not the model's.
-- **Correctness:** GSM8K with MTP on real acceptance (strict exact match, 5-shot, 1,319 problems) passed on three of the
-  builds: 97.65% on the decode-batch-8 build behind concurrency 1, 4 and 8, 97.42% on the always-on build behind
-  concurrency 2, and 97.35% on the decode-batch-24 build; the bar is 94% and H100 MTP's result is 97.42%. The
-  decode-batch-12 build's own result is not in my sources [unverified]. GSM8K runs 32 requests at once, so a build that
-  turns MTP off above 4 decoding users decodes most of its GSM8K steps without it (MTP was on in 0.2% to 4% of the
-  steps): that check covers the draft path less than the table's low-concurrency points exercise it. The always-on build
-  ran MTP on 16,410 of its 16,412 decode steps. The host-tier restore was checked with a needle test.
+- **Correctness:** GSM8K with MTP on real acceptance (strict exact match, 5-shot, 1,319 problems; the bar is 94%, and H100
+  MTP's result is 97.42%) passed on the builds behind the table:
+  - the decode-batch-8 build (concurrency 1, 4 and 8) scored 97.42% with the client at concurrency 4 and MTP on every
+    decode step (29,553 verify steps, none plain; 0.819 of the draft tokens accepted, a mean acceptance length of about
+    2.64 at 2 draft tokens), and 97.65% with 32 requests at once, where it speculates on only 1,260 of 33,840 steps;
+  - the always-on build (concurrency 2) scored 97.42%, with MTP on 16,410 of its 16,412 decode steps;
+  - the decode-batch-24 build (concurrency 24 and 32) scored 97.35%; the decode-batch-12 build's own result is not in my
+    sources [unverified].
+
+  A build that turns MTP off above 4 decoding users decodes most of a 32-wide GSM8K run without it (MTP on in 0.2% to 4%
+  of the steps), so those runs say little about the draft path. The host-tier restore was checked with a needle test.
 
 ## Long prompts
 
