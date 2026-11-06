@@ -100,7 +100,8 @@ the earlier tables.
 Context for every number in the table:
 
 - **Instance and unit:** trn2.48xlarge, one engine of 8 chips (tensor parallel 32 at logical NeuronCore 2). The price is
-  SemiAnalysis's rate for trn2, $0.58 per chip-hour, so one engine is $4.64 an hour; it is not what AWS charges.
+  SemiAnalysis's rate for trn2, $0.58 per chip-hour, so one engine is $4.64 an hour; it puts these runs on the same footing
+  as InferenceX's GPU runs, which use their own rates.
 - **Software:** Neuron SDK 2.32, neuronx-cc 2.27.5334.0, libtorch-neuronx-lite 2.11.0.1.0.1284+f49d8626, read from the
   serving host's installed packages.
 - **Configuration:** the preset in the table ([CONFIGURATION.md](CONFIGURATION.md#speculative-decoding-the-mtp--presets));
@@ -117,8 +118,9 @@ Context for every number in the table:
     decode step (29,553 verify steps, none plain; 0.819 of the draft tokens accepted, a mean acceptance length of about
     2.64 at 2 draft tokens), and 97.65% with 32 requests at once, where it speculates on only 1,260 of 33,840 steps;
   - the always-on build (concurrency 2) scored 97.42%, with MTP on 16,410 of its 16,412 decode steps;
-  - the decode-batch-24 build (concurrency 24 and 32) scored 97.35%; the decode-batch-12 build's own result is not in my
-    sources [unverified].
+  - the decode-batch-12 build (concurrency 12 and 16) scored 97.65% with 32 requests at once, where it speculates on only
+    62 of 21,603 steps (0.29%);
+  - the decode-batch-24 build (concurrency 24 and 32) scored 97.35%.
 
   A build that turns MTP off above 4 decoding users decodes most of a 32-wide GSM8K run without it (MTP on in 0.2% to 4%
   of the steps), so those runs say little about the draft path. The host-tier restore was checked with a needle test.
