@@ -93,6 +93,9 @@ PRESETS: dict[str, dict] = {
 }
 
 _MTP = {
+    "sp_gather": "nki",
+    "sp_gather_tp_experts": True,
+    "dsa_sel2g": True,
     "spec_method": "mtp",
     "spec_k": 2,
     "max_num_seqs": 16,
@@ -321,6 +324,24 @@ def add_engine_args(ap: argparse.ArgumentParser) -> None:
         help="the context-parallel DSA indexer's decode scores in kernel calls of at most this many rows (0: one call)",
     )
     k.add_argument(
+        "--sp-gather",
+        default="xla",
+        choices=["xla", "nki"],
+        help="the sequence-parallel stream's all-gather of a decode block's output: the XLA collective or the NKI kernel",
+    )
+    k.add_argument(
+        "--sp-gather-tp-experts",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="the NKI all-gather over the tensor-parallel group the experts run in",
+    )
+    k.add_argument(
+        "--dsa-sel2g",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="the DSA layer's two-stage selection in one kernel (needed by a page ladder with a 3072-page rung)",
+    )
+    k.add_argument(
         "--dense-half-skip-rows",
         type=_ints,
         default=(2,),
@@ -383,6 +404,9 @@ def engine_config(argv: list[str], core_base: int = 0):
         ffn_half_below=a.ffn_half_below,
         dsa_index_rows=a.dsa_index_rows,
         dense_half_skip_rows=tuple(a.dense_half_skip_rows),
+        sp_gather=a.sp_gather,
+        sp_gather_tp_experts=a.sp_gather_tp_experts,
+        dsa_sel2g=a.dsa_sel2g,
         spec_method=a.spec_method,
         spec_k=a.spec_k,
         spec_synth_al=a.spec_synth_al if a.spec_synth_al is not None else _env_synth_al(),
