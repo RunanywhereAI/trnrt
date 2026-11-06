@@ -35,10 +35,16 @@ SPEC_FIELDS = (
     "state_seats",
     "state_spec_seats",
     "dense_half_skip_rows",
+    "sp_gather",
+    "sp_gather_tp_experts",
+    "dsa_sel2g",
 )
 
 # What the shipped configurations set, by preset: engine shapes, then speculation.
 MTP = {
+    "sp_gather": "nki",
+    "sp_gather_tp_experts": True,
+    "dsa_sel2g": True,
     "spec_method": "mtp",
     "spec_k": 2,
     "mtp_chunk_q": 64,
@@ -140,6 +146,7 @@ def test_speculation_is_off_by_default_and_in_the_batch_presets():
         c = _cfg(*argv)
         assert c.spec_method is None and not c.spec_max_batch and not c.mtp_kv_only and not c.dyn_mtp_kv
         assert c.spec_synth_al is None and c.state_seats is None and c.dense_half_skip_rows == (2,)
+        assert (c.sp_gather, c.sp_gather_tp_experts, c.dsa_sel2g) == ("xla", False, False)
 
 
 def test_an_explicit_argument_wins_over_a_preset():
@@ -192,3 +199,11 @@ def test_the_valid_neighbours_of_the_refused_combinations_build():
     )
     for argv in ok:
         _cfg(*argv)
+
+
+def test_the_sequence_parallel_gather_is_xla_or_nki():
+    from trnrt.config import EngineConfig
+
+    assert EngineConfig(model_path="m", sp_gather="nki").sp_gather == "nki"
+    with pytest.raises(ValueError, match="'xla' or 'nki'"):
+        EngineConfig(model_path="m", sp_gather="rdma")
