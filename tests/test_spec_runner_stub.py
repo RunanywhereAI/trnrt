@@ -233,7 +233,7 @@ def expected(c):
     return out
 
 
-PRESETS = ["mtp-batch2", "mtp-batch8", "mtp-batch12", "mtp-batch24"]
+PRESETS = ["mtp-always", "mtp-batch8", "mtp-batch12", "mtp-batch24"]
 
 
 @pytest.mark.parametrize("preset", PRESETS)
@@ -263,13 +263,13 @@ def test_mtp_batch8_builds_the_families_it_names(monkeypatch):
     assert {k for k in keys if k[0] == "spec_post"} == {("spec_post", B, 3) for B in (1, 2, 4)}
 
 
-def test_mtp_batch2_is_static_speculation_with_no_plain_decode_graph(monkeypatch):
-    runner, _, _ = build("mtp-batch2", monkeypatch)
+def test_mtp_always_is_static_speculation_with_no_plain_decode_graph(monkeypatch):
+    runner, _, _ = build("mtp-always", monkeypatch)
     runner.warmup()
     keys = keys_of(runner)
     assert not [k for k in keys if k[0] == "decode"], "a static speculative engine never launches a plain decode"
     assert {k[1:] for k in keys if k[0] == "verify"} == {(B, 3, P) for B in (1, 2, 4, 6, 8) for P in (1024, 4096)}
-    assert not [k for k in keys if k[0] == "mtp_kv"], "mtp-batch2 has no KV-only windows"
+    assert not [k for k in keys if k[0] == "mtp_kv"], "mtp-always has no KV-only windows"
 
 
 def test_mtp_batch24_has_two_disjoint_families(monkeypatch):

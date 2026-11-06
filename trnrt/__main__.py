@@ -66,8 +66,8 @@ def _at_least(lo: int):
 # - mtp-batch8: decode batches of up to 8 requests per engine. The decode buckets 1, 2, 4, 6 and 8, 8 seats running,
 #   speculation while at most 4 requests decode and the plain decode step above, page buckets 1024, 3072 and 4096
 #   (the speculative graphs' own: 1024 and 4096).
-# - mtp-batch2: batches of up to 8 with speculation at every batch size (no plain decode step): the configuration
-#   of the lowest concurrency points, page buckets 1024 and 4096.
+# - mtp-always: decode batches of up to 8 with speculation at every batch size (no plain decode step), page buckets 1024
+#   and 4096: the configuration measured at concurrency 2.
 # - mtp-batch12: up to 12 requests: speculation while at most 4 decode (4 of the 12 state seats hold the rows a
 #   verify writes), the plain step above; decode buckets 1, 2, 4, 8 and 12.
 # - mtp-batch24: up to 24 requests, 32 seats: decode buckets 1, 2, 4, 16 and 24, speculation up to 4 requests.
@@ -125,7 +125,7 @@ PRESETS["mtp-batch8"] = {
     "state_seats": 8,
     "state_checkpoints": 8,
 }
-PRESETS["mtp-batch2"] = {
+PRESETS["mtp-always"] = {
     **_MTP,
     "page_buckets": (1024, 4096),
     "prefill_buckets": (512, 1024, 4096),

@@ -74,7 +74,7 @@ DYN = {
 SEATS8 = {"max_running": 8, "state_seats": 8, "state_checkpoints": 8, "host_cache_gb": 4.0}
 EXPECTED = {
     "mtp-batch8": {**DYN, **SEATS8, "decode_batch_buckets": (1, 2, 4, 6, 8)},
-    "mtp-batch2": {
+    "mtp-always": {
         **MTP,
         **SEATS8,
         "page_buckets": (1024, 4096),
@@ -107,7 +107,7 @@ EXPECTED = {
 }
 # The recurrent-state pool's rows: the scratch row, the running seats' rows (1 + spec_k for a seat that speculates), the
 # checkpoint rows and the zero row.
-STATE_ROWS = {"mtp-batch8": 34, "mtp-batch2": 34, "mtp-batch12": 34, "mtp-batch24": 58}
+STATE_ROWS = {"mtp-batch8": 34, "mtp-always": 34, "mtp-batch12": 34, "mtp-batch24": 58}
 
 
 def _cfg(*argv) -> EngineConfig:
