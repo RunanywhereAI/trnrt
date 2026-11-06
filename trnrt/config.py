@@ -109,6 +109,14 @@ class EngineConfig:
     # - dense_half_skip_rows (kernels/dense_half.py SKIP_T): the decode row counts a dense MLP layer runs as the XLA graph
     #   instead of the dense half's kernel.
     dense_half_skip_rows: tuple[int, ...] = (2,)
+    # - sp_gather (kernels/sp_gather.py): the sequence-parallel stream's all-gather of a decode block's output as the "xla"
+    #   collective or the "nki" kernel; sp_gather_tp_experts: the kernel gathers over the tensor-parallel group the experts
+    #   run in.
+    # - dsa_sel2g (kernels/dsa_satwf.py): the DSA layer's two-stage selection in one kernel (the page ladder with a
+    #   3072-page rung needs it).
+    sp_gather: str = "xla"
+    sp_gather_tp_experts: bool = False
+    dsa_sel2g: bool = False
     # Speculative decoding (engine/spec_async.py): the model's own MTP layer drafts spec_k tokens a step, the target
     # verifies them in the next step's call, and the accepted count, the newest token, the positions and the drafts stay
     # on the device, so a step is scheduled before the previous one is read back. None: plain decoding.
@@ -153,6 +161,8 @@ class EngineConfig:
                 raise ValueError(f"{name}={getattr(self, name)}: at least 1")
         if self.dsa_index_rows < 0:
             raise ValueError(f"dsa_index_rows={self.dsa_index_rows}: 0 (one call) or more")
+        if self.sp_gather not in ("xla", "nki"):
+            raise ValueError(f"sp_gather={self.sp_gather!r}: 'xla' or 'nki'")
         if self.spec_method not in (None, "mtp"):
             raise ValueError(f"spec_method={self.spec_method!r}: only 'mtp' (or None) is served")
         if self.spec_method is None:
