@@ -12,6 +12,8 @@ and versions follow [Semantic Versioning](https://semver.org/). Rebuild the comp
   `mtp-batch24` ([docs/CONFIGURATION.md](docs/CONFIGURATION.md)), a dynamic mode that speculates only while few requests
   decode, and `trnrt:spec_decode_*` metrics. A benchmark mode (`--spec-synth-al`) reproduces InferenceX's synthetic
   acceptance; it is off by default ([docs/AGENTX.md](docs/AGENTX.md)).
+- `TRNRT_DMA_HW`: the kernels' static DMA helpers in hardware DGE. The `mtp-*` presets set it, as in the builds behind
+  the published MTP numbers; the other configurations leave it unset.
 - Public release: README, docs, contributing and security policies, issue and pull request templates.
 - CI: pre-commit (ruff lint and format), mypy, the CPU test suite, a package build check, Dockerfile lint and CodeQL.
   Tag-triggered release workflow.
