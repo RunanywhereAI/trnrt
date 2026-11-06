@@ -131,7 +131,7 @@ def spec_lines(engine) -> list[str]:
     verify steps (one per sequence), draft tokens proposed, draft tokens accepted, and the accepted ones by draft position
     (position j counted over the verifies that reached it). Dynamic speculation adds its mode flips and the steps launched in
     each mode. With these, the mean acceptance length is 1 + accepted / drafts."""
-    if not getattr(engine.cfg, "spec_method", None):
+    if not getattr(getattr(engine, "cfg", None), "spec_method", None):
         return []
     out = [
         "# TYPE trnrt:spec_decode_num_drafts_total counter",
@@ -161,7 +161,7 @@ def spec_stats(engine) -> dict | None:
     """GET /v1/stats's speculative-decoding block (None without speculation): the counters of spec_lines, the acceptance
     rate and mean acceptance length they give, the benchmark mode's configured length (None: the draft head's own
     acceptance) and the counts per draft position (position j's rate is accepted / reached)."""
-    if not getattr(engine.cfg, "spec_method", None):
+    if not getattr(getattr(engine, "cfg", None), "spec_method", None):
         return None
     prop, acc, ver = engine.spec_proposed, engine.spec_accepted, engine.spec_verifies
     out = {
