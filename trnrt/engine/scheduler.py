@@ -170,6 +170,9 @@ class ScheduledSeq:
     # (k, row): the state after this entry's first k tokens goes to checkpoint row `row`, written by the
     # entry's own graph, not copied after it.
     mid: tuple[int, int] | None = None
+    # A blind speculative step's decode-checkpoint row, reserved by the engine (LLMEngine._reserve_async_ckpts) for the
+    # state after the page boundary the step may cross.
+    ckpt_row: int | None = None
 
     @property
     def end(self) -> int:
