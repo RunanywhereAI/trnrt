@@ -30,6 +30,7 @@ from tests.test_scheduler import EOS, VOCAB, next_token, reference_output
 from trnrt.config import EngineConfig
 from trnrt.engine import engine as E
 from trnrt.engine import state_pool as SP
+from trnrt.engine.host_cache import HostTier
 from trnrt.engine.kv_pool import PagePool
 from trnrt.engine.radix_cache import RadixCache
 from trnrt.engine.request import SamplingParams, Status
@@ -83,6 +84,8 @@ class FakeRunner:
         self.last_rows: list[str] = []
         self.calls: dict[str, int] = defaultdict(int)
         self.copies = 0
+        self.host_kv: dict[int, int] = {}  # host tier slot -> the page it was saved from
+        self.host_ckpt: dict[int, int] = {}  # host tier slot -> the tokens its state row had processed
 
     # -- helpers -------------------------------------------------------------------
 
@@ -121,6 +124,30 @@ class FakeRunner:
         self.copies += len(src)
         for a, b in zip(src, dst, strict=True):
             self.content[b] = self.content.get(a)
+
+    # -- the host tier's copies (engine/host_cache.py): a restored checkpoint is the state of the tokens it was saved at ------
+
+    def kv_save(self, slot, page) -> None:
+        self.host_kv[slot] = page
+
+    def kv_load(self, slot, page) -> None:
+        assert slot in self.host_kv, f"a restore of host slot {slot}, which holds nothing"
+        self.calls["kv_load"] += 1
+
+    def kv_drop(self, slot) -> None:
+        self.host_kv.pop(slot, None)
+
+    def state_save(self, slot, row) -> None:
+        assert self.content.get(row) is not None, f"a checkpoint saved from row {row}, which holds no state"
+        self.host_ckpt[slot] = self.content[row]
+
+    def state_load(self, slot, row) -> None:
+        assert slot in self.host_ckpt
+        self.content[row] = self.host_ckpt[slot]
+        self.calls["state_load"] += 1
+
+    def state_drop(self, slot) -> None:
+        self.host_ckpt.pop(slot, None)
 
     # -- plain graphs -------------------------------------------------------------------
 
@@ -233,6 +260,7 @@ def make_engine(
     accept=(0.2, 0.3, 0.5),
     seed=0,
     max_prefill=24,
+    host=False,
 ):
     cfg = EngineConfig(
         model_path="m",
@@ -264,6 +292,11 @@ def make_engine(
     eng.radix.free_ckpt = state.free_ckpt
     eng.runner = FakeRunner(cfg, state, random.Random(seed), accept)
     eng.host_tier = None
+    if host:  # as LLMEngine.__init__ wires the host tier under the radix cache
+        eng.host_tier = HostTier(eng.runner, PS, 64, 16)
+        eng.radix.offload, eng.radix.offload_ckpt = eng.host_tier.offload, eng.host_tier.offload_ckpt
+        eng.radix.offload_ckpt_hash = eng.host_tier.offload_ckpt_hash
+        eng.scheduler.host = eng.host_tier
     eng.tokenizer = None
     eng._ids = itertools.count()
     eng._inflight = None
@@ -508,3 +541,24 @@ def test_a_request_in_a_plain_seat_forces_plain_mode_and_returns_only_when_they_
     assert eng._dyn_want_plain() is False, "two requests fit the three free speculative seats: the flip moves them"
     _decoding(eng, 2)  # two more decoding requests, none holding a seat yet: five running, three speculative seats
     assert eng._dyn_want_plain() is True
+
+
+def test_a_prefix_restored_from_the_host_tier_then_speculated_equals_a_cold_request():
+    """A finished request's pages and checkpoints are evicted from the device into the host tier, and the same prompt
+    comes back: its prefix is restored (pages loaded, the deepest checkpoint's state copied into its row), the rest
+    prefilled, and the blind steps that follow generate what a cold request does. The fake checks that the restored row
+    holds exactly the tokens the chunk after it resumes at."""
+    eng = make_engine(host=True, num_pages=96, ckpts=10)
+    prompt = prompts(2, seed=11)[0][:30] + list(range(200, 230))
+    cold = eng.add_request(prompt, SamplingParams(max_new_tokens=24))
+    while eng.has_work():
+        eng.step()
+    assert cold.output_ids == reference_output(prompt, 24)
+    eng.radix.evict(eng.radix.total_pages())  # everything the tree holds goes to the host tier
+    assert eng.radix.total_pages() == 0 and eng.host_tier.entries and eng.host_tier.ckpts
+    again = eng.add_request(prompt, SamplingParams(max_new_tokens=24))
+    while eng.has_work():
+        eng.step()
+    assert again.num_cached_tokens > 0 and eng.runner.calls["kv_load"] > 0 and eng.runner.calls["state_load"] > 0
+    assert again.output_ids == cold.output_ids == reference_output(prompt, 24)
+    assert again.spec_proposed > 0, "the restored request speculated"
