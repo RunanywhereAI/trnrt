@@ -305,7 +305,7 @@ def test_a_speculative_engine_pools_every_call_of_its_blind_step_and_only_those(
     assert plain == {"decode"} == iopool.POOL_NAMES
     spec = iopool.pool_names(True)
     assert plain < spec and "mtp_kv" not in spec
-    for name in ("verify", "spec_prep", "spec_post", "spec_post_synth", "mtp_prep", "mtp", "mtp_post", "mtp_board"):
+    for name in ("verify", "spec_prep", "spec_post", "mtp", "mtp_post", "mtp_board", "spec_ckpt", "spec_init"):
         assert name in spec, name
     assert iopool.pool_names(True, kv_only=True) == spec | {"mtp_kv"}
     assert iopool.pool_names(False, kv_only=True) == plain  # the window graph exists only with speculation
