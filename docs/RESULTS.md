@@ -75,6 +75,50 @@ shorter at 4 agents than at 8. Counting only the time after the first token, the
 4 agents and 33 at 8. At 16 agents, the capacity-block price comes to $0.241 per million tokens, or $0.0312 per agent
 request.
 
+### MTP speculative decoding, one engine
+
+> **Not yet reproduced on this repository.** These numbers were measured on our internal builds of the configurations the
+> `mtp-*` presets name ([AGENTX.md](AGENTX.md)). Every number here is [unverified on this tree] until the device check of
+> this repository reproduces it; that check is the open item of the pull request that adds them.
+
+The table is the InferenceX AgentX benchmark, run by us with its own harness, for one engine (8 trn2 chips) at each
+concurrency, with MTP speculative decoding: 2 draft tokens a step. It is the same workload as above, a different unit
+(one engine, not a box of two) and scored with InferenceX's definitions of the metrics, so the columns do not line up with
+the earlier tables.
+
+| Concurrency | Configuration | Tokens per $ (millions) | $ per M tokens | Requests / min (per engine) | Output tokens/s per chip | p90 interactivity (tokens/s per user) | First token (p50 / p90) | End to end (p50) | Prefix-cache hit |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | `mtp-batch8` | 7.47 | $0.134 | 3.045 | 9.7 | 58.2 | 1.40 s / 4.8 s | 9.6 s | 94.7% |
+| 2 | `mtp-always` | 8.17 | $0.122 | 5.243 | 11.5 | 35.6 | 1.17 s / 3.7 s | 4.6 s | 93.8% |
+| 4 | `mtp-batch8` | 12.04 | $0.083 | 6.011 | 15.7 | 39.3 | 1.11 s / 3.6 s | 5.5 s | 95.2% |
+| 8 | `mtp-batch8` | 19.36 | $0.052 | 13.265 | 21.7 | 23.6 | 1.40 s / 9.4 s | 15.7 s | 94.4% |
+| 12 | `mtp-batch12`, 8 GB host cache per core | 21.04 | $0.048 | 13.505 | 25.4 | 17.0 | 1.80 s / 8.7 s | 18.1 s | 93.2% |
+| 16 | `mtp-batch12`, 8 GB host cache per core | 19.96 | $0.050 | 12.109 | 25.3 | 15.2 | 11.46 s / 37.7 s | 35.4 s | 90.9% |
+| 24 | `mtp-batch24`, 12 GB host cache per core | 21.37 | $0.047 | 15.352 | 24.6 | 7.4 | 13.02 s / 35.3 s | 47.5 s | 89.5% |
+| 32 | `mtp-batch24`, 12 GB host cache per core | 18.44 | $0.054 | 13.846 | 20.4 | 5.8 | 78.79 s / 154.8 s | 118.3 s | 84.2% |
+
+Context for every number in the table:
+
+- **Instance and unit:** trn2.48xlarge, one engine of 8 chips (tensor parallel 32 at logical NeuronCore 2). The price is
+  SemiAnalysis's rate for trn2, $0.58 per chip-hour, so one engine is $4.64 an hour; it is not what AWS charges.
+- **Software:** Neuron SDK 2.32, neuronx-cc 2.27.5334.0, libtorch-neuronx-lite 2.11.0.1.0.1284+f49d8626, read from the
+  serving host's installed packages.
+- **Configuration:** the preset in the table ([CONFIGURATION.md](CONFIGURATION.md#speculative-decoding-the-mtp--presets));
+  FP8 weights as released, FP8 KV cache, a 1M-token context, the prefix cache with its host-memory tier.
+- **Workload:** agentx-harness 1.0.12, the public dataset `semianalysis_cc_traces_weka_062126`, one 3,600 s profiling window
+  per point, scored with InferenceX's definitions ([AGENTX.md](AGENTX.md#run-and-score-a-point)). Tokens per dollar counts input,
+  cached input included, and output tokens.
+- **Acceptance:** synthetic, at InferenceX's golden acceptance length for 2 draft tokens, 2.519 tokens a step: InferenceX's
+  method for speculative decoding, reproduced by the benchmark mode ([AGENTX.md](AGENTX.md#benchmark-mode)). Drafting and
+  verification run for real; which positions count as accepted is drawn. The text of such a run is not the model's.
+- **Correctness:** GSM8K with MTP on real acceptance (strict exact match, 5-shot, 1,319 problems) passed on three of the
+  builds: 97.65% on the decode-batch-8 build behind concurrency 1, 4 and 8, 97.42% on the always-on build behind
+  concurrency 2, and 97.35% on the decode-batch-24 build; the bar is 94% and H100 MTP's result is 97.42%. The
+  decode-batch-12 build's own result is not in my sources [unverified]. GSM8K runs 32 requests at once, so a build that
+  turns MTP off above 4 decoding users decodes most of its GSM8K steps without it (MTP was on in 0.2% to 4% of the
+  steps): that check covers the draft path less than the table's low-concurrency points exercise it. The always-on build
+  ran MTP on 16,410 of its 16,412 decode steps. The host-tier restore was checked with a needle test.
+
 ## Long prompts
 
 Unique prompts with one output token, so the cost is all prompt processing:
