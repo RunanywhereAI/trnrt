@@ -207,3 +207,29 @@ def test_the_sequence_parallel_gather_is_xla_or_nki():
     assert EngineConfig(model_path="m", sp_gather="nki").sp_gather == "nki"
     with pytest.raises(ValueError, match="'xla' or 'nki'"):
         EngineConfig(model_path="m", sp_gather="rdma")
+
+
+@pytest.fixture
+def kernel_routes(monkeypatch):
+    """Whatever set_decode_routes writes is undone after the test."""
+    from trnrt.kernels import dense_half, dsa_satwf, sp_gather
+
+    for mod, name in ((sp_gather, "MODE"), (sp_gather, "TP_EXPERTS"), (dsa_satwf, "SEL2G"), (dense_half, "SKIP_T")):
+        monkeypatch.setattr(mod, name, getattr(mod, name))
+
+
+def test_set_decode_routes_hands_the_kernel_routes_of_a_preset_to_the_modules_and_a_later_engine_inherits_nothing(
+    kernel_routes,
+):
+    from trnrt.engine import engine as E
+    from trnrt.kernels import dense_half, dsa_satwf, sp_gather
+
+    def routes():
+        return sp_gather.MODE, sp_gather.TP_EXPERTS, dsa_satwf.SEL2G, dense_half.SKIP_T
+
+    E.set_decode_routes(_cfg("--preset", "mtp-batch24"))
+    assert routes() == ("nki", True, True, frozenset((2, 18, 24)))
+    E.set_decode_routes(_cfg("--preset", "mtp-batch12"))
+    assert routes() == ("nki", True, True, frozenset((2,)))
+    E.set_decode_routes(_cfg())
+    assert routes() == ("xla", False, False, frozenset((2,)))
