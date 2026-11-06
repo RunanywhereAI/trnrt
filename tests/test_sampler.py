@@ -210,3 +210,61 @@ def test_nan_and_neg_inf_rows_select_in_range(V):
     assert ((ids >= 0) & (ids < V)).all()
     ref = S.sample(*(_args(V=V)[0][[0, 3]], *tuple(r[[0, 3]] for r in rest)))
     assert torch.equal(out[[0, 3]], ref), "a NaN row changed its neighbours' samples"
+
+
+def _verify(logits, draft, temperature=0.0, top_p=1.0, top_k=0, min_p=0.0, K=64, seed=0):
+    R = logits.shape[0]
+    g = torch.Generator().manual_seed(seed)
+    f = lambda v: torch.full((R,), v, dtype=torch.float32)  # noqa: E731
+    return S.verify_sample(
+        logits,
+        f(temperature),
+        f(top_p),
+        torch.full((R,), top_k, dtype=torch.int64),
+        f(min_p),
+        torch.rand(R, K, generator=g),
+        torch.rand(R, generator=g),
+        draft,
+    )
+
+
+def test_a_greedy_verify_accepts_the_argmax_and_replaces_anything_else():
+    """Greedy rows: the draft is accepted exactly when it is the argmax; the replacement is then the runner-up (the
+    token that follows an accepted draft is never asked for), else the argmax; y is the argmax either way."""
+    logits = torch.randn(6, 300)
+    top2 = logits.topk(2, -1).indices
+    draft = torch.stack([top2[0, 0], top2[1, 1], top2[2, 0], torch.tensor(7), top2[4, 0], top2[5, 1]])
+    out = _verify(logits, draft)
+    assert out.shape == (6, S.VERIFY_COLS)
+    y, accept, r = out[:, 0].long(), out[:, 1], out[:, 2].long()
+    assert y.tolist() == top2[:, 0].tolist()
+    assert accept.tolist() == [float(d == t) for d, t in zip(draft.tolist(), top2[:, 0].tolist(), strict=True)]
+    want_r = [int(t[1]) if d == t[0] else int(t[0]) for d, t in zip(draft.tolist(), top2, strict=True)]
+    assert r.tolist() == want_r
+
+
+def test_the_verify_logprobs_are_the_raw_ones_of_y_r_and_the_draft():
+    logits = torch.randn(4, 200)
+    draft = torch.tensor([3, 50, 199, 0])
+    out = _verify(logits, draft, temperature=0.8, seed=3)
+    ref = torch.log_softmax(logits, -1)
+    for i in range(4):
+        y, r = int(out[i, 0]), int(out[i, 2])
+        assert abs(out[i, 3].item() - ref[i, y].item()) < 1e-4
+        assert abs(out[i, 4].item() - ref[i, r].item()) < 1e-4
+        assert abs(out[i, 5].item() - ref[i, int(draft[i])].item()) < 1e-4
+        assert out[i, 6 : 6 + NUM_TOP_LOGPROBS].long().tolist() == logits[i].topk(NUM_TOP_LOGPROBS).indices.tolist()
+
+
+def test_a_sampling_verify_emits_the_target_distribution_whatever_the_draft():
+    """Accept the draft d with probability p(d), else sample the distribution with d removed: the emitted token (the draft
+    when accepted, the replacement when not) is distributed as p. The property that lets speculation leave sampled output
+    unchanged, tested for a draft the target likes, one it dislikes and one outside its candidates."""
+    p = torch.tensor([0.5, 0.3, 0.2])
+    logits = torch.cat([p.log(), torch.full((61,), -30.0)]).repeat(20000, 1)
+    for d in (0, 2, 40):
+        out = _verify(logits, torch.full((20000,), d), temperature=1.0, seed=d)
+        emitted = torch.where(out[:, 1] > 0, torch.tensor(float(d)), out[:, 2]).long()
+        freq = torch.bincount(emitted, minlength=64)[:3].float() / 20000
+        assert (freq - p).abs().max() < 0.02, (d, freq.tolist())
+        assert (d == 40) == (out[:, 1].sum() == 0), "a draft outside the candidates is never accepted"
