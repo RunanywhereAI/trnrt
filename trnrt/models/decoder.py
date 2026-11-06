@@ -514,13 +514,27 @@ class DecoderForCausalLM(nn.Module):
         blocks (an index_select by the sp_index buffer)."""
         return x.reshape(self.tp_size, -1, *x.shape[1:]).index_select(0, self.sp_index)[0]
 
-    def _sp_gather(self, x: torch.Tensor) -> torch.Tensor:
+    def _sp_gather_kernel_ok(self) -> bool:
+        """Whether the world row gather may run as kernels/sp_gather.py's NKI all_gather: a model without routed experts,
+        or with expert-parallel ones, or with tensor-parallel experts when sp_gather.TP_EXPERTS is set (an NKI
+        all_gather with tensor-parallel experts failed neuronx-cc 2.27 on trn1's prefill pieces, NCC_ISCH719
+        "topological order violations"; on trn2 it compiles)."""
+        from ..kernels import sp_gather
+
+        return bool(getattr(self, "moe_ep", False)) or not self.cfg.num_experts or sp_gather.TP_EXPERTS
+
+    def _sp_gather(self, x: torch.Tensor, onehot: torch.Tensor | None = None) -> torch.Tensor:
         """Every rank's rows [tp_size * r, ...] from each rank's own x [r, ...], in rank order: x in its
         block of a zero [tp_size, r, ...] (a one-hot multiply: index_copy gave NaN on the device, see _head)
-        summed over the world. Exact: each element is one rank's value plus zeros. (An NKI all_gather here
-        failed neuronx-cc 2.27 on the prefill pieces with tensor-parallel experts, NCC_ISCH719 "topological
-        order violations".)"""
-        full = x.unsqueeze(0) * self.sp_onehot.view(self.tp_size, *[1] * x.dim())
+        summed over the world, or kernels/sp_gather.py's NKI all_gather when it is enabled. Exact either way:
+        each element is one rank's value plus zeros. onehot: the sp_onehot buffer when a graph takes it as an
+        argument (forward_mtp_k)."""
+        from ..kernels import sp_gather
+
+        if onehot is None and self._sp_gather_kernel_ok() and sp_gather.enabled(x):
+            return sp_gather.gather(x, self.tp_size, self.tp_size)
+        oh = self.sp_onehot if onehot is None else onehot
+        full = x.unsqueeze(0) * oh.view(self.tp_size, *[1] * x.dim())
         return self._all_reduce(full.reshape(-1, *x.shape[1:]))
 
     def _w(self, layer: DecoderLayer, name: str) -> torch.Tensor:
