@@ -444,4 +444,5 @@ def test_a_blind_verify_of_three_requests_one_of_them_cold(monkeypatch):
     assert mp["hidx"][:3].tolist() == [[0, 1, 2], [3, 4, 5], [6, 7, 8]], (
         "each sequence reads its own rows of the verify's hidden states"
     )
+    assert mp["hidx"][3].tolist() == [0, 0, 0], "the padding row reads the first row"
     assert mp["last"][:3].tolist() == [0, 0, 0] and mp["pos"][:3].tolist() == [[10, 11, 12], [6, 7, 8], [4, 5, 6]]
