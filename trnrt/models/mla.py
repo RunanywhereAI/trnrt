@@ -408,6 +408,15 @@ def _core(model, layer, q_nope, kc, vis, B: int, Q: int, top=None, index=None, a
     return o.reshape(B * Q, nh * dv)
 
 
+def verify_rows(table: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """A verify batch's block table as the decode form's (the long and context-parallel paths): one row per position,
+    row b Q + j sequence b's (forward_extend's b-major flatten of [B, Q]; the bias is decoder._long_attn's
+    [B, 1, 1, Q, 1] placeholder). Every row is a decode row of its own position: it selects its own candidate pools
+    and sees rows < j of its sequence, whose caches this call stored first. A rejected row is invisible by position
+    to every later step, and its owner rank rewrites it."""
+    return table.repeat_interleave(bias.shape[3], dim=0)
+
+
 def attention(model, layer, x, positions, slot_mapping, table, bias, mixed=None, ffn=None):
     """The attention block of a DSA layer over the paged cache, for a decode batch (table [B, P],
     positions [B]) or a prefill chunk (table [P], positions [C]); x is already normalised. Returns
@@ -417,10 +426,13 @@ def attention(model, layer, x, positions, slot_mapping, table, bias, mixed=None,
     Context-parallel layers (the device) run attention_cp / attention_cp_rows. At attention TP 1 (the
     host reference) a bucket of at most dsa_long.LONG_KEYS keys gathers its context: the latent, the
     indexer rows and the pool keys, the selection through the scratch as an additive mask; a longer
-    one takes attention_long."""
+    one takes attention_long. A speculative verify batch (decoder.forward_extend: table [B, P], bias
+    [B, 1, 1, Q, L] or the long path's placeholder) is B x Q rows, each a decode row of its own position."""
     if mixed is not None:
         raise NotImplementedError("mixed prefill + decode batches")
     if getattr(model, "cp", 1) > 1 and long_capable(layer.spec):
+        if bias.dim() == 5:  # a verify batch: B x Q rows, each a decode row of its own position
+            table = verify_rows(table, bias)
         if getattr(model, "cp_rows", 1) > 1 and table.dim() == 1:  # a chunk over context-parallel row groups
             return attention_cp_rows(model, layer, x, positions, slot_mapping, table)
         return attention_cp(model, layer, x, positions, slot_mapping, table, ffn=ffn)
@@ -438,6 +450,8 @@ def attention(model, layer, x, positions, slot_mapping, table, bias, mixed=None,
     elif layer.pool_inplace:
         write_pool_keys_inplace(model, layer, d, positions, table, slot_mapping, vrow)
     if long_capable(layer.spec) and _dsa_long.enabled(table.shape[-1] * model.page_size):
+        if bias.dim() == 5:  # a verify batch, after its rows' caches and pool keys are written above
+            table = verify_rows(table, bias)
         return attention_long(model, layer, q_nope, qi, wi, positions, table)
     kc = model._load(layer.k_cache, table).squeeze(-2)  # [(B,) L, r]
     kv = model._load(layer.v_cache, table).squeeze(-2)  # [(B,) L, 2 Di]
@@ -446,6 +460,8 @@ def attention(model, layer, x, positions, slot_mapping, table, bias, mixed=None,
         B, Q = 1, T
         kc, kv = kc.unsqueeze(0), kv.unsqueeze(0)
         pk = pk.unsqueeze(0) if pooled else None
+    elif bias.dim() == 5:  # a verify batch: B sequences of Q rows
+        B, Q = table.shape[0], bias.shape[3]
     else:  # decode
         B, Q = T, 1
     L = kc.shape[1]
@@ -716,23 +732,35 @@ def attention_cp(model, layer, x, positions, slot_mapping, table, ffn=None):
     if shell_sel and q_pre is not None and hasattr(layer, "w_uv_t") and (q_nope.device.type != "cpu" or SH.HOST_SIM):
         # the path below, from the selection to o_proj, as one NKI call
         ppl_ = ps // (kp * A)
-        if _shell_merge_takes(table, keep, A, kp, ppl_) and _mk_rows_on(T) and ffn is not None:
-            # + the world sum and the FFN half (the fused DSA layer); hybrid.layer reads the tuple
-            from ..kernels import dsa_decode, dsa_satwf, dsa_shell
-            from ..kernels import ffn_half as FH
+        if (_shell_merge_takes(table, keep, A, kp, ppl_) and _mk_rows_on(T)
+                and (ffn is not None or T * q_pre.shape[1] <= 128)):  # sat's receive rows (H T) on the partitions
+            from ..kernels import dsa_decode, dsa_shell
 
             ident = torch.eye(T, dtype=torch.bfloat16, device=q_nope.device)
-            S_, post_a, comb_a = ffn
-            blobs, fkw = FH.decode_args(model, layer, S_.shape[1])
-            r_ = dsa_satwf.satwf(q_p, w2.float() * scale, layer.pool_key.view(-1, dsa_shell.PPP * Di), table,
-                                 nloc, positions, q_pre, layer.k_cache, layer.w_uv_t, layer.o_t, ident, keep, A,
-                                 rank, model.tp_size, m.softmax_scale, S=S_, post_a=post_a, comb_a=comb_a,
-                                 blobs=blobs, w_blob=layer.w_blob, ffn=fkw, kp=kp, ns=dsa_decode.NCH * 128,
-                                 nr=SEL2_NR, pf=SEL2_PF, il=1, fz=1, ob=1, pw=1, rp=0, yb=1, pq=1, cs=SEL2_CS)
-            # fz 1 + ob 1 + pw 1 + rp 0 + yb 1: the measured-exact form of the join, every cross-program hand-off
-            # through outputs or program 0, none through internal shared scratch
-            Sn, post, comb, rp, sp = r_[10:15]
-            return Sn, post, comb, FH.decode_out(model, rp, sp, S_.dtype)
+            if ffn is not None:  # + the world sum and the FFN half (the fused DSA layer); hybrid.layer reads the tuple
+                from ..kernels import dsa_satwf
+                from ..kernels import ffn_half as FH
+
+                S_, post_a, comb_a = ffn
+                blobs, fkw = FH.decode_args(model, layer, S_.shape[1])
+                r_ = dsa_satwf.satwf(q_p, w2.float() * scale, layer.pool_key.view(-1, dsa_shell.PPP * Di), table,
+                                     nloc, positions, q_pre, layer.k_cache, layer.w_uv_t, layer.o_t, ident, keep, A,
+                                     rank, model.tp_size, m.softmax_scale, S=S_, post_a=post_a, comb_a=comb_a,
+                                     blobs=blobs, w_blob=layer.w_blob, ffn=fkw, kp=kp, ns=dsa_decode.NCH * 128,
+                                     nr=SEL2_NR, pf=SEL2_PF, il=1, fz=1, ob=1, pw=1, rp=0, yb=1,
+                                     **({"pq": _mk_pq(T, A)} if _mk_pq(T, A) else {}), cs=SEL2_CS)
+                # fz 1 + ob 1 + pw 1 + rp 0 + yb 1: the measured-exact form of the join, every cross-program hand-off
+                # through outputs or program 0, none through internal shared scratch
+                Sn, post, comb, rp, sp = r_[10:15]
+                return Sn, post, comb, FH.decode_out(model, rp, sp, S_.dtype)
+            # a layer whose FFN is not in the call (the plain MTP layer): the section and the tail only
+            from ..kernels import dsa_sat
+
+            r_ = dsa_sat.sat(q_p, w2.float() * scale, layer.pool_key.view(-1, dsa_shell.PPP * Di), table, nloc,
+                             positions, q_pre, layer.k_cache, layer.w_uv_t, layer.o_t, ident, keep, A, rank,
+                             model.tp_size, m.softmax_scale, kp=kp, ns=dsa_decode.NCH * 128, nr=SEL2_NR, pf=SEL2_PF,
+                             il=1, cs=SEL2_CS)
+            return r_[8]  # this rank's o_proj partial [T, H] (decoder._attn_all_reduce sums it over the world)
     if shell_sel:  # the scores, the selection and its compaction in one call
         from ..kernels import dsa_shell
 
@@ -1337,3 +1365,84 @@ def reference(model, layer, x, positions, state: dict):
     qi, ki, wi = _indexer(model, layer, x, q_resid, positions)
     out = _core(model, layer, q_nope, c.unsqueeze(0), vis, 1, T, None, (qi, wi, ki.unsqueeze(0)), absorb=False)
     return F.linear(out, model._w(layer, "o"))
+
+
+# The fused layer call's pq (kernels/dsa_sel_s2.py _s2_payload): pq 1 puts S2's payload (XR, RKP, lo) on A x T
+# partitions, so it exists only while A T <= 128 (A = the CP degree: T <= 16 at A 8). Above that the call takes pq 0, the
+# same bits (tests/test_dsa_sel_s2.py): a per-T choice, so a speculative verify of more rows (B 6 / 8 at k 2: 18 / 24) or
+# a 24-row decode keeps the call. LAYER_MK_PQ is the setting below the wall (served: 1).
+LAYER_MK_PQ = 1
+PQ_PARTITIONS = 128
+
+
+def pq_for(pq: int, rows: int, A: int) -> int:
+    """The pq a `rows`-row fused layer call takes under a pq setting: pq itself while S2's one-pass payload fits the
+    partitions (A x rows <= 128), else 0 (the kernels' default, passed as no argument)."""
+    return pq if A * rows <= PQ_PARTITIONS else 0
+
+
+def _mk_pq(rows: int, A: int) -> int:
+    """The pq the layer call passes at `rows` rows (LAYER_MK_PQ through pq_for)."""
+    return pq_for(LAYER_MK_PQ, rows, A)
+
+
+def write_kv_only(model, layer, x, positions, slot_mapping, table) -> None:
+    """ONLY the cache writes of attention() for x (the layer's normalised attention input), with no attention,
+    selection or output: the latent c into K, the indexer key and pool gate logits into V, and the pool keys, in the
+    batch form the table gives (a chunk: table [P]; a decode batch: table [B, P]). The MTP layer's KV of rows whose
+    draft nobody reads (decoder.forward_mtp_kv's after-prefill windows, decoder.DYN_MTP_KV's plain decode steps). The
+    writes are attention()'s (and under context parallelism attention_cp()'s) write halves, statement for statement,
+    kept apart so the attention code is untouched. A row's writes depend on its own x only (and the pool keys on the
+    pool's cached rows, read after this call's own writes, as attention() reads them)."""
+    if getattr(model, "cp", 1) > 1 and long_capable(layer.spec):
+        _cp_write_kv_only(model, layer, x, positions, slot_mapping, table)
+        return
+    d = layer.spec.mla.dsa
+    q_nope, q_pe, c, k_pe, q_resid = _project(model, layer, x, positions)
+    qi, ki, wi = _indexer(model, layer, x, q_resid, positions)
+    vrow = ki  # NoPE: no zero-width cat with k_pe
+    model._store(layer.k_cache, slot_mapping, c.unsqueeze(1))
+    model._store(layer.v_cache, slot_mapping, vrow.unsqueeze(1))
+    if layer.pool_key is not None:
+        write_pool_keys(model, layer, d, positions, table, slot_mapping)
+    elif layer.pool_inplace:
+        write_pool_keys_inplace(model, layer, d, positions, table, slot_mapping, vrow)
+
+
+def _cp_write_kv_only(model, layer, x, positions, slot_mapping, table) -> None:
+    """write_kv_only under context parallelism: attention_cp()'s write half (its first statements, through the pool
+    keys). Also the write half of attention_cp_rows (a prefill chunk over context-parallel row groups, table [P]):
+    that function's "this rank's share of every row" is these statements on every row of x (the row group only
+    selects and attends its own rows, which this does not)."""
+    m = layer.spec.mla
+    d = m.dsa
+    kp, Di = d.kpool, d.head_dim
+    A = model.cp
+    rank = model.long_grp_index
+    T = x.shape[0]
+    ps = model.page_size
+    if layer.pool_key is None:
+        raise NotImplementedError("context-parallel DSA needs the separate pool-key cache (an FP8 KV cache)")
+    q_nope, q_pe, c, k_pe, q_resid = _project(model, layer, x, positions, dec=table.dim() == 2)
+    qi, ki, wi = _indexer(model, layer, x, q_resid, positions)
+    real = slot_mapping >= ps
+    dump = _dsa_long.cp_dump_slot(ps, A)
+    ls = _dsa_long.cp_local_slots(positions, table, ps, kp, A, rank)
+    ls = torch.where(real, ls, torch.full_like(ls, dump))
+    model._store(layer.k_cache, ls, c.unsqueeze(1))
+    _cp_zero_dump(model, layer.k_cache, dump, c)
+    first = positions - positions % kp
+    pos4 = (first.unsqueeze(-1) + torch.arange(kp, device=positions.device, dtype=positions.dtype)).reshape(-1)
+    tb4 = table if table.dim() == 1 else table.repeat_interleave(kp, dim=0)
+    slots4 = _dsa_long.cp_local_slots(pos4, tb4, ps, kp, A, rank)
+    slots4 = torch.where(real.repeat_interleave(kp), slots4, torch.full_like(slots4, dump))
+    model._store(layer.v_cache, ls, ki.unsqueeze(1))
+    _cp_zero_dump(model, layer.v_cache, dump, ki)
+    rows = layer.v_cache[slots4]
+    if model.fp8_max is not None:
+        rows = rows.to(model.dtype)
+    from .glm5_next import pool_keys
+
+    keys = pool_keys(layer, d, rows.reshape(T, kp, -1)[..., : 2 * Di])
+    layer.pool_key.index_put_((slots4,), keys.reshape(T * kp, Di // kp).to(layer.pool_key.dtype))
+    _cp_zero_dump(None, layer.pool_key, dump, keys)
