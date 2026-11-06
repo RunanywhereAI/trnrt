@@ -1,9 +1,10 @@
 # Reproducing the InferenceX AgentX results
 
 > **Work in progress.** This page tracks the port of multi-token prediction (MTP) speculative decoding into TrnRT, with
-> the serving configurations behind our InferenceX AgentX measurements of GLM-5.3-Flash on one trn2.48xlarge. The code and
-> the commands below are in place; the on-device checks are listed under [Status](#status) and the measured results are not
-> published here yet.
+> the serving configurations behind our InferenceX AgentX measurements of GLM-5.3-Flash on one trn2.48xlarge. The serving
+> side and the commands below are in place; the model's verify and draft passes land in the same pull request. The
+> remaining checks are listed under [Status](#status), and the measured numbers in [RESULTS.md](RESULTS.md#mtp-speculative-decoding-one-engine)
+> are marked unverified on this tree until those checks reproduce them.
 
 ## What is added
 
@@ -79,7 +80,8 @@ same `--spec-synth-al`.
 ## Status
 
 Checked on the CPU suite: the scheduler, the board graphs, the engine's speculative step against a fake device that checks
-pages, state rows and token chains, dynamic speculation and its seat moves, the presets' values and graph families.
+pages, state rows and token chains (dynamic speculation, its seat moves, preemption, and a prefix restored from the host
+tier then speculated), the runner on a stub model with the real board graphs, and the presets' values and graph families.
 
 Not yet checked here, and listed in the pull request: that each preset's graphs are the graphs the measured configurations
 ran (`tools/graph_equiv.py`), compile from source, a served run, GSM8K accuracy with MTP, and an AgentX point.
