@@ -233,3 +233,33 @@ def test_set_decode_routes_hands_the_kernel_routes_of_a_preset_to_the_modules_an
     assert routes() == ("nki", True, True, frozenset((2,)))
     E.set_decode_routes(_cfg())
     assert routes() == ("xla", False, False, frozenset((2,)))
+
+
+def test_build_shard_builds_the_mtp_layer_only_for_an_engine_that_speculates(monkeypatch):
+    """load_model gets mtp=True only with spec_method mtp: a plain engine never builds or loads the checkpoint's MTP layer, so
+    its graphs (a decode call returning only its output) are the plain engine's."""
+    import json
+    import os
+
+    from trnrt.engine import engine as E
+    from trnrt.models.config import ModelConfig
+
+    with open(os.path.join(os.path.dirname(__file__), "fixtures", "GLM-5.3-Flash-config.json")) as f:
+        mcfg = ModelConfig.from_config_dict(json.load(f))
+    seen = {}
+
+    class Stop(Exception):
+        pass
+
+    def fake_load(*a, **k):
+        seen.update(k)
+        raise Stop
+
+    monkeypatch.setattr(E, "load_model", fake_load)
+    monkeypatch.setattr(E.ModelConfig, "from_pretrained", classmethod(lambda cls, p: mcfg))
+    for argv, want in (((), False), (("--preset", "mtp-batch8"), True)):
+        seen.clear()
+        cfg = _cfg(*argv, "--device", "cpu", "--tp", "1")
+        with pytest.raises(Stop):
+            E.build_shard(cfg, "m", 8)
+        assert seen["mtp"] is want, argv
