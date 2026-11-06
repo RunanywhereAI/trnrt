@@ -158,6 +158,31 @@ PRESETS["mtp-batch24"] = {
     "dense_half_skip_rows": (2, 18, 24),
 }
 
+# The environment a preset needs before anything imports trnrt.kernels. TRNRT_DMA_HW (the static DMA helpers of
+# kernels/shell.py, kda_half.py and mix_wide.py in hardware DGE) is read at kernel import instead of being set from the
+# configuration like the decode routes: dsa_shell and mhc_pre_split bind dma_static by name at import, and every
+# kernel that folds shell.REV folds it at import. Every build behind the published MTP numbers ran with it.
+PRESET_ENV: dict[str, dict[str, str]] = {
+    name: {"TRNRT_DMA_HW": "1"} for name in ("mtp-batch8", "mtp-always", "mtp-batch12", "mtp-batch24")
+}
+
+
+def apply_preset_env(argv: list[str]) -> dict[str, str]:
+    """Put the environment that the engine arguments `argv`'s --preset needs (PRESET_ENV) into this process before it
+    imports trnrt.kernels, so that it and the ranks it spawns, which inherit it, import the kernels in that form. A
+    value already in the environment wins, as an argument given explicitly wins over a preset's. Refuses when this
+    process has imported trnrt.kernels without a value it would set: those modules are bound in the other form.
+    Returns the values it set."""
+    want = PRESET_ENV.get(parse_engine_args(argv).preset or "", {})
+    new = {k: v for k, v in want.items() if k not in os.environ}
+    if new and any(m == "trnrt.kernels" or m.startswith("trnrt.kernels.") for m in sys.modules):
+        raise RuntimeError(
+            f"{', '.join(new)} must be set before trnrt.kernels is imported, and this process has already imported "
+            "it: set it in the environment that starts the process"
+        )
+    os.environ.update(new)
+    return new
+
 
 def add_engine_args(ap: argparse.ArgumentParser) -> None:
     """The engine's arguments, with the served values as defaults."""
@@ -479,6 +504,7 @@ def cmd_engine(argv: list[str]) -> int:
     add_compile_arg(ap)
     a = ap.parse_args(argv)
     cfg = engine_config(argv, a.core_base)
+    apply_preset_env(argv)  # before anything imports trnrt.kernels; the ranks the engine spawns inherit it
     from .engine import start_checks
 
     why = start_checks.refusal(cfg.device, a.core_base, cfg.tp)  # its devices free, enough contiguous host memory
@@ -652,6 +678,9 @@ def cmd_serve(argv: list[str]) -> int:
 
 
 def cmd_compile(argv: list[str]) -> int:
+    if "--" in argv and "capture" in argv[: argv.index("--")]:
+        # capture's engine arguments: their preset's environment, before its spawned ranks import the kernels
+        apply_preset_env(argv[argv.index("--") + 1 :])
     from .compile import farm
 
     return farm.main(argv, engine_config=engine_config)
