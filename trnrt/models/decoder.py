@@ -993,7 +993,7 @@ class DecoderForCausalLM(nn.Module):
                               swa_table, swa_first, target=True)
 
     def _mtp_pass(self, input_ids, positions, block_table, slot_mapping, hsrc, hidx, last_index, src_norm,
-                  swa_table=None, swa_first=None, target=False, sp_onehot=None):
+                  swa_table=None, swa_first=None, target=False, sp_onehot=None, later=False):
         """forward_mtp. GLM-5.3-Flash's MTP layer (vLLM v0.30.0 deepseek_mtp.py, SGLang v0.5.21 deepseek_nextn.py):
         x = eh_proj(cat(enorm(embed(token after p)), hnorm(h_p))), y = the plain decoder layer (pooled-DSA MLA, MoE +
         shared expert) on x, draft = argmax(lm_head(shared_head.norm(y))), with the target's embedding and lm_head
@@ -1001,9 +1001,14 @@ class DecoderForCausalLM(nn.Module):
         hsrc holds the target's streams, collapsed and normed by hybrid.final), or a previous pass's y after
         shared_head.norm (src_norm). The layer's latent and indexer key are one more KV layer in the shared page pool
         (kv_layers), written for every position the pass computes, which is how the later passes and the next step see
-        them. Its later passes run their own indexer: index_share_for_mtp_iteration is not implemented, so drafts can
-        differ from vLLM's there (never the tokens: verification keeps the target's). sp_onehot: hsrc holds only this
-        rank's rows of a sequence-parallel prefill chunk, and hidx indexes the chunk's rows in full."""
+        them. Its later passes run their own indexer, as in the builds behind the published numbers: the checkpoint's
+        index_share_for_mtp_iteration is not used (glm5_next leaves it unparsed, and under context-parallel DSA every
+        bucket takes the long path, which has no shared-selection form), so drafts can differ from vLLM's there (never the
+        tokens: verification keeps the target's). sp_onehot: hsrc holds only this
+        rank's rows of a sequence-parallel prefill chunk, and hidx indexes the chunk's rows in full. later: whether the
+        graph has later passes (forward_mtp_k); unused here, but forward_mtp_k computes it as this call's argument so that
+        dynamo realizes pos_rest at the same point as the published builds do (a graph's input order is part of its
+        compile key)."""
         cfg = self.cfg
         B, Q = input_ids.shape
         if self._mtp_chunk(B, Q, block_table, swa_table):  # the after-prefill rows in the main prefill's form
@@ -1040,7 +1045,7 @@ class DecoderForCausalLM(nn.Module):
         on multi-chip TP, where every graph execution holding a cross-chip collective costs about 5 ms at tp=32.
         Returns [B, k] fp32 drafts and the last pass's MTP hidden. sp_onehot: as _mtp_pass's."""
         draft, xl = self._mtp_pass(input_ids, positions, block_table, slot_mapping, hsrc, hidx, last_index, src_norm,
-                                   swa_table, swa_first, target=True, sp_onehot=sp_onehot)
+                                   swa_table, swa_first, target=True, sp_onehot=sp_onehot, later=pos_rest is not None)
         if pos_rest is None:
             return draft, xl
         B = draft.shape[0]
