@@ -576,9 +576,10 @@ class ModelRunner:
         self.last_hidden: str | None = None
         self._devs: dict[str, torch.Tensor] = {}
         self.spec_k = ecfg.spec_k if ecfg.spec_method == "mtp" else 1  # MTP passes per draft graph
-        self._mtp = compile_(model.forward_mtp_k) if getattr(model, "mtp", None) is not None else None
-        if ecfg.spec_method and self._mtp is None:
+        has_mtp = getattr(model, "mtp", None) is not None
+        if ecfg.spec_method and not has_mtp:
             raise ValueError("speculative decoding (spec_method mtp) needs a model with an MTP layer")
+        self._mtp = compile_(model.forward_mtp_k) if ecfg.spec_method else None
         # The KV-only window graph (DecoderForCausalLM.forward_mtp_kv): an after-prefill MTP window that holds no row of the
         # last position writes only the draft layer's KV.
         self._mtp_kv = (compile_(model.forward_mtp_kv) if (ecfg.mtp_kv_only and self._mtp is not None) else None)
