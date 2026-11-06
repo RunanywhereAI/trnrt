@@ -301,6 +301,11 @@ class MtpRecordingModel(StubModel):
     def __init__(self):
         super().__init__()
         self.mtp_calls = []
+        self.kv_calls = []
+
+    def forward_mtp_kv(self, input_ids, positions, block_table, slot_mapping, hsrc, hidx, src_norm, sp_onehot=None):
+        self.kv_calls.append({"ids": input_ids.clone(), "pos": positions.clone(), "hidx": hidx.clone()})
+        return super().forward_mtp_kv(input_ids, positions, block_table, slot_mapping, hsrc, hidx, src_norm, sp_onehot)
 
     def forward_mtp_k(
         self, input_ids, positions, block_table, slot_mapping, hsrc, hidx, last_index, src_norm, *rest, **kw
@@ -446,3 +451,32 @@ def test_a_blind_verify_of_three_requests_one_of_them_cold(monkeypatch):
     )
     assert mp["hidx"][3].tolist() == [0, 0, 0], "the padding row reads the first row"
     assert mp["last"][:3].tolist() == [0, 0, 0] and mp["pos"][:3].tolist() == [[10, 11, 12], [6, 7, 8], [4, 5, 6]]
+
+
+def test_a_long_chunk_fills_the_mtp_layers_kv_in_windows_and_only_the_last_carries_the_sampled_token(monkeypatch):
+    """A final prefill chunk of 2,500 rows in a 4,096-row call, with mtp_fill_rows 1,024: two KV-only windows over the
+    chunk's rows 0 .. 2047, then the full pass over the last 452 rows, whose last id is the token the prefill sampled, read
+    from the token board. Every window is the same 1,024 rows wide (the graph warmup built) and reads the one hidden stash."""
+    from trnrt.engine.request import Request, SamplingParams
+    from trnrt.engine.scheduler import ScheduledSeq
+
+    def prefill_hook(a):
+        a[10].index_put_((a[11],), torch.tensor([77.0]))
+
+    model = MtpRecordingModel()
+    runner, ecfg, _ = build("mtp-batch8", monkeypatch, hooks={"prefill": prefill_hook}, model=model)
+    assert runner.after_prefill_rows == 1024 and runner._mtp_kv is not None
+    n = 2500
+    req = Request("r", [(7 * i) % 997 + 10 for i in range(n)], SamplingParams(max_new_tokens=4))
+    req.pages = list(range(3, 3 + -(-n // ecfg.page_size) + 1))
+    seq = ScheduledSeq(req, 0, n, True)
+    runner.prefill(seq)
+    runner.spec_after_prefill([seq], runner.last_hidden)
+    assert [c["hidx"][0].tolist() for c in model.kv_calls] == [list(range(1024)), list(range(1024, 2048))]
+    assert [c["pos"][0, 0].item() for c in model.kv_calls] == [0, 1024]
+    assert [c["ids"][0, :3].tolist() for c in model.kv_calls] == [req.token_ids[1:4], req.token_ids[1025:1028]]
+    (full,) = model.mtp_calls
+    assert full["ids"].shape == (1, 1024) and full["last"].tolist() == [n - 2048 - 1]
+    assert full["ids"][0, n - 2048 - 1].item() == 77 and full["pos"][0, 0].item() == 2048
+    assert full["hidx"][0, : n - 2048].tolist() == list(range(2048, n))
+    assert full["ids"][0, : n - 2048 - 1].tolist() == req.token_ids[2049:n]
