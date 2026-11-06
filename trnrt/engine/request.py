@@ -89,6 +89,15 @@ class Request:
     ckpt_targets: list[int] = field(default_factory=list)
     ckpt_pending: list[tuple[int, int, bool]] = field(default_factory=list)
     ckpt_restore: int | None = None  # the checkpoint row a prefix hit restores, until the copy is launched
+    # Speculative decoding (engine/spec_async.py, engine/engine.py).
+    spec_proposed: int = 0  # draft tokens proposed for this request, and how many verification accepted
+    spec_accepted: int = 0
+    mtp_draft: list[int] = field(default_factory=list)  # MTP drafts for the next step (the synchronous path)
+    spec_inflight: int = 0  # blind speculative steps launched and not yet committed
+    spec_ready: bool = False  # its speculative board row is the device's (else the host initializes it)
+    # Index (into its state rows) of the row that holds its state after its last collected blind step; None: the state
+    # pool's own current row (dynamic speculation, EngineConfig.spec_max_batch).
+    spec_cur: int | None = None
 
     def __post_init__(self) -> None:
         if not self.prompt_ids:
