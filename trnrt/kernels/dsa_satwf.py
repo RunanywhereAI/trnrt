@@ -276,10 +276,10 @@ SEL2G = False
 _satwf_pre_sel2g = satwf
 
 
-def satwf(q, w, pkc, table, *args, **kw):  # noqa: F811
-    if SEL2G:
+def satwf(*args, **kw):  # noqa: F811
+    if SEL2G:  # the block table is sat_args' fourth argument (models/mla.py passes it positionally)
         from . import dsa_satwfg, dsa_sel2g
 
-        if dsa_sel2g.takes(table):
-            return dsa_satwfg.satwf(q, w, pkc, table, *args, **kw)
-    return _satwf_pre_sel2g(q, w, pkc, table, *args, **kw)
+        if dsa_sel2g.takes(args[3] if len(args) > 3 else kw["table"]):
+            return dsa_satwfg.satwf(*args, **kw)
+    return _satwf_pre_sel2g(*args, **kw)
