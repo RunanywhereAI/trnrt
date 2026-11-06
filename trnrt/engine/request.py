@@ -92,7 +92,6 @@ class Request:
     # Speculative decoding (engine/spec_async.py, engine/engine.py).
     spec_proposed: int = 0  # draft tokens proposed for this request, and how many verification accepted
     spec_accepted: int = 0
-    mtp_draft: list[int] = field(default_factory=list)  # MTP drafts for the next step (the synchronous path)
     spec_inflight: int = 0  # blind speculative steps launched and not yet committed
     spec_ready: bool = False  # its speculative board row is the device's (else the host initializes it)
     # Index (into its state rows) of the row that holds its state after its last collected blind step; None: the state
