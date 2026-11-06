@@ -57,10 +57,10 @@ class StepStats:
 
 
 def resolve_attention_tp(mcfg: ModelConfig, cfg: EngineConfig) -> int:
-    """The token mixers' TP degree (models/decoder.py attention_tp)."""
+    """The token mixers' TP degree (models/decoder.py attention_tp), the MTP layer's attention included when it speculates."""
     from ..models.decoder import attention_tp
 
-    return attention_tp(mcfg, cfg.tp)
+    return attention_tp(mcfg, cfg.tp, mtp=cfg.spec_method == "mtp")
 
 
 def _cp_degree(mcfg: ModelConfig, attn_tp: int) -> int:
@@ -208,6 +208,7 @@ def build_shard(cfg: EngineConfig, path: str, num_pages: int, rank: int = 0):
         moe_kernel=cfg.resolved_moe_kernel(),
         attn_tp=atp,
         attn_group=attn_group,
+        mtp=cfg.spec_method == "mtp",  # the checkpoint's MTP layer is built and loaded only when the engine speculates
     )
     if cp_group is not None:
         model.cp_group = cp_group
