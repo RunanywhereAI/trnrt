@@ -109,6 +109,22 @@ def config_from_hf(cls, c: dict, eos_ids: tuple[int, ...]) -> ModelConfig:
         kw, vw = cache_widths(m)
         specs.append(AttnSpec(t["num_attention_heads"], 1, kw, vw, 0, 10000.0, mla=m))
     experts = t.get("n_routed_experts") or 0
+    # The MTP layer (num_nextn_predict_layers, model.language_model.layers.<n> in zai-org/GLM-5.3-Flash's
+    # model.safetensors.index.json) is a pooled-DSA MLA layer with the MoE and NO hyper-connections (vLLM v0.30.0
+    # models/glm5next/nvidia/model.py Glm5NextDecoderLayer is_mtp_layer: "MTP layers use the non-mHC path";
+    # nvidia/mtp.py Glm5NextMultiTokenPredictorLayer: enorm, hnorm, eh_proj, shared_head). Its later passes run their own
+    # indexer: reusing the first pass's pooled selection (index_share_for_mtp_iteration) is not implemented, so drafts
+    # can differ from vLLM's there (never the tokens: greedy verification keeps the target's).
+    mtp = {}
+    if int(t.get("num_nextn_predict_layers") or 0):
+        mtp_dsa = DSASpec(t["index_n_heads"], t["index_head_dim"], t["index_topk"], kpool=kpool,
+                          kpool_tail=bool(t.get("index_kpool_always_select_tail", True)))
+        mtp_m = MLASpec(t["q_lora_rank"], t["kv_lora_rank"], dn, 0, dv, dn ** -0.5,
+                        norm_eps=t.get("rms_norm_eps", 1e-5), dsa=mtp_dsa)
+        mtp_kw, mtp_vw = cache_widths(mtp_m)
+        mtp = dict(mtp_layers=int(t["num_nextn_predict_layers"]),
+                   mtp_spec=AttnSpec(t["num_attention_heads"], 1, mtp_kw, mtp_vw, 0, 10000.0, mla=mtp_m),
+                   mtp_prefix=f"model.layers.{n}", mtp_moe=bool(experts))
     hy = HybridSpec("glm5_next", hc=int(t.get("hc_mult", 4)), sinkhorn_iters=int(t.get("hc_sinkhorn_iters", 20)),
                     hc_eps=float(t.get("hc_eps", 1e-6)), swiglu_limit=t.get("swiglu_limit"), block_norms=True)
     first = next((s for s in specs if not isinstance(s, LinearSpec)), None)
@@ -124,7 +140,7 @@ def config_from_hf(cls, c: dict, eos_ids: tuple[int, ...]) -> ModelConfig:
         moe_layers=tuple(i for i in range(n) if experts and mlp[i] == "sparse"), attn_layers=tuple(specs),
         router_scoring="sigmoid", router_bias=bool(experts), routed_scaling_factor=float(t.get("routed_scaling_factor") or 1.0),
         n_shared_experts=(t.get("n_shared_experts") or 0) if experts else 0, n_group=t.get("n_group") or 1,
-        topk_group=t.get("topk_group") or 1, hybrid=hy, **cls._quant(c if "quantization_config" in c else t))
+        topk_group=t.get("topk_group") or 1, hybrid=hy, **mtp, **cls._quant(c if "quantization_config" in c else t))
 
 
 def _ids(e) -> tuple[int, ...]:
