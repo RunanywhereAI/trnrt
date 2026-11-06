@@ -729,8 +729,8 @@ class ModelRunner:
     def _exec_inner(self, name: str, key: tuple, host_args: list):
         if self.tp_send is not None:  # with rank 0's count of finished executions (LaunchBound.done_to on the worker)
             self.tp_send((name, key, host_args, self.launch_bound.done))
-        fn = {"decode": self._decode, "prefill": self._prefill, "verify": self._extend, "mtp": self._mtp,
-              "mtp_kv": self._mtp_kv}.get(name) or self._spec_fns[name]
+        attr = {"decode": "_decode", "prefill": "_prefill", "verify": "_extend", "mtp": "_mtp", "mtp_kv": "_mtp_kv"}.get(name)
+        fn = getattr(self, attr) if attr else self._spec_fns[name]
         if name == "prefill" and len(key) > 1 and isinstance(key[1], int):
             self._prefill_c = key[1]  # ("prefill", C, P): the call's row bucket
         pool = self.iopool  # engine/iopool.py: j, this call's slot, or None
