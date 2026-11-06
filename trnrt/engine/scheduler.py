@@ -53,6 +53,8 @@ if TYPE_CHECKING:
     from .state_pool import StatePool
 
 PENDING = -1  # placeholder for a token sampled by a step whose results are not read yet
+# A blind speculative draft (engine/spec_async.py): the drafts are on the device, not known to the host.
+BLIND = -2
 
 
 class NeedSync(Exception):
@@ -158,6 +160,9 @@ class ScheduledSeq:
     start: int  # first position computed this step
     num_tokens: int
     sample: bool  # this chunk reaches the newest token, so it produces the next one
+    # Speculative draft slots verified after the newest token (decode only), [BLIND] * k: the drafts themselves are on the
+    # device. The step then covers positions start .. start + len(draft) and may emit up to len(draft) + 1 tokens.
+    draft: list[int] = field(default_factory=list)
     # Recurrent-state checkpoint rows (engine/state_pool.py): copied into the request's state row
     # before this entry runs (a prefix hit), and receiving a copy of it after (the state at end).
     restore: int | None = None
@@ -186,8 +191,11 @@ class StepPlan:
 class Scheduler:
     MAX_AHEAD = 4  # junction checkpoints one admission may add ahead (each costs a row and a copy)
 
-    def __init__(self, cfg: SchedulerConfig, pool: PagePool, radix: RadixCache):
+    def __init__(self, cfg: SchedulerConfig, pool: PagePool, radix: RadixCache, draft_fn=None):
         self.cfg = cfg
+        # draft_fn(req) -> [BLIND] * k for a decoding request that speculates in this step, else [] (speculative decoding,
+        # engine/spec_async.py).
+        self.draft_fn = draft_fn
         self.pool = pool
         self.radix = radix
         # Set by the engine before the first schedule(): the state pool whose checkpoint rows back the
@@ -260,20 +268,29 @@ class Scheduler:
     def advance(self, plan: StepPlan) -> None:
         """Move every scheduled request past this step BEFORE its results are known, so the
         next step can be scheduled while this one runs (overlap scheduling). A sampling
-        entry gets a PENDING placeholder where its new token will go."""
+        entry gets a PENDING placeholder where its new token will go. A blind speculative entry moves nothing: its tokens
+        and its progress stay on the device until its commit, and the request counts the step in flight."""
         for s in plan.seqs():
+            if s.draft:
+                s.req.spec_inflight += 1
+                continue
             s.req.num_computed = s.end
             if s.sample:
                 s.req.token_ids.append(PENDING)
 
     def commit(self, plan: StepPlan, tokens: list) -> list[Request]:
         """Fill in a step's results. `tokens[i]` is the sampled id for `plan.seqs()[i]` (ignored for
-        an entry that does not sample). An entry whose request already finished in an earlier commit
-        is ignored. Returns requests finished by this commit."""
+        an entry that does not sample), or for a speculative entry the list it emitted (accepted drafts, then one more).
+        An entry whose request already finished in an earlier commit is ignored. Returns requests finished by this commit."""
         now = time.monotonic()
         finished = []
         for s, tok in zip(plan.seqs(), tokens):
             req = s.req
+            if s.draft:
+                req.spec_inflight -= 1
+                if req.status is Status.RUNNING and self._commit_blind(req, tok, now) is not None:
+                    finished.append(req)
+                continue
             if req.status is not Status.RUNNING:
                 continue  # finished or aborted while this step was in flight
             if not s.sample:
@@ -297,6 +314,25 @@ class Scheduler:
             elif s.num_tokens > 1:
                 self._cache(req)
         return finished
+
+    def _commit_blind(self, req: Request, tok: list, now: float) -> str | None:
+        """A blind speculative entry's emitted tokens (accepted drafts, then the replacement or the bonus), in order:
+        appended as a plain step's are, the newest one's position becoming num_computed (the KV of the newest token and
+        of the accepted drafts is written; a rejected draft's lies beyond). Returns the finish reason."""
+        reason = None
+        for t in tok:
+            req.token_ids.append(int(t))
+            reason = self._finish_reason(req, int(t), length=len(req.token_ids))
+            if reason is not None:
+                break
+        req.num_computed = len(req.token_ids) - 1
+        if req.first_token_time is None:
+            req.first_token_time = now
+        if reason is not None:
+            req.finish_reason = reason
+            req.finish_time = now
+            self._release(req, Status.FINISHED)
+        return reason
 
     def finish_now(self, req: Request, reason: str) -> None:
         """Finish a running request outside update(), e.g. on a stop string."""
@@ -364,7 +400,17 @@ class Scheduler:
         for req in list(self.running):
             if req.status is not Status.RUNNING or not req.is_decoding:
                 continue
-            while not self._reserve(req, req.num_computed + 1):
+            draft = self.draft_fn(req) if self.draft_fn is not None else []
+            # A blind speculative row (engine/spec_async.py): the steps still in flight may each have advanced the request by
+            # up to 1 + k positions, so its newest token is at most this far on, and its pages cover the verify past that
+            # bound. The request finishes by max_model_len, so pages past it are never needed (padding writes go to the null
+            # page).
+            start = req.num_computed
+            end = start + 1
+            if draft:
+                start = min(start + (1 + len(draft)) * req.spec_inflight, self.cfg.max_model_len - 1)
+                end = min(start + 1 + len(draft), self.cfg.max_model_len)
+            while not self._reserve(req, end):
                 if self.in_flight:
                     raise NeedSync()
                 victim = self._youngest_running()
@@ -372,8 +418,8 @@ class Scheduler:
                 if victim is req:
                     break
             if req.status is Status.RUNNING:
-                save = self.track(req, req.num_computed, 1)
-                plan.decodes.append(ScheduledSeq(req, req.num_computed, 1, True, save=save))
+                save = None if draft else self.track(req, req.num_computed, 1)
+                plan.decodes.append(ScheduledSeq(req, start, 1 + len(draft), True, draft, save=save))
 
         # 2. Continue partial prefills, oldest first.
         budget = self.cfg.max_prefill_tokens
@@ -710,6 +756,7 @@ class Scheduler:
     def _preempt(self, req: Request) -> None:
         self._release(req, Status.WAITING)
         req.num_computed = 0
+        req.spec_ready = False  # its recompute rebuilds the speculative board row (engine/spec_async.py)
         req.num_preemptions += 1
         self.num_preemptions += 1
         self.waiting.appendleft(req)
