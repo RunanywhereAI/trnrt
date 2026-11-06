@@ -60,3 +60,43 @@ if nisa is not None:
 # -- end of the in-kernel helpers
 
 REV = zlib.crc32(repr((kernel_rev(__file__, "# -- in-kernel (NKI)", "# -- end of the in-kernel helpers"), P)).encode())
+
+# -- in-kernel (NKI): whole-row isolation of a kernel's input (moe_half's fin 2). Below REV's section, so the kernels that
+# fold REV keep their compile-cache keys; REV_ROWS is this section's.
+if nisa is not None:
+
+    def row_keep(x, T: int, H: int):
+        """keep fp32 [T, 1] on T partitions: 1.0 for each row of x (bf16 HBM [T, H]) whose values are all finite, 0.0
+        for a row holding any NaN / inf. Read on all 128 lanes: x again as [P, T, H / P] (h = p H / P + c, pieces of
+        H / P contiguous values: 64 bytes at H 4096), b mod 2^15 as in finite_or_zero3, its max over c, then each row's
+        count of values >= 32639.5 summed over the partitions by a matmul with a ones column (0 / 1 operands: exact).
+        Both programs of a grid call it alike (the same structure in each)."""
+        C = H // P
+        VE = nisa.vector_engine
+        xp = nl.ndarray((P, T, C), dtype=nl.bfloat16, buffer=nl.sbuf)
+        nisa.dma_copy(dst=xp, src=x.ap(pattern=[[C, P], [H, T], [1, C]], offset=0), dge_mode=nisa.dge_mode.none)
+        b = xp.view(nl.uint16)
+        f = nl.ndarray((P, T, C), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=f, data=b, op0=nl.greater, operand0=32767.5, engine=VE)  # the sign bit
+        nisa.scalar_tensor_tensor(dst=f, data=f, op0=nl.multiply, operand0=-32768.0, op1=nl.add, operand1=b)  # mod 2^15
+        mx = nl.ndarray((P, T), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_reduce(dst=mx, op=nl.maximum, data=f, axis=2)
+        bad = nl.ndarray((P, T), dtype=nl.bfloat16, buffer=nl.sbuf)  # 1 where the partition's piece of row t is not
+        nisa.tensor_scalar(dst=bad, data=mx, op0=nl.greater, operand0=32639.5, engine=VE)  # all finite
+        ones = nl.ndarray((P, 1), dtype=nl.bfloat16, buffer=nl.sbuf)
+        nisa.memset(dst=ones, value=1.0)
+        cnt = nl.ndarray((T, 1), dtype=nl.float32, buffer=nl.psum)
+        nisa.nc_matmul(dst=cnt, stationary=bad, moving=ones, accumulate=False)
+        keep = nl.ndarray((T, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=keep, data=cnt, op0=nl.less, operand0=0.5, engine=VE)
+        return keep
+
+    def zero_rows(src, dst, keep):
+        """dst (a native uint16 tile [T, n]) = src (a uint16 view of a bf16 tile [T, n], rows on the partitions) with
+        each row whose keep is 0 set to +0 whole: the bits, read as integers, times keep [T, 1] (exact, no NaN)."""
+        nisa.tensor_scalar(dst=dst, data=src, op0=nl.multiply, operand0=keep, engine=nisa.vector_engine)
+
+# -- end of the row helpers
+
+REV_ROWS = zlib.crc32(repr((kernel_rev(__file__, "# -- in-kernel (NKI): whole-row", "# -- end of the row helpers"),
+                            P)).encode())
