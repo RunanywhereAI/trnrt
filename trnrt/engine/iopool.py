@@ -49,8 +49,6 @@ SPEC_NAMES = frozenset(
         "verify",
         "spec_prep",
         "spec_post",
-        "spec_post_synth",
-        "mtp_prep",
         "mtp",
         "mtp_post",
         "spec_ckpt",
