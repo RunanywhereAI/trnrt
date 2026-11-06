@@ -1102,16 +1102,16 @@ class ModelRunner:
             for b, s in enumerate(seqs):
                 ck[b] = s.ckpt_row or 0
             self._exec("spec_ckpt", ("spec_ckpt", B, Q), [SPEC, slot_idx, rows.astype(np.float32), ck, valid])
-        self._spec_last = (B, slot_idx, valid, table, P, hkey)
+        self._spec_last = (len(seqs), B, slot_idx, valid, table, P, hkey)
         return out, res
 
     def mtp_async(self) -> None:
         """The MTP pass after the last verify_async: its positions, ids and last index from the board, its drafts into the
         board, in one graph (mtp_board) over the verify's hidden states."""
-        B, slot_idx, valid, table, P, hkey = self._spec_last
+        n, B, slot_idx, valid, table, P, hkey = self._spec_last
         Q = 1 + self.spec_k
-        hidx = np.zeros((B, Q), np.int64)
-        for b in range(B):
+        hidx = np.zeros((B, Q), np.int64)  # a padding row reads the first row
+        for b in range(n):
             hidx[b] = b * Q + np.arange(Q)  # the verify's rows of this sequence
         self._exec("mtp_board", self._mtp_board_key(B, Q, P, hkey),
                    [SPEC, slot_idx, table, self.pad_slots((B, Q)), valid, hkey, hidx, PARAM + "norm"])
