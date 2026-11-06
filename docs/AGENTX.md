@@ -28,13 +28,13 @@ Each row is a preset ([CONFIGURATION.md](CONFIGURATION.md#speculative-decoding-t
 | Concurrency | Arguments | Speculation | Decode batch |
 |---|---|---|---|
 | 1, 4, 8 | `--preset mtp-batch8` | while at most 4 users decode | up to 8 |
-| 2 | `--preset mtp-batch2` | always | up to 8 |
+| 2 | `--preset mtp-always` | always | up to 8 |
 | 12, 16 | `--preset mtp-batch12` | while at most 4 users decode | up to 12, 8 GB host cache per core |
-| 24 | `--preset mtp-batch12 --host-cache-gb 12` | while at most 4 users decode | up to 12, 12 GB host cache per core |
-| 32 | `--preset mtp-batch24` | while at most 4 users decode | up to 24, 12 GB host cache per core |
+| 24, 32 | `--preset mtp-batch24` | while at most 4 users decode | up to 24, 12 GB host cache per core |
 
-The host cache size is host only: it changes no graph, so `mtp-batch12` serves concurrency 12 to 24 on one compile cache.
-Every other row has its own graphs and its own capture.
+A preset names its decode batch; `mtp-always` is the one with speculation at every batch size. The host cache size is host
+only: it changes no graph, so `mtp-batch12 --host-cache-gb 12` is a larger tier on the same compile cache, though none of
+the measured points uses it. Every preset has its own graphs and its own capture.
 
 ## Build the compile cache
 
@@ -42,7 +42,7 @@ Follow [DEPLOY.md](DEPLOY.md) for the image, the model and the shape directory; 
 preset you serve, capture, compile and strip with the arguments you will serve with:
 
 ```bash
-PRESET=mtp-batch8      # or mtp-batch2, mtp-batch12, mtp-batch24
+PRESET=mtp-batch8      # or mtp-always, mtp-batch12, mtp-batch24
 trnrt compile capture --out $OUT -- --model $OUT/shapes --preset $PRESET
 trnrt compile compile --out $OUT --work-root $OUT/work
 trnrt compile strip --out $OUT
@@ -84,6 +84,40 @@ pages, state rows and token chains, dynamic speculation and its seat moves, the 
 Not yet checked here, and listed in the pull request: that each preset's graphs are the graphs the measured configurations
 ran (`tools/graph_equiv.py`), compile from source, a served run, GSM8K accuracy with MTP, and an AgentX point.
 
-## Workload
+## Run and score a point
 
-InferenceX's canonical AgentX workload (agentx-harness 1.0.12), one hour per point, scored with InferenceX's definitions.
+The load client is SemiAnalysis's AgentX harness, version 1.0.12 (built on AIPerf, Apache-2.0), on a separate CPU
+machine: the harness is CPU-heavy and the requests a minute it reaches depend on its client's cores, so state the
+client's core count next to any number (ours pinned the harness to 48 logical CPUs). Serve a preset from the table
+above, then run one point per concurrency:
+
+```bash
+pip install agentx-harness==1.0.12
+agentx profile \
+  --url http://<server>:<port> \
+  --endpoint /v1/chat/completions \
+  --model <the served model name> \
+  --tokenizer <a directory holding the model's tokenizer files> --tokenizer-trust-remote-code \
+  --max-context-length 1048576 \
+  --concurrency <C> \
+  --public-dataset semianalysis_cc_traces_weka_062126 \
+  --output-artifact-dir <dir>
+```
+
+- **Tokenizer files:** take them from the revision the engine serves, `eb9eb208eb0d988989d07a6a12d0fdeb5f52574a` of
+  `zai-org/GLM-5.3-Flash` ([DEPLOY.md](DEPLOY.md)). `tokenizer.json` and `tokenizer_config.json` of that revision are
+  byte-identical to the repository's current head (sha256 `19e77364…` and `98b12715…`); its chat template is not, so pin
+  the revision rather than the name.
+- **What the `agentx` command applies:** its built-in `agentx` scenario. The dataset has 393 entries (random seed 42,
+  idle gaps capped at 300 s); one profiling phase of 3,600 s at the given concurrency with a 30 s grace period and a warmup
+  of 10 requests per lane; chat completions, streamed, with the token counts taken from the server's usage (so the server
+  must return usage on streamed responses); `ignore_eos` required; no input truncation; the first turn's prefix cache
+  busted. The dataset downloads from the Hugging Face Hub on first use.
+- **Score it with InferenceX's own code,** `inferencex-e2e/infx/results/agentic` in
+  [SemiAnalysisAI/InferenceX](https://github.com/SemiAnalysisAI/InferenceX), not a restatement: requests a minute, total
+  tokens per second per chip (input, cached input included, plus output, over the profiled span, per chip: 8 for one
+  engine), and the time to first token, end-to-end and inter-token latencies, with interactivity the inverse of the
+  inter-token latency statistic. Records from the warmup phase and records with an error are dropped; each of our points
+  dropped 164 to 222 records as invalid inference results, about 11 warmup requests per unit of concurrency among them.
+- **Dollars per token** use a price per chip-hour you state. The numbers in [RESULTS.md](RESULTS.md#mtp-speculative-decoding-one-engine)
+  use SemiAnalysis's $0.58 per trn2 chip-hour.
