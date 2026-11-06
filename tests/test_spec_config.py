@@ -213,8 +213,16 @@ def test_the_sequence_parallel_gather_is_xla_or_nki():
 def kernel_routes(monkeypatch):
     """Whatever set_decode_routes writes is undone after the test."""
     from trnrt.kernels import dense_half, dsa_satwf, sp_gather
+    from trnrt.models import decoder
 
-    for mod, name in ((sp_gather, "MODE"), (sp_gather, "TP_EXPERTS"), (dsa_satwf, "SEL2G"), (dense_half, "SKIP_T")):
+    for mod, name in (
+        (sp_gather, "MODE"),
+        (sp_gather, "TP_EXPERTS"),
+        (dsa_satwf, "SEL2G"),
+        (dense_half, "SKIP_T"),
+        (decoder, "MTP_CHUNK_Q"),
+        (decoder, "DYN_MTP_KV"),
+    ):
         monkeypatch.setattr(mod, name, getattr(mod, name))
 
 
@@ -223,16 +231,26 @@ def test_set_decode_routes_hands_the_kernel_routes_of_a_preset_to_the_modules_an
 ):
     from trnrt.engine import engine as E
     from trnrt.kernels import dense_half, dsa_satwf, sp_gather
+    from trnrt.models import decoder
 
     def routes():
-        return sp_gather.MODE, sp_gather.TP_EXPERTS, dsa_satwf.SEL2G, dense_half.SKIP_T
+        return (
+            sp_gather.MODE,
+            sp_gather.TP_EXPERTS,
+            dsa_satwf.SEL2G,
+            dense_half.SKIP_T,
+            decoder.MTP_CHUNK_Q,
+            decoder.DYN_MTP_KV,
+        )
 
     E.set_decode_routes(_cfg("--preset", "mtp-batch24"))
-    assert routes() == ("nki", True, True, frozenset((2, 18, 24)))
+    assert routes() == ("nki", True, True, frozenset((2, 18, 24)), 64, "1")
     E.set_decode_routes(_cfg("--preset", "mtp-batch12"))
-    assert routes() == ("nki", True, True, frozenset((2,)))
+    assert routes() == ("nki", True, True, frozenset((2,)), 64, "1")
     E.set_decode_routes(_cfg())
-    assert routes() == ("xla", False, False, frozenset((2,)))
+    assert routes() == ("xla", False, False, frozenset((2,)), 0, "0")
+    E.set_decode_routes(_cfg("--preset", "mtp-always"))
+    assert routes()[4:] == (64, "0"), "the static preset has the chunk form and no plain-step KV write"
 
 
 def test_build_shard_builds_the_mtp_layer_only_for_an_engine_that_speculates(monkeypatch):
