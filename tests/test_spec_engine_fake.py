@@ -196,7 +196,7 @@ class FakeRunner:
         (s,) = seqs
         if s.sample:
             r = s.req
-            self.board[r.rid] = {"base": s.end, "cur": self._row(r), "nd": 1}
+            self.board[r.rid] = {"base": s.end, "cur": self._row(r), "nd": 1, "fresh": True}
             r.spec_ready = True
 
     def verify_async(self, seqs, q: int):
@@ -212,7 +212,7 @@ class FakeRunner:
             if not r.spec_ready:  # spec_host_init: its newest token is a token the host holds
                 assert PENDING not in r.token_ids[: s.start + 1], f"{r.rid}: a host init with a token still in flight"
                 self._chain(r, s.start)
-                self.board[r.rid] = {"base": s.start, "cur": self._row(r), "nd": 0}
+                self.board[r.rid] = {"base": s.start, "cur": self._row(r), "nd": 0, "fresh": False}
                 r.spec_ready = True
             bd = self.board[r.rid]
             base, h = bd["base"], self.hist[r.rid]
@@ -223,6 +223,7 @@ class FakeRunner:
                 f"{r.rid}: verify at {base} reads a state of {self.content.get(bd['cur'])}"
             )
             drafted = bd["nd"] > 0
+            assert bd["fresh"] or not drafted, f"{r.rid}: a verify of drafts no MTP pass wrote after the last verify"
             acc = self.rng.choices(range(K + 1), weights=self.accept)[0] if drafted else 0
             emitted = []
             for _ in range(acc + 1):
@@ -236,7 +237,9 @@ class FakeRunner:
                 c = (old + acc + 1) // t * t
                 if c > old:
                     self.content[s.ckpt_row] = self.content[rows[c - 1 - old]]
-            bd.update(base=old + 1 + acc, cur=rows[acc])
+            bd.update(
+                base=old + 1 + acc, cur=rows[acc], fresh=False
+            )  # the drafts are the last verify's: the MTP pass writes new ones
             res[b, : acc + 1] = torch.tensor(emitted, dtype=torch.float32)
             res[b, Q], res[b, Q + 1] = acc, float(drafted)
             for j in range(Q):  # the logprob columns carry which column they are, so a mix-up shows
@@ -246,7 +249,7 @@ class FakeRunner:
 
     def mtp_async(self) -> None:
         for rid in self.last_rows:
-            self.board[rid]["nd"] = 1
+            self.board[rid].update(nd=1, fresh=True)
 
 
 def make_engine(
