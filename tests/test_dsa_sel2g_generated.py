@@ -58,3 +58,22 @@ def test_takes_only_the_partial_chunk_buckets():
     assert not dsa_sel2g.takes(t(1024))  # NT 64: one chunk
     assert not dsa_sel2g.takes(t(4096))  # NT 256: whole chunks
     assert not dsa_sel2g.takes(t(512))
+
+
+def test_sel2g_dispatch_reads_the_table_in_either_form(monkeypatch):
+    """With SEL2G on, dsa_satwf.satwf sends a call whose block table dsa_sel2g.takes to dsa_satwfg, whether the table
+    comes positionally (models/mla.py) or by keyword; anything else, and every call with SEL2G off, goes to the call
+    below it unchanged (keyword-only calls included: tests/test_dsa_fused_layer.py's comb dispatch)."""
+    pytest.importorskip("torch")
+    from trnrt.kernels import dsa_satwf, dsa_satwfg, dsa_sel2g
+
+    monkeypatch.setattr(dsa_sel2g, "takes", lambda table: table == "p3072")
+    monkeypatch.setattr(dsa_satwfg, "satwf", lambda *a, **k: ("g", a, k))
+    monkeypatch.setattr(dsa_satwf, "_satwf_pre_sel2g", lambda *a, **k: ("pre", a, k))
+    monkeypatch.setattr(dsa_satwf, "SEL2G", True)
+    assert dsa_satwf.satwf(1, 2, 3, "p3072", 5, comb_a=0)[0] == "g"
+    assert dsa_satwf.satwf(1, 2, 3, "p1024", comb_a=0)[0] == "pre"
+    assert dsa_satwf.satwf(q=1, w=2, pkc=3, table="p3072")[0] == "g"
+    monkeypatch.setattr(dsa_satwf, "SEL2G", False)
+    assert dsa_satwf.satwf(1, 2, 3, "p3072", comb_a=0) == ("pre", (1, 2, 3, "p3072"), {"comb_a": 0})
+    assert dsa_satwf.satwf(comb_a=0) == ("pre", (), {"comb_a": 0})
