@@ -122,7 +122,9 @@ def test_the_realized_accepted_count_distribution_is_the_golden_schedules(k):
     check_distribution(realized(SS.SynthAccept(al, k, seed=3), 40000), al, k)
 
 
-@pytest.mark.parametrize(("al", "k"), [(1.0, 3), (4.0, 3), (2.0, 3), (2.6, 3)])
+@pytest.mark.parametrize(
+    ("al", "k"), [(1.0, 3), (4.0, 3), (2.0, 3), (2.6, 3), (2.518506, 2)]
+)  # the last: AgentX's golden length
 def test_the_edges_of_the_schedule_hold_too(al, k):
     check_distribution(realized(SS.SynthAccept(al, k, seed=5), 20000), al, k)
 

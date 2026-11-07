@@ -12,7 +12,8 @@
   in the next step. The accepted count, the newest token, the positions, the state row and the drafts stay on the device,
   so the next step is scheduled before the previous one is read back (`trnrt/engine/spec_async.py`).
 - **MTP only while few users decode.** MTP runs while at most 4 requests decode in a step and plain decode runs above that,
-  because past that point a verify step costs more per token than it saves. Plain steps still write the MTP layer's KV
+  because past that point a verify step costs more per token than it saves. Once plain, MTP returns when 3 or fewer
+  decode (`--spec-hysteresis 1`), so a batch hovering at the limit doesn't flip every step. Plain steps still write the MTP layer's KV
   cache, so a return to MTP finds it complete.
 - **Larger decode batches** for higher concurrency (12 and 24 requests per engine), with a state checkpoint row per
   decoding seat. Only the seats that speculate hold the 3 state rows a verify writes.
@@ -62,9 +63,10 @@ docker run ... trnrt serve --model /model --port 8000 --preset mtp-batch8 --engi
 `--engines 1` is the measured layout: one engine of 8 chips, the unit of [RESULTS.md](RESULTS.md) and of the per-chip
 scoring below. It changes no graph. With the default two engines the box serves on 16 chips, so divide by 16 instead.
 
-`GET /v1/stats` carries a `spec` block (drafts proposed and accepted, the mean acceptance length, the per-position counts,
-and in a dynamic preset the mode flips), and `GET /metrics` the same counters as `trnrt:spec_decode_*`, under vLLM's
-metric names.
+Each engine's `GET /v1/stats` carries a `spec` block (drafts proposed and accepted, the mean acceptance length, the
+per-position counts, and in a dynamic preset the mode flips), and its `GET /metrics` the same counters as
+`trnrt:spec_decode_*`, under vLLM's metric names. Both are on the engine's own port, `--port` + 1 (8001 here) on
+127.0.0.1, not on the router's.
 
 ## Benchmark mode
 
@@ -77,8 +79,8 @@ length for 2 draft tokens.
 Drafting and verification still run for real, and the step costs what it costs; only which positions count as accepted is
 drawn. An accepted position takes its draft whether or not the target agrees, so the **text of a benchmark-mode run is not
 the model's**: use it only to compare serving throughput with InferenceX's published runs, never to judge output quality.
-The mode adds one input to one small graph (the draw's flags), so it needs its own capture: run `compile capture` with the
-same `--spec-synth-al`.
+The mode adds one input to one small graph (the draw's flags), so it needs its own capture: pass the same
+`--spec-synth-al` to both `compile capture` and `serve`.
 
 ## Status
 
