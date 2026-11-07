@@ -6,8 +6,9 @@ name: Release
 #
 # - PyPI: only when the repository variable PUBLISH_PYPI is "true" and a trusted publisher is configured for the
 #   `pypi` environment.
-# - Container image (ghcr.io/runanywhereai/trnrt): built on every run, pushed only from a release tag when the
-#   repository variable PUBLISH_IMAGE is "true". It is independent of the package jobs, so a release never waits on it.
+# - Container image (ghcr.io/runanywhereai/trnrt): built and checked on dry runs; built, pushed and attested from a
+#   release tag when the repository variable PUBLISH_IMAGE is "true", after the tag checks. The package release never
+#   waits on it, and only the publish job holds write permissions.
 #
 # A dry run (manual, or a PR that changes the release machinery) builds everything and publishes nothing.
 
@@ -52,6 +53,8 @@ jobs:
       - run: pip install build twine
       - run: python -m build
       - run: twine check --strict dist/*
+      - name: Checksums
+        run: cd dist && sha256sum -- * > SHA256SUMS && cat SHA256SUMS
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dist
@@ -59,7 +62,22 @@ jobs:
 
   image:
     name: Release image
-    if: github.repository == 'RunanywhereAI/trnrt'
+    # Dry runs only: builds and checks the image (docker/check_image.py runs inside the build), publishes nothing.
+    if: github.repository == 'RunanywhereAI/trnrt' && github.event_name != 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      IMAGE: ghcr.io/runanywhereai/trnrt
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: docker/ci_build_image.sh
+
+  image-publish:
+    name: Publish image
+    needs: build # the tag checks run there; an image is never pushed from a tag that fails them
+    if: github.event_name == 'push' && vars.PUBLISH_IMAGE == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     permissions:
@@ -69,47 +87,22 @@ jobs:
       attestations: write
     env:
       IMAGE: ghcr.io/runanywhereai/trnrt
-      PUSH: ${{ github.event_name == 'push' && vars.PUBLISH_IMAGE == 'true' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Free disk space
-        run: |
-          # The built image is about 27 GB (docs/DEPLOY.md). Docker's data root moves to the runner's larger
-          # temporary disk, and preinstalled toolchains TrnRT doesn't use are removed.
-          df -h / /mnt
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
-          sudo systemctl stop docker
-          sudo mkdir -p /mnt/docker
-          echo '{"data-root": "/mnt/docker"}' | sudo tee /etc/docker/daemon.json
-          sudo systemctl start docker
-          df -h / /mnt
-      - name: Build
-        run: |
-          v=$(python3 -c "import ast;print(next(n.value.value for n in ast.parse(open('trnrt/__init__.py').read()).body if isinstance(n, ast.Assign) and n.targets[0].id == '__version__'))")
-          echo "VERSION=$v" >> "$GITHUB_ENV"
-          docker build -f docker/Dockerfile \
-            --build-arg "TRNRT_VERSION=$v" --build-arg "TRNRT_REVISION=$GITHUB_SHA" \
-            -t "$IMAGE:$v" .
-          docker image ls "$IMAGE"
-          df -h / /mnt
-          sudo du -sh /mnt/docker
-      - name: Log in to GHCR
-        if: env.PUSH == 'true'
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+      - run: docker/ci_build_image.sh
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Push
-        if: env.PUSH == 'true'
         run: |
           docker push "$IMAGE:$VERSION"
           digest=$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE:$VERSION")
           echo "DIGEST=${digest#*@}" >> "$GITHUB_ENV"
       - name: Attest the image's build provenance
-        if: env.PUSH == 'true'
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ${{ env.IMAGE }}
@@ -133,7 +126,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
-        run: gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --title "TrnRT $TAG" --generate-notes --verify-tag
+        run: |
+          # A rerun after a later job failed finds the release already there: upload the files again instead.
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --title "TrnRT $TAG" --generate-notes --verify-tag
+          fi
 
   pypi:
     name: PyPI

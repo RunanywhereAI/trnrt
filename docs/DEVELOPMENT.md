@@ -88,11 +88,13 @@ To cut a release:
    Unreleased entries under the new version. Rebuild the compile cache for every release: a release can change graphs,
    and a mismatched cache fails start-up.
 2. **Check on a device.** On a `trn2.48xlarge`, `docker/check_image.py --device` passes on the image built from that
-   commit, and the default configuration serves. CI has no Trainium runner, so the result goes in the release PR.
+   commit, and the default configuration (batch 12) compiles and serves on all 32 ranks. `tools/graph_equiv.py`
+   against the previous release's capture shows which graphs changed, if any. CI has no Trainium runner, so the
+   commands, configuration and results go in the release PR.
 3. **Promote.** A PR from `development` into `main`, titled `release: vX.Y.Z`, merged with a merge commit.
 4. **Tag** `main`'s merge commit: `git tag vX.Y.Z <commit> && git push origin vX.Y.Z`. `release.yml` refuses a tag
    that is not on `main` or does not match `__version__`.
-5. **Publish.** `release.yml` creates the GitHub release with the sdist and wheel. PyPI runs when the repository
+5. **Publish.** `release.yml` creates the GitHub release with the sdist, the wheel and their `SHA256SUMS`. PyPI runs when the repository
    variable `PUBLISH_PYPI` is `true` and a trusted publisher is configured for the `pypi` environment. The image is
    pushed to `ghcr.io/runanywhereai/trnrt` when `PUBLISH_IMAGE` is `true`.
 

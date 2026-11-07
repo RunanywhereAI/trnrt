@@ -6,6 +6,7 @@ name: Promotion
 on:
   pull_request:
     branches: [main]
+    types: [opened, edited, synchronize, reopened] # edited: a PR retargeted to main is checked at once
 
 permissions:
   contents: read
