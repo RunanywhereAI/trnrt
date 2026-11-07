@@ -18,7 +18,8 @@ lower_bound * sigmoid(exp(A_log) * g)).
 
 Static-shape formulation (the same code runs on CPU and on a NeuronCore):
 - decode (B sequences x 1 token): the recurrent step above as batched einsums. On the device a
-  decode step's KDA layers run as the KDA shell instead (models/hybrid.py, kernels/kda_shell.py).
+  decode step's KDA layers run as the KDA shell instead (models/hybrid.py, kernels/kda_shell.py), and a step above
+  the shell's row cap runs the recurrence here as kernels/kda_decode.py.
 - prefill chunk (one sequence x C tokens): the chunked form (fla / the transformers chunk
   kernels) over fixed sub-chunks of CHUNK tokens, unrolled at trace time; on the device the NKI
   chunked delta rule (kernels/delta_rule.py). The per-chunk triangular solve (I + A)^-1, which
@@ -478,11 +479,18 @@ def _mix_rows(model, layer, x: torch.Tensor, positions: torch.Tensor, slot_mappi
         _write_rows(layer.rec_state, write, states.reshape(B * Q, nv, dk, dv))
         o = o.reshape(T, nv, dv)
     elif form == "decode":
-        keep4 = keep.view(T, 1, 1, 1)
-        S = layer.rec_state[state_slot]
-        S = torch.where(keep4, S, torch.zeros_like(S))
-        o, S = recurrent_step(q, k, v, g, beta, S)
-        _write_rows(layer.rec_state, state_slot, S)
+        # Above the KDA shell's row cap (hybrid.kda_shell_rows), on the device: the recurrence as one kernel, which
+        # reads, updates and writes the pool rows in place (kernels/kda_decode.py); the einsums below elsewhere.
+        from ..kernels import kda_decode
+
+        if kda_decode.takes(x, dk, dv, sp.kind == "kda" and g.dim() == 3):
+            o = kda_decode.decode_step(layer.rec_state, state_slot, keep.view(T), q, k, v, g, beta)
+        else:
+            keep4 = keep.view(T, 1, 1, 1)
+            S = layer.rec_state[state_slot]
+            S = torch.where(keep4, S, torch.zeros_like(S))
+            o, S = recurrent_step(q, k, v, g, beta, S)
+            _write_rows(layer.rec_state, state_slot, S)
     elif form == "chunk":
         S = layer.rec_state[state_slot][0]
         S = torch.where(keep.view(1, 1, 1), S, torch.zeros_like(S))
