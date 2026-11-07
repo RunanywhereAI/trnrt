@@ -1,0 +1,21 @@
+# yaml-language-server: $schema=https://cubic.dev/schema/cubic-repository-config.schema.json
+# cubic reviews every ready-for-review pull request into development, forks included. Its status is never a required
+# check; its comments, like every review comment, are fixed or answered and resolved before a merge. Promotions into main are not reviewed: their changes were reviewed on the way into development.
+version: 1
+reviews:
+  enabled: true
+  check_drafts: false
+  incremental_commits: true
+  external_contributors_require_manual_review: false
+  custom_instructions: |
+    Follow AGENTS.md. Traced code (trnrt/kernels/, trnrt/models/, trnrt/engine/model_runner.py,
+    trnrt/compile/capture.py, trnrt/config.py, trnrt/platform.py, and the graph-shape defaults in trnrt/__main__.py)
+    feeds the compiled graphs and compile-cache keys:
+    review it for correctness only, never suggest cosmetic edits there, and ask for tools/graph_equiv.py or device
+    evidence when a PR changes it. API handlers never mutate engine state directly; unsupported API fields get a 400
+    that says why.
+  ignore:
+    base_branches:
+      - main
+    files:
+      - docs/assets/

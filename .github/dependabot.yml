@@ -1,9 +1,13 @@
 version: 2
+# Updates open against the default branch, development. A week's cooldown lets a new release prove itself before it
+# is proposed.
 updates:
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
     groups:
       actions:
         patterns: ["*"]
@@ -11,4 +15,6 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
     open-pull-requests-limit: 5
