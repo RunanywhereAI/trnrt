@@ -77,8 +77,8 @@ token unless a job needs more.
 
 | Branch | Takes | Protection |
 |---|---|---|
-| `development` (default) | every pull request, squash or merge | 1 maintainer approval, the 4 CI jobs, no force-push or deletion |
-| `main` | promotions of `development`, for releases only | 1 maintainer approval, the 4 CI jobs and "Promotion source", merge commits only, only admins merge, no force-push or deletion |
+| `development` (default) | every pull request, squash-merged | 1 maintainer approval, every review conversation resolved, the 4 CI jobs, no force-push or deletion |
+| `main` | promotions of `development`, for releases only | 1 maintainer approval, every review conversation resolved, the 4 CI jobs and "Promotion source", merge commits only, only admins merge, no force-push or deletion |
 
 `v*` tags are created by admins only, and nobody can move or delete one.
 

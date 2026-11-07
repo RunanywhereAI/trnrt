@@ -1,6 +1,7 @@
 # yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
 # CodeRabbit reviews every ready-for-review pull request into development, forks included, and each later push.
-# Its review is advice: it is not a required check and never requests changes.
+# Its status is never a required check and it never requests changes; its comments, like every review comment, are
+# fixed or answered and resolved before a merge (the branch rulesets require resolved conversations).
 language: en-US
 reviews:
   profile: chill

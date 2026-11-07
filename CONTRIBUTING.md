@@ -31,11 +31,13 @@ approach before you write it.
 |---|---|---|
 | CI | lint and format (pre-commit, including the workflow linters), mypy, the CPU test suite, package build, Dockerfile lint. `make check` runs the first three locally | yes |
 | PR checks | the title format, and a note when the PR touches traced code | no, advice |
-| AI review | CodeRabbit, cubic and Greptile review the PR when it is ready for review (not while it is a draft) and after each push | no, advice |
+| AI review | CodeRabbit, cubic and Greptile review the PR when it is ready for review (not while it is a draft) and after each push | their status never blocks; their comments do, like any other (next row) |
 | Maintainer review | one approval from a maintainer ([CODEOWNERS](.github/CODEOWNERS)) | yes |
+| Open comments | every review comment, a bot's included, is fixed or answered, and its conversation resolved | yes |
 
-A first-time contributor's CI runs once a maintainer approves it. Most PRs are squash-merged, so the PR title becomes
-the commit subject.
+A first-time contributor's CI runs once a maintainer approves it. PRs into `development` are squash-merged, so the PR
+title becomes the commit subject. If a comment is wrong, reply with why and resolve it; a fix gets a reply naming its
+commit.
 
 ## Rules every change follows
 

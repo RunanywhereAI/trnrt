@@ -1,6 +1,6 @@
 # yaml-language-server: $schema=https://cubic.dev/schema/cubic-repository-config.schema.json
-# cubic reviews every ready-for-review pull request into development, forks included. Its review is advice, never a
-# required check. Promotions into main are not reviewed: their changes were reviewed on the way into development.
+# cubic reviews every ready-for-review pull request into development, forks included. Its status is never a required
+# check; its comments, like every review comment, are fixed or answered and resolved before a merge. Promotions into main are not reviewed: their changes were reviewed on the way into development.
 version: 1
 reviews:
   enabled: true
