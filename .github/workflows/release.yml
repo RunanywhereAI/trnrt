@@ -1,40 +1,118 @@
 name: Release
 
-# Push a tag vX.Y.Z whose version matches trnrt/__init__.py. The workflow builds the sdist and wheel, checks them, and
-# attaches them to a GitHub release. Publishing to PyPI runs only when the repository variable PUBLISH_PYPI is "true"
-# and a trusted publisher is configured for the `pypi` environment.
+# Releases are cut from main only (docs/DEVELOPMENT.md, "Releasing"). Push a tag vX.Y.Z on main's promotion merge
+# commit, matching trnrt/__init__.py. The workflow checks the tag, builds and checks the sdist and wheel, and attaches
+# them to a GitHub release.
+#
+# - PyPI: only when the repository variable PUBLISH_PYPI is "true" and a trusted publisher is configured for the
+#   `pypi` environment.
+# - Container image (ghcr.io/runanywhereai/trnrt): built and checked on dry runs; built, pushed and attested from a
+#   release tag when the repository variable PUBLISH_IMAGE is "true", after the tag checks. The package release never
+#   waits on it, and only the publish job holds write permissions.
+#
+# A dry run (manual, or a PR that changes the release machinery) builds everything and publishes nothing.
 
 on:
   push:
-    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - "docker/**"
+      - "pyproject.toml"
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   build:
+    name: Release package
     if: github.repository == 'RunanywhereAI/trnrt'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # the tag's commit must be reachable from main
+          persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.13"
-      - name: The tag matches the package version
+      - name: The tag matches the package version and is on main
+        if: github.event_name == 'push'
         run: |
           v=$(python -c "import ast;print(next(n.value.value for n in ast.parse(open('trnrt/__init__.py').read()).body if isinstance(n, ast.Assign) and n.targets[0].id == '__version__'))")
-          test "v$v" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME != version v$v"; exit 1; }
+          test "v$v" = "$GITHUB_REF_NAME" || { echo "::error::tag $GITHUB_REF_NAME != version v$v"; exit 1; }
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main \
+            || { echo "::error::tag $GITHUB_REF_NAME is not on main; releases are cut from main only"; exit 1; }
       - run: pip install build twine
       - run: python -m build
       - run: twine check --strict dist/*
+      - name: Checksums
+        run: cd dist && sha256sum -- * > SHA256SUMS && cat SHA256SUMS
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dist
           path: dist/
 
+  image:
+    name: Release image
+    # Dry runs only: builds and checks the image (docker/check_image.py runs inside the build), publishes nothing.
+    if: github.repository == 'RunanywhereAI/trnrt' && github.event_name != 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      IMAGE: ghcr.io/runanywhereai/trnrt
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: docker/ci_build_image.sh
+
+  image-publish:
+    name: Publish image
+    needs: build # the tag checks run there; an image is never pushed from a tag that fails them
+    if: github.event_name == 'push' && vars.PUBLISH_IMAGE == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    env:
+      IMAGE: ghcr.io/runanywhereai/trnrt
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: docker/ci_build_image.sh
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push
+        run: |
+          docker push "$IMAGE:$VERSION"
+          digest=$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE:$VERSION")
+          echo "DIGEST=${digest#*@}" >> "$GITHUB_ENV"
+      - name: Attest the image's build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ env.DIGEST }}
+          push-to-registry: true
+
   github-release:
+    name: GitHub release
     needs: build
+    if: github.event_name == 'push'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
@@ -44,14 +122,22 @@ jobs:
         with:
           name: dist
           path: dist/
-      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
-        with:
-          files: dist/*
-          generate_release_notes: true
+      - name: Create the release with the sdist and wheel
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          # A rerun after a later job failed finds the release already there: upload the files again instead.
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --title "TrnRT $TAG" --generate-notes --verify-tag
+          fi
 
   pypi:
+    name: PyPI
     needs: build
-    if: vars.PUBLISH_PYPI == 'true'
+    if: github.event_name == 'push' && vars.PUBLISH_PYPI == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     environment: pypi
@@ -62,4 +148,6 @@ jobs:
         with:
           name: dist
           path: dist/
+      - name: Upload only the sdist and wheel
+        run: rm dist/SHA256SUMS
       - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3

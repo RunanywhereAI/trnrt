@@ -57,18 +57,45 @@ itself; `configure()` then adds no second handler. Hang reports reach stderr eit
 
 ## CI
 
-| Workflow | Runs | On |
+| Workflow | Runs | On | Blocks a merge |
+|---|---|---|---|
+| `ci.yml` | pre-commit (ruff lint and format, file checks, doc links, actionlint and zizmor on the workflows); mypy; the CPU suite; package build and `twine check`; Dockerfile lint | every PR, every push to `development` and `main` | yes, all four jobs |
+| `promotion.yml` | "Promotion source": the PR comes from this repository's `development` | every PR into `main` | yes, on `main` |
+| `pr-checks.yml` | the PR title reads `<area>: <what changes>`; a warning and checklist when traced code changes | every PR | no |
+| `dependency-review.yml` | new dependencies' known vulnerabilities and licences | every PR | no |
+| CodeQL (GitHub's default setup, extended query suite) | security analysis of the Python and the workflows | pushes to `development` and `main`, PRs from branches of this repository, weekly | no |
+| `scorecard.yml` | OpenSSF Scorecard | pushes to `development`, weekly | no |
+| `links.yml` | external links in the Markdown docs | weekly | no |
+| `release.yml` | build and check the sdist, wheel and container image; on a release tag, the GitHub release, PyPI and the image when enabled | a `vX.Y.Z` tag on `main`; a dry run on PRs that change it, `docker/` or `pyproject.toml`, or by hand | — |
+
+CodeRabbit, cubic and Greptile review every ready-for-review PR into `development` (`.coderabbit.yaml`, `cubic.yaml`,
+`greptile.json`). None is a required check. Dependabot keeps the pinned actions and Python dependencies current, a
+week after each release. Every third-party action is pinned to a commit SHA, and every workflow runs on a read-only
+token unless a job needs more.
+
+## Branches and releases
+
+| Branch | Takes | Protection |
 |---|---|---|
-| `ci.yml` | pre-commit (ruff lint and format, file checks, doc links); mypy; the CPU suite; package build and `twine check`; Dockerfile lint | every push to `development` or `main`, and every PR |
-| CodeQL (GitHub's default setup, extended query suite) | security analysis of the Python and the workflows | every push and PR to `main`, weekly |
-| `release.yml` | build, check and attach the sdist and wheel to a GitHub release; PyPI when enabled | a `vX.Y.Z` tag that matches `trnrt.__version__` |
+| `development` (default) | every pull request, squash-merged | 1 maintainer approval, every review conversation resolved, the 4 CI jobs, no force-push or deletion |
+| `main` | promotions of `development`, for releases only | 1 maintainer approval, every review conversation resolved, the 4 CI jobs and "Promotion source", merge commits only, only admins merge, no force-push or deletion |
 
-Dependabot keeps the pinned actions current. Every third-party action is pinned to a commit SHA.
+`v*` tags are created by admins only, and nobody can move or delete one.
 
-## Releasing
+To cut a release:
 
-1. Bump `__version__` in `trnrt/__init__.py` and move `CHANGELOG.md`'s Unreleased entries under the new version.
-   Rebuild the compile cache for every release: a release can change graphs, and a mismatched cache fails start-up.
-2. Merge to `main`, then tag: `git tag v0.2.0 && git push origin v0.2.0`.
-3. To publish to PyPI as well, configure a trusted publisher for the `pypi` environment, and set the repository
-   variable `PUBLISH_PYPI` to `true`.
+1. **Prepare on `development`.** One PR bumps `__version__` in `trnrt/__init__.py` and moves `CHANGELOG.md`'s
+   Unreleased entries under the new version. Rebuild the compile cache for every release: a release can change graphs,
+   and a mismatched cache fails start-up.
+2. **Check on a device.** On a `trn2.48xlarge`, `docker/check_image.py --device` passes on the image built from that
+   commit, and the default configuration (batch 12) compiles and serves on all 32 ranks. `tools/graph_equiv.py`
+   against the previous release's capture shows which graphs changed, if any. CI has no Trainium runner, so the
+   commands, configuration and results go in the release PR.
+3. **Promote.** A PR from `development` into `main`, titled `release: vX.Y.Z`, merged with a merge commit.
+4. **Tag** `main`'s merge commit: `git tag vX.Y.Z <commit> && git push origin vX.Y.Z`. `release.yml` refuses a tag
+   that is not on `main` or does not match `__version__`.
+5. **Publish.** `release.yml` creates the GitHub release with the sdist, the wheel and their `SHA256SUMS`. PyPI runs when the repository
+   variable `PUBLISH_PYPI` is `true` and a trusted publisher is configured for the `pypi` environment. The image is
+   pushed to `ghcr.io/runanywhereai/trnrt` when `PUBLISH_IMAGE` is `true`.
+
+An urgent fix takes the same path: a PR into `development`, then a promotion and a patch release.

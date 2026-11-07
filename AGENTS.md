@@ -29,7 +29,7 @@ Nothing here needs a Trainium device. Device-only work (`docker/check_image.py -
    ladders, the pool sizes, the page size or a decode kernel route (`trnrt/config.py`, `trnrt/__main__.py` defaults).
    Make such a change only on purpose, prove it with `tools/graph_equiv.py`, and say so in the PR. The formatter and
    ruff's fixes skip these paths (`pyproject.toml` lists them); never run a formatter over them by hand.
-2. **Bump `trnrt.__version__` only for a release** ([docs/DEVELOPMENT.md](docs/DEVELOPMENT.md#releasing)). Captures
+2. **Bump `trnrt.__version__` only for a release** ([docs/DEVELOPMENT.md](docs/DEVELOPMENT.md#branches-and-releases)). Captures
    record it, and each release gets its own compile cache.
 3. **Every argparse parser passes `allow_abbrev=False`** (`tests/test_no_abbrev.py`): one parser's argv is handed to
    another, and an abbreviation silently became a different flag once.
@@ -64,6 +64,8 @@ Nothing here needs a Trainium device. Device-only work (`docker/check_image.py -
   A message that must survive an unconfigured process (a hang report before exit) uses `trnrt.log.always`.
 
 - Commit subjects are `<area>: <what changes>`, written as a sentence (`router: answer a malformed body with 400`).
+- Pull requests target `development`. `main` takes promotions of `development` for releases only
+  ([docs/DEVELOPMENT.md](docs/DEVELOPMENT.md#branches-and-releases)).
 - Docstrings and comments say why, with the measurement or the reference behind a number.
 - Docs and the README use plain, short sentences, with tables over paragraphs. Use relative links; `make lint` checks
   them.
