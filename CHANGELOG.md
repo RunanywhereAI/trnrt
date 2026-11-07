@@ -24,6 +24,8 @@ and versions follow [Semantic Versioning](https://semver.org/). Rebuild the comp
 
 ### Fixed
 
+- An unknown request field is refused with 400 naming it, as AGENTS.md invariant 7 requires. It was ignored, and the
+  request answered 200 as if it had been applied (`prediction`, `modalities`, `audio`, a misspelled field).
 - The router answers a request body that is not a JSON object with 400, as each engine does, instead of 500.
 
 ## [0.1.0]
