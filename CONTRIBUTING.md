@@ -2,24 +2,40 @@
 
 Thanks for helping. Bug reports, performance work, kernel fixes, docs and new model families are all welcome.
 
-## Before you start
+## Quick start
 
-- **Bugs:** open an issue with the bug form. It asks for the instance type, the Neuron SDK version, `neuron-ls` output,
-  the exact command and the logs.
-- **Larger changes** (a new model family, a new kernel, an API change): open an issue first, so we can agree on the
-  approach before you write it.
-- **Security issues:** do not open a public issue. See [SECURITY.md](SECURITY.md).
+1. **Fork** the repository and clone your fork.
+2. **Set up and check:** `make dev && make check`. You need Python 3.13 and no Trainium device.
+3. **Open a pull request against `development`.**
 
-## Set up
+That's all. The rest of this page says what happens next and what a change needs.
 
-```bash
-git clone https://github.com/RunanywhereAI/trnrt.git && cd trnrt
-make dev      # Python 3.13 venv: editable install, test and lint tools, the pre-commit hook
-make check    # lint, type-check, then the CPU test suite
-```
+## Where to go
 
-The CPU suite needs no NeuronCore. Kernel tests that need the NKI simulator, and tests that need a checkpoint, skip
-cleanly without them. [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) lists every test tier and how to run it.
+| You want to | Go to |
+|---|---|
+| Report a bug | [a bug report](https://github.com/RunanywhereAI/trnrt/issues/new?template=10-bug-report.yml) |
+| Report something slower than before | [a performance regression](https://github.com/RunanywhereAI/trnrt/issues/new?template=40-performance-regression.yml) |
+| Ask for a feature or a model | [a feature request](https://github.com/RunanywhereAI/trnrt/issues/new?template=20-feature-request.yml) or [a model request](https://github.com/RunanywhereAI/trnrt/issues/new?template=30-model-request.yml) |
+| Fix or improve the docs | [a docs issue](https://github.com/RunanywhereAI/trnrt/issues/new?template=50-docs.yml), or just open the PR |
+| Ask a question | [Discussions](https://github.com/RunanywhereAI/trnrt/discussions) |
+| Report a security issue | [SECURITY.md](SECURITY.md), never a public issue |
+| Find something to work on | issues labelled [`good first issue`](https://github.com/RunanywhereAI/trnrt/labels/good%20first%20issue) or [`help wanted`](https://github.com/RunanywhereAI/trnrt/labels/help%20wanted) |
+
+For a larger change (a new model family, a new kernel, an API change), open an issue first so we can agree on the
+approach before you write it.
+
+## What happens to your pull request
+
+| Step | What it is | Blocks the merge |
+|---|---|---|
+| CI | lint and format (pre-commit, including the workflow linters), mypy, the CPU test suite, package build, Dockerfile lint. `make check` runs the same locally | yes |
+| PR checks | the title format, and a note when the PR touches traced code | no, advice |
+| AI review | CodeRabbit, cubic and Greptile review the PR when it is ready for review (not while it is a draft) and after each push | no, advice |
+| Maintainer review | one approval from a maintainer ([CODEOWNERS](.github/CODEOWNERS)) | yes |
+
+A first-time contributor's CI runs once a maintainer approves it. We squash-merge, so the PR title becomes the commit
+subject.
 
 ## Rules every change follows
 
@@ -39,13 +55,16 @@ cleanly without them. [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) lists every tes
 5. **Keep the OpenAI API compatible.** Refuse what is unsupported with a 400 that says why. Never silently ignore a
    field.
 
+The CPU suite needs no NeuronCore. Kernel tests that need the NKI simulator, and tests that need a checkpoint, skip
+cleanly without them. [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) lists every test tier and how to run it.
+
 ## Commits and pull requests
 
-- Commit subject: `<area>: <what changes>`, written as a plain sentence. Examples: `router: answer a malformed body
-  with 400` or `kda_half: one program's measured weight-stream rate`. The area is a module or doc name.
-- One logical change per commit. Keep each PR focused, and fill in the PR template.
-- CI runs `pre-commit run --all-files` (ruff lint and format), mypy and the CPU suite. All must pass: `make check`
-  runs the same locally.
+- PR title and commit subject: `<area>: <what changes>`, written as a plain sentence. Examples: `router: answer a
+  malformed body with 400` or `kda_half: one program's measured weight-stream rate`. The area is a module or doc name.
+- One logical change per PR. Fill in the PR template.
+- Pull requests target `development`. `main` takes releases only
+  ([docs/DEVELOPMENT.md](docs/DEVELOPMENT.md#branches-and-releases)).
 
 ## License
 

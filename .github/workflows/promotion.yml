@@ -1,0 +1,30 @@
+name: Promotion
+
+# main receives releases only: every PR into main is a promotion of this repository's development branch. "Promotion
+# source" is a required check on main. It is a guard rail; the gate is that only admins can merge into main.
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  source:
+    name: Promotion source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: The PR promotes RunanywhereAI/trnrt's development branch
+        env:
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          REPO: ${{ github.repository }}
+        run: |
+          if [ "$HEAD_REPO" = "$REPO" ] && [ "$HEAD_REF" = "development" ]; then
+            echo "ok: $HEAD_REPO:$HEAD_REF"
+          else
+            echo "::error::main takes promotions from $REPO:development only, not $HEAD_REPO:$HEAD_REF. Open the PR against development."
+            exit 1
+          fi

@@ -1,0 +1,62 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+# CodeRabbit reviews every ready-for-review pull request into development, forks included, and each later push.
+# Its review is advice: it is not a required check and never requests changes.
+language: en-US
+reviews:
+  profile: chill
+  request_changes_workflow: false
+  fail_commit_status: false
+  high_level_summary: true
+  poem: false
+  auto_review:
+    enabled: true
+    auto_incremental_review: true
+    drafts: false
+    base_branches: ["development"]
+  auto_apply_labels: true
+  labeling_instructions:
+    - label: router
+      instructions: Changes trnrt/serve/router.py or the router's tests.
+    - label: serve
+      instructions: Changes the OpenAI-compatible API or server under trnrt/serve/, other than the router.
+    - label: engine
+      instructions: Changes trnrt/engine/ or trnrt/compile/.
+    - label: kernels
+      instructions: Changes an NKI kernel under trnrt/kernels/.
+    - label: models
+      instructions: Changes model code under trnrt/models/.
+    - label: docs
+      instructions: Changes README.md, docs/ or another Markdown file only.
+    - label: ci
+      instructions: Changes .github/, the Makefile, pre-commit or packaging configuration.
+    - label: graphs-changed
+      instructions: >-
+        Changes trnrt/kernels/, trnrt/models/, trnrt/engine/model_runner.py, trnrt/compile/capture.py,
+        trnrt/config.py, trnrt/platform.py or the graph-shape defaults in trnrt/__main__.py.
+  path_filters:
+    - "!docs/assets/**"
+  path_instructions:
+    - path: "trnrt/{kernels,models}/**"
+      instructions: >-
+        Traced code: its source text feeds the compiled graphs and the compile-cache keys, so even a moved line can
+        invalidate every cache. Review correctness only. Never suggest formatting, renames, comment edits or other
+        cosmetic changes here. Check that the PR states which graphs change and gives tools/graph_equiv.py or device
+        evidence (AGENTS.md, invariant 1).
+    - path: "trnrt/{engine/model_runner.py,compile/capture.py,config.py,platform.py}"
+      instructions: >-
+        Traced or graph-shape code (AGENTS.md, invariant 1). Same rule: correctness only, no cosmetic suggestions,
+        and graph-equivalence evidence for any change to a graph shape.
+    - path: "trnrt/serve/**"
+      instructions: >-
+        The engine thread owns engine state: handlers must hand work to it through its inbox, never mutate the
+        scheduler or pools. Unsupported API fields are refused with a 400 that says why, never ignored.
+    - path: "**/*.md"
+      instructions: >-
+        Every number carries its context: instance, Neuron SDK, configuration, workload, precision, baseline and how
+        correctness was checked (AGENTS.md, invariant 8).
+chat:
+  auto_reply: true
+knowledge_base:
+  code_guidelines:
+    enabled: true
+    filePatterns: ["AGENTS.md", "CONTRIBUTING.md"]

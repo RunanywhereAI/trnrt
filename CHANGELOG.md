@@ -11,6 +11,14 @@ and versions follow [Semantic Versioning](https://semver.org/). Rebuild the comp
 - CI: pre-commit (ruff lint and format), mypy, the CPU test suite, a package build check, Dockerfile lint and CodeQL.
   Tag-triggered release workflow.
 - `tools/check_docs.py`: every relative Markdown link and image resolves.
+- Branches: pull requests target `development`; `main` takes promotions of `development` for releases only. Both need
+  a maintainer's approval (`.github/CODEOWNERS`), and release tags are cut from `main` only.
+- Contributor CI: actionlint and zizmor on the workflows (pre-commit); advisory PR checks (title format, a warning
+  when traced code changes); dependency review; OpenSSF Scorecard; a weekly external-link check; a release dry run
+  that builds the package and the container image.
+- AI review on every ready-for-review PR into `development` (CodeRabbit, cubic, Greptile), never a required check.
+- Contributing: a three-step quick start, issue forms for performance regressions and docs, Discussions for questions,
+  `SUPPORT.md`.
 
 ### Changed
 
