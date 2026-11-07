@@ -91,7 +91,7 @@ larger prefix-cache tier. The presets' speculation arguments:
 |---|---|---|
 | `--spec-method`, `--spec-k` | mtp, 2 | speculative decoding with the model's MTP layer, drafts per step |
 | `--spec-max-batch`, `--spec-hysteresis` | 4, 1 (`mtp-always`: `--spec-max-batch 0`, always speculate) | speculate while at most this many requests decode; once plain, speculate again at this many fewer |
-| `--spec-bucket-max`, `--plain-bucket-min` | 4, 4 (`mtp-batch24`: 4, 16) | the verify family's graphs only at decode buckets up to this, the plain decode graphs only from this |
+| `--spec-bucket-max`, `--plain-bucket-min` | 4, 4 (`mtp-batch24`: 4, 16; `mtp-always`: 0, 0, every bucket) | the verify family's graphs only at decode buckets up to this, the plain decode graphs only from this |
 | `--spec-page-buckets` | 1024,4096 | the page buckets of every graph the MTP layer or a verify runs in |
 | `--mtp-chunk-q`, `--mtp-fill-rows` | 64, 1024 | the MTP pass over a prefill chunk takes the prefill form from 64 rows, in calls of at most 1024 |
 | `--mtp-kv-only`, `--dyn-mtp-kv` | on, on (`mtp-always`: off, off) | KV-only windows for the MTP pass over a chunk, and the MTP layer's KV written by plain decode steps |
@@ -106,6 +106,8 @@ The `mtp-*` presets also set these arguments of the first table (`trnrt/__main__
 | `--max-num-seqs` | 16 (`mtp-batch24`: 32) |
 | `--kda-shell-max-rows`, `--dsa-layer-max-rows`, `--ffn-half-below`, `--dsa-index-rows` | 12, 16, 17, 8 (`mtp-batch24`: 12, 24, 25, 8) |
 | `--dense-half-skip-rows` | 2, the default (`mtp-batch24`: 2,18,24) |
+| `--prefill-buckets` | 512,1024,2048,4096, the default (`mtp-always`: 512,1024,4096) |
+| `--state-checkpoints` | the decode batch: 8 (`mtp-batch12`: 12; `mtp-batch24`: 24) |
 
 Like every row of the first table, these are graph shapes, except `--spec-hysteresis`, which is host only: an argument
 other than a preset's changes the graphs and needs its own capture. The `mtp-*` presets also set `TRNRT_DMA_HW=1` ([Environment variables](#environment-variables)),

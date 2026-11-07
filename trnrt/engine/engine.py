@@ -721,17 +721,21 @@ class LLMEngine:
             # commit() stops at the first finishing token; drop logprobs past it.
             if s.draft and s.req.params.logprobs is not None:
                 del s.req.logprobs[len(s.req.output_ids) :]
-        finished += self._check_stop_strings(plan.seqs())
+        finished += self._check_stop_strings(plan.seqs(), finished)
         for r in finished:
             self.runner.forget(r)
         return finished
 
-    def _check_stop_strings(self, seqs) -> list[Request]:
+    def _check_stop_strings(self, seqs, finished=()) -> list[Request]:
         done = []
+        ended = {id(r) for r in finished}  # finished by this step's commit (EOS, a stop id, the length)
         for s in seqs:
             req = s.req
             stops = req.params.stop
-            if not stops or not s.sample or req.status is not Status.RUNNING:
+            # A speculative step can complete a stop string and then reach EOS or the length in the same step; one-token
+            # steps would have stopped at the stop string, so it is checked for those requests too.
+            ended_here = s.draft and id(req) in ended
+            if not stops or not s.sample or (req.status is not Status.RUNNING and not ended_here):
                 continue
             # Only the tail can newly contain a stop string; decode enough of it to cover
             # the longest one plus multi-token characters.
@@ -740,8 +744,11 @@ class LLMEngine:
             if any(x in tail for x in stops):
                 if s.draft:
                     self._trim_past_stop(req, stops, w)
-                self.scheduler.finish_now(req, "stop")
-                done.append(req)
+                if ended_here:
+                    req.finish_reason = "stop"  # already released by the commit, and already in `finished`
+                else:
+                    self.scheduler.finish_now(req, "stop")
+                    done.append(req)
         return done
 
     def _trim_past_stop(self, req: Request, stops, w: int) -> None:

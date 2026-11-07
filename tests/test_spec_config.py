@@ -219,9 +219,13 @@ def test_the_sequence_parallel_gather_is_xla_or_nki():
 def kernel_routes(monkeypatch):
     """Whatever set_decode_routes writes is undone after the test."""
     from trnrt.kernels import dense_half, dsa_satwf, sp_gather
-    from trnrt.models import decoder
+    from trnrt.models import decoder, hybrid, mla
 
     for mod, name in (
+        (hybrid, "KDA_SHELL_MAXB"),
+        (hybrid, "MOE_HALF_BELOW"),
+        (mla, "LAYER_MK_MAXB"),
+        (mla, "CP_INDEX_ROWS"),
         (sp_gather, "MODE"),
         (sp_gather, "TP_EXPERTS"),
         (dsa_satwf, "SEL2G"),
@@ -259,7 +263,7 @@ def test_set_decode_routes_hands_the_kernel_routes_of_a_preset_to_the_modules_an
     assert routes()[4:] == (64, "0"), "the static preset has the chunk form and no plain-step KV write"
 
 
-def test_build_shard_builds_the_mtp_layer_only_for_an_engine_that_speculates(monkeypatch):
+def test_build_shard_builds_the_mtp_layer_only_for_an_engine_that_speculates(monkeypatch, kernel_routes):
     """load_model gets mtp=True only with spec_method mtp: a plain engine never builds or loads the checkpoint's MTP layer, so
     its graphs (a decode call returning only its output) are the plain engine's."""
     import json

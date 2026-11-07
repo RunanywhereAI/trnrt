@@ -608,3 +608,24 @@ def test_a_preempted_request_forgets_its_speculative_row():
     eng.scheduler._drop_pending(req)
     eng.scheduler._preempt(req)
     assert req.spec_cur is None and req.status is Status.WAITING
+
+
+def test_a_stop_string_completed_in_the_step_that_reaches_the_length_still_finishes_on_the_stop_string():
+    # The length limit falls one token after the stop token; with full acceptance (1 + K tokens a step) the two land in
+    # the same blind step for some j, which one-token steps would have finished on the stop string.
+    prompt = prompts(1, seed=5, shared=False)[0]
+    ref = reference_output(prompt, 40)
+    tried = 0
+    for j in range(4, 30):
+        if ref[j] in ref[:j]:
+            continue
+        eng = make_engine(accept=(0.0, 0.0, 1.0))
+        eng.tokenizer = _Tok()
+        req = eng.add_request(prompt, SamplingParams(max_new_tokens=j + 2, logprobs=0, stop=(f"<{ref[j]}>",)))
+        while eng.has_work():
+            eng.step()
+        assert (req.finish_reason, req.output_ids) == ("stop", ref[: j + 1]), j
+        assert len(req.logprobs) == len(req.output_ids)
+        check_done_pools(eng)
+        tried += 1
+    assert tried >= 3
