@@ -24,6 +24,9 @@ and versions follow [Semantic Versioning](https://semver.org/). Rebuild the comp
 
 ### Fixed
 
+- The router matches and inserts a sessionless request's text in its prefix trees in a worker thread, not on its event
+  loop, which every relayed stream shares: a 1.1 MB (~250K-token) request stalled the loop for ~300 ms; now ~12 ms.
+  The routing decisions are unchanged.
 - The router answers a request body that is not a JSON object with 400, as each engine does, instead of 500.
 
 ## [0.1.0]
