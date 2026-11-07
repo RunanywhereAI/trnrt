@@ -29,13 +29,13 @@ approach before you write it.
 
 | Step | What it is | Blocks the merge |
 |---|---|---|
-| CI | lint and format (pre-commit, including the workflow linters), mypy, the CPU test suite, package build, Dockerfile lint. `make check` runs the same locally | yes |
+| CI | lint and format (pre-commit, including the workflow linters), mypy, the CPU test suite, package build, Dockerfile lint. `make check` runs the first three locally | yes |
 | PR checks | the title format, and a note when the PR touches traced code | no, advice |
 | AI review | CodeRabbit, cubic and Greptile review the PR when it is ready for review (not while it is a draft) and after each push | no, advice |
 | Maintainer review | one approval from a maintainer ([CODEOWNERS](.github/CODEOWNERS)) | yes |
 
-A first-time contributor's CI runs once a maintainer approves it. We squash-merge, so the PR title becomes the commit
-subject.
+A first-time contributor's CI runs once a maintainer approves it. Most PRs are squash-merged, so the PR title becomes
+the commit subject.
 
 ## Rules every change follows
 

@@ -148,4 +148,6 @@ jobs:
         with:
           name: dist
           path: dist/
+      - name: Upload only the sdist and wheel
+        run: rm dist/SHA256SUMS
       - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3

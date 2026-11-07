@@ -9,7 +9,8 @@ reviews:
   external_contributors_require_manual_review: false
   custom_instructions: |
     Follow AGENTS.md. Traced code (trnrt/kernels/, trnrt/models/, trnrt/engine/model_runner.py,
-    trnrt/compile/capture.py, trnrt/config.py, trnrt/platform.py) feeds the compiled graphs and compile-cache keys:
+    trnrt/compile/capture.py, trnrt/config.py, trnrt/platform.py, and the graph-shape defaults in trnrt/__main__.py)
+    feeds the compiled graphs and compile-cache keys:
     review it for correctness only, never suggest cosmetic edits there, and ask for tools/graph_equiv.py or device
     evidence when a PR changes it. API handlers never mutate engine state directly; unsupported API fields get a 400
     that says why.
