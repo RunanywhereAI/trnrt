@@ -61,7 +61,7 @@ itself; `configure()` then adds no second handler. Hang reports reach stderr eit
 |---|---|---|
 | `ci.yml` | pre-commit (ruff lint and format, file checks, doc links); mypy; the CPU suite; package build and `twine check`; Dockerfile lint | every push to `development` or `main`, and every PR |
 | CodeQL (GitHub's default setup, extended query suite) | security analysis of the Python and the workflows | pushes to the default branch and protected branches, PRs from this repository's branches, weekly |
-| `release.yml` | build, check and attach the sdist and wheel to a GitHub release; PyPI when enabled | a `vX.Y.Z` tag that matches `trnrt.__version__` |
+| `release.yml` | build, check and attach the sdist and wheel to a GitHub release; PyPI when enabled | a `vX.Y.Z` tag on `main` that matches `trnrt.__version__` |
 
 Dependabot keeps the pinned actions current. Every third-party action is pinned to a commit SHA.
 
