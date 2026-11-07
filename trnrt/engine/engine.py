@@ -624,7 +624,7 @@ class LLMEngine:
         """ModelRunner.spec_after_prefill, with the pages of a final chunk's later draft passes (k > 1: MTP KV up to
         end + k - 2) reserved first."""
         if self.cfg.spec_k > 1 and s.sample:
-            self.scheduler._reserve(s.req, s.end + self.cfg.spec_k)
+            self.scheduler._reserve(s.req, min(s.end + self.cfg.spec_k, self.cfg.max_model_len))
         self.runner.spec_after_prefill([s], hkey)
 
     def _reserve_async_ckpts(self, chunk) -> None:
@@ -735,11 +735,28 @@ class LLMEngine:
                 continue
             # Only the tail can newly contain a stop string; decode enough of it to cover
             # the longest one plus multi-token characters.
-            tail = self.tokenizer.decode(req.output_ids[-(max(len(x) for x in stops) + 8) :])
+            w = max(len(x) for x in stops) + 8
+            tail = self.tokenizer.decode(req.output_ids[-w:])
             if any(x in tail for x in stops):
+                if s.draft:
+                    self._trim_past_stop(req, stops, w)
                 self.scheduler.finish_now(req, "stop")
                 done.append(req)
         return done
+
+    def _trim_past_stop(self, req: Request, stops, w: int) -> None:
+        """A speculative step appends up to 1 + spec_k tokens at once, so the stop string can end before its newest one.
+        Drop the tokens past it, and their logprobs, so the output (and its usage count) is what one-token steps would
+        have stopped at: the shortest prefix whose last w tokens decode to a stop string."""
+        out = req.output_ids
+        n = len(out)
+        while n > 1 and any(x in self.tokenizer.decode(out[max(0, n - 1 - w) : n - 1]) for x in stops):
+            n -= 1
+        if n < len(out):
+            del req.token_ids[req.num_prompt + n :]
+            req.num_computed = min(req.num_computed, len(req.token_ids) - 1)
+            if req.params.logprobs is not None:
+                del req.logprobs[n:]
 
     def generate(self, prompts: list[list[int]], params: SamplingParams | list[SamplingParams]) -> list[Request]:
         plist = params if isinstance(params, list) else [params] * len(prompts)

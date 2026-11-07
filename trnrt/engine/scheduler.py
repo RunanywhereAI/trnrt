@@ -760,6 +760,9 @@ class Scheduler:
         self._release(req, Status.WAITING)
         req.num_computed = 0
         req.spec_ready = False  # its recompute rebuilds the speculative board row (engine/spec_async.py)
+        req.spec_cur = (
+            None  # its recompute writes row 0; a flip to plain before its next verify must not pick an old row
+        )
         req.num_preemptions += 1
         self.num_preemptions += 1
         self.waiting.appendleft(req)

@@ -6,7 +6,8 @@ acceptance length is forced with.
   2. the REALIZED accepted-count distribution is the schedule's, not only its mean: the minimum-variance schedule takes exactly two values, so a schedule with
      the right mean and the wrong shape must fail (a plant).
 
-The engine-level tests (spec_post takes the host's flags; CPU engines realize the schedule) are in tests/test_spec_synth_engine.py.
+The engine-level tests (spec_post takes the host's flags; CPU engines realize the schedule) are not written yet; tests/test_spec_metrics.py covers
+the synthetic acceptance's counters.
 
     python3 -m pytest tests/test_spec_synth.py -q"""
 

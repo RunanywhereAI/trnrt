@@ -90,7 +90,7 @@ larger prefix-cache tier. The presets' speculation arguments:
 | Argument | Preset value | |
 |---|---|---|
 | `--spec-method`, `--spec-k` | mtp, 2 | speculative decoding with the model's MTP layer, drafts per step |
-| `--spec-max-batch`, `--spec-hysteresis` | 4, 1 (`mtp-always`: 0) | speculate while at most this many requests decode; once plain, speculate again at this many fewer |
+| `--spec-max-batch`, `--spec-hysteresis` | 4, 1 (`mtp-always`: `--spec-max-batch 0`, always speculate) | speculate while at most this many requests decode; once plain, speculate again at this many fewer |
 | `--spec-bucket-max`, `--plain-bucket-min` | 4, 4 (`mtp-batch24`: 4, 16) | the verify family's graphs only at decode buckets up to this, the plain decode graphs only from this |
 | `--spec-page-buckets` | 1024,4096 | the page buckets of every graph the MTP layer or a verify runs in |
 | `--mtp-chunk-q`, `--mtp-fill-rows` | 64, 1024 | the MTP pass over a prefill chunk takes the prefill form from 64 rows, in calls of at most 1024 |
@@ -98,8 +98,17 @@ larger prefix-cache tier. The presets' speculation arguments:
 | `--state-seats`, `--state-spec-seats` | 8, unset (`mtp-batch12`: 12, 4; `mtp-batch24`: 24, 4) | recurrent-state seats, and how many of them hold the 3 rows a verify writes |
 | `--spec-synth-al` | unset | the benchmark mode of [AGENTX.md](AGENTX.md#benchmark-mode) |
 
-Like every row of the first table, these are graph shapes: an argument other than a preset's changes the graphs and
-needs its own capture. The `mtp-*` presets also set `TRNRT_DMA_HW=1` ([Environment variables](#environment-variables)),
+The `mtp-*` presets also set these arguments of the first table (`trnrt/__main__.py`, `_MTP` and the presets):
+
+| Argument | Preset value |
+|---|---|
+| `--sp-gather`, `--sp-gather-tp-experts`, `--dsa-sel2g` | nki, on, on |
+| `--max-num-seqs` | 16 (`mtp-batch24`: 32) |
+| `--kda-shell-max-rows`, `--dsa-layer-max-rows`, `--ffn-half-below`, `--dsa-index-rows` | 12, 16, 17, 8 (`mtp-batch24`: 12, 24, 25, 8) |
+| `--dense-half-skip-rows` | 2, the default (`mtp-batch24`: 2,18,24) |
+
+Like every row of the first table, these are graph shapes, except `--spec-hysteresis`, which is host only: an argument
+other than a preset's changes the graphs and needs its own capture. The `mtp-*` presets also set `TRNRT_DMA_HW=1` ([Environment variables](#environment-variables)),
 which changes the kernels' DMA form. A speculative engine serves temperature and top-p sampling as the plain engine does (verification
 is the rejection sampler's, so the output distribution is unchanged), and refuses the requests the plain engine refuses.
 
@@ -107,8 +116,9 @@ is the rejection sampler's, so the output distribution is unchanged), and refuse
 
 The supported configurations are the default (batch 12), `--preset batch8`, the four `mtp-*` presets, and any of them
 with a lower `--max-running` (batch 4: `--preset batch8 --max-running 4`). Larger decode batches, and values of
-`--kda-shell-max-rows`, `--dsa-layer-max-rows`, `--ffn-half-below`, `--dsa-index-rows` and the speculation arguments
-other than those of these configurations, are not supported.
+`--kda-shell-max-rows`, `--dsa-layer-max-rows`, `--ffn-half-below`, `--dsa-index-rows`, `--dense-half-skip-rows`,
+`--sp-gather`, `--sp-gather-tp-experts`, `--dsa-sel2g` and the speculation arguments other than those of these
+configurations, are not supported.
 
 ## Environment variables
 

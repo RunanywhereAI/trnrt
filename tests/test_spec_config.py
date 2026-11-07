@@ -110,6 +110,12 @@ EXPECTED = {
 STATE_ROWS = {"mtp-batch8": 34, "mtp-always": 34, "mtp-batch12": 34, "mtp-batch24": 58}
 
 
+@pytest.fixture(autouse=True)
+def _no_synthetic_acceptance_from_the_shell(monkeypatch):
+    # cli reads TRNRT_SPEC_SYNTH_AL; a developer's exported value must not change what these tests build.
+    monkeypatch.delenv("TRNRT_SPEC_SYNTH_AL", raising=False)
+
+
 def _cfg(*argv) -> EngineConfig:
     return cli.engine_config(["--model", "m", *argv])
 

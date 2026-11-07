@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import os
 import pathlib
 import re
 
@@ -106,9 +107,11 @@ def test_revs_carry_their_parts():
     assert SAT.REV not in (SA.REV, CT.REV)
     assert SH.kernel_rev(SATWF_M.__file__, k, "    dsa_satwf_kernel = None") ^ SAT.REV ^ CW.REV ^ FS.REV == SATWF_M.REV
     assert SH.kernel_rev(SATWFC_M.__file__, k, "    dsa_satwfc_kernel = None") ^ SATWF_M.REV ^ MS.REV_K == SATWFC_M.REV
+    hw = CT._dma_hw_rev() if os.environ.get("TRNRT_DMA_HW", "0") == "1" else 0  # an mtp-* preset's environment
     assert (
         SH.kernel_rev(CT.__file__, "LP = 16", "# -- the tail end")
         ^ SH.kernel_rev(CT.__file__, "    def _tail_heads_hs(", "# -- _tail_heads_hs end")
+        ^ hw
     ) == CT.REV
 
 

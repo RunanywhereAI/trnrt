@@ -56,8 +56,11 @@ entries; capture and compile each preset you serve.
 ## Serve
 
 ```bash
-docker run ... trnrt serve --model /model --port 8000 --preset mtp-batch8   # the mounts and variables of DEPLOY.md, step 4
+docker run ... trnrt serve --model /model --port 8000 --preset mtp-batch8 --engines 1   # the mounts and variables of DEPLOY.md, step 4
 ```
+
+`--engines 1` is the measured layout: one engine of 8 chips, the unit of [RESULTS.md](RESULTS.md) and of the per-chip
+scoring below. It changes no graph. With the default two engines the box serves on 16 chips, so divide by 16 instead.
 
 `GET /v1/stats` carries a `spec` block (drafts proposed and accepted, the mean acceptance length, the per-position counts,
 and in a dynamic preset the mode flips), and `GET /metrics` the same counters as `trnrt:spec_decode_*`, under vLLM's

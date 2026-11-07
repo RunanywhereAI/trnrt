@@ -565,3 +565,46 @@ def test_a_prefix_restored_from_the_host_tier_then_speculated_equals_a_cold_requ
     assert again.num_cached_tokens > 0 and eng.runner.calls["kv_load"] > 0 and eng.runner.calls["state_load"] > 0
     assert again.output_ids == cold.output_ids == reference_output(prompt, 24)
     assert again.spec_proposed > 0, "the restored request speculated"
+
+
+class _Tok:
+    """Detokenizes each id to its own bracketed text, so a stop string names exactly one token."""
+
+    @staticmethod
+    def decode(ids):
+        return "".join(f"<{i}>" for i in ids)
+
+
+def test_a_stop_string_in_the_middle_of_a_speculative_step_drops_the_tokens_after_it():
+    # Full acceptance: every blind step emits 1 + K tokens, so the stop token usually lands before the step's last.
+    eng = make_engine(accept=(0.0, 0.0, 1.0))
+    eng.tokenizer = _Tok()
+    prompt = prompts(1, seed=5, shared=False)[0]
+    ref = reference_output(prompt, 40)
+    j = next(i for i in range(4, len(ref)) if ref[i] not in ref[:i])  # a token whose first appearance is at i
+    req = eng.add_request(prompt, SamplingParams(max_new_tokens=40, logprobs=0, stop=(f"<{ref[j]}>",)))
+    while eng.has_work():
+        eng.step()
+    assert req.finish_reason == "stop"
+    assert req.output_ids == ref[: j + 1], "a one-token-at-a-time decode stops at the stop string's token"
+    assert len(req.logprobs) == len(req.output_ids)
+    check_done_pools(eng)
+
+
+def check_done_pools(eng):
+    pool, radix = eng.pool, eng.radix
+    assert pool.num_free + radix.total_pages() == pool.num_usable, "a page leaked"
+    assert not eng.runner.state._held, "a request still holds state rows"
+
+
+def test_a_preempted_request_forgets_its_speculative_row():
+    # _dyn_flip reads spec_cur to pick the state row a request leaves speculation with; after a preemption the recompute
+    # writes row 0, so an old row index must not survive it.
+    eng = make_engine()
+    req = eng.add_request(prompts(1)[0], SamplingParams(max_new_tokens=8))
+    eng.step()
+    assert req.status is Status.RUNNING
+    req.spec_cur = 2
+    eng.scheduler._drop_pending(req)
+    eng.scheduler._preempt(req)
+    assert req.spec_cur is None and req.status is Status.WAITING
