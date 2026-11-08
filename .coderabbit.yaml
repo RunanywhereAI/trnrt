@@ -27,7 +27,7 @@ reviews:
     - label: models
       instructions: Changes model code under trnrt/models/.
     - label: docs
-      instructions: Changes README.md, docs/ or another Markdown file only.
+      instructions: Changes README.md, a file under docs/, or another top-level Markdown file (with or without code).
     - label: ci
       instructions: Changes .github/, the Makefile, pre-commit or packaging configuration.
     - label: graphs-changed

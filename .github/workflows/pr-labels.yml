@@ -18,7 +18,8 @@ permissions: {}
 jobs:
   label:
     name: Label
-    if: github.event.workflow_run.event == 'pull_request'
+    # A cancelled run (a newer push superseded it) may have no PR number; the newer run labels the PR.
+    if: github.event.workflow_run.event == 'pull_request' && github.event.workflow_run.conclusion != 'cancelled'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
@@ -42,14 +43,20 @@ jobs:
           n=$(tr -d '[:space:]' < pr-number.txt)
           printf '%s' "$n" | grep -Eqx '[0-9]{1,7}' || { echo "::error::not a PR number"; exit 1; }
           head=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$n" --jq .head.sha)
-          [ "$head" = "$HEAD_SHA" ] || { echo "::error::PR #$n's head $head is not this run's $HEAD_SHA"; exit 1; }
+          if [ "$head" != "$HEAD_SHA" ]; then
+            # A newer push (whose own run labels the PR), or a number that isn't this run's PR: label nothing.
+            echo "::notice::PR #$n's head $head is not this run's $HEAD_SHA; not labelling from this run"
+            exit 0
+          fi
           echo "number=$n" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.pr.outputs.number != ''
         with:
           persist-credentials: false
           sparse-checkout: .github/labeler.yml
           sparse-checkout-cone-mode: false
       - uses: actions/labeler@b8dd2d9be0f68b860e7dae5dae7d772984eacd6d # v6.2.0
+        if: steps.pr.outputs.number != ''
         with:
           pr-number: ${{ steps.pr.outputs.number }}
           sync-labels: true # an area label comes off when a later push no longer touches it; labels not in the rules stay
