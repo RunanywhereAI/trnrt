@@ -1,25 +1,31 @@
 name: Release
 
-# Releases are cut from main only (docs/DEVELOPMENT.md, "Releasing"). Push a tag vX.Y.Z on main's promotion merge
-# commit, matching trnrt/__init__.py. The workflow checks the tag, builds and checks the sdist and wheel, and attaches
-# them to a GitHub release.
+# Merging a promotion into main is the release (docs/DEVELOPMENT.md, "Branches and releases"). On every push to main,
+# tools/release_plan.py reads trnrt.__version__ and decides: release it (no tag for that version yet, and it is newer
+# than every tag), run its publishing again (the tag already points at this commit), or do nothing (the version is not
+# bumped, or is not a final X.Y.Z). So a merge into main that does not bump the version publishes nothing.
 #
-# - PyPI: only when the repository variable PUBLISH_PYPI is "true" and a trusted publisher is configured for the
-#   `pypi` environment.
-# - Container image (ghcr.io/runanywhereai/trnrt): built and checked on dry runs; built, pushed and attested from a
-#   release tag when the repository variable PUBLISH_IMAGE is "true", after the tag checks. The package release never
-#   waits on it, and only the publish job holds write permissions.
+# A release creates the tag vX.Y.Z on the merge commit and a GitHub release with the sdist, the wheel and SHA256SUMS,
+# in one job: a tag pushed with the workflow token would not trigger another workflow. Then:
 #
-# A dry run (manual, or a PR that changes the release machinery) builds everything and publishes nothing.
+# - PyPI: when the repository variable PUBLISH_PYPI is "true", by trusted publishing from the `pypi` environment (which
+#   only main may deploy to). An upload that already exists is skipped, so a rerun is safe.
+# - Container image (ghcr.io/runanywhereai/trnrt): built and checked on dry runs; built, pushed and attested on a
+#   release when the repository variable PUBLISH_IMAGE is "true". The package release never waits on it, and only the
+#   publish job holds write permissions.
+#
+# A dry run (a PR that changes the release machinery, or a manual run) builds and checks everything and publishes
+# nothing.
 
 on:
   push:
-    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+    branches: [main]
   pull_request:
     paths:
       - ".github/workflows/release.yml"
       - "docker/**"
       - "pyproject.toml"
+      - "tools/release_plan.py"
   workflow_dispatch:
 
 permissions:
@@ -30,6 +36,26 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  plan:
+    name: Release plan
+    if: github.repository == 'RunanywhereAI/trnrt'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      action: ${{ steps.plan.outputs.action }}
+      version: ${{ steps.plan.outputs.version }}
+      tag: ${{ steps.plan.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # the existing tags
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+      - id: plan
+        run: python tools/release_plan.py --sha "$GITHUB_SHA" --github-output "$GITHUB_OUTPUT"
+
   build:
     name: Release package
     if: github.repository == 'RunanywhereAI/trnrt'
@@ -38,18 +64,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0 # the tag's commit must be reachable from main
           persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.13"
-      - name: The tag matches the package version and is on main
-        if: github.event_name == 'push'
-        run: |
-          v=$(python -c "import ast;print(next(n.value.value for n in ast.parse(open('trnrt/__init__.py').read()).body if isinstance(n, ast.Assign) and n.targets[0].id == '__version__'))")
-          test "v$v" = "$GITHUB_REF_NAME" || { echo "::error::tag $GITHUB_REF_NAME != version v$v"; exit 1; }
-          git merge-base --is-ancestor "$GITHUB_SHA" origin/main \
-            || { echo "::error::tag $GITHUB_REF_NAME is not on main; releases are cut from main only"; exit 1; }
       - run: pip install build twine
       - run: python -m build
       - run: twine check --strict dist/*
@@ -76,8 +94,8 @@ jobs:
 
   image-publish:
     name: Publish image
-    needs: build # the tag checks run there; an image is never pushed from a tag that fails them
-    if: github.event_name == 'push' && vars.PUBLISH_IMAGE == 'true'
+    needs: [plan, build] # an image is never pushed unless the plan releases this version
+    if: github.event_name == 'push' && needs.plan.outputs.action != 'skip' && vars.PUBLISH_IMAGE == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     permissions:
@@ -111,33 +129,35 @@ jobs:
 
   github-release:
     name: GitHub release
-    needs: build
-    if: github.event_name == 'push'
+    needs: [plan, build]
+    if: github.event_name == 'push' && needs.plan.outputs.action != 'skip'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
-      contents: write
+      contents: write # creates the tag and the release
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: dist
           path: dist/
-      - name: Create the release with the sdist and wheel
+      - name: Create the tag and the release with the sdist, wheel and checksums
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ needs.plan.outputs.tag }}
         run: |
-          # A rerun after a later job failed finds the release already there: upload the files again instead.
+          # The tag is created here, on the merge commit. A rerun after a later job failed finds the release already
+          # there: upload the files again instead.
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
             gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
           else
-            gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --title "TrnRT $TAG" --generate-notes --verify-tag
+            gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+              --title "TrnRT $TAG" --generate-notes --latest
           fi
 
   pypi:
     name: PyPI
-    needs: build
-    if: github.event_name == 'push' && vars.PUBLISH_PYPI == 'true'
+    needs: [plan, build, github-release] # after the tag exists: an upload to PyPI cannot be taken back
+    if: github.event_name == 'push' && needs.plan.outputs.action != 'skip' && vars.PUBLISH_PYPI == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     environment: pypi
@@ -151,3 +171,5 @@ jobs:
       - name: Upload only the sdist and wheel
         run: rm dist/SHA256SUMS
       - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          skip-existing: true
