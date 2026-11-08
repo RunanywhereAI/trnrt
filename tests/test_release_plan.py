@@ -72,7 +72,7 @@ def test_a_merge_that_did_not_bump_the_version_releases_nothing(repo):
     assert p.action == "skip" and "v0.1.0 already exists" in p.why
 
 
-@pytest.mark.parametrize("version", ["0.2.0rc1", "0.2.0.dev3", "0.2", "1.0.0+local"])
+@pytest.mark.parametrize("version", ["0.2.0rc1", "0.2.0.dev3", "0.2", "1.0.0+local", "01.2.3", "1.02.3", "1.2.03"])
 def test_a_version_that_is_not_a_final_release_is_never_released(repo, version):
     sha = commit(repo, version)
     p = rp.plan(repo, sha)

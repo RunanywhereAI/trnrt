@@ -20,8 +20,8 @@ and versions follow [Semantic Versioning](https://semver.org/). Rebuild the comp
 - `tools/check_docs.py`: every relative Markdown link and image resolves.
 - Branches: pull requests target `development` and are squash-merged; `main` takes promotions of `development` for
   releases only, as merge commits. Both need a maintainer's approval (`.github/CODEOWNERS`) and every review
-  conversation resolved. Merging a promotion into `main` is the release: it tags `vX.Y.Z` on the merge commit and
-  publishes, once per version (`tools/release_plan.py`).
+  conversation resolved. Merging a promotion that bumps the version into `main` is the release: it tags `vX.Y.Z` on the
+  merge commit and publishes, once per version (`tools/release_plan.py`).
 - Contributor CI: actionlint and zizmor on the workflows (pre-commit); advisory PR checks (title format, a warning
   when traced code changes); dependency review; OpenSSF Scorecard; a weekly external-link check; a release dry run
   that builds the package and the container image.

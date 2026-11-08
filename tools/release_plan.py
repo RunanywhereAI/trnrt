@@ -25,8 +25,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-_FINAL = re.compile(r"\d+\.\d+\.\d+")
-_TAG = re.compile(r"v(\d+\.\d+\.\d+)")
+_NUM = r"(?:0|[1-9]\d*)"  # no leading zeros: PyPI normalizes 01.2.3 to 1.2.3, and the tag would not match
+_FINAL = re.compile(rf"{_NUM}\.{_NUM}\.{_NUM}")
+_TAG = re.compile(rf"v({_NUM}\.{_NUM}\.{_NUM})")
 
 
 @dataclass(frozen=True)
