@@ -62,6 +62,15 @@ def _at_least(lo: int):
 #   is re-keyed against the defaults), decode buckets 1, 2, 4, 6 and 8, all 8 seats running (--max-running unset), and
 #   the fused decode kernels' row caps of steps of up to 8 rows: the model modules' own (hybrid.KDA_SHELL_MAXB,
 #   mla.LAYER_MK_MAXB, ...) and EngineConfig's.
+# The mtp-* presets serve with speculative decoding (docs/AGENTX.md): the model's MTP layer drafts 2 tokens a step.
+# - mtp-batch8: decode batches of up to 8 requests per engine. The decode buckets 1, 2, 4, 6 and 8, 8 seats running,
+#   speculation while at most 4 requests decode and the plain decode step above, page buckets 1024, 3072 and 4096
+#   (the speculative graphs' own: 1024 and 4096).
+# - mtp-always: decode batches of up to 8 with speculation at every batch size (no plain decode step), page buckets 1024
+#   and 4096: the configuration measured at concurrency 2.
+# - mtp-batch12: up to 12 requests: speculation while at most 4 decode (4 of the 12 state seats hold the rows a
+#   verify writes), the plain step above; decode buckets 1, 2, 4, 8 and 12.
+# - mtp-batch24: up to 24 requests, 32 seats: decode buckets 1, 2, 4, 16 and 24, speculation up to 4 requests.
 PRESETS: dict[str, dict] = {
     "batch12": {
         "max_num_seqs": 16,
@@ -82,6 +91,97 @@ PRESETS: dict[str, dict] = {
         "dsa_index_rows": 0,
     },
 }
+
+_MTP = {
+    "sp_gather": "nki",
+    "sp_gather_tp_experts": True,
+    "dsa_sel2g": True,
+    "spec_method": "mtp",
+    "spec_k": 2,
+    "max_num_seqs": 16,
+    "prefill_buckets": (512, 1024, 2048, 4096),
+    "mtp_chunk_q": 64,
+    "mtp_fill_rows": 1024,
+    "kda_shell_max_rows": 12,
+    "dsa_layer_max_rows": 16,
+    "ffn_half_below": 17,
+    "dsa_index_rows": 8,
+}
+_MTP_DYN = {
+    **_MTP,
+    "page_buckets": (1024, 3072, 4096),
+    "spec_max_batch": 4,
+    "spec_hysteresis": 1,
+    "spec_bucket_max": 4,
+    "plain_bucket_min": 4,
+    "spec_page_buckets": (1024, 4096),
+    "mtp_kv_only": True,
+    "dyn_mtp_kv": True,
+}
+PRESETS["mtp-batch8"] = {
+    **_MTP_DYN,
+    "decode_buckets": (1, 2, 4, 6, 8),
+    "max_running": 8,
+    "state_seats": 8,
+    "state_checkpoints": 8,
+}
+PRESETS["mtp-always"] = {
+    **_MTP,
+    "page_buckets": (1024, 4096),
+    "prefill_buckets": (512, 1024, 4096),
+    "decode_buckets": (1, 2, 4, 6, 8),
+    "max_running": 8,
+    "state_seats": 8,
+    "state_checkpoints": 8,
+}
+PRESETS["mtp-batch12"] = {
+    **_MTP_DYN,
+    "decode_buckets": (1, 2, 4, 8, 12),
+    "max_running": 12,
+    "state_seats": 12,
+    "state_spec_seats": 4,
+    "state_checkpoints": 12,
+    "host_cache_gb": 8.0,
+}
+PRESETS["mtp-batch24"] = {
+    **_MTP_DYN,
+    "max_num_seqs": 32,
+    "decode_buckets": (1, 2, 4, 16, 24),
+    "max_running": 24,
+    "state_seats": 24,
+    "state_spec_seats": 4,
+    "state_checkpoints": 24,
+    "plain_bucket_min": 16,
+    "host_cache_gb": 12.0,
+    "dsa_layer_max_rows": 24,
+    "ffn_half_below": 25,
+    "dense_half_skip_rows": (2, 18, 24),
+}
+
+# The environment a preset needs before anything imports trnrt.kernels. TRNRT_DMA_HW (the static DMA helpers of
+# kernels/shell.py, kda_half.py and mix_wide.py in hardware DGE) is read at kernel import instead of being set from the
+# configuration like the decode routes: dsa_shell and mhc_pre_split bind dma_static by name at import, and every
+# kernel that folds shell.REV folds it at import. Every build behind the published MTP numbers ran with it.
+PRESET_ENV: dict[str, dict[str, str]] = {
+    name: {"TRNRT_DMA_HW": "1"} for name in ("mtp-batch8", "mtp-always", "mtp-batch12", "mtp-batch24")
+}
+
+
+def apply_preset_env(argv: list[str]) -> dict[str, str]:
+    """Put the environment that the engine arguments `argv`'s --preset needs (PRESET_ENV) into this process before it
+    imports trnrt.kernels, so that it and the ranks it spawns, which inherit it, import the kernels in that form. A
+    value already in the environment wins, as an argument given explicitly wins over a preset's. Refuses when this
+    process has imported trnrt.kernels without a value it would set: those modules are bound in the other form.
+    Returns the values it set."""
+    want = PRESET_ENV.get(parse_engine_args(argv).preset or "", {})
+    new = {k: v for k, v in want.items() if k not in os.environ}
+    if new and any(m == "trnrt.kernels" or m.startswith("trnrt.kernels.") for m in sys.modules):
+        raise RuntimeError(
+            f"{', '.join(new)} must be set before trnrt.kernels is imported, and this process has already imported "
+            "it: set it in the environment that starts the process"
+        )
+    os.environ.update(new)
+    return new
 
 
 def add_engine_args(ap: argparse.ArgumentParser) -> None:
@@ -139,6 +239,85 @@ def add_engine_args(ap: argparse.ArgumentParser) -> None:
         "Neuron, xla on --device cpu, where NKI kernels do not run)",
     )
     g.add_argument("--num-layers", type=int, default=None, help="debugging: the first n layers only")
+    sp = ap.add_argument_group(
+        "speculative decoding",
+        "the model's MTP layer drafts --spec-k tokens a step and the target verifies them in the next step "
+        "(docs/AGENTX.md). Graph structure: a change needs a new capture. Supported: the --preset mtp-* values",
+    )
+    sp.add_argument("--spec-method", default=None, choices=["mtp"], help="speculative decoding with the MTP layer")
+    sp.add_argument("--spec-k", type=_at_least(1), default=2, help="drafts per step")
+    sp.add_argument(
+        "--spec-synth-al",
+        type=float,
+        default=None,
+        help="benchmark mode: draw each verify's accepted drafts from a schedule with this mean acceptance length "
+        "(1 + the accepted drafts a step, in [1, spec-k + 1]) instead of the draft head's own; for comparing serving "
+        "throughput at a published acceptance length, not for quality. Default: the TRNRT_SPEC_SYNTH_AL "
+        "environment variable, else off",
+    )
+    sp.add_argument(
+        "--spec-max-batch",
+        type=_at_least(0),
+        default=0,
+        help="speculate while at most this many requests decode, plain decode steps above it (0: always speculate)",
+    )
+    sp.add_argument(
+        "--spec-hysteresis",
+        type=_at_least(0),
+        default=1,
+        help="once plain, speculate again only when at most spec-max-batch minus this many requests decode",
+    )
+    sp.add_argument(
+        "--spec-bucket-max",
+        type=_at_least(0),
+        default=0,
+        help="with --spec-max-batch: the verify family's graphs only at decode buckets up to this (0: all)",
+    )
+    sp.add_argument(
+        "--plain-bucket-min",
+        type=_at_least(0),
+        default=0,
+        help="with --spec-max-batch: the plain decode graphs only at decode buckets from this (0: all)",
+    )
+    sp.add_argument(
+        "--spec-page-buckets",
+        type=_ints,
+        default=None,
+        help="the page buckets of every graph the MTP layer or a verify runs in (default: --page-buckets)",
+    )
+    sp.add_argument(
+        "--mtp-fill-rows",
+        type=_at_least(1),
+        default=None,
+        help="the MTP pass over a prefill chunk in calls of this many rows",
+    )
+    sp.add_argument(
+        "--mtp-chunk-q", type=_at_least(0), default=0, help="the MTP pass takes the prefill form from this many rows"
+    )
+    sp.add_argument(
+        "--mtp-kv-only",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="MTP windows of a prefill chunk that hold no last position write only the draft layer's KV",
+    )
+    sp.add_argument(
+        "--dyn-mtp-kv",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="plain decode steps write the draft layer's KV for their rows",
+    )
+    sp.add_argument(
+        "--state-seats",
+        type=_at_least(1),
+        default=None,
+        help="seats of the recurrent-state pool, apart from --max-num-seqs (default: --max-num-seqs)",
+    )
+    sp.add_argument(
+        "--state-spec-seats",
+        type=_at_least(1),
+        default=None,
+        help="of the state seats, how many hold the rows a verify writes (1 + spec-k); the rest hold one",
+    )
     k = ap.add_argument_group(
         "decode kernel routes",
         "the row counts at which a decode step takes each fused kernel. "
@@ -169,6 +348,36 @@ def add_engine_args(ap: argparse.ArgumentParser) -> None:
         default=8,
         help="the context-parallel DSA indexer's decode scores in kernel calls of at most this many rows (0: one call)",
     )
+    k.add_argument(
+        "--sp-gather",
+        default="xla",
+        choices=["xla", "nki"],
+        help="the sequence-parallel stream's all-gather of a decode block's output: the XLA collective or the NKI kernel",
+    )
+    k.add_argument(
+        "--sp-gather-tp-experts",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="the NKI all-gather over the tensor-parallel group the experts run in",
+    )
+    k.add_argument(
+        "--dsa-sel2g",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="the DSA layer's two-stage selection in one kernel (needed by a page ladder with a 3072-page rung)",
+    )
+    k.add_argument(
+        "--dense-half-skip-rows",
+        type=_ints,
+        default=(2,),
+        help="the decode row counts at which a dense MLP layer runs as the XLA graph instead of the dense half's kernel",
+    )
+
+
+def _env_synth_al() -> float | None:
+    """TRNRT_SPEC_SYNTH_AL: the benchmark mode's mean acceptance length, when --spec-synth-al is not given."""
+    v = os.environ.get("TRNRT_SPEC_SYNTH_AL")
+    return float(v) if v else None
 
 
 def parse_engine_args(argv: list[str]) -> argparse.Namespace:
@@ -219,6 +428,24 @@ def engine_config(argv: list[str], core_base: int = 0):
         dsa_layer_max_rows=a.dsa_layer_max_rows,
         ffn_half_below=a.ffn_half_below,
         dsa_index_rows=a.dsa_index_rows,
+        dense_half_skip_rows=tuple(a.dense_half_skip_rows),
+        sp_gather=a.sp_gather,
+        sp_gather_tp_experts=a.sp_gather_tp_experts,
+        dsa_sel2g=a.dsa_sel2g,
+        spec_method=a.spec_method,
+        spec_k=a.spec_k,
+        spec_synth_al=a.spec_synth_al if a.spec_synth_al is not None else _env_synth_al(),
+        spec_max_batch=a.spec_max_batch,
+        spec_hysteresis=a.spec_hysteresis,
+        spec_bucket_max=a.spec_bucket_max,
+        plain_bucket_min=a.plain_bucket_min,
+        spec_page_buckets=a.spec_page_buckets,
+        mtp_fill_rows=a.mtp_fill_rows,
+        mtp_chunk_q=a.mtp_chunk_q,
+        mtp_kv_only=a.mtp_kv_only,
+        dyn_mtp_kv=a.dyn_mtp_kv,
+        state_seats=a.state_seats,
+        state_spec_seats=a.state_spec_seats,
     )
 
 
@@ -277,6 +504,7 @@ def cmd_engine(argv: list[str]) -> int:
     add_compile_arg(ap)
     a = ap.parse_args(argv)
     cfg = engine_config(argv, a.core_base)
+    apply_preset_env(argv)  # before anything imports trnrt.kernels; the ranks the engine spawns inherit it
     from .engine import start_checks
 
     why = start_checks.refusal(cfg.device, a.core_base, cfg.tp)  # its devices free, enough contiguous host memory
@@ -450,6 +678,9 @@ def cmd_serve(argv: list[str]) -> int:
 
 
 def cmd_compile(argv: list[str]) -> int:
+    if "--" in argv and "capture" in argv[: argv.index("--")]:
+        # capture's engine arguments: their preset's environment, before its spawned ranks import the kernels
+        apply_preset_env(argv[argv.index("--") + 1 :])
     from .compile import farm
 
     return farm.main(argv, engine_config=engine_config)

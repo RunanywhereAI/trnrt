@@ -70,10 +70,11 @@ def heads_fit(spec, atp: int) -> bool:
     return spec.num_heads % atp == 0
 
 
-def attention_tp(cfg: ModelConfig, tp: int, requested: int | None = None) -> int:
+def attention_tp(cfg: ModelConfig, tp: int, requested: int | None = None, mtp: bool = False) -> int:
     """The tensor-parallel degree of the token mixers: `requested` when given (it must divide tp and fit
-    every mixer's heads), else the largest divisor of tp that every mixer of the model can split."""
-    specs = list(layer_specs(cfg))
+    every mixer's heads), else the largest divisor of tp that every mixer of the model (and the MTP layer's, with
+    mtp) can split."""
+    specs = list(layer_specs(cfg)) + ([cfg.mtp_spec] if mtp and cfg.mtp_spec is not None else [])
     if requested is not None:
         bad = [s for s in specs if not heads_fit(s, requested)]
         if requested < 1 or tp % requested or bad:
@@ -100,6 +101,23 @@ def state_bytes_per_token_rank(cfg: ModelConfig, atp: int, dtype: torch.dtype, k
 # over the whole chunk) instead of kernels/moe_dedupe.py's calls (models/hybrid.py _moe_clamped): a 512-row chunk
 # takes one moe_dedupe_v10 call.
 MOE_PREFILL_MIN_TOKENS = 600
+
+# Multi-token prediction (DecoderForCausalLM's MTP passes; the engine sets both on every rank from its EngineConfig
+# before it builds the shard). Both are read at trace time, so a graph is one form or the other and its compile key with
+# it; at their defaults no graph moves.
+# MTP_CHUNK_Q: an MTP pass of one sequence with at least this many rows (an after-prefill window) takes the main
+# prefill's chunk form (prep_extend_chunk: table [P], a context-parallel DSA layer's chunk path) instead of verify_rows'
+# one decode row per position with a copy of the whole table each, which measured 227 ms (P1024) / 313 ms (P4096) for a
+# 1,024-row window against ~3.5 ms for the same rows in the main prefill layer. Set it above the largest k + 1: at
+# B = 1 a verify-sized pass would take it too. 0: off (served: 64).
+MTP_CHUNK_Q = 0
+# DYN_MTP_KV: a plain decode step also writes the MTP layer's KV for its rows, as a speculative step's MTP pass does.
+# An engine that steps its requests with the plain decode graph above a batch size (speculation off there) needs it,
+# or the drafts after a plain stretch attend latents and indexer keys nobody wrote. "1": the write half only
+# (models/mla.py write_kv_only: latent, indexer key, pool keys); "full": the whole MTP layer (its attention's own
+# writes; the reference "1" is pinned against); "0": off. The target's computation is unchanged: the writes come after
+# its sampling and touch only the MTP layer's caches.
+DYN_MTP_KV = "0"
 
 
 # Sequence-parallel residual streams for prefill: between the layers of a prefill chunk every
@@ -132,7 +150,8 @@ def moe_prefill_down(layer):
 class DecoderLayer(nn.Module):
     def __init__(self, cfg: ModelConfig, spec: AttnSpec | LinearSpec, dtype: torch.dtype, tp: int, tp_rank: int,
                  moe: bool, index: int = 0, keep_fp8: bool = False, prefix: str | None = None,
-                 moe_kernel: str = "xla", attn_tp: int | None = None, attn_rank: int | None = None):
+                 moe_kernel: str = "xla", attn_tp: int | None = None, attn_rank: int | None = None,
+                 plain: bool = False):
         """tp / tp_rank shard the MLP (dense or experts); attn_tp / attn_rank (default: the same) shard the
         token mixer's heads. keep_fp8: weights the checkpoint quantizes stay FP8 (with fp32 block scales, see
         models/quant.py) and are dequantized inside the graph right before their matmul. moe_kernel "nki":
@@ -221,7 +240,11 @@ class DecoderLayer(nn.Module):
             dense_half.register(self, cfg, I)  # the dense FFN half's blob, decode-only
         self.k_cache: torch.Tensor | None = None  # [num_pages * page_size, nkv, Dk]
         self.v_cache: torch.Tensor | None = None  # [num_pages * page_size, nkv, Dv]
-        _hybrid.init_layer(self, cfg, spec, index, tp, p)  # the hyper-connection streams' parameters
+        # A plain layer (GLM-5.3-Flash's MTP layer) has none of the hyper-connection streams' parameters and runs as an
+        # ordinary residual block (DecoderForCausalLM._layer).
+        self.plain = plain
+        if not plain:
+            _hybrid.init_layer(self, cfg, spec, index, tp, p)  # the hyper-connection streams' parameters
 
     def pack_experts(self) -> None:
         """Replace w_gu, w_gu_scale, w_down, w_down_scale (filled, on the host) by w_blob, the layout of
@@ -268,9 +291,10 @@ class DecoderForCausalLM(nn.Module):
 
     def __init__(self, cfg: ModelConfig, dtype: torch.dtype, max_positions: int,
                  tp_rank: int = 0, tp_size: int = 1, tp_group=None, keep_fp8: bool = False,
-                 vocab_parallel: bool = False, moe_kernel: str = "xla", attn_tp: int | None = None, attn_group=None):
+                 vocab_parallel: bool = False, moe_kernel: str = "xla", attn_tp: int | None = None, attn_group=None,
+                 mtp: bool = False):
         """attn_tp: the attention TP (None: attention_tp's default), which must equal tp_size; attn_group
-        is then the tensor-parallel group."""
+        is then the tensor-parallel group. mtp: build the multi-token-prediction layer (speculative decoding)."""
         super().__init__()
         self.keep_fp8 = keep_fp8
         if cfg.intermediate_size % tp_size:
@@ -278,7 +302,7 @@ class DecoderForCausalLM(nn.Module):
         self.cfg = cfg
         self.dtype = dtype
         self.tp_rank, self.tp_size, self.tp_group = tp_rank, tp_size, tp_group
-        self.attn_tp = attention_tp(cfg, tp_size, attn_tp)
+        self.attn_tp = attention_tp(cfg, tp_size, attn_tp, mtp=mtp)
         if self.attn_tp != tp_size:
             raise NotImplementedError(f"attention TP {self.attn_tp} below tp={tp_size}")
         self.attn_rank = tp_rank
@@ -306,6 +330,21 @@ class DecoderForCausalLM(nn.Module):
             None if cfg.tie_word_embeddings
             else nn.Parameter(torch.empty(self.vocab_rows, cfg.hidden_size, dtype=dtype), requires_grad=False)
         )
+        # Multi-token prediction (models/mtp.py): one MTP layer, applied recursively for k drafts:
+        # x = eh_proj(cat(enorm(embed(next token)), hnorm(previous hidden))), the layer (MLA, DSA, MoE; no
+        # hyper-connections), its final norm and the shared lm_head. It owns one more KV cache (kv_layers()). Built only
+        # with mtp, so a model served without speculation keeps every graph.
+        self.mtp = None
+        if mtp:
+            if not cfg.mtp_layers:
+                raise ValueError("the checkpoint has no MTP layers (num_nextn_predict_layers)")
+            H = cfg.hidden_size
+            self.mtp = DecoderLayer(cfg, cfg.mtp_spec, dtype, tp_size, tp_rank, moe=cfg.mtp_moe, keep_fp8=keep_fp8,
+                                    prefix=cfg.mtp_prefix, moe_kernel=moe_kernel, attn_tp=self.attn_tp,
+                                    attn_rank=self.attn_rank, plain=cfg.hybrid is not None)
+            self.mtp_enorm, self.mtp_hnorm, self.mtp_norm = (
+                nn.Parameter(torch.empty(H, dtype=dtype), requires_grad=False) for _ in range(3))
+            self.mtp_eh = nn.Parameter(torch.empty(H, 2 * H, dtype=dtype), requires_grad=False)
         self.window = None  # no sliding-window layers
         self.page_size = 0
         self.fp8_max = None
@@ -367,8 +406,10 @@ class DecoderForCausalLM(nn.Module):
                 self.register_buffer("cp_row_onehot", g3.to(device), persistent=False)
 
     def kv_layers(self) -> list:
-        """Every layer with a KV cache. Linear-attention layers hold a recurrent state instead (state_layers)."""
-        return [l for l in self.layers if not isinstance(l.spec, LinearSpec)]
+        """Every layer with a KV cache, the MTP layer last. Linear-attention layers hold a recurrent state instead
+        (state_layers)."""
+        layers = [l for l in self.layers if not isinstance(l.spec, LinearSpec)]
+        return layers + ([self.mtp] if getattr(self, "mtp", None) is not None else [])
 
     def state_layers(self) -> list:
         """Layers whose per-sequence state is a fixed-size recurrent state (linear attention)."""
@@ -514,13 +555,27 @@ class DecoderForCausalLM(nn.Module):
         blocks (an index_select by the sp_index buffer)."""
         return x.reshape(self.tp_size, -1, *x.shape[1:]).index_select(0, self.sp_index)[0]
 
-    def _sp_gather(self, x: torch.Tensor) -> torch.Tensor:
+    def _sp_gather_kernel_ok(self) -> bool:
+        """Whether the world row gather may run as kernels/sp_gather.py's NKI all_gather: a model without routed experts,
+        or with expert-parallel ones, or with tensor-parallel experts when sp_gather.TP_EXPERTS is set (an NKI
+        all_gather with tensor-parallel experts failed neuronx-cc 2.27 on trn1's prefill pieces, NCC_ISCH719
+        "topological order violations"; on trn2 it compiles)."""
+        from ..kernels import sp_gather
+
+        return bool(getattr(self, "moe_ep", False)) or not self.cfg.num_experts or sp_gather.TP_EXPERTS
+
+    def _sp_gather(self, x: torch.Tensor, onehot: torch.Tensor | None = None) -> torch.Tensor:
         """Every rank's rows [tp_size * r, ...] from each rank's own x [r, ...], in rank order: x in its
         block of a zero [tp_size, r, ...] (a one-hot multiply: index_copy gave NaN on the device, see _head)
-        summed over the world. Exact: each element is one rank's value plus zeros. (An NKI all_gather here
-        failed neuronx-cc 2.27 on the prefill pieces with tensor-parallel experts, NCC_ISCH719 "topological
-        order violations".)"""
-        full = x.unsqueeze(0) * self.sp_onehot.view(self.tp_size, *[1] * x.dim())
+        summed over the world, or kernels/sp_gather.py's NKI all_gather when it is enabled. Exact either way:
+        each element is one rank's value plus zeros. onehot: the sp_onehot buffer when a graph takes it as an
+        argument (forward_mtp_k)."""
+        from ..kernels import sp_gather
+
+        if onehot is None and self._sp_gather_kernel_ok() and sp_gather.enabled(x):
+            return sp_gather.gather(x, self.tp_size, self.tp_size)
+        oh = self.sp_onehot if onehot is None else onehot
+        full = x.unsqueeze(0) * oh.view(self.tp_size, *[1] * x.dim())
         return self._all_reduce(full.reshape(-1, *x.shape[1:]))
 
     def _w(self, layer: DecoderLayer, name: str) -> torch.Tensor:
@@ -681,8 +736,17 @@ class DecoderForCausalLM(nn.Module):
 
     def _layer(self, layer, h, positions, slot_mapping, table, bias, state_slot=None, **mixin):
         """state_slot: each sequence's row in the recurrent-state pool, read by linear-attention layers
-        (models/linear_attn.py); attention layers ignore it. mixin: hybrid.layer's pend / defer (_run_layers)."""
-        return _hybrid.layer(self, layer, h, positions, slot_mapping, table, bias, state_slot, **mixin)
+        (models/linear_attn.py); attention layers ignore it. mixin: hybrid.layer's pend / defer (_run_layers). A plain
+        layer (the MTP layer: no hyper-connections) runs as an ordinary residual block: its MLA attention, then its MLP
+        as the hybrid's (the clamped SwiGLU MoE)."""
+        if not getattr(layer, "plain", False):
+            return _hybrid.layer(self, layer, h, positions, slot_mapping, table, bias, state_slot, **mixin)
+        if mixin:
+            raise ValueError(f"hybrid.layer's {sorted(mixin)} reached a layer with no hyper-connections")
+        eps = self.cfg.rms_norm_eps
+        x = rms_norm(h, layer.in_norm, eps)
+        h = h + self._attn_all_reduce(_mla.attention(self, layer, x, positions, slot_mapping, table, bias))
+        return h + _hybrid._mlp(self, layer, rms_norm(h, layer.post_norm, eps))
 
     def long_ctx(self, L: int) -> bool:
         """Whether a bucket of L keys runs every attention layer's long-context path (models/dsa_long.py; static
@@ -812,7 +876,10 @@ class DecoderForCausalLM(nn.Module):
         sliding-window layers, no n-gram embedding): None."""
         h, attn = self.prep_decode(input_ids, positions, block_table, context_lens, board, read_slot)
         h = self._run_layers(h, positions, slot_mapping, attn, state_slot)
-        return self.post_decode(h, temperature, top_p, top_k, min_p, noise, board, write_slot, bitmask, penalties)
+        out = self.post_decode(h, temperature, top_p, top_k, min_p, noise, board, write_slot, bitmask, penalties)
+        if DYN_MTP_KV != "0" and getattr(self, "mtp", None) is not None:  # after the target's sampling
+            self._mtp_kv_decode(out, h, positions, slot_mapping, attn)
+        return self._draft_out(out, h)
 
     # -- prefill: one sequence x C tokens ---------------------------------------------
 
@@ -850,8 +917,197 @@ class DecoderForCausalLM(nn.Module):
         piecewise prefill (prep_prefill, group_fn, post_prefill)."""
         h, attn = self.prep_prefill(input_ids, positions, block_table)
         h = self._run_layers(h, positions, slot_mapping, attn, state_slot)
-        return self.post_prefill(h, last_index, temperature, top_p, top_k, min_p, noise, board, write_slot,
-                                 bitmask, penalties, plp_targets)
+        out = self.post_prefill(h, last_index, temperature, top_p, top_k, min_p, noise, board, write_slot,
+                                bitmask, penalties, plp_targets)
+        return self._draft_out(out, h)
+
+    # -- speculative verify: B sequences x Q positions ----------------------------------
+
+    def prep_extend(self, input_ids, positions, block_table, swa_table=None, swa_first=None):
+        """input_ids / positions [B, Q], block_table [B, P]: the token embedding of the B Q rows (b-major) and the
+        attention inputs, each row seeing its sequence's keys up to its own position (bias [B, 1, 1, Q, L], or the
+        long path's placeholder). swa_table / swa_first: the engine's calling convention (None)."""
+        B, Q = input_ids.shape
+        if self.long_ctx(block_table.shape[1] * self.page_size):  # models/dsa_long.py: no [B, Q, L] visibility
+            return self._embed(input_ids.reshape(B * Q)), self._long_attn(block_table, (B, 1, 1, Q))
+        j = torch.arange(block_table.shape[1] * self.page_size, device=block_table.device).view(1, 1, -1)
+        pos = positions.unsqueeze(-1)
+        attn = self._attn_inputs(j <= pos, block_table, (B, 1, 1, Q))
+        return self._embed(input_ids.reshape(B * Q)), attn
+
+    def prep_verify(self, input_ids, positions, block_table, swa_table=None, swa_first=None, ngram_ids=None):
+        """prep_extend with the model's own input hidden state (the hyper-connection streams), for forward_extend."""
+        h, attn = self.prep_extend(input_ids, positions, block_table, swa_table, swa_first)
+        h = self._hidden_in(input_ids.reshape(-1))
+        return h, attn
+
+    def post_extend(self, h, temperature, top_p, top_k, min_p, noise, u_accept, draft):
+        """Every row's verification of its draft (engine/sampler.py verify_sample): [B Q, VERIFY_COLS]."""
+        from ..engine.sampler import verify_sample
+
+        hn = self._final(h)
+        return verify_sample(self._head(hn), temperature, top_p, top_k, min_p, noise, u_accept, draft)
+
+    def forward_extend(self, input_ids, positions, block_table, slot_mapping,
+                       temperature, top_p, top_k, min_p, noise, u_accept, draft,
+                       swa_table=None, swa_first=None, state_slot=None, ngram_ids=None):
+        """The speculative verify call. input_ids / positions / slot_mapping [B, Q], draft [B Q]; per-row sampling
+        parameters [B Q]; noise [B Q, K]. Every position is scored: returns [B Q, VERIFY_COLS] (and, with the MTP
+        layer, the final hidden states the MTP pass drafts from).
+
+        state_slot [B, 1 + Q]: each sequence's state row to read, then the rows that receive its state after each of
+        the Q positions, so a partly rejected draft continues from the state after its last accepted position
+        (models/linear_attn.py verify_scan)."""
+        h, attn = self.prep_verify(input_ids, positions, block_table, swa_table, swa_first, ngram_ids)
+        h = self._run_layers(h, positions.reshape(-1), slot_mapping.reshape(-1), attn, state_slot)
+        out = self.post_extend(h, temperature, top_p, top_k, min_p, noise, u_accept, draft)
+        return self._draft_out(out, h)
+
+    # -- the MTP layer's draft passes ---------------------------------------------------
+
+    def _mtp_chunk(self, B: int, Q: int, block_table, swa_table) -> bool:
+        """Whether an MTP pass over input_ids [B, Q] takes the prefill form (MTP_CHUNK_Q); static per graph."""
+        return bool(MTP_CHUNK_Q) and B == 1 and Q >= MTP_CHUNK_Q and Q >= 2 and swa_table is None
+
+    def prep_extend_chunk(self, input_ids, positions, block_table):
+        """prep_extend of ONE sequence's rows as forward_prefill's prep_prefill builds them: block_table [1, P] -> [P],
+        the chunk form's bias (the long path's placeholder of rank 4, not the verify batch's of rank 5), the embedding
+        of the rows (_mtp_chunk)."""
+        B, Q = input_ids.shape
+        tab = block_table[0]
+        if self.long_ctx(tab.shape[0] * self.page_size):
+            attn = self._long_attn(tab, (1, 1, Q))
+        else:
+            j = torch.arange(tab.shape[0] * self.page_size, device=tab.device).unsqueeze(0)
+            pos = positions.reshape(-1).unsqueeze(1)
+            attn = self._attn_inputs(j <= pos, tab, (1, 1, Q))
+        return self._embed(input_ids.reshape(Q)), attn
+
+    def forward_mtp(self, input_ids, positions, block_table, slot_mapping, hsrc, hidx, last_index, src_norm,
+                    swa_table=None, swa_first=None):
+        """One MTP pass over B rows x Q positions, in the target's positions (vLLM's EAGLE / MTP convention): row b
+        position j takes input_ids[b, j], the token AFTER that position, and hsrc[hidx[b, j]], the hidden state of the
+        model (or of the previous MTP pass) AT that position; its KV goes to slot_mapping[b, j]. Returns [B, 1] fp32
+        greedy drafts from position last_index[b] and the MTP hidden there [B, H], which seeds the next pass."""
+        return self._mtp_pass(input_ids, positions, block_table, slot_mapping, hsrc, hidx, last_index, src_norm,
+                              swa_table, swa_first, target=True)
+
+    def _mtp_pass(self, input_ids, positions, block_table, slot_mapping, hsrc, hidx, last_index, src_norm,
+                  swa_table=None, swa_first=None, target=False, sp_onehot=None, later=False):
+        """forward_mtp. GLM-5.3-Flash's MTP layer (vLLM v0.30.0 deepseek_mtp.py, SGLang v0.5.21 deepseek_nextn.py):
+        x = eh_proj(cat(enorm(embed(token after p)), hnorm(h_p))), y = the plain decoder layer (pooled-DSA MLA, MoE +
+        shared expert) on x, draft = argmax(lm_head(shared_head.norm(y))), with the target's embedding and lm_head
+        (the checkpoint's MTP layer stores neither). h_p is the target's last hidden state after its final norm (target:
+        hsrc holds the target's streams, collapsed and normed by hybrid.final), or a previous pass's y after
+        shared_head.norm (src_norm). The layer's latent and indexer key are one more KV layer in the shared page pool
+        (kv_layers), written for every position the pass computes, which is how the later passes and the next step see
+        them. Its later passes run their own indexer, as in the builds behind the published numbers: the checkpoint's
+        index_share_for_mtp_iteration is not used (glm5_next leaves it unparsed, and under context-parallel DSA every
+        bucket takes the long path, which has no shared-selection form), so drafts can differ from vLLM's there (never the
+        tokens: verification keeps the target's). sp_onehot: hsrc holds only this
+        rank's rows of a sequence-parallel prefill chunk, and hidx indexes the chunk's rows in full. later: whether the
+        graph has later passes (forward_mtp_k); unused here, but forward_mtp_k computes it as this call's argument so that
+        dynamo realizes pos_rest at the same point as the published builds do (a graph's input order is part of its
+        compile key)."""
+        cfg = self.cfg
+        B, Q = input_ids.shape
+        if self._mtp_chunk(B, Q, block_table, swa_table):  # the after-prefill rows in the main prefill's form
+            e, attn = self.prep_extend_chunk(input_ids, positions, block_table)
+        else:
+            e, attn = self.prep_extend(input_ids, positions, block_table, swa_table, swa_first)
+        # hsrc holds UNNORMALISED hidden states (the target's last layer output, or the previous MTP pass's) and
+        # src_norm is their final norm: returning normed states from the post graphs made neuronx-cc 2.27 fail with
+        # NCC_IBIR243 on the tp=32 verify graph.
+        if sp_onehot is not None:  # every rank's rows of the chunk's final hidden state, as post_prefill gathers them
+            h_prev = self._sp_gather(self._final(hsrc), sp_onehot).index_select(0, hidx.reshape(-1))
+        else:
+            h_prev = hsrc.index_select(0, hidx.reshape(-1))
+            if target:  # the target's streams, collapsed and normed (models/hybrid.py final)
+                h_prev = self._final(h_prev)
+            else:
+                h_prev = rms_norm(h_prev, src_norm, cfg.rms_norm_eps)
+        x = F.linear(torch.cat([rms_norm(e, self.mtp_enorm, cfg.rms_norm_eps),
+                                rms_norm(h_prev, self.mtp_hnorm, cfg.rms_norm_eps)], dim=-1), self.mtp_eh)
+        bias, table = attn[None]
+        rows = torch.arange(B, device=input_ids.device) * Q + last_index
+        x = self._layer(self.mtp, x, positions.reshape(-1), slot_mapping.reshape(-1), table, bias)
+        xl = x.index_select(0, rows)
+        hm = rms_norm(xl, self.mtp_norm, cfg.rms_norm_eps)
+        _, top = topk_large(self._head(hm), 1)
+        return top[:, :1].float(), xl
+
+    def forward_mtp_k(self, input_ids, positions, block_table, slot_mapping, hsrc, hidx, last_index, src_norm,
+                      pos_rest=None, slot_rest=None, swa_table=None, swa_first=None, swa_rest=None,
+                      swa_first_rest=None, sp_onehot=None):
+        """forward_mtp, then k - 1 more single-position passes in the SAME graph, each fed the previous pass's draft
+        and MTP hidden. pos_rest / slot_rest [B, k - 1] are the later passes' positions and KV slots, known on the host
+        in advance (swa_rest / swa_first_rest: the engine's calling convention, None). One graph instead of k matters
+        on multi-chip TP, where every graph execution holding a cross-chip collective costs about 5 ms at tp=32.
+        Returns [B, k] fp32 drafts and the last pass's MTP hidden. sp_onehot: as _mtp_pass's."""
+        draft, xl = self._mtp_pass(input_ids, positions, block_table, slot_mapping, hsrc, hidx, last_index, src_norm,
+                                   swa_table, swa_first, target=True, sp_onehot=sp_onehot, later=pos_rest is not None)
+        if pos_rest is None:
+            return draft, xl
+        B = draft.shape[0]
+        rows = torch.arange(B, device=draft.device).view(B, 1)
+        zero = torch.zeros(B, dtype=last_index.dtype, device=draft.device)
+        drafts = [draft]
+        for s in range(pos_rest.shape[1]):
+            draft, xl = self._mtp_pass(draft.long(), pos_rest[:, s : s + 1], block_table, slot_rest[:, s : s + 1],
+                                       xl, rows, zero, self.mtp_norm)
+            drafts.append(draft)
+        return torch.cat(drafts, dim=1), xl
+
+    def mtp_kv_takes(self, Q: int, P: int) -> bool:
+        """Whether an after-prefill window of Q rows over a table of P pages can be KV-only (forward_mtp_kv): exactly
+        the windows that take _mtp_chunk's prefill form at B = 1. Static per graph (the runner asks it when it builds a
+        window's key)."""
+        return bool(MTP_CHUNK_Q) and Q >= MTP_CHUNK_Q and Q >= 2 and self.mtp is not None and self.mtp.plain
+
+    def forward_mtp_kv(self, input_ids, positions, block_table, slot_mapping, hsrc, hidx, src_norm, sp_onehot=None):
+        """A KV-ONLY after-prefill MTP window: the MTP layer's KV of the window's rows and nothing else. input_ids
+        [1, Q] (the tokens AFTER the rows' positions: prompt tokens, no sampled one), positions / slot_mapping [1, Q],
+        block_table [1, P], hsrc the prefill call's hidden stash with hidx [Q] its rows. x is _mtp_pass's, statement for
+        statement up to the layer; the layer's attention input is rms_norm(x, in_norm) as _layer builds it, and
+        models/mla.py write_kv_only stores what the layer's attention would have stored from it (latent, indexer key,
+        pool keys). No attention, MoE, head or later draft pass: the KV of a position depends on its own input alone,
+        so a window's KV equals the full pass's. Returns a [1, 1] slice of the normed input (a graph needs an output;
+        the writes are in place on the cache)."""
+        cfg = self.cfg
+        B, Q = input_ids.shape
+        tab = block_table[0]  # prep_extend_chunk's: one sequence's table [P], the prefill form
+        e = self._embed(input_ids.reshape(Q))
+        if sp_onehot is not None:  # every rank's rows of the chunk's final hidden state, as post_prefill gathers them
+            h_prev = self._sp_gather(self._final(hsrc), sp_onehot).index_select(0, hidx.reshape(-1))
+        else:
+            h_prev = self._final(hsrc.index_select(0, hidx.reshape(-1)))  # the target's streams, collapsed and normed
+        x = F.linear(torch.cat([rms_norm(e, self.mtp_enorm, cfg.rms_norm_eps),
+                                rms_norm(h_prev, self.mtp_hnorm, cfg.rms_norm_eps)], dim=-1), self.mtp_eh)
+        xa = rms_norm(x, self.mtp.in_norm, cfg.rms_norm_eps)
+        _mla.write_kv_only(self, self.mtp, xa, positions.reshape(-1), slot_mapping.reshape(-1), tab)
+        return xa[:1, :1].float()
+
+    def _mtp_kv_decode(self, out, h, positions, slot_mapping, attn) -> None:
+        """The MTP layer's cache writes for a plain decode batch's rows (DYN_MTP_KV): _mtp_pass's first-pass input for
+        the target's position p (token p + 1 = the row's sampled token, out[:, 0]; hidden = the target's final(h_p)),
+        then the layer's write half only ("1") or the whole layer ("full", its output unused)."""
+        eps = self.cfg.rms_norm_eps
+        e = self._embed(out[:, 0].long())
+        hp = self._final(h)
+        x = F.linear(torch.cat([rms_norm(e, self.mtp_enorm, eps), rms_norm(hp, self.mtp_hnorm, eps)], dim=-1),
+                     self.mtp_eh)
+        bias, table = attn[None]
+        p, sl = positions.reshape(-1), slot_mapping.reshape(-1)
+        if DYN_MTP_KV == "full":
+            self._layer(self.mtp, x, p, sl, table, bias)
+            return
+        xn = rms_norm(x, self.mtp.in_norm, eps)
+        _mla.write_kv_only(self, self.mtp, xn, p, sl, table)
+
+    def _draft_out(self, out, h):
+        """A target graph's output, plus its last hidden state h when the model drafts with the MTP layer (the runner
+        keeps it on the device for the MTP pass); out alone otherwise, so a model without speculation keeps its graphs."""
+        return (out, h) if getattr(self, "mtp", None) is not None else out
 
     # -- reference: logits for a whole sequence, no cache (tests only) -----------------
 
