@@ -32,7 +32,9 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  # One group per commit pushed to main: GitHub keeps a single pending run per group and cancels the older one, which
+  # would drop a promotion's release when two arrive while one runs. PRs share their ref's group and cancel superseded runs.
+  group: release-${{ github.event_name == 'push' && github.sha || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -151,7 +153,7 @@ jobs:
             gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
           else
             gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
-              --title "TrnRT $TAG" --generate-notes --latest
+              --title "TrnRT $TAG" --generate-notes
           fi
 
   pypi:

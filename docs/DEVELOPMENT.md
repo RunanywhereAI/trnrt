@@ -105,4 +105,18 @@ To cut a release:
 5. **Check it.** The run's summary names the action and the tag; the release page lists the files. If a publishing
    job failed, run it again from the Actions tab: the tag and release exist, and the rerun finishes the rest.
 
+### One-time setup for PyPI
+
+PyPI publishes by trusted publishing, so the repository holds no token. Once, with a PyPI account that has a verified
+email address and two-factor authentication:
+
+1. At <https://pypi.org/manage/account/publishing/>, add a **pending publisher**: project `trnrt`, owner
+   `RunanywhereAI`, repository `trnrt`, workflow `release.yml`, environment `pypi`. The first release creates the
+   project under that account.
+2. In the repository, turn publishing on: `gh variable set PUBLISH_PYPI --body true -R RunanywhereAI/trnrt`. The `pypi`
+   environment already exists and only deploys from `main`.
+
+The first release afterwards publishes the version in `trnrt/__init__.py`. A PyPI version cannot be reused or taken
+back, so confirm the version and the changelog before merging the promotion.
+
 An urgent fix takes the same path: a PR into `development`, then a promotion and a patch release.
