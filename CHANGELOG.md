@@ -24,6 +24,7 @@ and versions follow [Semantic Versioning](https://semver.org/). Rebuild the comp
 - Contributor CI: actionlint and zizmor on the workflows (pre-commit); advisory PR checks (title format, a warning
   when traced code changes); dependency review; OpenSSF Scorecard; a weekly external-link check; a release dry run
   that builds the package and the container image.
+- Area labels on every PR from the paths it changes (`.github/labeler.yml`), forks included.
 - AI review on every ready-for-review PR into `development` (CodeRabbit, cubic, Greptile), never a required check.
 - Contributing: a three-step quick start, issue forms for performance regressions and docs, Discussions for questions,
   `SUPPORT.md`.

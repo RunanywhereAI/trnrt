@@ -1,0 +1,37 @@
+# Area labels by the paths a pull request changes (actions/labeler, applied by .github/workflows/pr-labels.yml).
+# Read from the default branch only, so a pull request can't change its own labels' rules.
+router:
+  - changed-files:
+      - any-glob-to-any-file: ["trnrt/serve/router.py", "tests/test_router*.py"]
+serve:
+  - changed-files:
+      - any-glob-to-any-file: ["trnrt/serve/**", "tests/test_serve*.py"]
+engine:
+  - changed-files:
+      - any-glob-to-any-file: ["trnrt/engine/**", "trnrt/compile/**", "tests/test_spec*.py", "tests/test_scheduler*.py"]
+kernels:
+  - changed-files:
+      - any-glob-to-any-file: ["trnrt/kernels/**"]
+models:
+  - changed-files:
+      - any-glob-to-any-file: ["trnrt/models/**"]
+docs:
+  - changed-files:
+      - any-glob-to-any-file: ["docs/**", "*.md"]
+ci:
+  - changed-files:
+      - any-glob-to-any-file:
+          [".github/**", "Makefile", ".pre-commit-config.yaml", "pyproject.toml", "docker/**", "tools/check_docs.py"]
+# The traced paths (pyproject.toml, [tool.ruff.format] exclude) and the graph-shape defaults (AGENTS.md, invariant 1).
+graphs-changed:
+  - changed-files:
+      - any-glob-to-any-file:
+          [
+            "trnrt/kernels/**",
+            "trnrt/models/**",
+            "trnrt/engine/model_runner.py",
+            "trnrt/compile/capture.py",
+            "trnrt/config.py",
+            "trnrt/platform.py",
+            "trnrt/__main__.py",
+          ]
