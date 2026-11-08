@@ -18,13 +18,17 @@ from .kv_pool import PagePool
 from .model_runner import ModelRunner
 from .radix_cache import RadixCache
 from .request import Request, SamplingParams, Status, unsupported
-from .sampler import unpack
-from .scheduler import NeedSync, Scheduler, SchedulerConfig, StepPlan
+from .sampler import NUM_TOP_LOGPROBS, unpack
+from .scheduler import BLIND, NeedSync, Scheduler, SchedulerConfig, StepPlan
 
 if TYPE_CHECKING:
     from .host_cache import HostTier
 
 logger = logging.getLogger(__name__)
+
+# The position a speculative decode checkpoint is pending at until its step is read back (LLMEngine._reserve_async_ckpts):
+# past any real position, so the scheduler's _cache keeps it pending and _release frees its row with the request.
+ASYNC_CKPT = 1 << 60
 
 # Tensor-parallel engines not closed yet, held weakly: close() at exit (stopping the workers) without
 # keeping every engine a process ever made alive. atexit.register(self.close) did, so a test session
@@ -53,10 +57,10 @@ class StepStats:
 
 
 def resolve_attention_tp(mcfg: ModelConfig, cfg: EngineConfig) -> int:
-    """The token mixers' TP degree (models/decoder.py attention_tp)."""
+    """The token mixers' TP degree (models/decoder.py attention_tp), the MTP layer's attention included when it speculates."""
     from ..models.decoder import attention_tp
 
-    return attention_tp(mcfg, cfg.tp)
+    return attention_tp(mcfg, cfg.tp, mtp=cfg.spec_method == "mtp")
 
 
 def _cp_degree(mcfg: ModelConfig, attn_tp: int) -> int:
@@ -98,16 +102,24 @@ def pool_pages(cfg: EngineConfig, mcfg: ModelConfig) -> int:
 
 
 def set_decode_routes(cfg: EngineConfig) -> None:
-    """The decode kernel routes' row caps of `cfg` (EngineConfig.kda_shell_max_rows, dsa_layer_max_rows, ffn_half_below,
-    dsa_index_rows) into the model modules that read them when a graph is traced. Every rank's build_shard calls it
-    before building its shard (an engine's ranks and a capture's alike: each rank is its own process, given the
-    EngineConfig), so they all trace the same routes; it sets every cap, so an engine never inherits another's."""
-    from ..models import hybrid, mla
+    """The decode kernel routes of `cfg` (the row caps kda_shell_max_rows, dsa_layer_max_rows, ffn_half_below and
+    dsa_index_rows, the dense MLP's skipped row counts, the routes sp_gather, sp_gather_tp_experts and dsa_sel2g, and the MTP
+    layer's chunk form and plain-step KV write) into the modules that read them when a graph is traced. Every rank's
+    build_shard calls it before building its shard (an engine's ranks and a capture's alike: each rank is its own process,
+    given the EngineConfig), so they all trace the same routes; it sets every one, so an engine never inherits another's."""
+    from ..kernels import dense_half, dsa_satwf, sp_gather
+    from ..models import decoder, hybrid, mla
 
     hybrid.KDA_SHELL_MAXB = int(cfg.kda_shell_max_rows)
     hybrid.MOE_HALF_BELOW = int(cfg.ffn_half_below)
     mla.LAYER_MK_MAXB = int(cfg.dsa_layer_max_rows)
     mla.CP_INDEX_ROWS = int(cfg.dsa_index_rows)
+    sp_gather.MODE = cfg.sp_gather
+    sp_gather.TP_EXPERTS = cfg.sp_gather_tp_experts
+    dsa_satwf.SEL2G = cfg.dsa_sel2g
+    dense_half.SKIP_T = frozenset(cfg.dense_half_skip_rows)
+    decoder.MTP_CHUNK_Q = int(cfg.mtp_chunk_q)
+    decoder.DYN_MTP_KV = "1" if cfg.dyn_mtp_kv else "0"
 
 
 def local_k_counts(model) -> list[float] | None:
@@ -198,6 +210,7 @@ def build_shard(cfg: EngineConfig, path: str, num_pages: int, rank: int = 0):
         moe_kernel=cfg.resolved_moe_kernel(),
         attn_tp=atp,
         attn_group=attn_group,
+        mtp=cfg.spec_method == "mtp",  # the checkpoint's MTP layer is built and loaded only when the engine speculates
     )
     if cp_group is not None:
         model.cp_group = cp_group
@@ -280,7 +293,7 @@ class LLMEngine:
         # boundary in decode, and a checkpoint a newer one dominates is freed when its path is released.
         if self.runner.state is None:
             raise ValueError("TrnRT serves models with linear-attention layers: this model has no recurrent state")
-        self.scheduler = Scheduler(scfg, self.pool, self.radix)
+        self.scheduler = Scheduler(scfg, self.pool, self.radix, draft_fn=self._propose if cfg.spec_method else None)
         self.scheduler.states = self.runner.state  # checkpoint rows of the state pool back the radix nodes
         self.radix.free_ckpt = self.runner.state.free_ckpt
         # Host memory under the radix cache (engine/host_cache.py), per rank: half for state checkpoints, the rest for
@@ -301,6 +314,20 @@ class LLMEngine:
             self.scheduler.host = self.host_tier
         self._ids = itertools.count()
         self.last_step = StepStats()
+        # Speculative decoding (engine/spec_async.py): drafts proposed and accepted over the engine's run, per request in
+        # Request.spec_proposed / spec_accepted, and per draft position (reached, accepted).
+        self.spec_proposed = 0
+        self.spec_accepted = 0
+        self.spec_verifies = 0  # drafts verified (one per sequence and step); tokens per verify = 1 + accepted / this
+        self.spec_pos_reached: list[int] = []
+        self.spec_pos_accepted: list[int] = []
+        # Dynamic speculation (EngineConfig.spec_max_batch): whether the engine is stepping its requests with the plain
+        # decode graph, and what the flips between the two modes did.
+        self._dyn_plain = False
+        self.dyn_flips = 0
+        self.dyn_seat_moves = 0  # requests moved into speculative state seats at plain -> speculative flips
+        self.dyn_plain_steps = 0  # steps launched in plain mode / in speculative mode (decode steps only)
+        self.dyn_spec_steps = 0
         # (plan, launches) of a step whose results are not read yet
         self._inflight: tuple[StepPlan, list[Any]] | None = None
 
@@ -424,6 +451,12 @@ class LLMEngine:
         """
         t = time.perf_counter()
         self.last_step = StepStats()
+        flipped: list[Request] = []
+        if self._dyn_active():
+            want = self._dyn_want_plain()
+            if want != self._dyn_plain:
+                flipped = self._dyn_flip(want)
+            self.runner.state.prefer_spec = not self._dyn_plain  # a request's first rows take the mode's kind of seat
         self.scheduler.in_flight = self._inflight is not None
         try:
             plan = self.scheduler.schedule()
@@ -439,6 +472,70 @@ class LLMEngine:
                 self._inflight = (plan, launches)
                 self.scheduler.in_flight = True
         self.last_step.seconds = time.perf_counter() - t
+        return flipped + finished
+
+    # -- speculative decoding (engine/spec_async.py) --------------------------------------
+
+    def _propose(self, req: Request) -> list[int]:  # noqa: ARG002  the scheduler's draft_fn signature
+        """The drafts of a decoding request's next step, for the scheduler: k blind slots, since the drafts, the newest
+        token, the positions and the state row are on the device and the verify always carries k of them (tokens past the
+        request's limits are dropped at commit); none in plain mode (dynamic speculation steps every request plain)."""
+        return [] if self._dyn_plain else [BLIND] * self.cfg.spec_k
+
+    @property
+    def dyn_plain(self) -> bool:
+        """Whether dynamic speculation is stepping the requests with the plain decode graph right now."""
+        return self._dyn_plain
+
+    def _dyn_active(self) -> bool:
+        """Whether the engine switches between speculative and plain steps with the number of decoding requests."""
+        return bool(self.cfg.spec_max_batch) and self.cfg.spec_method == "mtp"
+
+    def _dyn_want_plain(self) -> bool:
+        """Whether the decoding requests are more than the speculation limit (with hysteresis: once plain, stay until at
+        most limit - h decode). With speculative seats fewer than the running cap, a verify needs one: plain -> speculative
+        only when every running request can sit in a speculative seat (the flip moves them), and in speculative mode a
+        request admitted into a plain seat (no speculative seat was free) is stepped plain, never moved blind."""
+        n = sum(1 for r in self.scheduler.running if r.status is Status.RUNNING and r.is_decoding)
+        m = self.cfg.spec_max_batch
+        want = n > (m - max(self.cfg.spec_hysteresis, 0) if self._dyn_plain else m)
+        st = self.runner.state
+        if not want and st.mixed_seats:
+            run = [r for r in self.scheduler.running if r.status is Status.RUNNING]
+            if self._dyn_plain:
+                want = sum(1 for r in run if not st.is_spec(r)) > st.spec_available()
+            else:
+                want = any(st.holds(r) and not st.is_spec(r) for r in run)
+        return want
+
+    def _dyn_flip(self, want_plain: bool) -> list[Request]:
+        """Switch every request between speculative and plain stepping at a step boundary. The step in flight is read first
+        (its tokens, the accepted counts, positions and pages become the host's): a blind step launched in one mode cannot be
+        followed by a step of the other, whose inputs are on a different board. speculative -> plain: each request's current
+        state row is the one its last blind step left (rows[acc]); plain -> speculative: each request's board row is rebuilt
+        from the host at its next verify (spec_host_init), after its state moved into a speculative seat if it sat in a
+        plain one."""
+        finished = self._drain() if self._inflight is not None else []
+        state = self.runner.state
+        moves: tuple[list[int], list[int]] = ([], [])
+        for r in list(self.scheduler.running):
+            if want_plain:
+                if r.spec_cur is not None:
+                    state.set_current(r, r.spec_cur)
+                r.spec_cur = None
+            else:
+                r.spec_ready = False
+                if state.mixed_seats and state.holds(r) and not state.is_spec(r):
+                    mv = state.move(r, to_spec=True)  # its current row copied into the new seat (after the drain)
+                    if mv is None:
+                        raise RuntimeError(f"no speculative seat for request {r.rid} at a plain -> speculative flip")
+                    moves[0].append(mv[0])
+                    moves[1].append(mv[1])
+        if moves[0]:
+            self.runner.copy_state(*moves)
+            self.dyn_seat_moves += len(moves[0])
+        self._dyn_plain = want_plain
+        self.dyn_flips += 1
         return finished
 
     def _drain(self) -> list[Request]:
@@ -454,13 +551,29 @@ class LLMEngine:
         """Every call of the step, launched before the first read-back: (seqs, device output, kind)."""
         max_b = self.runner.decode_buckets[-1]
         launches = []
+        # Speculative decoding: every decode of a speculative step is a blind verify (a row without drafts rides in the
+        # verify graph too); in plain mode, and without speculation, every decode is the plain graph.
+        merged = bool(self.cfg.spec_method) and not self._dyn_plain
+        plain = [s for s in plan.decodes if not s.draft and not merged]
+        spec = [s for s in plan.decodes if s.draft or merged]
+        if self._dyn_active():
+            self.dyn_plain_steps += bool(plain)
+            self.dyn_spec_steps += bool(spec)
         self._restore_states(plan)
-        for i in range(0, len(plan.decodes), max_b):
-            chunk = plan.decodes[i : i + max_b]
+        for i in range(0, len(plain), max_b):
+            chunk = plain[i : i + max_b]
             launches.append((chunk, self.runner.decode(chunk), "decode"))
             self._save_states(chunk)
+        Q = 1 + self.cfg.spec_k
+        for i in range(0, len(spec), max_b):
+            chunk = spec[i : i + max_b]
+            self._reserve_async_ckpts(chunk)
+            launches.append((chunk, self.runner.verify_async(chunk, Q), "verify_async"))
+            self.runner.mtp_async()
         for s in plan.prefills:
             launches.append(([s], self.runner.prefill(s), "prefill"))
+            if self.cfg.spec_method:
+                self._spec_after_prefill(s, self.runner.last_hidden)
             self._save_states([s])
         self.last_step = StepStats(
             len(plan.decodes),
@@ -491,8 +604,11 @@ class LLMEngine:
 
     def _collect(self, plan, launches) -> list:
         """Read a step's outputs; returns tokens aligned with plan.seqs()."""
-        results: dict[int, int] = {}
+        results: dict[int, Any] = {}
         for chunk, out, kind in launches:
+            if kind == "verify_async":
+                self._collect_blind(chunk, out, results)
+                continue
             with watchdog.watched(self.runner.watchdog, f"reading back a {kind} call"):
                 host_out = out.cpu()
             self.runner.launch_bound.done_through(out)  # this call and every launch before it are done
@@ -504,26 +620,150 @@ class LLMEngine:
                     s.req.logprobs.append((lps[i], top_ids[i][:n], top_lps[i][:n]))
         return [results[id(s)] for s in plan.seqs()]
 
+    def _spec_after_prefill(self, s, hkey: str) -> None:
+        """ModelRunner.spec_after_prefill, with the pages of a final chunk's later draft passes (k > 1: MTP KV up to
+        end + k - 2) reserved first."""
+        if self.cfg.spec_k > 1 and s.sample:
+            self.scheduler._reserve(s.req, min(s.end + self.cfg.spec_k, self.cfg.max_model_len))
+        self.runner.spec_after_prefill([s], hkey)
+
+    def _reserve_async_ckpts(self, chunk) -> None:
+        """Decode checkpoints of a speculative step (ModelRunner spec_ckpt): a checkpoint row for each request whose blind
+        verify may cross a page boundary (its computed positions lie between its newest committed token and the step's upper
+        bound s.start + Q), pending at a sentinel position until _collect_blind reads the step back: released with the
+        request if it ends first, kept by the scheduler's _cache meanwhile. Taken as Scheduler.track takes one, evicting a
+        tree checkpoint when no row is free: in serving the pool is mostly full of the tree's, so free rows alone would
+        almost never come (a row that goes back unused is free for the next reservation)."""
+        t = self.runner.async_ckpt_t
+        if not t:
+            return
+        Q = 1 + self.cfg.spec_k
+        for s in chunk:
+            req = s.req
+            if (s.start + Q) // t <= (len(req.token_ids) - 1) // t:
+                continue
+            row = self.scheduler._alloc_ckpt()
+            if row is None:
+                continue
+            s.ckpt_row = row
+            req.ckpt_pending.append((ASYNC_CKPT + row, row, True))
+
+    def _resolve_async_ckpt(self, s, acc: int) -> None:
+        """The step's verify computed positions old .. old + acc (old its newest token's, this step's tokens not yet
+        committed): if they crossed a multiple b of the page size, spec_ckpt copied the state after b - 1 into the reserved
+        row, now the request's decode checkpoint at b (superseding its older one, as Scheduler.track); else the row goes
+        back."""
+        row = s.ckpt_row
+        if row is None:
+            return
+        req = s.req
+        item = next((x for x in req.ckpt_pending if x[1] == row and x[0] >= ASYNC_CKPT), None)
+        if item is None:  # released first: the scheduler's _release freed the row
+            return
+        req.ckpt_pending.remove(item)
+        states = self.runner.state
+        t = self.runner.async_ckpt_t
+        old = len(req.token_ids) - 1
+        b = (old + acc + 1) // t * t
+        if b > old:
+            for x in [x for x in req.ckpt_pending if x[2] and x[0] < ASYNC_CKPT]:
+                req.ckpt_pending.remove(x)
+                states.free_ckpt(x[1])
+            req.ckpt_pending.append((b, row, True))
+        else:
+            states.free_ckpt(row)
+
+    def _collect_blind(self, chunk, outs, results) -> None:
+        """A blind verify's read-back (engine/spec_async.py): spec_post's (tokens, acc) row per sequence gives the emitted
+        tokens; the verify's own rows give their logprobs, chosen as a synchronous verify chooses them (the draft's for an
+        accepted position, then the replacement's or the bonus token's)."""
+        out, res = outs
+        with watchdog.watched(self.runner.watchdog, "reading back a blind verify"):
+            out, res = out.cpu(), res.cpu()
+        Q = 1 + self.cfg.spec_k
+        N = NUM_TOP_LOGPROBS
+        k = self.cfg.spec_k
+        for i, s in enumerate(chunk):
+            row = res[i].tolist()
+            acc, drafted = int(row[Q]), row[Q + 1] > 0.5
+            results[id(s)] = [int(t) for t in row[: acc + 1]]
+            req = s.req
+            self._resolve_async_ckpt(s, acc)
+            req.spec_cur = acc  # the row of its state rows that holds its state after this step (the host's current row if it leaves speculation)
+            if drafted:  # a draftless row (its newest token from the host, spec_host_init) is a decode
+                self.spec_proposed += k
+                self.spec_accepted += acc
+                self.spec_verifies += 1
+                req.spec_proposed += k
+                req.spec_accepted += acc
+                for j in range(min(acc + 1, k)):
+                    if j == len(self.spec_pos_reached):
+                        self.spec_pos_reached.append(0)
+                        self.spec_pos_accepted.append(0)
+                    self.spec_pos_reached[j] += 1
+                    self.spec_pos_accepted[j] += j < acc
+            n = req.params.logprobs
+            if n is not None and req.status is Status.RUNNING:
+                rows = out[i * Q : (i + 1) * Q].tolist()
+                for j in range(acc + 1):
+                    r_ = rows[j]
+                    # the draft's (accepted), the replacement's, the bonus token's; a draftless row's is y_0's. Synthetic
+                    # acceptance: a rejected position emits the target's own sample y there, not the recovered token.
+                    lp = (
+                        r_[5]
+                        if j < acc
+                        else (r_[4] if drafted and acc < k and not self.runner.synth_active() else r_[3])
+                    )
+                    req.logprobs.append((lp, [int(x) for x in r_[6 : 6 + n]], r_[6 + N : 6 + N + n]))
+
     def _finish(self, plan, finished: list[Request]) -> list[Request]:
-        finished += self._check_stop_strings(plan.seqs())
+        for s in plan.seqs():
+            # commit() stops at the first finishing token; drop logprobs past it.
+            if s.draft and s.req.params.logprobs is not None:
+                del s.req.logprobs[len(s.req.output_ids) :]
+        finished += self._check_stop_strings(plan.seqs(), finished)
         for r in finished:
             self.runner.forget(r)
         return finished
 
-    def _check_stop_strings(self, seqs) -> list[Request]:
+    def _check_stop_strings(self, seqs, finished=()) -> list[Request]:
         done = []
+        ended = {id(r) for r in finished}  # finished by this step's commit (EOS, a stop id, the length)
         for s in seqs:
             req = s.req
             stops = req.params.stop
-            if not stops or not s.sample or req.status is not Status.RUNNING:
+            # A speculative step can complete a stop string and then reach EOS or the length in the same step; one-token
+            # steps would have stopped at the stop string, so it is checked for those requests too.
+            ended_here = s.draft and id(req) in ended
+            if not stops or not s.sample or (req.status is not Status.RUNNING and not ended_here):
                 continue
             # Only the tail can newly contain a stop string; decode enough of it to cover
             # the longest one plus multi-token characters.
-            tail = self.tokenizer.decode(req.output_ids[-(max(len(x) for x in stops) + 8) :])
+            w = max(len(x) for x in stops) + 8
+            tail = self.tokenizer.decode(req.output_ids[-w:])
             if any(x in tail for x in stops):
-                self.scheduler.finish_now(req, "stop")
-                done.append(req)
+                if s.draft:
+                    self._trim_past_stop(req, stops, w)
+                if ended_here:
+                    req.finish_reason = "stop"  # already released by the commit, and already in `finished`
+                else:
+                    self.scheduler.finish_now(req, "stop")
+                    done.append(req)
         return done
+
+    def _trim_past_stop(self, req: Request, stops, w: int) -> None:
+        """A speculative step appends up to 1 + spec_k tokens at once, so the stop string can end before its newest one.
+        Drop the tokens past it, and their logprobs, so the output (and its usage count) is what one-token steps would
+        have stopped at: the shortest prefix whose last w tokens decode to a stop string."""
+        out = req.output_ids
+        n = len(out)
+        while n > 1 and any(x in self.tokenizer.decode(out[max(0, n - 1 - w) : n - 1]) for x in stops):
+            n -= 1
+        if n < len(out):
+            del req.token_ids[req.num_prompt + n :]
+            req.num_computed = min(req.num_computed, len(req.token_ids) - 1)
+            if req.params.logprobs is not None:
+                del req.logprobs[n:]
 
     def generate(self, prompts: list[list[int]], params: SamplingParams | list[SamplingParams]) -> list[Request]:
         plist = params if isinstance(params, list) else [params] * len(prompts)

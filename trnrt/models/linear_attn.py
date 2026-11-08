@@ -18,7 +18,8 @@ lower_bound * sigmoid(exp(A_log) * g)).
 
 Static-shape formulation (the same code runs on CPU and on a NeuronCore):
 - decode (B sequences x 1 token): the recurrent step above as batched einsums. On the device a
-  decode step's KDA layers run as the KDA shell instead (models/hybrid.py, kernels/kda_shell.py).
+  decode step's KDA layers run as the KDA shell instead (models/hybrid.py, kernels/kda_shell.py), and a step above
+  the shell's row cap runs the recurrence here as kernels/kda_decode.py.
 - prefill chunk (one sequence x C tokens): the chunked form (fla / the transformers chunk
   kernels) over fixed sub-chunks of CHUNK tokens, unrolled at trace time; on the device the NKI
   chunked delta rule (kernels/delta_rule.py). The per-chunk triangular solve (I + A)^-1, which
@@ -295,6 +296,22 @@ def _nki_chunk(q, k, v, g, beta, S, keep_pad: bool = False, ug: int | None = Non
     return delta_rule.chunk(q, k, v, g, beta, S, keep_pad=keep_pad, ug=ug)
 
 
+def verify_scan(q, k, v, g, beta, S):
+    """B sequences x Q tokens each, from their own state (speculative verify): q, k [B, Q, H, Dk] (q scaled),
+    v [B, Q, H, Dv], g [B, Q, H, Dk], beta [B, Q, H], S [B, H, Dk, Dv]; fp32. recurrent_step once per position, the
+    decode step's own arithmetic. Returns o [B, Q, H, Dv] and the state after EVERY position, [B, Q, H, Dk, Dv]: a
+    rejected draft is rolled back by continuing from the state after the last accepted position (vLLM v0.30.0
+    v1/attention/backends/gdn_attn.py spec_state_indices_tensor: num_spec + 1 state slots per request, the next step
+    reading the one at num_accepted_tokens - 1; SGLang v0.5.21 mem_cache/memory_pool.py intermediate_ssm_state_cache,
+    one state per draft token)."""
+    outs, states = [], []
+    for t in range(k.shape[1]):
+        o, S = recurrent_step(q[:, t], k[:, t], v[:, t], g[:, t], beta[:, t], S)
+        outs.append(o)
+        states.append(S)
+    return torch.stack(outs, 1), torch.stack(states, 1)
+
+
 def _write_rows(pool: torch.Tensor, rows: torch.Tensor, values: torch.Tensor) -> None:
     """pool[rows] = values. A ONE-row index_put_ is written with the scratch row added (it may
     hold anything): on trn1 (neuronx-cc 2.27, SDK 2.32) a one-row index_put_ of a value computed
@@ -366,6 +383,10 @@ def _mix_rows(model, layer, x: torch.Tensor, positions: torch.Tensor, slot_mappi
     mid_row = mid_k = None
     if state_slot is None:
         form = "sequence"
+    elif state_slot.dim() == 2:  # a speculative verify (decoder.forward_extend): B sequences x Q positions
+        form = "verify"
+        B, Q = state_slot.shape[0], state_slot.shape[1] - 1
+        read, write = state_slot[:, 0], state_slot[:, 1:].reshape(B * Q)
     elif state_slot.dim() != 1:
         raise ValueError(f"state_slot {tuple(state_slot.shape)} matches no batch form of {T} tokens")
     elif state_slot.shape[0] == T:
@@ -383,7 +404,15 @@ def _mix_rows(model, layer, x: torch.Tensor, positions: torch.Tensor, slot_mappi
         raise ValueError(f"state_slot {tuple(state_slot.shape)} matches no batch form of {T} tokens")
 
     # Short conv over q, k, v, with the K - 1 previous inputs from the state.
-    if form == "decode":
+    if form == "verify":  # each sequence's window read once, then one window written per position
+        keep = (positions.view(B, Q)[:, 0] > 0).view(B, 1, 1)
+        prev = layer.conv_state[read]
+        prev = torch.where(keep, prev, torch.zeros_like(prev)).to(qkv.dtype)
+        xe = torch.cat([prev, qkv.view(B, Q, -1)], dim=1)  # [B, K - 1 + Q, D]
+        y = _causal_conv(xe, layer.conv_w, Q).reshape(T, -1)
+        win = torch.stack([xe[:, t + 1 : t + K] for t in range(Q)], dim=1)  # the last K - 1 inputs after each position
+        _write_rows(layer.conv_state, write, win.reshape(B * Q, K - 1, -1).to(layer.conv_state.dtype))
+    elif form == "decode":
         keep = (positions > 0).view(T, 1, 1)
         if T == 1:  # one row is a direct copy already
             prev = layer.conv_state[state_slot]
@@ -442,12 +471,26 @@ def _mix_rows(model, layer, x: torch.Tensor, positions: torch.Tensor, slot_mappi
     else:
         scan = lambda *a: chunk_scan(*a, CHUNK)  # noqa: E731
 
-    if form == "decode":
-        keep4 = keep.view(T, 1, 1, 1)
-        S = layer.rec_state[state_slot]
-        S = torch.where(keep4, S, torch.zeros_like(S))
-        o, S = recurrent_step(q, k, v, g, beta, S)
-        _write_rows(layer.rec_state, state_slot, S)
+    if form == "verify":  # from each sequence's state; the state after every position written to its own row
+        S = layer.rec_state[read]
+        S = torch.where(keep.view(B, 1, 1, 1), S, torch.zeros_like(S))
+        o, states = verify_scan(q.view(B, Q, nv, dk), k.view(B, Q, nv, dk), v.view(B, Q, nv, dv),
+                                g.view(B, Q, *g.shape[1:]), beta.view(B, Q, nv), S)
+        _write_rows(layer.rec_state, write, states.reshape(B * Q, nv, dk, dv))
+        o = o.reshape(T, nv, dv)
+    elif form == "decode":
+        # Above the KDA shell's row cap (hybrid.kda_shell_rows), on the device: the recurrence as one kernel, which
+        # reads, updates and writes the pool rows in place (kernels/kda_decode.py); the einsums below elsewhere.
+        from ..kernels import kda_decode
+
+        if kda_decode.takes(x, dk, dv, sp.kind == "kda" and g.dim() == 3):
+            o = kda_decode.decode_step(layer.rec_state, state_slot, keep.view(T), q, k, v, g, beta)
+        else:
+            keep4 = keep.view(T, 1, 1, 1)
+            S = layer.rec_state[state_slot]
+            S = torch.where(keep4, S, torch.zeros_like(S))
+            o, S = recurrent_step(q, k, v, g, beta, S)
+            _write_rows(layer.rec_state, state_slot, S)
     elif form == "chunk":
         S = layer.rec_state[state_slot][0]
         S = torch.where(keep.view(1, 1, 1), S, torch.zeros_like(S))

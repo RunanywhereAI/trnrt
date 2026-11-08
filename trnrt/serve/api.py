@@ -45,7 +45,7 @@ from fastapi import Request as HTTPRequest
 from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
 
 from ..engine.request import Request, SamplingParams, Status
-from ..metrics import Metrics, kv_pages
+from ..metrics import Metrics, kv_pages, spec_stats
 from .parsers import THINK_OPEN, StreamParser, chat_finish_reason, parse_full, template_messages, tool_choice_error
 
 if TYPE_CHECKING:  # only annotations: importing this module does not load the engine and its model code
@@ -687,7 +687,11 @@ def build_app(engine: LLMEngine, model_name: str) -> FastAPI:
     async def stats():
         """The router's tie-break between engines: KV pages in use and usable (metrics.kv_pages)."""
         used, total = kv_pages(engine)
-        return {"gauges": {"kv_pages_used": used, "kv_pages_total": total}}
+        gauges: dict = {"kv_pages_used": used, "kv_pages_total": total}
+        spec = spec_stats(engine)
+        if spec is not None:
+            gauges["spec"] = spec
+        return {"gauges": gauges}
 
     @app.get("/metrics")
     async def metrics():

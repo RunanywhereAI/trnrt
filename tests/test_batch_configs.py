@@ -94,7 +94,10 @@ def test_batch8_sets_exactly_its_values_and_batch12_none():
     assert _diff(plain, cli.engine_config(["--model", "m", "--preset", "batch8"])) == BATCH8
     assert _diff(plain, cli.engine_config(["--model", "m", "--preset=batch8"])) == BATCH8
     assert _diff(plain, cli.engine_config(["--model", "m", "--preset", "batch12"])) == {}
-    assert sorted(cli.PRESETS) == ["batch12", "batch8"]
+    assert sorted(p for p in cli.PRESETS if not p.startswith("mtp-")) == [
+        "batch12",
+        "batch8",
+    ]  # tests/test_spec_config.py
 
 
 def test_an_explicit_argument_wins_over_the_preset():

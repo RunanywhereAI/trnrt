@@ -9,6 +9,7 @@ kernels/kda_half.py's, device-proven on trn2.
 
 from __future__ import annotations
 
+import os
 import zlib
 
 import torch
@@ -425,6 +426,30 @@ if nisa is not None:
 # -- end of the in-kernel helpers
 REV = (kernel_rev(__file__, "# -- in-kernel (NKI)", "# -- end of the in-kernel helpers")
        ^ zlib.crc32(repr((P,)).encode()))  # and P, which its helpers read (kda_shell, ffn_half, ...)
+
+# -- the hardware-DGE span (TRNRT_DMA_HW): with TRNRT_DMA_HW=1 this module's static DMA helper (dma_static) issues its DMAs in
+# hardware DGE (dge_mode hwdge) instead of static descriptors, which cost a descriptor-ring entry per contiguous run in
+# every loaded NEFF (the decode spill rings). Every MTP preset sets it (it is in every build behind the published MTP
+# numbers); the default presets do not. Read at import, before any kernel module binds dma_static by name or folds REV, so the
+# process environment has to carry it (trnrt/__main__.py sets it for a preset that needs it). Below the hashed span;
+# REV folds this span's source when it is set (_dma_hw_rev), so every kernel folding REV re-keys, and unset no source,
+# REV or key moves.
+if os.environ.get("TRNRT_DMA_HW", "0") == "1" and nisa is not None:
+    def dma_static(dst, src):  # noqa: F811
+        """dma_static under TRNRT_DMA_HW=1: hardware DGE."""
+        nisa.dma_copy(dst=dst, src=src, dge_mode=nisa.dge_mode.hwdge)
+# -- the hardware-DGE span end
+
+
+def _dma_hw_rev() -> int:
+    """CRC-32 of the hardware-DGE span above (the TRNRT_DMA_HW variant's source): REV's term when it is set."""
+    src = open(os.path.abspath(__file__)).read()
+    a = src.index("# -- the hardware-DGE span (TRNRT_DMA_HW)")
+    return zlib.crc32(src[a:src.index("# -- the hardware-DGE span end", a)].encode())
+
+
+if os.environ.get("TRNRT_DMA_HW", "0") == "1":
+    REV ^= _dma_hw_rev()
 
 # mix_in_h's served form is kernels/mix_wide.py's wide-cast, rebound here, outside the hashed span. The helper above
 # (fin) stays as its reference: wide-cast equals its bits on every normal value. MIX_REV is what each caller of
