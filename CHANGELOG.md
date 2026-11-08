@@ -5,6 +5,15 @@ and versions follow [Semantic Versioning](https://semver.org/). Rebuild the comp
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-11-08
+
+The first public release.
+
+- GLM-5.3-Flash on one trn2.48xlarge: two engines of 32 tensor-parallel ranks behind a session-affine router, an
+  OpenAI-compatible API, 1M-token context, a prefix cache with a host-memory tier, and NKI decode megakernels.
+  These describe the configuration, not a measurement; [docs/RESULTS.md](docs/RESULTS.md) has the measured numbers with
+  their context, and [docs/DEPLOY.md](docs/DEPLOY.md) the deployment.
+
 ### Added
 
 - MTP speculative decoding with GLM-5.3-Flash's own MTP layer: 2 draft tokens a step, verified by the target in the next
@@ -50,8 +59,3 @@ and versions follow [Semantic Versioning](https://semver.org/). Rebuild the comp
 - A non-streaming client that disconnects from the router now aborts its request on the engine. The router kept its
   own connection to the engine open, so the engine generated to `max_tokens` and held a decode seat.
 - The router answers a request body that is not a JSON object with 400, as each engine does, instead of 500.
-
-## [0.1.0]
-
-- GLM-5.3-Flash on one trn2.48xlarge: two engines of 32 tensor-parallel ranks behind a session-affine router, an
-  OpenAI-compatible API, 1M-token context, a prefix cache with a host-memory tier, and NKI decode megakernels.
