@@ -30,6 +30,8 @@ and versions follow [Semantic Versioning](https://semver.org/). Rebuild the comp
 
 ### Changed
 
+- A request without `temperature`, `top_p`, `top_k` or `min_p` takes the checkpoint's `generation_config.json`
+  values, as vLLM does by default. For GLM-5.3-Flash that is top_p 0.95; it was 1.0.
 - The display name is TrnRT. The package, the `trnrt` command, environment variables and metric names are unchanged.
 - Server, engine and router messages go through Python `logging`, on stderr. Their text is unchanged, and
   `TRNRT_LOG_LEVEL` sets the level. They used to be printed, some on stdout. A hang report still reaches stderr when
