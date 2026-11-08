@@ -62,6 +62,7 @@ itself; `configure()` then adds no second handler. Hang reports reach stderr eit
 | `ci.yml` | pre-commit (ruff lint and format, file checks, doc links, actionlint and zizmor on the workflows); mypy; the CPU suite; package build and `twine check`; Dockerfile lint | every PR, every push to `development` and `main` | yes, all four jobs |
 | `promotion.yml` | "Promotion source": the PR comes from this repository's `development` | every PR into `main` | yes, on `main` |
 | `pr-checks.yml` | the PR title reads `<area>: <what changes>`; a warning and checklist when traced code changes | every PR | no |
+| `pr-labels.yml` | area labels from the paths a PR changes (`.github/labeler.yml`), forks included; runs after `pr-checks.yml`, from the default branch, never on PR code | every PR | no |
 | `dependency-review.yml` | new dependencies' known vulnerabilities and licences | every PR | no |
 | CodeQL (GitHub's default setup, extended query suite) | security analysis of the Python and the workflows | pushes to `development` and `main`, PRs from branches of this repository, weekly | no |
 | `scorecard.yml` | OpenSSF Scorecard | pushes to `development`, weekly | no |

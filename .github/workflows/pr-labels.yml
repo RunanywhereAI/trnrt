@@ -1,0 +1,47 @@
+name: PR labels
+
+# Area labels on every pull request, forks included, by the paths it changes (.github/labeler.yml).
+#
+# A fork's pull_request run gets a read-only token, and pull_request_target is blocked by default in public
+# repositories from 2 December 2026, so labelling runs here, after "PR checks" completes: in this repository's
+# context, from the default branch's workflow and label rules. It never checks out or runs the pull request's code.
+# The only thing it takes from the pull request's run is its number (an artifact), which it checks is a number.
+
+on:
+  workflow_run: # zizmor: ignore[dangerous-triggers] reads only a PR number, checks it, runs no PR code
+    workflows: ["PR checks"]
+    types: [completed]
+
+permissions: {}
+
+jobs:
+  label:
+    name: Label
+    if: github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read # the artifact of the PR checks run
+      contents: read # .github/labeler.yml, from the default branch
+      pull-requests: write # the labels
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: pr-number
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+      - name: The PR number
+        id: pr
+        run: |
+          n=$(tr -d '[:space:]' < pr-number.txt)
+          printf '%s' "$n" | grep -Eqx '[0-9]{1,7}' || { echo "::error::not a PR number"; exit 1; }
+          echo "number=$n" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/labeler.yml
+          sparse-checkout-cone-mode: false
+      - uses: actions/labeler@b8dd2d9be0f68b860e7dae5dae7d772984eacd6d # v6.2.0
+        with:
+          pr-number: ${{ steps.pr.outputs.number }}
+          sync-labels: false

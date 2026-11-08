@@ -14,7 +14,7 @@ reviews:
     auto_incremental_review: true
     drafts: false
     base_branches: ["development"]
-  auto_apply_labels: true
+  auto_apply_labels: false # area labels come from .github/labeler.yml (pr-labels.yml); these only suggest
   labeling_instructions:
     - label: router
       instructions: Changes trnrt/serve/router.py or the router's tests.

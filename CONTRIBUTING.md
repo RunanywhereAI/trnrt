@@ -30,7 +30,7 @@ approach before you write it.
 | Step | What it is | Blocks the merge |
 |---|---|---|
 | CI | lint and format (pre-commit, including the workflow linters), mypy, the CPU test suite, package build, Dockerfile lint. `make check` runs the first three locally | yes |
-| PR checks | the title format, and a note when the PR touches traced code | no, advice |
+| PR checks | the title format, a note when the PR touches traced code, and area labels from the paths it changes | no, advice |
 | AI review | CodeRabbit, cubic and Greptile review the PR when it is ready for review (not while it is a draft) and after each push | their status never blocks; their comments do, like any other (next row) |
 | Maintainer review | one approval from a maintainer ([CODEOWNERS](.github/CODEOWNERS)) | yes |
 | Open comments | every review comment, a bot's included, is fixed or answered, and its conversation resolved | yes |
