@@ -67,7 +67,7 @@ itself; `configure()` then adds no second handler. Hang reports reach stderr eit
 | CodeQL (GitHub's default setup, extended query suite) | security analysis of the Python and the workflows | pushes to `development` and `main`, PRs from branches of this repository, weekly | no |
 | `scorecard.yml` | OpenSSF Scorecard | pushes to `development`, weekly | no |
 | `links.yml` | external links in the Markdown docs | weekly | no |
-| `release.yml` | build and check the sdist, wheel and container image; on a release tag, the GitHub release, PyPI and the image when enabled | a `vX.Y.Z` tag on `main`; a dry run on PRs that change it, `docker/` or `pyproject.toml`, or by hand | — |
+| `release.yml` | decide from `trnrt.__version__` and the existing tags whether this push releases (`tools/release_plan.py`); build and check the sdist, wheel and container image; on a release, the tag and the GitHub release, plus PyPI and the image when enabled | every push to `main` (a merged promotion); a dry run on PRs that change it, `docker/`, `pyproject.toml` or the planner, or by hand | — |
 
 CodeRabbit, cubic and Greptile review every ready-for-review PR into `development` (`.coderabbit.yaml`, `cubic.yaml`,
 `greptile.json`). None is a required check. Dependabot keeps the pinned actions and Python dependencies current, a
@@ -81,7 +81,7 @@ token unless a job needs more.
 | `development` (default) | every pull request, squash-merged | 1 maintainer approval, every review conversation resolved, the 4 CI jobs, no force-push or deletion |
 | `main` | promotions of `development`, for releases only | 1 maintainer approval, every review conversation resolved, the 4 CI jobs and "Promotion source", merge commits only, only admins merge, no force-push or deletion |
 
-`v*` tags are created by admins only, and nobody can move or delete one.
+Nobody can move or delete a `v*` tag. The release creates them (the workflow's own token cannot be exempted from a rule that restricts who creates tags, so creation is not restricted: the three admins hold the only write access).
 
 To cut a release:
 
@@ -92,11 +92,33 @@ To cut a release:
    commit, and the default configuration (batch 12) compiles and serves on all 32 ranks. `tools/graph_equiv.py`
    against the previous release's capture shows which graphs changed, if any. CI has no Trainium runner, so the
    commands, configuration and results go in the release PR.
-3. **Promote.** A PR from `development` into `main`, titled `release: vX.Y.Z`, merged with a merge commit.
-4. **Tag** `main`'s merge commit: `git tag vX.Y.Z <commit> && git push origin vX.Y.Z`. `release.yml` refuses a tag
-   that is not on `main` or does not match `__version__`.
-5. **Publish.** `release.yml` creates the GitHub release with the sdist, the wheel and their `SHA256SUMS`. PyPI runs when the repository
-   variable `PUBLISH_PYPI` is `true` and a trusted publisher is configured for the `pypi` environment. The image is
-   pushed to `ghcr.io/runanywhereai/trnrt` when `PUBLISH_IMAGE` is `true`.
+3. **Promote.** A PR from `development` into `main`, titled `release: vX.Y.Z`, merged with a merge commit by an admin.
+   **That merge is the release:** there is no tag to push.
+4. **What happens next, with no one's hands.** `release.yml` runs on the push to `main`. `tools/release_plan.py` reads
+   `__version__` and the existing final release tags (`vX.Y.Z`): a final `X.Y.Z` with no tag, newer than every such tag, is released; the tag already
+   at this commit means a failed run started again (publishing is idempotent); a tag elsewhere, or a pre-release
+   version, releases nothing: once the current version is tagged, a merge into `main` that does not bump it publishes
+   nothing (before the first release, the current version is the one released). A release
+   creates the tag `vX.Y.Z` on the merge commit and the GitHub release with the sdist, the wheel and `SHA256SUMS`.
+   Then PyPI, when the repository variable `PUBLISH_PYPI` is `true` (trusted publishing, from the `pypi` environment,
+   which only `main` can deploy to; an upload that exists is skipped), and the image at `ghcr.io/runanywhereai/trnrt`
+   when `PUBLISH_IMAGE` is `true`.
+5. **Check it.** The run's summary names the action and the tag (the plan job's log says why); the release page lists
+   the files. Releases run one at a time; promote the next only after the release run has finished. If a publishing
+   job failed, run it again from the Actions tab: the tag and release exist, and the rerun finishes the rest.
+
+### One-time setup for PyPI
+
+PyPI publishes by trusted publishing, so the repository holds no token. Once, with a PyPI account that has a verified
+email address and two-factor authentication:
+
+1. At <https://pypi.org/manage/account/publishing/>, add a **pending publisher**: project `trnrt`, owner
+   `RunanywhereAI`, repository `trnrt`, workflow `release.yml`, environment `pypi`. The first release creates the
+   project under that account.
+2. In the repository, turn publishing on: `gh variable set PUBLISH_PYPI --body true -R RunanywhereAI/trnrt`. The `pypi`
+   environment already exists and only deploys from `main`.
+
+The first release afterwards publishes the version in `trnrt/__init__.py`. A PyPI version cannot be reused or taken
+back, so confirm the version and the changelog before merging the promotion.
 
 An urgent fix takes the same path: a PR into `development`, then a promotion and a patch release.

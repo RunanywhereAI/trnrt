@@ -16,11 +16,12 @@ and versions follow [Semantic Versioning](https://semver.org/). Rebuild the comp
   the published MTP numbers; the other configurations leave it unset.
 - Public release: README, docs, contributing and security policies, issue and pull request templates.
 - CI: pre-commit (ruff lint and format), mypy, the CPU test suite, a package build check, Dockerfile lint and CodeQL.
-  Tag-triggered release workflow.
+  Release workflow.
 - `tools/check_docs.py`: every relative Markdown link and image resolves.
 - Branches: pull requests target `development` and are squash-merged; `main` takes promotions of `development` for
   releases only, as merge commits. Both need a maintainer's approval (`.github/CODEOWNERS`) and every review
-  conversation resolved, and release tags are cut from `main` only.
+  conversation resolved. Merging a promotion that bumps the version into `main` is the release: it tags `vX.Y.Z` on the
+  merge commit and publishes, once per version (`tools/release_plan.py`).
 - Contributor CI: actionlint and zizmor on the workflows (pre-commit); advisory PR checks (title format, a warning
   when traced code changes); dependency review; OpenSSF Scorecard; a weekly external-link check; a release dry run
   that builds the package and the container image.
