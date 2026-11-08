@@ -10,7 +10,7 @@ import pytest
 for _m in ("httpx", "fastapi", "uvicorn"):  # the router's stack
     pytest.importorskip(_m)
 
-from trnrt.serve.router import PrefixTree, Router  # noqa: E402
+from trnrt.serve.router import STATELESS_ROUTES, PrefixTree, Router  # noqa: E402
 
 
 def test_prefix_tree_match_insert_and_prune():
@@ -167,13 +167,13 @@ async def _stop(servers, tasks, i=None):
 
 
 def _stub_worker(i: int, chat_status: int = 200):
-    """A worker that answers /health, /v1/models and /v1/chat/completions (with chat_status: 503 is a failed engine,
-    whose serve/api.py refuses every request before it queues it), streaming or not."""
+    """A worker that answers /health, /v1/models, /v1/chat/completions and STATELESS_ROUTES (with chat_status: 503 is a
+    failed engine, whose serve/api.py refuses every request before it queues it), streaming or not."""
     from fastapi import FastAPI, HTTPException, Request
     from fastapi.responses import StreamingResponse
 
     app = FastAPI()
-    app.state.chats, app.state.status = 0, chat_status
+    app.state.chats, app.state.toks, app.state.status = 0, 0, chat_status
 
     @app.get("/health")
     async def health():
@@ -200,6 +200,14 @@ def _stub_worker(i: int, chat_status: int = 200):
             return StreamingResponse(stream(), media_type="text/event-stream")
         return {"choices": [{"message": {"role": "assistant", "content": f"w{i}"}}]}
 
+    async def stateless(req: Request):
+        app.state.toks += 1
+        if app.state.status != 200:
+            raise HTTPException(status_code=app.state.status, detail="engine failed: rank 3 exited")
+        return {"worker": i, "body": await req.json()}
+
+    for path in STATELESS_ROUTES:
+        app.add_api_route(path, stateless, methods=["POST"])
     return app
 
 
@@ -255,7 +263,7 @@ def test_router_health_and_models_follow_the_workers():
     asyncio.run(main())
 
 
-@pytest.mark.parametrize("path", ["/v1/chat/completions", "/v1/completions"])
+@pytest.mark.parametrize("path", ["/v1/chat/completions", "/v1/completions", "/tokenize", "/v1/detokenize"])
 @pytest.mark.parametrize("body", [b"{not json", b"[1, 2]", b'"text"', b"null", b"true", b"3", b"", b"\xff\xfe"])
 def test_a_body_that_is_not_a_json_object_is_answered_400_and_reaches_no_worker(path, body):
     """The router refuses a malformed body, or JSON that is not an object, with 400, as each engine does, instead of
@@ -277,7 +285,43 @@ def test_a_body_that_is_not_a_json_object_is_answered_400_and_reaches_no_worker(
                 )
                 assert r.status_code == 400, r.text
                 assert r.json()["detail"] == "the request body must be a JSON object"
-                assert router.load == [0] and worker.state.chats == 0
+                assert router.load == [0] and worker.state.chats == 0 and worker.state.toks == 0
+        finally:
+            await _stop(servers, tasks)
+
+    asyncio.run(main())
+
+
+@pytest.mark.parametrize("path", STATELESS_ROUTES)
+def test_tokenize_and_detokenize_go_to_a_live_worker_and_change_no_routing_state(path):
+    """STATELESS_ROUTES go to the least loaded live worker and touch no prefix tree, no session and no load count: a
+    /tokenize of an agent's context must not steer where its next turn goes. A refused connection or a 503 marks the
+    worker down and the next one is asked; 503 once none answers."""
+    import asyncio
+
+    import httpx
+
+    from trnrt.serve.router import build_router_app
+
+    async def main() -> None:
+        ports = [_free_port() for _ in range(4)]  # ports[0] serves nothing: a dead worker
+        router = Router([f"http://127.0.0.1:{p}" for p in ports[:3]])
+        failed, ok = _stub_worker(1, chat_status=503), _stub_worker(2)
+        servers, tasks = await _start(
+            [(failed, ports[1]), (ok, ports[2]), (build_router_app(router, poll_s=0), ports[3])]
+        )
+        body = {"messages": [{"role": "user", "content": "x" * 64}], "session_id": "s1"}
+        try:
+            async with httpx.AsyncClient(timeout=30) as c:
+                r = await c.post(f"http://127.0.0.1:{ports[3]}{path}", json=body)
+                assert r.status_code == 200, r.text
+                assert r.json() == {"worker": 2, "body": body}
+                assert router.up == [False, False, True]  # refused, then 503: both marked down
+                assert failed.state.toks == 1 and ok.state.toks == 1
+                assert router.sessions == {} and all(t.size == 0 for t in router.trees) and router.load == [0, 0, 0]
+                await _stop(servers, tasks, 1)
+                r = await c.post(f"http://127.0.0.1:{ports[3]}{path}", json=body)
+                assert r.status_code == 503 and r.json()["detail"] == f"no engine answered {path}", r.text
         finally:
             await _stop(servers, tasks)
 
