@@ -87,8 +87,11 @@ _LOOPS: weakref.WeakSet = weakref.WeakSet()
 @atexit.register
 def _stop_loops() -> None:
     if DETOK_CHECK["checked"]:  # the streaming self-check's total (_Detok._check), for the engine log
-        print(f"trnrt: detok self-check at exit: {DETOK_CHECK['checked']} streams checked, {DETOK_CHECK['mismatch']} "
-              "mismatches", flush=True)
+        logger.info(
+            "detok self-check at exit: %d streams checked, %d mismatches",
+            DETOK_CHECK["checked"],
+            DETOK_CHECK["mismatch"],
+        )
     for lp in list(_LOOPS):
         lp.stop()
         lp.engine.close()
@@ -302,8 +305,9 @@ class EngineLoop:
                     new = out[st.sent : ready]
                     lps = req.logprobs[st.sent : ready] if with_lp else None
                     st.sent = ready
-                    batch.setdefault(st.loop, []).append((st.out, ("tokens", new, req.finish_reason if finished else None,
-                                                                   lps)))
+                    batch.setdefault(st.loop, []).append(
+                        (st.out, ("tokens", new, req.finish_reason if finished else None, lps))
+                    )
                 if finished:
                     del self.streams[rid]
                     self.metrics.on_finish(req)
@@ -317,7 +321,7 @@ def _deliver(items) -> None:
 
 
 # The streaming self-check: every stream checks, when it ends, that what it streamed is a prefix of the full decode of its
-# ids, and all of it when no stop string cut it. Counted here, one line printed per mismatch, the total at exit.
+# ids, and all of it when no stop string cut it. Counted here, one warning logged per mismatch, the total at exit.
 DETOK_CHECK = {"checked": 0, "mismatch": 0}
 
 
@@ -356,14 +360,22 @@ class _Detok:
         here."""
         if full is None:
             full = self.tok.decode(self.ids, skip_special_tokens=True)
-        got = "".join(self._streamed)
+        got = "".join(self._streamed or ())  # set for an incremental stream, the only caller (push)
         DETOK_CHECK["checked"] += 1
         if full.startswith(got) and (self.stopped or got == full):
             return
         DETOK_CHECK["mismatch"] += 1
         i = next((k for k, (a, b) in enumerate(zip(got, full)) if a != b), min(len(got), len(full)))
-        print(f"trnrt: detok self-check mismatch {DETOK_CHECK['mismatch']} of {DETOK_CHECK['checked']}: rid {self.rid}, "
-              f"streamed {len(got)} chars, the full decode {len(full)}, first difference at offset {i}", flush=True)
+        logger.warning(
+            "detok self-check mismatch %d of %d: rid %s, streamed %d chars, the full decode %d, first difference at "
+            "offset %d",
+            DETOK_CHECK["mismatch"],
+            DETOK_CHECK["checked"],
+            self.rid,
+            len(got),
+            len(full),
+            i,
+        )
 
     def _decoded(self, final: bool) -> str:
         if final or not self.incremental:
@@ -371,7 +383,7 @@ class _Detok:
         prefix = self.tok.decode(self.ids[self._po : self._ro], skip_special_tokens=True)
         new = self.tok.decode(self.ids[self._po :], skip_special_tokens=True)
         if len(new) > len(prefix) and not new.endswith("\ufffd"):
-            self._text += new[len(prefix):]
+            self._text += new[len(prefix) :]
             self._po, self._ro = self._ro, len(self.ids)
             return self._text
         # Not committed (the newest character is incomplete, or the window added no text): the text as the full decode
@@ -379,7 +391,7 @@ class _Detok:
         # this push, as the full decode finds it (returning only the committed text + U+FFFD finds it one push late).
         # The offsets stay, so the next push re-decodes the window from the same complete point.
         if new.startswith(prefix):
-            return self._text + new[len(prefix):]
+            return self._text + new[len(prefix) :]
         return self._text + "\ufffd"  # an incomplete character: held back below, as the full decode's would be
 
     def push(self, ids: list[int], final: bool) -> str:

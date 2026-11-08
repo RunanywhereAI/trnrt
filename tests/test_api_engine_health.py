@@ -148,6 +148,7 @@ def _spy_dead_ranks(eng):
     def spy():
         callers.add(threading.current_thread().name)
         return real()
+
     eng.dead_ranks = spy
     return callers
 
@@ -167,7 +168,9 @@ def test_an_idle_death_turns_health_503_within_a_second_from_the_rank_watch_alon
         callers.clear()
         t0 = time.monotonic()
         eng._workers[0].kill()
-        while loop.failed is None:  # no HTTP call meanwhile: /health checks the workers itself, so only the watch can see it
+        while (
+            loop.failed is None
+        ):  # no HTTP call meanwhile: /health checks the workers itself, so only the watch can see it
             assert time.monotonic() - t0 < 5.0, "no thread noticed the dead rank"
             time.sleep(0.01)
         took = time.monotonic() - t0
