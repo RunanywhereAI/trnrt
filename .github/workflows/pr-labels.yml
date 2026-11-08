@@ -5,7 +5,8 @@ name: PR labels
 # A fork's pull_request run gets a read-only token, and pull_request_target is blocked by default in public
 # repositories from 2 December 2026, so labelling runs here, after "PR checks" completes: in this repository's
 # context, from the default branch's workflow and label rules. It never checks out or runs the pull request's code.
-# The only thing it takes from the pull request's run is its number (an artifact), which it checks is a number.
+# The only thing it takes from the pull request's run is its number (an artifact), which it checks is a number and
+# names the PR whose head commit triggered this run.
 
 on:
   workflow_run: # zizmor: ignore[dangerous-triggers] reads only a PR number, checks it, runs no PR code
@@ -30,11 +31,18 @@ jobs:
           name: pr-number
           run-id: ${{ github.event.workflow_run.id }}
           github-token: ${{ github.token }}
-      - name: The PR number
+      - name: The PR number, checked against the run that triggered this one
         id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
+          # The artifact comes from a run the pull request controls, so it is only a claim: the PR it names must have
+          # the head commit of the run that triggered this one, or another PR could be labelled.
           n=$(tr -d '[:space:]' < pr-number.txt)
           printf '%s' "$n" | grep -Eqx '[0-9]{1,7}' || { echo "::error::not a PR number"; exit 1; }
+          head=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$n" --jq .head.sha)
+          [ "$head" = "$HEAD_SHA" ] || { echo "::error::PR #$n's head $head is not this run's $HEAD_SHA"; exit 1; }
           echo "number=$n" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -44,4 +52,4 @@ jobs:
       - uses: actions/labeler@b8dd2d9be0f68b860e7dae5dae7d772984eacd6d # v6.2.0
         with:
           pr-number: ${{ steps.pr.outputs.number }}
-          sync-labels: false
+          sync-labels: true # an area label comes off when a later push no longer touches it; labels not in the rules stay

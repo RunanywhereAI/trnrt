@@ -19,7 +19,7 @@ reviews:
     - label: router
       instructions: Changes trnrt/serve/router.py or the router's tests.
     - label: serve
-      instructions: Changes the OpenAI-compatible API or server under trnrt/serve/, other than the router.
+      instructions: Changes the OpenAI-compatible API or server under trnrt/serve/, the router included.
     - label: engine
       instructions: Changes trnrt/engine/ or trnrt/compile/.
     - label: kernels
