@@ -168,6 +168,7 @@ def test_an_idle_death_turns_health_503_within_a_second_from_the_rank_watch_alon
         callers.clear()
         t0 = time.monotonic()
         eng._workers[0].kill()
+        eng._workers[0].join(10)  # gone before anything broadcasts to it, so the reason names the dead rank
         while (
             loop.failed is None
         ):  # no HTTP call meanwhile: /health checks the workers itself, so only the watch can see it

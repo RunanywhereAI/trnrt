@@ -163,7 +163,7 @@ def serve():
 
     def start(script, tp=1):
         eng = ScriptedEngine(script)
-        eng.cfg.tp = tp  # tp > 1 starts the rank watch (EngineLoop._watch_ranks), the only check for a dead rank
+        eng.cfg.tp = tp  # tp > 1 starts the rank watch (EngineLoop._watch_ranks), the only background dead-rank check
         client = TestClient(api.build_app(eng, "glm"))
         client.__enter__()
         started.append((client, eng))

@@ -121,3 +121,28 @@ def test_random_byte_splits_chunkings_and_stops_match_push_by_push(seed):
     assert runs == 200 and old_diffs > 0, (
         f"the control never differed in {runs} runs: this test can't see the bug class"
     )
+
+
+@pytest.mark.parametrize("incremental", [True, False])
+def test_each_push_of_an_incremental_stream_decodes_a_window_not_the_whole_output(incremental):
+    # The point of the incremental mode: a push decodes a few of the newest ids, so a stream's decoding work grows with
+    # its length, not with its square; only the final push decodes the whole output, once.
+    from trnrt.serve.api import _Detok
+
+    calls: list[int] = []
+
+    class Counting(ByteTok):
+        def decode(self, ids, skip_special_tokens=True):
+            calls.append(len(ids))
+            return super().decode(ids, skip_special_tokens)
+
+    tok = Counting([bytes([97 + i]) for i in range(26)])  # one ASCII character per id: every push completes its text
+    d, n = _Detok(tok, (), incremental=incremental), 2000
+    for i in range(n):
+        d.push([i % 26], final=False)
+    if incremental:
+        assert max(calls) <= 4, max(calls)
+    else:
+        assert max(calls) == n  # the reference mode decodes everything on every push
+    d.push([], final=True)
+    assert calls[-1] == n

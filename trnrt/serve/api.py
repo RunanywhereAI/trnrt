@@ -382,7 +382,7 @@ class _Detok:
             return self.tok.decode(self.ids, skip_special_tokens=True)
         prefix = self.tok.decode(self.ids[self._po : self._ro], skip_special_tokens=True)
         new = self.tok.decode(self.ids[self._po :], skip_special_tokens=True)
-        if len(new) > len(prefix) and not new.endswith("\ufffd"):
+        if new.startswith(prefix) and len(new) > len(prefix) and not new.endswith("\ufffd"):
             self._text += new[len(prefix) :]
             self._po, self._ro = self._ro, len(self.ids)
             return self._text
