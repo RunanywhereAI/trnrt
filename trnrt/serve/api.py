@@ -27,6 +27,7 @@ import functools
 import json
 import logging
 import math
+import os
 import queue
 import re
 import signal
@@ -45,7 +46,7 @@ from fastapi import Request as HTTPRequest
 from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
 
 from ..engine.request import Request, SamplingParams, Status
-from ..metrics import Metrics, kv_pages
+from ..metrics import Metrics, kv_pages, spec_stats
 from .parsers import THINK_OPEN, StreamParser, chat_finish_reason, parse_full, template_messages, tool_choice_error
 
 if TYPE_CHECKING:  # only annotations: importing this module does not load the engine and its model code
@@ -86,6 +87,12 @@ _LOOPS: weakref.WeakSet = weakref.WeakSet()
 
 @atexit.register
 def _stop_loops() -> None:
+    if DETOK_CHECK["checked"]:  # the streaming self-check's total (_Detok._check), for the engine log
+        logger.info(
+            "detok self-check at exit: %d streams checked, %d mismatches",
+            DETOK_CHECK["checked"],
+            DETOK_CHECK["mismatch"],
+        )
     for lp in list(_LOOPS):
         lp.stop()
         lp.engine.close()
@@ -213,16 +220,13 @@ class EngineLoop:
 
     def _watch_ranks(self) -> None:
         """A rank that dies while the loop waits in a step leaves no thread to notice it: a collective with a dead peer
-        can block instead of raising (gloo on macOS does until its timeout; a device collective too). The loop's own
-        check between steps gets the first second."""
-        seen = None
-        while not self._stopping.wait(0.5) and self.failed is None:
+        can block instead of raising (gloo on macOS does until its timeout; a device collective too). This thread is the
+        only check: the loop does not poll its workers between steps (each poll's waitpid calls release the GIL early in
+        the step's gap, and the engine thread then waits behind the streams' detokenize). So it polls every 0.25 s and
+        fails at first sight: a dead rank does not come back."""
+        while not self._stopping.wait(0.25) and self.failed is None:
             dead = self.engine.dead_ranks()
-            if not dead:
-                seen = None
-            elif seen is None:
-                seen = time.monotonic()
-            elif time.monotonic() - seen > 1.0:
+            if dead:
                 self._fail(f"tensor-parallel rank(s) {dead} exited")
                 return
 
@@ -270,10 +274,6 @@ class EngineLoop:
 
     def _loop(self) -> None:
         while not self._stopping.is_set() and self.failed is None:
-            dead = self.engine.dead_ranks()
-            if dead:
-                self._fail(f"tensor-parallel rank(s) {dead} exited")
-                return
             self._drain(block=not self.engine.has_work())
             if not self.engine.has_work():
                 self._read_local_k()
@@ -294,6 +294,7 @@ class EngineLoop:
                         self.engine.abort(st.req)
                 self.streams.clear()
                 continue
+            batch: dict = {}  # one cross-thread call per event loop and step, not one per stream
             for rid, st in list(self.streams.items()):
                 req = st.req
                 out = req.output_ids
@@ -305,12 +306,24 @@ class EngineLoop:
                     new = out[st.sent : ready]
                     lps = req.logprobs[st.sent : ready] if with_lp else None
                     st.sent = ready
-                    st.loop.call_soon_threadsafe(
-                        st.out.put_nowait, ("tokens", new, req.finish_reason if finished else None, lps)
+                    batch.setdefault(st.loop, []).append(
+                        (st.out, ("tokens", new, req.finish_reason if finished else None, lps))
                     )
                 if finished:
                     del self.streams[rid]
                     self.metrics.on_finish(req)
+            for loop, items in batch.items():
+                loop.call_soon_threadsafe(_deliver, items)
+
+
+def _deliver(items) -> None:
+    for q, item in items:
+        q.put_nowait(item)
+
+
+# The streaming self-check: every stream checks, when it ends, that what it streamed is a prefix of the full decode of its
+# ids, and all of it when no stop string cut it. Counted here, one warning logged per mismatch, the total at exit.
+DETOK_CHECK = {"checked": 0, "mismatch": 0}
 
 
 class _Detok:
@@ -324,19 +337,69 @@ class _Detok:
     the OpenAI API specifies.
     """
 
-    def __init__(self, tokenizer, stops: tuple[str, ...] = ()):
+    def __init__(self, tokenizer, stops: tuple[str, ...] = (), incremental: bool = False, rid: str = ""):
         self.tok = tokenizer
+        self.rid = rid
         self.stops = stops
         self.hold = max((len(x) for x in stops), default=1) - 1
         self.ids: list[int] = []
         self.emitted = 0
         self.stopped = False
+        # incremental (the server's streams): the text so far is kept and extended by decoding a window of the newest ids
+        # (from the last point where the text was complete, TGI's prefix / read offsets), instead of decoding every id on
+        # every push, which is O(n^2) per stream and holds the GIL while the engine thread waits. The final push decodes
+        # the whole output once, so the complete text is the full decode. incremental=False (decode it all, every push) is
+        # the reference the tests compare against.
+        self.incremental = incremental
+        self._text = ""
+        self._po = self._ro = 0
+        self._streamed: list[str] | None = [] if incremental else None  # the self-check's record (DETOK_CHECK)
+
+    def _check(self, full: str | None) -> None:
+        """DETOK_CHECK: everything this stream emitted is a prefix of the full decode of its ids, and all of it if the
+        stream ended without a stop string. `full`: that decode when the caller has it (the final push), else decoded
+        here."""
+        if full is None:
+            full = self.tok.decode(self.ids, skip_special_tokens=True)
+        got = "".join(self._streamed or ())  # set for an incremental stream, the only caller (push)
+        DETOK_CHECK["checked"] += 1
+        if full.startswith(got) and (self.stopped or got == full):
+            return
+        DETOK_CHECK["mismatch"] += 1
+        i = next((k for k, (a, b) in enumerate(zip(got, full)) if a != b), min(len(got), len(full)))
+        logger.warning(
+            "detok self-check mismatch %d of %d: rid %s, streamed %d chars, the full decode %d, first difference at "
+            "offset %d",
+            DETOK_CHECK["mismatch"],
+            DETOK_CHECK["checked"],
+            self.rid,
+            len(got),
+            len(full),
+            i,
+        )
+
+    def _decoded(self, final: bool) -> str:
+        if final or not self.incremental:
+            return self.tok.decode(self.ids, skip_special_tokens=True)
+        prefix = self.tok.decode(self.ids[self._po : self._ro], skip_special_tokens=True)
+        new = self.tok.decode(self.ids[self._po :], skip_special_tokens=True)
+        if new.startswith(prefix) and len(new) > len(prefix) and not new.endswith("\ufffd"):
+            self._text += new[len(prefix) :]
+            self._po, self._ro = self._ro, len(self.ids)
+            return self._text
+        # Not committed (the newest character is incomplete, or the window added no text): the text as the full decode
+        # reads it now, the incomplete character's U+FFFD included, so a stop string before that character is found at
+        # this push, as the full decode finds it (returning only the committed text + U+FFFD finds it one push late).
+        # The offsets stay, so the next push re-decodes the window from the same complete point.
+        if new.startswith(prefix):
+            return self._text + new[len(prefix) :]
+        return self._text + "\ufffd"  # an incomplete character: held back below, as the full decode's would be
 
     def push(self, ids: list[int], final: bool) -> str:
         if self.stopped:
             return ""
         self.ids.extend(ids)
-        text = self.tok.decode(self.ids, skip_special_tokens=True)
+        text = self._decoded(final)
         cut = min((i for i in (text.find(x) for x in self.stops) if i >= 0), default=-1)
         if cut >= 0:
             self.stopped = True
@@ -349,6 +412,10 @@ class _Detok:
             end = max(self.emitted, len(text) - self.hold)
         delta = text[self.emitted : end]
         self.emitted = end
+        if self._streamed is not None:
+            self._streamed.append(delta)
+            if final or self.stopped:
+                self._check(text if final else None)  # the final push's text is already the full decode
         return delta
 
 
@@ -435,9 +502,46 @@ def _flag(body: dict, key: str, default: bool = False) -> bool:
     return v
 
 
-def _params(body: dict, default_max: int, chat: bool, vocab: int) -> SamplingParams:
+# The sampling fields a checkpoint's generation_config.json may set defaults for, with the range each must be in.
+# Penalties are left out: a default the engine refuses (engine.unsupported) would fail every request.
+_GEN_DEFAULTS = {"temperature": (0.0, math.inf), "top_p": (0.0, 1.0), "top_k": (-1, _INT64_MAX), "min_p": (0.0, 1.0)}
+
+
+def generation_defaults(model_path: str | None) -> dict[str, float]:
+    """The checkpoint's sampling defaults, from its generation_config.json, for a request that sets none: vLLM's
+    `--generation-config auto`, its default. GLM-5.3-Flash's (eb9eb208) sets temperature 1.0 and top_p 0.95, so a
+    request without top_p sampled the whole candidate set at top_p 1.0. A value of the wrong type or out of range is
+    left out (the server's own default stands) and logged; no file, no defaults."""
+    if not model_path:
+        return {}
+    path = os.path.join(model_path, "generation_config.json")
+    try:
+        with open(path) as f:
+            gen = json.load(f)
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as e:
+        logger.warning("trnrt: %s is unreadable (%s); no sampling defaults from it", path, e)
+        return {}
+    out: dict[str, float] = {}
+    for k, (lo, hi) in _GEN_DEFAULTS.items():
+        v = gen.get(k) if isinstance(gen, dict) else None
+        if v is None:
+            continue
+        if type(v) in (int, float) and math.isfinite(v) and lo <= v <= hi and (k != "top_p" or v > 0):
+            out[k] = v
+        else:
+            logger.warning("trnrt: %s sets %s to %r, out of range; not used as a default", path, k, v)
+    return out
+
+
+def _params(
+    body: dict, default_max: int, chat: bool, vocab: int, defaults: dict[str, float] | None = None
+) -> SamplingParams:
     """A request's sampling. Every field is checked here, before the request is queued: 400 for a value of the wrong
-    type or out of range, and the default for a null. default_max is used when the request sets no max_tokens."""
+    type or out of range, and the default for a null. default_max is used when the request sets no max_tokens;
+    `defaults` (generation_defaults) replace the server's own temperature, top_p, top_k and min_p defaults."""
+    d = defaults or {}
     asked = _refused(body)
     if asked:
         raise _bad(f"not supported: {', '.join(asked)}")
@@ -458,13 +562,13 @@ def _params(body: dict, default_max: int, chat: bool, vocab: int) -> SamplingPar
     max_new = _int(body, "max_tokens", None, 1)
     if max_new is None:
         max_new = _int(body, "max_completion_tokens", default_max, 1)
-    top_k = _int(body, "top_k", 0, -1)  # -1 and 0 both turn it off (vLLM's -1, the engine's 0)
+    top_k = _int(body, "top_k", int(d.get("top_k", 0)), -1)  # -1 and 0 both turn it off (vLLM's -1, the engine's 0)
     return SamplingParams(
         max_new_tokens=max_new,
-        temperature=_num(body, "temperature", 1.0, lo=0.0),
-        top_p=_num(body, "top_p", 1.0, lo=0.0, hi=1.0, lo_open=True),
+        temperature=_num(body, "temperature", d.get("temperature", 1.0), lo=0.0),
+        top_p=_num(body, "top_p", d.get("top_p", 1.0), lo=0.0, hi=1.0, lo_open=True),
         top_k=max(top_k, 0),
-        min_p=_num(body, "min_p", 0.0, lo=0.0, hi=1.0),
+        min_p=_num(body, "min_p", d.get("min_p", 0.0), lo=0.0, hi=1.0),
         repetition_penalty=_num(body, "repetition_penalty", 1.0, lo=0.0, lo_open=True),
         frequency_penalty=_num(body, "frequency_penalty", 0.0),
         presence_penalty=_num(body, "presence_penalty", 0.0),
@@ -675,6 +779,9 @@ def build_app(engine: LLMEngine, model_name: str) -> FastAPI:
     # stream, and two threads in one Hugging Face fast tokenizer can raise "Already borrowed".
     prompt_pool = ThreadPoolExecutor(1, thread_name_prefix="trnrt-prompt")
     prompt_tok = copy.deepcopy(tok)
+    gen_defaults = generation_defaults(getattr(engine, "model_path", None))
+    if gen_defaults:
+        logger.info("trnrt: sampling defaults from the checkpoint's generation_config.json: %s", gen_defaults)
 
     @app.get("/health")
     async def health():
@@ -687,7 +794,11 @@ def build_app(engine: LLMEngine, model_name: str) -> FastAPI:
     async def stats():
         """The router's tie-break between engines: KV pages in use and usable (metrics.kv_pages)."""
         used, total = kv_pages(engine)
-        return {"gauges": {"kv_pages_used": used, "kv_pages_total": total}}
+        gauges: dict = {"kv_pages_used": used, "kv_pages_total": total}
+        spec = spec_stats(engine)
+        if spec is not None:
+            gauges["spec"] = spec
+        return {"gauges": gauges}
 
     @app.get("/metrics")
     async def metrics():
@@ -719,7 +830,7 @@ def build_app(engine: LLMEngine, model_name: str) -> FastAPI:
         created = int(time.time())
         oid = ("chatcmpl-" if chat else "cmpl-") + sub.rid
         obj = "chat.completion" if chat else "text_completion"
-        detok = _Detok(tok, params.stop)
+        detok = _Detok(tok, params.stop, incremental=True, rid=sub.rid)
 
         def usage_of(n_out: int) -> dict:
             """OpenAI usage, with prompt_tokens_details.cached_tokens: the prompt tokens this request resumed from the
@@ -888,7 +999,9 @@ def build_app(engine: LLMEngine, model_name: str) -> FastAPI:
         else:
             raise HTTPException(status_code=400, detail="prompt must be a string or a list of token ids")
         # max_tokens defaults to 16, the OpenAI completions API's default
-        return await _generate(http, body, ids, _params(body, 16, chat=False, vocab=loop_.vocab), chat=False)
+        return await _generate(
+            http, body, ids, _params(body, 16, chat=False, vocab=loop_.vocab, defaults=gen_defaults), chat=False
+        )
 
     @app.post("/v1/chat/completions")
     async def chat(http: HTTPRequest):
@@ -898,7 +1011,12 @@ def build_app(engine: LLMEngine, model_name: str) -> FastAPI:
         # (Max) can run long, and a smaller hidden default would cut the answer off
         room = max(engine.cfg.max_model_len - len(ids), 1)
         return await _generate(
-            http, body, ids, _params(body, room, chat=True, vocab=loop_.vocab), chat=True, parse=parse
+            http,
+            body,
+            ids,
+            _params(body, room, chat=True, vocab=loop_.vocab, defaults=gen_defaults),
+            chat=True,
+            parse=parse,
         )
 
     return app

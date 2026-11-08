@@ -1,6 +1,7 @@
 """The router's prefix tree and its sessionless policy (trnrt/serve/router.py), and its connection pool under many
 concurrent streams."""
 
+import contextlib
 import random
 import sys
 
@@ -337,6 +338,157 @@ def test_a_503_from_a_request_marks_its_worker_down_and_the_request_goes_to_anot
                 code, text = await ask(c, body("s2"))
                 assert code == 503 and "engine failed" in text and router.up == [False, False], (code, text)
                 assert router.load == [0, 0]
+        finally:
+            await _stop(servers, tasks)
+
+    asyncio.run(main())
+
+
+def test_pick_off_loop_routes_as_pick_does():
+    """The same sequence of sessionless requests and loads gives the same workers, routing counters and trees through
+    pick (on the event loop) and pick_off_loop (the trees in a worker thread)."""
+    import asyncio
+
+    rng = random.Random(3)
+    shared = ["".join(rng.choices("abcdefgh", k=rng.randint(200, 40_000))) for _ in range(6)]
+    reqs = []
+    for _ in range(300):
+        text = rng.choice(shared) + "".join(rng.choices("xyz", k=rng.randint(0, 3000)))
+        reqs.append((text, rng.choice((0, 0, 100)), [rng.randint(0, 40) for _ in range(3)]))
+
+    def new() -> Router:
+        return Router(["a", "b", "c"], max_tree_chars=200_000, sticky_chars=1_000)
+
+    a, b = new(), new()
+    want = []
+    for text, head, load in reqs:
+        a.load = list(load)
+        want.append(a.pick(text, head=head))
+
+    async def main() -> list[int]:
+        got = []
+        for text, head, load in reqs:
+            b.load = list(load)
+            got.append(await b.pick_off_loop(text, head=head))
+        return got
+
+    assert asyncio.run(main()) == want
+    assert a.routed == b.routed and [t.size for t in a.trees] == [t.size for t in b.trees]
+    assert len(set(want)) > 1  # the sequence exercises more than one rule
+
+
+def test_the_prefix_trees_are_walked_off_the_event_loop(monkeypatch):
+    """A sessionless request's match and insert walk its text character by character (~300 ms for 1.1 MB, ~250K
+    tokens): on the router's event loop, they stalled every stream it relays. Through the app, both run in another
+    thread than the loop's."""
+    import asyncio
+    import threading
+
+    import httpx
+
+    from trnrt.serve import router as router_mod
+
+    threads: list[tuple[str, int | None]] = []
+    real_match, real_insert = router_mod.PrefixTree.match, router_mod.PrefixTree.insert
+
+    def match(self, s):
+        threads.append(("match", threading.get_ident()))
+        return real_match(self, s)
+
+    def insert(self, s):
+        threads.append(("insert", threading.get_ident()))
+        return real_insert(self, s)
+
+    monkeypatch.setattr(router_mod.PrefixTree, "match", match)
+    monkeypatch.setattr(router_mod.PrefixTree, "insert", insert)
+
+    async def main() -> int:
+        ports = [_free_port() for _ in range(3)]
+        router = Router([f"http://127.0.0.1:{p}" for p in ports[:2]])
+        servers, tasks = await _start(
+            [
+                (_stub_worker(0), ports[0]),
+                (_stub_worker(1), ports[1]),
+                (router_mod.build_router_app(router, poll_s=0), ports[2]),
+            ]
+        )
+        try:
+            async with httpx.AsyncClient(timeout=30) as c:
+                for stream in (False, True):
+                    body = {"messages": [{"role": "user", "content": "hello " * 1000}], "stream": stream}
+                    r = await c.post(f"http://127.0.0.1:{ports[2]}/v1/chat/completions", json=body)
+                    assert r.status_code == 200, r.text
+        finally:
+            await _stop(servers, tasks)
+        return threading.get_ident()
+
+    loop_thread = asyncio.run(main())
+    assert {k for k, _ in threads} == {"match", "insert"}
+    assert all(t != loop_thread for _, t in threads), threads
+
+
+def test_a_plain_client_that_disconnects_from_the_router_aborts_its_request_on_the_worker():
+    """A non-streaming request: the worker aborts a request whose client disconnects (serve/api.py), but behind the
+    router its client is the router's pooled connection, which stayed open, so the worker generated to max_tokens and
+    held a seat. The router now watches its own client and closes the upstream request. The stub worker watches for
+    the disconnect as the engine's API does; the control is the same request sent straight to it."""
+    import asyncio
+    import time
+
+    import httpx
+    from fastapi import FastAPI, Request
+
+    from trnrt.serve.router import build_router_app
+
+    seen: list[tuple[str, float]] = []
+    worker = FastAPI()
+
+    @worker.get("/health")
+    async def health():
+        return {"status": "ok"}
+
+    @worker.post("/v1/chat/completions")
+    async def chat(req: Request):
+        await req.json()
+        t0 = time.monotonic()
+
+        async def watch():
+            while (await req.receive())["type"] != "http.disconnect":
+                pass
+
+        gone, work = asyncio.ensure_future(watch()), asyncio.ensure_future(asyncio.sleep(10))
+        await asyncio.wait({gone, work}, return_when=asyncio.FIRST_COMPLETED)
+        seen.append(("disconnect" if gone.done() else "ran to the end", time.monotonic() - t0))
+        gone.cancel()
+        work.cancel()
+        return {"choices": [{"message": {"role": "assistant", "content": "x"}}]}
+
+    async def leave_after(url: str, s: float) -> None:
+        body = {"messages": [{"role": "user", "content": "hi"}]}
+        async with httpx.AsyncClient(timeout=30) as c:  # the client itself gives up after `s`
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(c.post(url + "/v1/chat/completions", json=body), s)
+
+    async def wait_seen(n: int) -> None:
+        deadline = time.monotonic() + 5
+        while len(seen) < n and time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+
+    async def main() -> None:
+        ports = [_free_port() for _ in range(2)]
+        router = Router([f"http://127.0.0.1:{ports[0]}"])
+        servers, tasks = await _start([(worker, ports[0]), (build_router_app(router, poll_s=0), ports[1])])
+        try:
+            await leave_after(f"http://127.0.0.1:{ports[0]}", 0.5)  # the control: straight to the worker
+            await wait_seen(1)
+            assert seen and seen[0][0] == "disconnect", seen
+            await leave_after(f"http://127.0.0.1:{ports[1]}", 0.5)  # through the router
+            await wait_seen(2)
+            assert len(seen) == 2 and seen[1][0] == "disconnect" and seen[1][1] < 3, seen
+            deadline = time.monotonic() + 5
+            while router.load != [0] and time.monotonic() < deadline:
+                await asyncio.sleep(0.05)
+            assert router.load == [0]
         finally:
             await _stop(servers, tasks)
 

@@ -211,6 +211,7 @@ SITES = {
     ("trnrt/models/hybrid.py", "_moe_clamped"): ["off"],  # decode's MoE runs in the FFN half
     ("trnrt/models/hybrid.py", "kda_shell_takes"): ["flip"],
     ("trnrt/models/hybrid.py", "ffn_half_takes"): ["flip"],
+    ("trnrt/models/hybrid.py", "_mlp"): ["flip"],  # the plain MTP layer's decode MoE: moe_half's kernel
     ("trnrt/kernels/mhc_pre.py", "pre"): ["flip"],
     ("trnrt/kernels/mhc_mix.py", "mix"): ["flip"],
     ("trnrt/kernels/mhc_front.py", "front"): ["flip"],
@@ -225,6 +226,7 @@ SITES = {
     ("trnrt/kernels/dsa_long_select_t.py", "select"): ["off"],
     ("trnrt/kernels/dsa_shell.py", "attend"): ["flip"],
     ("trnrt/kernels/dsa_shell.py", "select2"): ["flip"],  # sel2 is the served decode selection
+    ("trnrt/kernels/dsa_sel2g.py", "select2g"): ["flip"],  # sel2's generated copy: the P3072 decode selection
     ("trnrt/kernels/dsa_slots_c.py", "attend"): ["off"],
     ("trnrt/kernels/dsa_slots_n.py", "attend"): ["flip"],
     ("trnrt/kernels/dsa_topk.py", "select"): ["flip"],
