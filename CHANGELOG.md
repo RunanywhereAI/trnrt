@@ -5,6 +5,12 @@ and versions follow [Semantic Versioning](https://semver.org/). Rebuild the comp
 
 ## [Unreleased]
 
+### Added
+
+- `/tokenize` and `/detokenize` (also under `/v1`), as SGLang and vLLM serve them. A chat request is counted exactly as
+  `/v1/chat/completions` would send it to the engine. The router sends them to any live engine without touching its
+  routing state ([docs/API.md](docs/API.md)).
+
 ## [0.1.0] - 2026-11-08
 
 The first public release.
