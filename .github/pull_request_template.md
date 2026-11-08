@@ -22,3 +22,5 @@
 - [ ] `make check` passes (lint, type-check and the CPU suite)
 - [ ] Tests cover the change
 - [ ] Docs updated (README, `docs/`, `CHANGELOG.md`)
+
+<!-- label smoke test: closed unmerged -->
