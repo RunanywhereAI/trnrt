@@ -1,6 +1,6 @@
 # API
 
-The router on `--port` (default 8000) speaks the OpenAI API: `/v1/chat/completions`, `/v1/completions`, `/v1/models` and `/health`. Any OpenAI client works with `base_url="http://<host>:8000/v1"`.
+The router on `--port` (default 8000) speaks the OpenAI API: `/v1/chat/completions`, `/v1/completions`, `/v1/models` and `/health`, plus `/tokenize` and `/detokenize` ([below](#tokenize-and-detokenize)). Any OpenAI client works with `base_url="http://<host>:8000/v1"`.
 
 ## Example
 
@@ -30,7 +30,8 @@ curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -
 - A response cut off by `max_tokens` has `finish_reason` `"length"`, even when it ends in a tool call: that call may
   be incomplete.
 - A client that disconnects aborts its request, streamed or not.
-- Endpoints on `--port` (the router): `/v1/chat/completions`, `/v1/completions`, `/v1/models` and `/health`. Each
+- Endpoints on `--port` (the router): `/v1/chat/completions`, `/v1/completions`, `/v1/models`, `/health`, `/tokenize`
+  and `/detokenize`. Each
   engine also serves Prometheus metrics at `/metrics` on its own port (8001 and 8002 with the default `--port`), on
   127.0.0.1 only, among them the sparse-attention selection's counters (`trnrt:dsa_local_k_*`,
   [KNOWN_ISSUES.md](KNOWN_ISSUES.md)).
@@ -45,3 +46,23 @@ curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -
 - Status codes: 400 for a request that cannot be served as sent (a field of the wrong type or out of range, a prompt
   longer than the context, a chat template variable the template never reads); 500 for an error inside the engine;
   503 once the engine has failed, with the reason on `/health`.
+
+## Tokenize and detokenize
+
+`/tokenize` and `/detokenize` (also under `/v1`) answer as SGLang and vLLM do. Neither runs the model, and the router
+sends them to any live engine.
+
+| Endpoint | Request | Response |
+|---|---|---|
+| `/tokenize` | exactly one of `prompt` (a string, or a list of strings for a batch) or `messages` (with the chat fields `/v1/chat/completions` takes: `tools`, `tool_choice`, `chat_template_kwargs`, `reasoning_effort`); `add_special_tokens` (prompt only, default `true`); `return_token_strs` | `tokens`, `count`, `max_model_len`, and `token_strs` when asked |
+| `/detokenize` | `tokens`: a list of token ids, or a list of such lists for a batch; `skip_special_tokens` (default `true`) | the text as `text` (SGLang's name) and as `prompt` (vLLM's) |
+
+A chat request is counted exactly as `/v1/chat/completions` would send it to the engine, rendered by the model's chat
+template, so `count` is the prompt length that request would use against `--max-model-len`. Fields the chat endpoint
+refuses that would change the rendering (`add_generation_prompt` false, `continue_final_message` true) are refused here
+too.
+
+```bash
+curl -s localhost:8000/tokenize -H 'Content-Type: application/json' \
+  -d '{"messages": [{"role": "user", "content": "What is the weather in Paris?"}]}'
+```
