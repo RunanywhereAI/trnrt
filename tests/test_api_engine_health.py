@@ -137,3 +137,69 @@ def test_a_worker_killed_mid_request_ends_the_request_with_the_error(tmp_path):
         assert "error" in events[-1], events[-1]
         assert "rank(s) [1] exited" in _failed(c, loop, eng, thread_ends=False)
         assert aborted == []
+
+
+def _spy_dead_ranks(eng):
+    """Which threads call dead_ranks(): the engine thread must not (the loop does not poll its workers between steps)."""
+    import threading
+
+    real, callers = eng.dead_ranks, set()
+
+    def spy():
+        callers.add(threading.current_thread().name)
+        return real()
+
+    eng.dead_ranks = spy
+    return callers
+
+
+def test_an_idle_death_turns_health_503_within_a_second_from_the_rank_watch_alone(tmp_path, monkeypatch):
+    """The engine loop does not poll its workers between steps; the rank-watch thread alone must turn /health 503 within
+    1.0 s of a worker's death. The served request before it went through the incremental detokenize and its self-check."""
+    from trnrt.serve import api
+
+    check = {"checked": 0, "mismatch": 0}
+    monkeypatch.setattr(api, "DETOK_CHECK", check)
+    with _server(tmp_path) as (c, eng, loop, aborted):
+        callers = _spy_dead_ranks(eng)
+        assert _completion(c).status_code == 200
+        assert check == {"checked": 1, "mismatch": 0}  # the handler's _Detok is incremental (only that mode checks)
+        assert "trnrt-engine" not in callers, callers
+        callers.clear()
+        t0 = time.monotonic()
+        eng._workers[0].kill()
+        eng._workers[0].join(10)  # gone before anything broadcasts to it, so the reason names the dead rank
+        while (
+            loop.failed is None
+        ):  # no HTTP call meanwhile: /health checks the workers itself, so only the watch can see it
+            assert time.monotonic() - t0 < 5.0, "no thread noticed the dead rank"
+            time.sleep(0.01)
+        took = time.monotonic() - t0
+        assert callers == {"trnrt-rank-watch"}, callers  # the rank-watch thread alone
+        assert took <= 1.0, f"the dead rank was noticed {took:.2f} s after the kill"
+        print(f"idle death noticed in {took:.3f} s")
+        assert "rank(s) [1] exited" in _failed(c, loop, eng)
+        assert aborted == []
+
+
+def test_a_death_mid_request_ends_it_within_a_second(tmp_path):
+    """Mid-request: SIGKILL a worker between two steps of a 200-token request; the request ends with the error within
+    1.0 s of the kill (the rank-watch thread when the step blocks in gloo on macOS, the step's own raise on Linux)."""
+    with _server(tmp_path) as (c, eng, loop, aborted):
+        real, calls, t0 = eng.step, [0], []
+
+        def step():
+            calls[0] += 1
+            if calls[0] == 5:
+                eng._workers[0].kill()
+                t0.append(time.monotonic())
+            return real()
+
+        eng.step = step
+        events = _stream_events(c)
+        took = time.monotonic() - t0[0]
+        assert "error" in events[-1], events[-1]
+        assert took <= 1.0, f"the request ended {took:.2f} s after the kill"
+        print(f"mid-request death ended the request in {took:.3f} s")
+        assert "rank(s) [1] exited" in _failed(c, loop, eng, thread_ends=False)
+        assert aborted == []

@@ -161,8 +161,9 @@ def serve():
 
     started = []
 
-    def start(script):
+    def start(script, tp=1):
         eng = ScriptedEngine(script)
+        eng.cfg.tp = tp  # tp > 1 starts the rank watch (EngineLoop._watch_ranks), the only background dead-rank check
         client = TestClient(api.build_app(eng, "glm"))
         client.__enter__()
         started.append((client, eng))
@@ -375,13 +376,13 @@ def test_health_stats_models_and_metrics(serve):
 def test_a_dead_rank_turns_health_503_and_refuses_new_requests(serve):
     from trnrt.serve import api
 
-    client, eng = serve(PLAIN)
+    client, eng = serve(PLAIN, tp=2)
     loop = next(lp for lp in api._LOOPS if lp.engine is eng)
     eng.dead = [1]
     h = client.get("/health")  # at once: /health asks the engine itself
     assert h.status_code == 503 and "rank(s) [1] exited" in h.json()["error"]
     assert client.post("/v1/completions", json={"prompt": [1]}).status_code == 503
-    loop.thread.join(10)  # the loop's own check between steps fails the engine and ends the thread
+    loop.thread.join(10)  # the rank watch fails the engine and the loop's thread ends
     assert not loop.thread.is_alive() and loop.failed == "tensor-parallel rank(s) [1] exited"
     assert eng.closed and eng.aborted == []
 
