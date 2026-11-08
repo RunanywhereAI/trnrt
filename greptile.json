@@ -1,0 +1,20 @@
+{
+  "autoReview": ["open", "push"],
+  "triggerOnDrafts": false,
+  "includeBranches": ["development"],
+  "commentTypes": ["logic", "syntax"],
+  "ignorePatterns": "docs/assets/**",
+  "instructions": "Follow AGENTS.md. Your status is never a required check, but every comment you leave must be fixed or answered before the PR merges, so comment only on what matters.",
+  "customContext": {
+    "rules": [
+      {
+        "rule": "Traced code feeds the compiled graphs and compile-cache keys: review it for correctness only, never suggest formatting, renames or comment edits, and ask for tools/graph_equiv.py or device evidence when it changes (AGENTS.md, invariant 1).",
+        "scope": ["trnrt/kernels/**", "trnrt/models/**", "trnrt/engine/model_runner.py", "trnrt/compile/capture.py", "trnrt/config.py", "trnrt/platform.py", "trnrt/__main__.py"]
+      },
+      {
+        "rule": "API handlers hand work to the engine thread through its inbox and never mutate the scheduler or pools directly; an unsupported request field is refused with a 400 that says why.",
+        "scope": ["trnrt/serve/**"]
+      }
+    ]
+  }
+}

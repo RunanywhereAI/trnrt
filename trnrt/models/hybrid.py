@@ -187,6 +187,9 @@ def defers(model, layer, nxt, h, positions, table, bias, state_slot) -> bool:
 # engine's --ffn-half-below (EngineConfig.ffn_half_below, set by engine.build_shard; 16 here and under --preset
 # batch8, 17 served).
 MOE_HALF_BELOW = 16
+# A decode MoE block that is not inside the FFN half's call (_mlp: the plain MTP layer's) runs as moe_half's kernel below
+# MOE_HALF_BELOW rows.
+MOE_HALF = True
 
 
 def ffn_half_takes(model, layer, streams, dec: bool, sp: bool) -> bool:
@@ -425,6 +428,13 @@ def _mlp(model, layer, x: torch.Tensor, route=None) -> torch.Tensor:
     lim = model.cfg.hybrid.swiglu_limit
     if not layer.moe:
         return model._out_reduce(_swiglu(model, layer, x, "gate_up", "down", lim))
+    if (MOE_HALF and route is None and getattr(layer, "mh_blob_bf16", None) is not None
+            and (x.device.type != "cpu" or SH.HOST_SIM) and x.shape[0] < MOE_HALF_BELOW):
+        # A decode MoE block outside the FFN half's call (the plain MTP layer's: the hyper-connection layers' decode
+        # MoE runs inside ffn_half_takes' call) as moe_half's one kernel call.
+        from ..kernels import moe_half
+
+        return model._out_reduce(moe_half.decode_half(model, layer, x))
     y = _moe_clamped(model, layer, x, lim, route)
     if layer.shared_gate_up is not None:  # mlp.shared_experts, clamped like the experts
         y = y + _swiglu(model, layer, x, "shared_gate_up", "shared_down", lim)

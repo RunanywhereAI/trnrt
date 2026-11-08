@@ -7,7 +7,8 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/RunanywhereAI/trnrt/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/RunanywhereAI/trnrt/ci.yml?branch=main&style=flat-square&labelColor=161515&label=CI"></a>
+  <a href="https://github.com/RunanywhereAI/trnrt/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/RunanywhereAI/trnrt/ci.yml?branch=development&style=flat-square&labelColor=161515&label=CI"></a>
+  <a href="https://scorecard.dev/viewer/?uri=github.com/RunanywhereAI/trnrt"><img alt="OpenSSF Scorecard" src="https://img.shields.io/ossf-scorecard/github.com/RunanywhereAI/trnrt?style=flat-square&labelColor=161515&label=OpenSSF%20Scorecard"></a>
   <a href="LICENSE"><img alt="License: Apache 2.0" src="https://img.shields.io/badge/license-Apache%202.0-fd7014?style=flat-square&labelColor=161515"></a>
   <img alt="Python 3.13" src="https://img.shields.io/badge/python-3.13-fd7014?style=flat-square&labelColor=161515">
   <img alt="AWS Trainium2" src="https://img.shields.io/badge/AWS-Trainium2-fd7014?style=flat-square&labelColor=161515">
@@ -188,7 +189,8 @@ make check   # lint, type-check, then the CPU test suite
 ```
 
 See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for the test tiers and CI, [CONTRIBUTING.md](CONTRIBUTING.md) to send a
-change, and [SECURITY.md](SECURITY.md) to report a vulnerability.
+change (pull requests target `development`), [SUPPORT.md](SUPPORT.md) to get help, and [SECURITY.md](SECURITY.md) to
+report a vulnerability.
 
 ## AWS resources
 

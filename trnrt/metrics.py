@@ -98,6 +98,7 @@ class Metrics:
             f"trnrt:num_preemptions_total {s.num_preemptions}",
         ]
         lines += startup_lines(engine)
+        lines += spec_lines(engine)
         with self.lock:
             lines += [
                 "# TYPE trnrt:prompt_tokens_total counter",
@@ -123,6 +124,69 @@ class Metrics:
             lines += local_k_lines(self.local_k)
             self.local_k_wanted = True
         return "\n".join(lines) + "\n"
+
+
+def spec_lines(engine) -> list[str]:
+    """Speculative decoding's counters over the engine's run, under vLLM's spec_decode names, when the engine speculates:
+    verify steps (one per sequence), draft tokens proposed, draft tokens accepted, and the accepted ones by draft position
+    (position j counted over the verifies that reached it). Dynamic speculation adds its mode flips and the steps launched in
+    each mode. With these, the mean acceptance length is 1 + accepted / drafts."""
+    if not getattr(getattr(engine, "cfg", None), "spec_method", None):
+        return []
+    out = [
+        "# TYPE trnrt:spec_decode_num_drafts_total counter",
+        f"trnrt:spec_decode_num_drafts_total {engine.spec_verifies}",
+        "# TYPE trnrt:spec_decode_num_draft_tokens_total counter",
+        f"trnrt:spec_decode_num_draft_tokens_total {engine.spec_proposed}",
+        "# TYPE trnrt:spec_decode_num_accepted_tokens_total counter",
+        f"trnrt:spec_decode_num_accepted_tokens_total {engine.spec_accepted}",
+        "# TYPE trnrt:spec_decode_num_accepted_tokens_per_pos_total counter",
+    ]
+    out += [
+        f'trnrt:spec_decode_num_accepted_tokens_per_pos_total{{position="{j}"}} {a}'
+        for j, a in enumerate(list(engine.spec_pos_accepted))
+    ]
+    if engine.cfg.spec_max_batch:
+        out += [
+            "# TYPE trnrt:spec_mode_flips_total counter",
+            f"trnrt:spec_mode_flips_total {engine.dyn_flips}",
+            "# TYPE trnrt:spec_steps_total counter",
+            f'trnrt:spec_steps_total{{mode="speculative"}} {engine.dyn_spec_steps}',
+            f'trnrt:spec_steps_total{{mode="plain"}} {engine.dyn_plain_steps}',
+        ]
+    return out
+
+
+def spec_stats(engine) -> dict | None:
+    """GET /v1/stats's speculative-decoding block (None without speculation): the counters of spec_lines, the acceptance
+    rate and mean acceptance length they give, the benchmark mode's configured length (None: the draft head's own
+    acceptance) and the counts per draft position (position j's rate is accepted / reached)."""
+    if not getattr(getattr(engine, "cfg", None), "spec_method", None):
+        return None
+    prop, acc, ver = engine.spec_proposed, engine.spec_accepted, engine.spec_verifies
+    out = {
+        "method": engine.cfg.spec_method,
+        "k": engine.cfg.spec_k,
+        "proposed": prop,
+        "accepted": acc,
+        "verifies": ver,
+        "acceptance": acc / prop if prop else None,
+        "accept_length": 1 + acc / ver if ver else None,
+        "synth_al": engine.cfg.spec_synth_al,
+        "per_position": [
+            {"reached": r, "accepted": a} for r, a in zip(engine.spec_pos_reached, engine.spec_pos_accepted)
+        ],
+    }
+    if engine.cfg.spec_max_batch:
+        out["dyn"] = {
+            "max_batch": engine.cfg.spec_max_batch,
+            "hysteresis": engine.cfg.spec_hysteresis,
+            "plain_now": engine.dyn_plain,
+            "flips": engine.dyn_flips,
+            "plain_steps": engine.dyn_plain_steps,
+            "spec_steps": engine.dyn_spec_steps,
+        }
+    return out
 
 
 def local_k_lines(counts: list[float] | None) -> list[str]:

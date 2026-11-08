@@ -27,6 +27,7 @@ import functools
 import json
 import logging
 import math
+import os
 import queue
 import re
 import signal
@@ -45,7 +46,7 @@ from fastapi import Request as HTTPRequest
 from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
 
 from ..engine.request import Request, SamplingParams, Status
-from ..metrics import Metrics, kv_pages
+from ..metrics import Metrics, kv_pages, spec_stats
 from .parsers import THINK_OPEN, StreamParser, chat_finish_reason, parse_full, template_messages, tool_choice_error
 
 if TYPE_CHECKING:  # only annotations: importing this module does not load the engine and its model code
@@ -435,9 +436,46 @@ def _flag(body: dict, key: str, default: bool = False) -> bool:
     return v
 
 
-def _params(body: dict, default_max: int, chat: bool, vocab: int) -> SamplingParams:
+# The sampling fields a checkpoint's generation_config.json may set defaults for, with the range each must be in.
+# Penalties are left out: a default the engine refuses (engine.unsupported) would fail every request.
+_GEN_DEFAULTS = {"temperature": (0.0, math.inf), "top_p": (0.0, 1.0), "top_k": (-1, _INT64_MAX), "min_p": (0.0, 1.0)}
+
+
+def generation_defaults(model_path: str | None) -> dict[str, float]:
+    """The checkpoint's sampling defaults, from its generation_config.json, for a request that sets none: vLLM's
+    `--generation-config auto`, its default. GLM-5.3-Flash's (eb9eb208) sets temperature 1.0 and top_p 0.95, so a
+    request without top_p sampled the whole candidate set at top_p 1.0. A value of the wrong type or out of range is
+    left out (the server's own default stands) and logged; no file, no defaults."""
+    if not model_path:
+        return {}
+    path = os.path.join(model_path, "generation_config.json")
+    try:
+        with open(path) as f:
+            gen = json.load(f)
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as e:
+        logger.warning("trnrt: %s is unreadable (%s); no sampling defaults from it", path, e)
+        return {}
+    out: dict[str, float] = {}
+    for k, (lo, hi) in _GEN_DEFAULTS.items():
+        v = gen.get(k) if isinstance(gen, dict) else None
+        if v is None:
+            continue
+        if type(v) in (int, float) and math.isfinite(v) and lo <= v <= hi and (k != "top_p" or v > 0):
+            out[k] = v
+        else:
+            logger.warning("trnrt: %s sets %s to %r, out of range; not used as a default", path, k, v)
+    return out
+
+
+def _params(
+    body: dict, default_max: int, chat: bool, vocab: int, defaults: dict[str, float] | None = None
+) -> SamplingParams:
     """A request's sampling. Every field is checked here, before the request is queued: 400 for a value of the wrong
-    type or out of range, and the default for a null. default_max is used when the request sets no max_tokens."""
+    type or out of range, and the default for a null. default_max is used when the request sets no max_tokens;
+    `defaults` (generation_defaults) replace the server's own temperature, top_p, top_k and min_p defaults."""
+    d = defaults or {}
     asked = _refused(body)
     if asked:
         raise _bad(f"not supported: {', '.join(asked)}")
@@ -458,13 +496,13 @@ def _params(body: dict, default_max: int, chat: bool, vocab: int) -> SamplingPar
     max_new = _int(body, "max_tokens", None, 1)
     if max_new is None:
         max_new = _int(body, "max_completion_tokens", default_max, 1)
-    top_k = _int(body, "top_k", 0, -1)  # -1 and 0 both turn it off (vLLM's -1, the engine's 0)
+    top_k = _int(body, "top_k", int(d.get("top_k", 0)), -1)  # -1 and 0 both turn it off (vLLM's -1, the engine's 0)
     return SamplingParams(
         max_new_tokens=max_new,
-        temperature=_num(body, "temperature", 1.0, lo=0.0),
-        top_p=_num(body, "top_p", 1.0, lo=0.0, hi=1.0, lo_open=True),
+        temperature=_num(body, "temperature", d.get("temperature", 1.0), lo=0.0),
+        top_p=_num(body, "top_p", d.get("top_p", 1.0), lo=0.0, hi=1.0, lo_open=True),
         top_k=max(top_k, 0),
-        min_p=_num(body, "min_p", 0.0, lo=0.0, hi=1.0),
+        min_p=_num(body, "min_p", d.get("min_p", 0.0), lo=0.0, hi=1.0),
         repetition_penalty=_num(body, "repetition_penalty", 1.0, lo=0.0, lo_open=True),
         frequency_penalty=_num(body, "frequency_penalty", 0.0),
         presence_penalty=_num(body, "presence_penalty", 0.0),
@@ -675,6 +713,9 @@ def build_app(engine: LLMEngine, model_name: str) -> FastAPI:
     # stream, and two threads in one Hugging Face fast tokenizer can raise "Already borrowed".
     prompt_pool = ThreadPoolExecutor(1, thread_name_prefix="trnrt-prompt")
     prompt_tok = copy.deepcopy(tok)
+    gen_defaults = generation_defaults(getattr(engine, "model_path", None))
+    if gen_defaults:
+        logger.info("trnrt: sampling defaults from the checkpoint's generation_config.json: %s", gen_defaults)
 
     @app.get("/health")
     async def health():
@@ -687,7 +728,11 @@ def build_app(engine: LLMEngine, model_name: str) -> FastAPI:
     async def stats():
         """The router's tie-break between engines: KV pages in use and usable (metrics.kv_pages)."""
         used, total = kv_pages(engine)
-        return {"gauges": {"kv_pages_used": used, "kv_pages_total": total}}
+        gauges: dict = {"kv_pages_used": used, "kv_pages_total": total}
+        spec = spec_stats(engine)
+        if spec is not None:
+            gauges["spec"] = spec
+        return {"gauges": gauges}
 
     @app.get("/metrics")
     async def metrics():
@@ -888,7 +933,9 @@ def build_app(engine: LLMEngine, model_name: str) -> FastAPI:
         else:
             raise HTTPException(status_code=400, detail="prompt must be a string or a list of token ids")
         # max_tokens defaults to 16, the OpenAI completions API's default
-        return await _generate(http, body, ids, _params(body, 16, chat=False, vocab=loop_.vocab), chat=False)
+        return await _generate(
+            http, body, ids, _params(body, 16, chat=False, vocab=loop_.vocab, defaults=gen_defaults), chat=False
+        )
 
     @app.post("/v1/chat/completions")
     async def chat(http: HTTPRequest):
@@ -898,7 +945,12 @@ def build_app(engine: LLMEngine, model_name: str) -> FastAPI:
         # (Max) can run long, and a smaller hidden default would cut the answer off
         room = max(engine.cfg.max_model_len - len(ids), 1)
         return await _generate(
-            http, body, ids, _params(body, room, chat=True, vocab=loop_.vocab), chat=True, parse=parse
+            http,
+            body,
+            ids,
+            _params(body, room, chat=True, vocab=loop_.vocab, defaults=gen_defaults),
+            chat=True,
+            parse=parse,
         )
 
     return app

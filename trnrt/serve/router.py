@@ -511,6 +511,36 @@ async def _json_object(http: Request) -> dict:
     return body
 
 
+async def _disconnected(http: Request) -> None:
+    """Returns once the client has gone away. The body is read already, so the next ASGI message is the disconnect."""
+    while (await http.receive())["type"] != "http.disconnect":
+        pass
+
+
+async def _unless_disconnected(http: Request, aw):
+    """`aw`'s result, or None if the client disconnected first (aw is then cancelled). aw's exceptions propagate.
+
+    A plain (non-streaming) request needs this: nothing cancels its handler when its client goes away, so the request to
+    the worker went on, and the worker, whose own client is this router's pooled connection, saw no disconnect and
+    generated to max_tokens, holding a decode seat. Cancelling the upstream request closes that connection (httpcore
+    closes a connection whose response was not read to the end), and the worker aborts the request (serve/api.py)."""
+    task = asyncio.ensure_future(aw)
+    gone = asyncio.ensure_future(_disconnected(http))
+    try:
+        await asyncio.wait({task, gone}, return_when=asyncio.FIRST_COMPLETED)
+    except BaseException:  # this handler was cancelled itself
+        task.cancel()
+        raise
+    finally:
+        gone.cancel()
+    if not task.done():  # the client went away first
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        return None
+    return task.result()
+
+
 def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: float = 5.0) -> FastAPI:
     # A streaming request holds its connection to the worker until the last token, so the pool's connection cap is a cap
     # on requests in flight at every worker together. httpx's default (Limits(max_connections=100), shared by all hosts)
@@ -610,7 +640,10 @@ def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: floa
                             await resp.aclose()
                         r = resp
                 else:
-                    r = await client.post(url, json=body)
+                    r = await _unless_disconnected(http, client.post(url, json=body))
+                    if r is None:  # the client went away: the upstream request is cancelled and its connection closed
+                        router.load[w] -= 1
+                        return Response(status_code=499)  # nginx's "client closed request"; nobody reads it
             except (httpx.ConnectError, httpx.ConnectTimeout) as e:
                 router.load[w] -= 1
                 router.note_failure(w, hard=isinstance(e, httpx.ConnectError))  # refused: a dead port

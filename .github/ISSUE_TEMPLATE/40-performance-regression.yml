@@ -1,0 +1,36 @@
+name: Performance regression
+description: Something got slower than a previous version or a published number
+labels: ["performance"]
+body:
+  - type: markdown
+    attributes:
+      value: A regression is only actionable with both measurements and their context (CONTRIBUTING.md, rule 2).
+  - type: textarea
+    id: what
+    attributes:
+      label: What got slower, and by how much
+      description: The metric (decode step, first token, tokens/s, requests/min), the before and after numbers.
+    validations:
+      required: true
+  - type: input
+    id: good
+    attributes:
+      label: Last good version or commit
+    validations:
+      required: true
+  - type: input
+    id: bad
+    attributes:
+      label: First bad version or commit
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: >-
+        Instance, Neuron SDK, configuration (`--preset` and flags), workload and shapes, precision, and how you
+        measured (the exact benchmark command).
+      render: shell
+    validations:
+      required: true
