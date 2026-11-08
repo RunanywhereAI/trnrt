@@ -67,7 +67,7 @@ itself; `configure()` then adds no second handler. Hang reports reach stderr eit
 | CodeQL (GitHub's default setup, extended query suite) | security analysis of the Python and the workflows | pushes to `development` and `main`, PRs from branches of this repository, weekly | no |
 | `scorecard.yml` | OpenSSF Scorecard | pushes to `development`, weekly | no |
 | `links.yml` | external links in the Markdown docs | weekly | no |
-| `release.yml` | decide from `trnrt.__version__` and the existing tags whether this push releases (`tools/release_plan.py`); build and check the sdist, wheel and container image; on a release, the tag, the GitHub release, PyPI and the image when enabled | every push to `main` (a merged promotion); a dry run on PRs that change it, `docker/`, `pyproject.toml` or the planner, or by hand | — |
+| `release.yml` | decide from `trnrt.__version__` and the existing tags whether this push releases (`tools/release_plan.py`); build and check the sdist, wheel and container image; on a release, the tag and the GitHub release, plus PyPI and the image when enabled | every push to `main` (a merged promotion); a dry run on PRs that change it, `docker/`, `pyproject.toml` or the planner, or by hand | — |
 
 CodeRabbit, cubic and Greptile review every ready-for-review PR into `development` (`.coderabbit.yaml`, `cubic.yaml`,
 `greptile.json`). None is a required check. Dependabot keeps the pinned actions and Python dependencies current, a
@@ -95,14 +95,16 @@ To cut a release:
 3. **Promote.** A PR from `development` into `main`, titled `release: vX.Y.Z`, merged with a merge commit by an admin.
    **That merge is the release:** there is no tag to push.
 4. **What happens next, with no one's hands.** `release.yml` runs on the push to `main`. `tools/release_plan.py` reads
-   `__version__` and the existing tags: a final `X.Y.Z` with no tag, newer than every tag, is released; the tag already
+   `__version__` and the existing final release tags (`vX.Y.Z`): a final `X.Y.Z` with no tag, newer than every such tag, is released; the tag already
    at this commit means a failed run started again (publishing is idempotent); a tag elsewhere, or a pre-release
-   version, releases nothing, so a merge into `main` that does not bump the version publishes nothing. A release
+   version, releases nothing: once the current version is tagged, a merge into `main` that does not bump it publishes
+   nothing (before the first release, the current version is the one released). A release
    creates the tag `vX.Y.Z` on the merge commit and the GitHub release with the sdist, the wheel and `SHA256SUMS`.
    Then PyPI, when the repository variable `PUBLISH_PYPI` is `true` (trusted publishing, from the `pypi` environment,
    which only `main` can deploy to; an upload that exists is skipped), and the image at `ghcr.io/runanywhereai/trnrt`
    when `PUBLISH_IMAGE` is `true`.
-5. **Check it.** The run's summary names the action and the tag; the release page lists the files. If a publishing
+5. **Check it.** The run's summary names the action and the tag (the plan job's log says why); the release page lists
+   the files. Releases run one at a time; promote the next only after the release run has finished. If a publishing
    job failed, run it again from the Actions tab: the tag and release exist, and the rerun finishes the rest.
 
 ### One-time setup for PyPI

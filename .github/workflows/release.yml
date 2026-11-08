@@ -32,9 +32,11 @@ permissions:
   contents: read
 
 concurrency:
-  # One group per commit pushed to main: GitHub keeps a single pending run per group and cancels the older one, which
-  # would drop a promotion's release when two arrive while one runs. PRs share their ref's group and cancel superseded runs.
-  group: release-${{ github.event_name == 'push' && github.sha || github.ref }}
+  # Releases run one at a time, in order: two overlapping runs could each plan from tags the other is about to change.
+  # GitHub keeps one pending run and replaces an older pending one, which is harmless here: the plan reads the version
+  # and the tags, not the run, so the newer run releases the version still untagged on main (an intermediate version,
+  # bumped and promoted again before its run began, is skipped). PRs share their ref's group and cancel superseded runs.
+  group: release-${{ github.event_name == 'push' && 'main' || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -57,6 +59,11 @@ jobs:
           python-version: "3.13"
       - id: plan
         run: python tools/release_plan.py --sha "$GITHUB_SHA" --github-output "$GITHUB_OUTPUT"
+      - name: Name the decision in the run summary
+        env:
+          ACTION: ${{ steps.plan.outputs.action }}
+          TAG: ${{ steps.plan.outputs.tag }}
+        run: echo "Release plan for $GITHUB_SHA is **$ACTION** ($TAG)." >> "$GITHUB_STEP_SUMMARY"
 
   build:
     name: Release package
