@@ -344,6 +344,89 @@ def test_a_503_from_a_request_marks_its_worker_down_and_the_request_goes_to_anot
     asyncio.run(main())
 
 
+def test_pick_off_loop_routes_as_pick_does():
+    """The same sequence of sessionless requests and loads gives the same workers, routing counters and trees through
+    pick (on the event loop) and pick_off_loop (the trees in a worker thread)."""
+    import asyncio
+
+    rng = random.Random(3)
+    shared = ["".join(rng.choices("abcdefgh", k=rng.randint(200, 40_000))) for _ in range(6)]
+    reqs = []
+    for _ in range(300):
+        text = rng.choice(shared) + "".join(rng.choices("xyz", k=rng.randint(0, 3000)))
+        reqs.append((text, rng.choice((0, 0, 100)), [rng.randint(0, 40) for _ in range(3)]))
+
+    def new() -> Router:
+        return Router(["a", "b", "c"], max_tree_chars=200_000, sticky_chars=1_000)
+
+    a, b = new(), new()
+    want = []
+    for text, head, load in reqs:
+        a.load = list(load)
+        want.append(a.pick(text, head=head))
+
+    async def main() -> list[int]:
+        got = []
+        for text, head, load in reqs:
+            b.load = list(load)
+            got.append(await b.pick_off_loop(text, head=head))
+        return got
+
+    assert asyncio.run(main()) == want
+    assert a.routed == b.routed and [t.size for t in a.trees] == [t.size for t in b.trees]
+    assert len(set(want)) > 1  # the sequence exercises more than one rule
+
+
+def test_the_prefix_trees_are_walked_off_the_event_loop(monkeypatch):
+    """A sessionless request's match and insert walk its text character by character (~300 ms for 1.1 MB, ~250K
+    tokens): on the router's event loop, they stalled every stream it relays. Through the app, both run in another
+    thread than the loop's."""
+    import asyncio
+    import threading
+
+    import httpx
+
+    from trnrt.serve import router as router_mod
+
+    threads: list[tuple[str, int | None]] = []
+    real_match, real_insert = router_mod.PrefixTree.match, router_mod.PrefixTree.insert
+
+    def match(self, s):
+        threads.append(("match", threading.get_ident()))
+        return real_match(self, s)
+
+    def insert(self, s):
+        threads.append(("insert", threading.get_ident()))
+        return real_insert(self, s)
+
+    monkeypatch.setattr(router_mod.PrefixTree, "match", match)
+    monkeypatch.setattr(router_mod.PrefixTree, "insert", insert)
+
+    async def main() -> int:
+        ports = [_free_port() for _ in range(3)]
+        router = Router([f"http://127.0.0.1:{p}" for p in ports[:2]])
+        servers, tasks = await _start(
+            [
+                (_stub_worker(0), ports[0]),
+                (_stub_worker(1), ports[1]),
+                (router_mod.build_router_app(router, poll_s=0), ports[2]),
+            ]
+        )
+        try:
+            async with httpx.AsyncClient(timeout=30) as c:
+                for stream in (False, True):
+                    body = {"messages": [{"role": "user", "content": "hello " * 1000}], "stream": stream}
+                    r = await c.post(f"http://127.0.0.1:{ports[2]}/v1/chat/completions", json=body)
+                    assert r.status_code == 200, r.text
+        finally:
+            await _stop(servers, tasks)
+        return threading.get_ident()
+
+    loop_thread = asyncio.run(main())
+    assert {k for k, _ in threads} == {"match", "insert"}
+    assert all(t != loop_thread for _, t in threads), threads
+
+
 def test_a_plain_client_that_disconnects_from_the_router_aborts_its_request_on_the_worker():
     """A non-streaming request: the worker aborts a request whose client disconnects (serve/api.py), but behind the
     router its client is the router's pooled connection, which stayed open, so the worker generated to max_tokens and
