@@ -11,6 +11,8 @@ The first public release.
 
 - GLM-5.3-Flash on one trn2.48xlarge: two engines of 32 tensor-parallel ranks behind a session-affine router, an
   OpenAI-compatible API, 1M-token context, a prefix cache with a host-memory tier, and NKI decode megakernels.
+  These describe the configuration, not a measurement; [docs/RESULTS.md](docs/RESULTS.md) has the measured numbers with
+  their context, and [docs/DEPLOY.md](docs/DEPLOY.md) the deployment.
 
 ### Added
 
