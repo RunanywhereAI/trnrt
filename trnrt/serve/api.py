@@ -1019,4 +1019,59 @@ def build_app(engine: LLMEngine, model_name: str) -> FastAPI:
             parse=parse,
         )
 
+    # SGLang's and vLLM's /tokenize and /detokenize (also under /v1). A chat request is rendered exactly as
+    # /v1/chat/completions renders it (chat_prompt), so `count` is what the engine would be sent; a prompt is encoded as
+    # /v1/completions encodes it. Both run on the prompt thread with its tokenizer, as a chat prompt does: never on the
+    # event loop, and never in a second thread inside one tokenizer.
+    def tokenize(body: dict) -> dict:
+        if (body.get("prompt") is None) == (body.get("messages") is None):
+            raise _bad("exactly one of prompt or messages is required")
+        if body.get("messages") is not None:
+            # The fields chat refuses unless neutral (_NEUTRAL) and that change the rendered prompt.
+            for key in ("add_generation_prompt", "continue_final_message"):
+                if body.get(key) not in _NEUTRAL[key]:
+                    raise _bad(f"{key} is not supported; send the request without it")
+            ids, _ = chat_prompt(prompt_tok, body)
+            seqs, batch = [ids], False
+        else:
+            prompt = body["prompt"]
+            batch = isinstance(prompt, list)
+            texts = prompt if batch else [prompt]
+            if not texts or not all(isinstance(t, str) for t in texts):
+                raise _bad("prompt must be a string or a non-empty list of strings")
+            special = _flag(body, "add_special_tokens", True)
+            seqs = [list(prompt_tok(t, add_special_tokens=special)["input_ids"]) for t in texts]
+        out: dict = {
+            "tokens": seqs if batch else seqs[0],
+            "count": [len(s) for s in seqs] if batch else len(seqs[0]),
+            "max_model_len": engine.cfg.max_model_len,
+        }
+        if _flag(body, "return_token_strs"):  # vLLM's
+            strs = [prompt_tok.convert_ids_to_tokens(s) for s in seqs]
+            out["token_strs"] = strs if batch else strs[0]
+        return out
+
+    def detokenize(body: dict) -> dict:
+        tokens = body.get("tokens")
+        batch = isinstance(tokens, list) and bool(tokens) and all(isinstance(s, list) for s in tokens)
+        seqs: list = cast("list", tokens) if batch else [tokens]
+        if not all(isinstance(s, list) and all(type(t) is int and 0 <= t < loop_.vocab for t in s) for s in seqs):
+            raise _bad(f"tokens must be a list of token ids in [0, {loop_.vocab}), or a list of such lists")
+        skip = _flag(body, "skip_special_tokens", True)  # SGLang's default
+        texts = [prompt_tok.decode(s, skip_special_tokens=skip) for s in seqs]
+        text = texts if batch else texts[0]
+        return {"text": text, "prompt": text}  # SGLang answers `text`, vLLM `prompt`
+
+    @app.post("/tokenize")
+    @app.post("/v1/tokenize")
+    async def tokenize_route(http: HTTPRequest):
+        body = await _body(http)
+        return await asyncio.get_running_loop().run_in_executor(prompt_pool, tokenize, body)
+
+    @app.post("/detokenize")
+    @app.post("/v1/detokenize")
+    async def detokenize_route(http: HTTPRequest):
+        body = await _body(http)
+        return await asyncio.get_running_loop().run_in_executor(prompt_pool, detokenize, body)
+
     return app
