@@ -60,7 +60,9 @@ jobs:
 
   build:
     name: Release package
-    if: github.repository == 'RunanywhereAI/trnrt'
+    needs: plan
+    # A push that releases nothing builds nothing; dry runs (PRs, manual) always build.
+    if: github.repository == 'RunanywhereAI/trnrt' && (github.event_name != 'push' || needs.plan.outputs.action != 'skip')
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -71,7 +73,8 @@ jobs:
         with:
           python-version: "3.13"
       - run: pip install build twine
-      - run: python -m build
+      - name: Build, with timestamps fixed to the commit's so a rebuild of it gives the same files
+        run: SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) python -m build
       - run: twine check --strict dist/*
       - name: Checksums
         run: cd dist && sha256sum -- * > SHA256SUMS && cat SHA256SUMS
@@ -148,9 +151,13 @@ jobs:
           TAG: ${{ needs.plan.outputs.tag }}
         run: |
           # The tag is created here, on the merge commit. A rerun after a later job failed finds the release already
-          # there: upload the files again instead.
+          # there: upload only the files it lacks, never replacing one (PyPI keeps the file it first received, and the
+          # checksums must describe the files that were published).
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
-            gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+            have=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
+            for f in dist/*; do
+              grep -qxF "$(basename "$f")" <<< "$have" || gh release upload "$TAG" "$f" --repo "$GITHUB_REPOSITORY"
+            done
           else
             gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
               --title "TrnRT $TAG" --generate-notes

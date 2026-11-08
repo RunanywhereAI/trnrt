@@ -2,6 +2,7 @@
 and tags it has, and asks for the plan at its latest commit."""
 
 import importlib.util
+import os
 import re
 import subprocess
 import sys
@@ -17,7 +18,13 @@ _spec.loader.exec_module(rp)
 
 
 def git(repo, *args):
-    env = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+    env = {
+        **os.environ,  # PATH: git may live outside the default search path
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
+    }
     out = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, check=True, env=env)
     return out.stdout.strip()
 
