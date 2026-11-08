@@ -628,3 +628,83 @@ def test_the_checkpoints_generation_config_sets_the_sampling_defaults(serve, tmp
     assert params_with({"temperature": 0.6, "top_k": 20, "min_p": 0.05}, msgs) == (0.6, 1.0, 20, 0.05)
     assert params_with({"top_p": 0, "temperature": -1, "top_k": "x"}, msgs) == (1.0, 1.0, 0, 0.0)
     assert params_with(None, msgs) == (1.0, 1.0, 0, 0.0)
+
+
+@pytest.mark.parametrize("prefix", ["", "/v1"])
+def test_tokenize_counts_what_the_engine_would_be_sent(serve, prefix):
+    """A chat request's tokens are the prompt /v1/chat/completions sends the engine for the same body (tools and
+    template arguments included); a prompt's are /v1/completions' encoding. No request reaches the engine."""
+    client, eng = serve(PLAIN)
+    chat = {
+        "messages": [{"role": "user", "content": "weather?"}],
+        "tools": TOOLS,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    r = client.post(prefix + "/tokenize", json=chat)
+    assert r.status_code == 200, r.text
+    assert eng.added == []
+    assert client.post("/v1/chat/completions", json={**chat, "max_tokens": 2}).status_code == 200
+    sent = eng.added[-1].prompt_ids
+    assert r.json() == {"tokens": sent, "count": len(sent), "max_model_len": 64}
+
+    r = client.post(prefix + "/tokenize", json={"prompt": "Hello !", "return_token_strs": True})
+    assert r.json() == {"tokens": [ID["Hello"], ID["!"]], "count": 2, "max_model_len": 64, "token_strs": ["Hello", "!"]}
+    r = client.post(prefix + "/tokenize", json={"prompt": ["Hello", "Hello !"], "add_special_tokens": False})
+    assert r.json() == {"tokens": [[ID["Hello"]], [ID["Hello"], ID["!"]]], "count": [1, 2], "max_model_len": 64}
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {},
+        {"prompt": "Hello", "messages": [{"role": "user", "content": "hi"}]},
+        {"prompt": [ID["Hello"]]},  # token ids: nothing to tokenize
+        {"prompt": []},
+        {"prompt": ["Hello", 3]},
+        {"prompt": "Hello", "add_special_tokens": "yes"},
+        {"messages": []},
+        {"messages": [{"role": "user", "content": "hi"}], "continue_final_message": True},
+        {"messages": [{"role": "user", "content": "hi"}], "add_generation_prompt": False},
+        {"messages": [{"role": "user", "content": "hi"}], "chat_template_kwargs": {"unread": 1}},
+    ],
+)
+def test_tokenize_refuses_what_it_cannot_answer_with_a_400(serve, body):
+    client, eng = serve(PLAIN)
+    r = client.post("/tokenize", json=body)
+    assert r.status_code == 400, r.text
+    assert eng.added == []
+
+
+@pytest.mark.parametrize("prefix", ["", "/v1"])
+def test_detokenize_answers_sglang_and_vllm_clients(prefix):
+    from fastapi.testclient import TestClient
+
+    from trnrt.serve import api
+
+    eng = ScriptedEngine(PLAIN)
+    # <unk> registered as a special token (its id stays 0), so skip_special_tokens has one to drop
+    eng.tokenizer.add_special_tokens({"unk_token": "<unk>"})
+    with TestClient(api.build_app(eng, "glm")) as client:
+        _detokenize_checks(client, prefix)
+    for lp in [lp for lp in api._LOOPS if lp.engine is eng]:
+        lp.stop()
+
+
+def _detokenize_checks(client, prefix: str) -> None:
+    r = client.post(prefix + "/detokenize", json={"tokens": [ID["<unk>"], ID["Hello"], ID[" there"]]})
+    assert r.status_code == 200, r.text
+    assert r.json() == {"text": "Hello there", "prompt": "Hello there"}  # <unk> is special: skipped by default
+    r = client.post(prefix + "/detokenize", json={"tokens": [ID["<unk>"], ID["Hello"]], "skip_special_tokens": False})
+    assert r.json()["text"] == "<unk>Hello"
+    r = client.post(prefix + "/detokenize", json={"tokens": [[ID["Hello"]], [ID["Hello"], ID["!"]]]})
+    assert r.json() == {"text": ["Hello", "Hello!"], "prompt": ["Hello", "Hello!"]}
+    assert client.post(prefix + "/detokenize", json={"tokens": []}).json()["text"] == ""
+
+
+@pytest.mark.parametrize(
+    "tokens", [None, "Hello", [-1], [len(WORDS)], [True], [1.0], [[1], 2], [[1], [len(WORDS)]]], ids=repr
+)
+def test_detokenize_refuses_ids_outside_the_vocabulary(serve, tokens):
+    client, _ = serve(PLAIN)
+    r = client.post("/detokenize", json={} if tokens is None else {"tokens": tokens})
+    assert r.status_code == 400, r.text
