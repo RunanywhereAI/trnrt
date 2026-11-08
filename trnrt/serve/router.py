@@ -87,6 +87,9 @@ SESSION_FIELD = "session_id"  # the request body field naming the session (serve
 LOG_SESSIONS_ENV = "TRNRT_ROUTER_LOG_SESSIONS"
 SESSION_KEY_CHARS = 4096
 ROUTES = ("/v1/completions", "/v1/chat/completions")
+# Every worker answers these the same (one model, one tokenizer), so they go to the least loaded live worker and touch
+# no prefix tree and no session: a /tokenize of an agent's context must not steer where its next turn is routed.
+STATELESS_ROUTES = ("/tokenize", "/v1/tokenize", "/detokenize", "/v1/detokenize")
 
 
 class _Node:
@@ -691,8 +694,34 @@ def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: floa
 
         return handler
 
+    async def stateless(path: str, http: Request):
+        """STATELESS_ROUTES: the first live worker that answers, least loaded first. A refused connection or a 503 (a
+        failed engine) marks the worker down, as in a request, and the next one is asked."""
+        body = await _json_object(http)
+        for w in sorted(router._live(), key=lambda i: (router.load[i], i)):
+            try:
+                r = await client.post(router.workers[w] + path, json=body)
+            except httpx.ConnectError:
+                router.note_failure(w, hard=True)
+                continue
+            except httpx.HTTPError:
+                continue
+            if r.status_code == 503:
+                router.note_failure(w, hard=True)
+                continue
+            return Response(r.content, status_code=r.status_code, media_type=r.headers.get("content-type"))
+        raise HTTPException(status_code=503, detail=f"no engine answered {path}")
+
+    def stateless_route(path: str):
+        async def handler(http: Request):
+            return await stateless(path, http)
+
+        return handler
+
     for path in ROUTES:
         app.add_api_route(path, route(path), methods=["POST"])
+    for path in STATELESS_ROUTES:
+        app.add_api_route(path, stateless_route(path), methods=["POST"])
     return app
 
 
