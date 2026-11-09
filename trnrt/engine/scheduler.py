@@ -403,6 +403,10 @@ class Scheduler:
         for req in list(self.running):
             if req.status is not Status.RUNNING or not req.is_decoding:
                 continue
+            if req.token_ids[-1] == PENDING and req.host_bound:
+                # Its next step's mask or penalties need its newest token, still in flight: it waits for the read-back
+                # (the next schedule), and every other row runs as before (engine/host_inputs.py).
+                continue
             draft = self.draft_fn(req) if self.draft_fn is not None else []
             # A blind speculative row (engine/spec_async.py): the steps still in flight may each have advanced the request by
             # up to 1 + k positions, so its newest token is at most this far on, and its pages cover the verify past that
