@@ -55,7 +55,11 @@ The router's own endpoints:
   sessions go to the live ones, so a load balancer in front keeps sending); 503 {"status": "down"} once none is. Each
   body names the workers down ("down": their URLs) and carries the routing counters. Up and down are the router's view
   (above): the /health polls and the requests' refused connections and 503s;
-- GET /v1/models: the answer of the first live worker that gives one (least loaded first), 503 if none does.
+- GET /v1/models: the answer of the first live worker that gives one (least loaded first), 503 if none does;
+- GET /v1/stats: every worker's /v1/stats ({"engines": [{"url", "up", "stats"}], "router": the /health counters}), or
+  with ?engine=i worker i's alone, with a "router" block naming the engines;
+- GET /dashboard: the engines' page (serve/dashboard.py), one engine at a time (?engine=i): the engines listen on
+  127.0.0.1 only, so the router is where a browser can reach it.
 
     python -m trnrt.serve.router --worker-urls http://127.0.0.1:8111,http://127.0.0.1:8112 --port 8000
 """
@@ -73,9 +77,10 @@ import time
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 
 from .. import log
+from .dashboard import PAGE as DASHBOARD_PAGE
 
 logger = log.get("router")
 
@@ -619,6 +624,52 @@ def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: floa
                 with contextlib.suppress(ValueError):
                     return JSONResponse(r.json())
         raise HTTPException(status_code=503, detail="no engine answered /v1/models")
+
+    def engines() -> list[dict]:
+        return [{"url": u, "up": ok} for u, ok in zip(router.workers, router.up)]
+
+    async def worker_stats(w: int) -> dict:
+        """Worker w's GET /v1/stats; HTTPException 503 when it does not answer with one."""
+        try:
+            r = await client.get(router.workers[w] + "/v1/stats", timeout=health_timeout_s)
+            if r.status_code == 200:
+                body = r.json()
+                if isinstance(body, dict):
+                    return body
+        except (httpx.HTTPError, ValueError):
+            pass
+        raise HTTPException(status_code=503, detail=f"engine {w} did not answer /v1/stats")
+
+    def engine_index(raw: str | None) -> int | None:
+        if raw is None:
+            return None
+        if not raw.isdigit() or int(raw) >= len(router.workers):
+            raise HTTPException(status_code=400, detail=f"engine must be an integer in [0, {len(router.workers)})")
+        return int(raw)
+
+    @app.get("/v1/stats")
+    async def stats(engine: str | None = None):
+        """Every engine's statistics (serve/stats.py), or engine i's with ?engine=i. Read only: no routing state."""
+        w = engine_index(engine)
+        if w is not None:
+            body = await worker_stats(w)
+            body["router"] = {"engine": w, "engines": engines()}
+            return JSONResponse(body)
+        out = []
+        for i, e in enumerate(engines()):
+            try:
+                out.append({**e, "stats": await worker_stats(i)})
+            except HTTPException as x:
+                out.append({**e, "stats": None, "error": x.detail})
+        return JSONResponse({"engines": out, "router": router.health()})
+
+    @app.get("/dashboard")
+    async def dashboard(engine: str | None = None):
+        """The engines' page, for one engine: without ?engine, the first live one's."""
+        if engine_index(engine) is None:
+            live = router._live()
+            return RedirectResponse(f"dashboard?engine={live[0] if live else 0}", status_code=307)
+        return HTMLResponse(DASHBOARD_PAGE)
 
     async def proxy(path: str, http: Request):
         body = await _json_object(http)
