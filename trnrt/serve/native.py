@@ -74,17 +74,18 @@ _SAMPLING: dict[str, str] = {
     "repetition_penalty": "repetition_penalty",
     "ignore_eos": "ignore_eos",
     "sampling_seed": "seed",
-    "n": "n",
     "logit_bias": "logit_bias",
     "min_new_tokens": "min_tokens",
-    "no_stop_trim": "include_stop_str_in_output",
-    "skip_special_tokens": "skip_special_tokens",
     "json_schema": "guided_json",
     "regex": "guided_regex",
     "ebnf": "guided_grammar",
 }
-# SGLang sampling parameters with no counterpart here, accepted only at these values.
+# SGLang sampling parameters with no counterpart here, or not served on /generate (n choices, kept stop text and special
+# tokens in the text are the OpenAI endpoints' Run path), accepted only at these values.
 _SAMPLING_NEUTRAL: dict[str, tuple[object, ...]] = {
+    "n": (None, 1),
+    "no_stop_trim": (None, False),
+    "skip_special_tokens": (None, True),
     "stop_regex": (None, [], ""),
     "structural_tag": (None,),
     "spaces_between_special_tokens": (None, True),
