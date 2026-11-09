@@ -22,6 +22,7 @@ from .sampler import NUM_TOP_LOGPROBS, unpack
 from .scheduler import BLIND, NeedSync, Scheduler, SchedulerConfig, Scheduling, StepPlan
 
 if TYPE_CHECKING:
+    from .guided import HostSampling
     from .host_cache import HostTier
 
 logger = logging.getLogger(__name__)
@@ -220,6 +221,9 @@ def build_shard(cfg: EngineConfig, path: str, num_pages: int, rank: int = 0):
 
 class LLMEngine:
     scheduling = Scheduling()  # the defaults, for an engine assembled without __init__ (the tests' stand-ins)
+    # Guided decoding, thinking budgets and min_tokens (engine/guided.py), set in __init__; None on an engine assembled
+    # without it (the tests' fake engines), which then serves none of them.
+    host_sampling: HostSampling | None = None
 
     def __init__(self, cfg: EngineConfig, scheduling: Scheduling | None = None):
         self.cfg = cfg
@@ -276,6 +280,11 @@ class LLMEngine:
         except (OSError, ValueError, TypeError):
             self.tokenizer = None  # token-id-only use; stop strings need one
         self.device = self.runner.device
+        # Guided decoding, thinking budgets and min_tokens (engine/guided.py): the reasoning tags' ids and, from the first
+        # guided request, the grammar backend.
+        from .guided import HostSampling
+
+        self.host_sampling = HostSampling(self.tokenizer, self.mcfg.vocab_size, self.mcfg.eos_token_ids, self.runner)
         if cfg.tp > 1:
             from . import tp
 
@@ -347,12 +356,14 @@ class LLMEngine:
     ) -> Request:
         """Queue a request. ValueError for one the engine does not serve; scheduler.QueueFull when the waiting queue is
         at its limit. A waiting request a higher-priority one displaced from a full queue ends with Request.error set."""
-        why = unsupported(params)
+        why = unsupported(params, self.cfg.structured_outputs, self.cfg.penalties)
         if why:  # before anything is built or queued: the request never reaches a step
             raise ValueError(f"{why} is not supported; send the request without it")
         self.scheduling.check_priority(priority)
         req = Request(rid or f"req-{next(self._ids)}", list(prompt_ids), params, session_id=session_id)
         req.priority = priority
+        if self.host_sampling is not None:
+            self.host_sampling.admit(req)  # its grammar matcher and thinking-budget state (ValueError: a 400)
         displaced = self.scheduler.add(req)
         if displaced is not None:
             self.runner.forget(displaced)
@@ -513,6 +524,8 @@ class LLMEngine:
         most limit - h decode). With speculative seats fewer than the running cap, a verify needs one: plain -> speculative
         only when every running request can sit in a speculative seat (the flip moves them), and in speculative mode a
         request admitted into a plain seat (no speculative seat was free) is stepped plain, never moved blind."""
+        if any(r.needs_host_inputs for r in self.scheduler.running if r.status is Status.RUNNING):
+            return True  # a mask or penalties ride only the plain decode graph: such a request never speculates
         n = sum(1 for r in self.scheduler.running if r.status is Status.RUNNING and r.is_decoding)
         m = self.cfg.spec_max_batch
         want = n > (m - max(self.cfg.spec_hysteresis, 0) if self._dyn_plain else m)
@@ -739,6 +752,9 @@ class LLMEngine:
             if s.draft and s.req.params.logprobs is not None:
                 del s.req.logprobs[len(s.req.output_ids) :]
         finished += self._check_stop_strings(plan.seqs(), finished)
+        # Thinking budgets count, and grammars accept, the committed tokens; a grammar that terminated finishes its request.
+        if self.host_sampling is not None:
+            finished += self.host_sampling.advance(plan.seqs(), self.scheduler.finish_now)
         for r in finished:
             self.runner.forget(r)
         return finished
@@ -753,6 +769,8 @@ class LLMEngine:
             # steps would have stopped at the stop string, so it is checked for those requests too.
             ended_here = s.draft and id(req) in ended
             if not stops or not s.sample or (req.status is not Status.RUNNING and not ended_here):
+                continue
+            if len(req.output_ids) < req.params.min_tokens:  # vLLM checks stop strings from min_tokens on
                 continue
             # Only the tail can newly contain a stop string; decode enough of it to cover
             # the longest one plus multi-token characters.

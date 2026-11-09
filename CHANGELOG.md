@@ -36,6 +36,12 @@ and versions follow [Semantic Versioning](https://semver.org/). Rebuild the comp
 - `TRNRT_PROD_DIR`: an opt-in on-disk log of request records (counts and times only) and gauges.
 - `TRNRT_PROMPT_CACHE_MB`: an opt-in prompt token cache that builds a chat turn's prompt ids from the previous turn's,
   with the same ids as a full encode or none.
+- Structured outputs through xgrammar, an optional dependency: `response_format` `json_object` and `json_schema`, vLLM's
+  `guided_*` and `structured_outputs`, and SGLang's `json_schema`, `regex` and `ebnf`. Also `min_tokens` and
+  `thinking_token_budget`. They need `--structured-outputs`, which adds graphs that take a token mask
+  ([docs/API.md](docs/API.md#structured-outputs-penalties-and-thinking-budgets)).
+- Repetition, frequency and presence penalties, with `--penalties` and `--penalty-buckets`, which add graphs that take
+  penalty inputs ([docs/CONFIGURATION.md](docs/CONFIGURATION.md#structured-outputs-penalties-and-thinking-budgets)).
 
 ### Changed
 

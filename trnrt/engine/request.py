@@ -5,9 +5,10 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from .grammar import GrammarSpec
     from .radix_cache import RadixNode
 
 
@@ -26,20 +27,41 @@ class SamplingParams:
     stop_token_ids: tuple[int, ...] = ()
     ignore_eos: bool = False
     seed: int | None = None
-    # vLLM's thinking_token_budget. Not served: unsupported() refuses any value but None.
+    # vLLM's thinking_token_budget: reasoning tokens before the engine forces the reasoning's end (engine/engine.py).
     thinking_token_budget: int | None = None
+    # Guided decoding (engine/grammar.py), and vLLM's min_tokens (SGLang min_new_tokens): no end-of-sequence or stop id
+    # among the first min_tokens output tokens.
+    grammar: GrammarSpec | None = None
+    min_tokens: int = 0
+
+    @property
+    def has_penalties(self) -> bool:
+        return self.repetition_penalty != 1.0 or self.frequency_penalty != 0.0 or self.presence_penalty != 0.0
+
+    @property
+    def needs_mask(self) -> bool:
+        """Whether the request needs the graphs that take a token mask: a grammar, a thinking budget's forced tokens,
+        or min_tokens."""
+        return self.grammar is not None or self.thinking_token_budget is not None or self.min_tokens > 0
 
 
-def unsupported(params: SamplingParams) -> str | None:
-    """What in a request's sampling the engine does not serve, or None. Every graph samples on the device from the
-    logits alone; penalties and a thinking budget's forced tokens need graph variants with host inputs, which the
-    engine neither compiles nor warms. add_request refuses them before anything is queued (the API answers 400)."""
+def unsupported(params: SamplingParams, structured: bool = False, penalties: bool = False) -> str | None:
+    """What in a request's sampling this engine does not serve, or None. The served graphs sample on the device from the
+    logits alone; a token mask (guided decoding, a thinking budget's forced tokens, min_tokens) and penalties need graph
+    variants with host inputs, which an engine compiles and warms only when started with --structured-outputs
+    (`structured`) or --penalties (`penalties`). add_request refuses the rest before anything is queued (the API answers
+    400)."""
     # Only values that change the output are refused: clients send the neutral ones (penalties of 1 / 0 / 0, no
     # budget) by default.
-    if params.repetition_penalty != 1.0 or params.frequency_penalty != 0.0 or params.presence_penalty != 0.0:
-        return "repetition / frequency / presence penalties"
-    if params.thinking_token_budget is not None:
-        return "a thinking token budget"
+    if params.has_penalties and not penalties:
+        return "repetition / frequency / presence penalties (on an engine started without --penalties)"
+    if not structured:
+        if params.grammar is not None:
+            return "guided decoding (on an engine started without --structured-outputs)"
+        if params.thinking_token_budget is not None:
+            return "a thinking token budget (on an engine started without --structured-outputs)"
+        if params.min_tokens > 0:
+            return "min_tokens (on an engine started without --structured-outputs)"
     return None
 
 
@@ -88,6 +110,12 @@ class Request:
     think_seen: int = 0
     think_force: list[int] = field(default_factory=list)
     think_done: bool = False
+    # Guided decoding: the request's grammar matcher (engine/grammar.py), and whether it constrains the output yet. Under a
+    # reasoning block the prompt opened, it waits for the block's end (vLLM's structured outputs outside reasoning).
+    matcher: Any = None  # an xgrammar GrammarMatcher
+    grammar_armed: bool = True
+    grammar_seen: int = 0  # output tokens its matcher has been given
+    grammar_dead: bool = False  # its grammar reached a dead end and was ended (engine/host_inputs.py)
     # Recurrent-state checkpoints (engine/scheduler.py): prefill positions still to save at, and
     # saved rows waiting for their pages to enter the radix tree, as (position, row, from decode).
     ckpt_targets: list[int] = field(default_factory=list)
@@ -109,14 +137,36 @@ class Request:
 
     @property
     def host_bound(self) -> bool:
-        """Needs every previous token on the host before its next step (no overlap): penalties,
-        or a thinking budget still running."""
-        return self.has_penalties or (self.params.thinking_token_budget is not None and not self.think_done)
+        """Whether its next step needs its newest token on the host (the scheduler then leaves it out of a step while
+        that token is in flight, engine/scheduler.py): penalties count every output token; a grammar's matcher must
+        accept the newest token before it masks the next (and, before it is armed, see the reasoning's end first); a
+        thinking budget whose next token may be forced (a forced token pending, or at most one reasoning token left: the
+        count rises by at most one a step, so further from the budget no step can need the force)."""
+        if self.params.has_penalties or self.grammar_active:
+            return True
+        b = self.params.thinking_token_budget
+        return b is not None and not self.think_done and (bool(self.think_force) or self.think_count + 1 >= b)
+
+    @property
+    def grammar_active(self) -> bool:
+        m = self.matcher
+        return m is not None and not m.is_terminated()
+
+    @property
+    def needs_host_inputs(self) -> bool:
+        """Whether a step of it may still take a mask or penalties, so it never speculates (a verify takes neither):
+        penalties, a grammar not terminated, a thinking budget not done, or min_tokens not reached."""
+        p = self.params
+        return (
+            p.has_penalties
+            or self.grammar_active
+            or (p.thinking_token_budget is not None and not self.think_done)
+            or self.num_tokens - self.num_prompt < p.min_tokens
+        )
 
     @property
     def has_penalties(self) -> bool:
-        p = self.params
-        return p.repetition_penalty != 1.0 or p.frequency_penalty != 0.0 or p.presence_penalty != 0.0
+        return self.params.has_penalties
 
     @property
     def num_prompt(self) -> int:

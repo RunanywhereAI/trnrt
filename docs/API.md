@@ -42,11 +42,11 @@ curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -
 - The router keeps an idle client connection open for 75 s (`--timeout-keep-alive`). A proxy or client connection pool
   in front of it should drop idle connections sooner than that; otherwise a request can go out on a connection the
   router is closing.
-- Not supported, answered with 400: repetition, frequency and presence penalties, guided decoding (`response_format`
-  other than text, `tool_choice` `"required"` or a named tool), prompt logprobs, thinking budgets, and a minimum length
-  (`min_tokens`, SGLang's `min_new_tokens`). Every graph samples on the device, and these need host inputs no served
-  graph takes. A minimum length needs EOS masked out of the distribution a token is drawn from; ignoring EOS on the
-  host instead would put it in the output and let the model write past it.
+- Structured outputs, penalties, `min_tokens` and thinking budgets need an engine started with `--structured-outputs` or
+  `--penalties` ([below](#structured-outputs-penalties-and-thinking-budgets)); otherwise they are answered with 400,
+  naming the flag.
+- Not supported, answered with 400: `tool_choice` `"required"` or a named tool, prompt logprobs (`prompt_logprobs`,
+  `echo` with `logprobs`), and SGLang's `min_new_tokens` on the OpenAI endpoints (use `min_tokens`).
 - Status codes: 400 for a request that cannot be served as sent (a field of the wrong type or out of range, a prompt
   longer than the context, a chat template variable the template never reads); 500 for an error inside the engine;
   503 once the engine has failed, with the reason on `/health`, and 503 for a full queue
@@ -226,3 +226,29 @@ all of them:
 | `GET` or `POST /flush_cache` | Drops the prefix cache (device pages, state checkpoints and the host-memory tier), only while no request runs or waits. `?timeout=<s>` (default 0) waits up to that long for the engine to be idle. 200 when flushed, 400 with the reason when not | Every engine; 200 only when all flushed. The router also forgets a flushed engine's prefixes |
 
 None of these returns a secret or a host path the operator did not pass.
+
+## Structured outputs, penalties and thinking budgets
+
+Each needs graphs that take inputs from the host. An engine serves them only when started with the flag
+([CONFIGURATION.md](CONFIGURATION.md#structured-outputs-penalties-and-thinking-budgets)).
+
+| Field | Flag | Behaviour |
+|---|---|---|
+| `response_format` `{"type": "json_object"}` | `--structured-outputs` | a JSON object (the schema `{"type": "object"}`, as SGLang) |
+| `response_format` `{"type": "json_schema", "json_schema": {"schema": ...}}` | `--structured-outputs` | JSON matching the schema |
+| vLLM `guided_json`, `guided_regex`, `guided_choice`, `guided_grammar`; `structured_outputs` `{json, regex, choice, grammar, json_object}` | `--structured-outputs` | a schema, a regular expression, one of the strings, an EBNF grammar |
+| SGLang `json_schema` (a string), `regex`, `ebnf` | `--structured-outputs` | the same |
+| `min_tokens` | `--structured-outputs` | no end-of-sequence or `stop_token_ids` id, and no stop string, among the first `min_tokens` tokens |
+| `thinking_token_budget` | `--structured-outputs` | at most this many reasoning tokens after `<think>`; then `</think>` is forced |
+| `repetition_penalty`, `frequency_penalty`, `presence_penalty` | `--penalties` | vLLM's formulas: repetition over prompt and output tokens, frequency and presence over the output |
+
+- One constraint per request. Two (say `response_format` and `regex`) are refused with 400, as SGLang refuses them.
+- Guided decoding uses [xgrammar](https://github.com/mlc-ai/xgrammar), an optional dependency:
+  `pip install 'trnrt[grammar]'`. Without it, guided requests are answered with 400.
+- GLM-5.3-Flash reasons first. As in vLLM, the constraint applies to the answer after `</think>`, not to the reasoning.
+- Logprobs stay the raw model's, before the mask and the penalties, as vLLM reports them by default.
+- A request with penalties, a grammar, or a thinking budget near its end waits for its newest token before each step,
+  so it gives up the overlap of host and device work; the requests beside it keep it. Under the dynamic `mtp-*` presets
+  the engine stops speculating while a request that uses any of these runs.
+- If a grammar can continue only with text no token spells, the request ends there with `finish_reason` `"stop"`, and a
+  warning is logged.
