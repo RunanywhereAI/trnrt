@@ -19,7 +19,7 @@ from .model_runner import ModelRunner
 from .radix_cache import RadixCache
 from .request import Request, SamplingParams, Status, unsupported
 from .sampler import NUM_TOP_LOGPROBS, unpack
-from .scheduler import BLIND, NeedSync, Scheduler, SchedulerConfig, StepPlan
+from .scheduler import BLIND, NeedSync, Scheduler, SchedulerConfig, Scheduling, StepPlan
 
 if TYPE_CHECKING:
     from .host_cache import HostTier
@@ -219,8 +219,12 @@ def build_shard(cfg: EngineConfig, path: str, num_pages: int, rank: int = 0):
 
 
 class LLMEngine:
-    def __init__(self, cfg: EngineConfig):
+    scheduling = Scheduling()  # the defaults, for an engine assembled without __init__ (the tests' stand-ins)
+
+    def __init__(self, cfg: EngineConfig, scheduling: Scheduling | None = None):
         self.cfg = cfg
+        # Host-only scheduling settings (policy, priorities, queue limits, eviction): outside cfg, which keys the graphs.
+        self.scheduling = scheduling or Scheduling()
         self.t_start = time.perf_counter()  # startup_seconds counts from here to the end of warmup()
         self.startup_seconds: float | None = None
         path = resolve_model_path(cfg.model_path, cfg.model_revision)
@@ -278,7 +282,8 @@ class LLMEngine:
             self.runner.tp_send = tp.send
             _OPEN.add(self)
         self.pool = PagePool(num_pages)
-        self.radix = RadixCache(self.pool, cfg.page_size)
+        sch = self.scheduling
+        self.radix = RadixCache(self.pool, cfg.page_size, sch.eviction_policy, sch.eviction_config)
         scfg = SchedulerConfig(
             page_size=cfg.page_size,
             max_num_seqs=cfg.max_num_seqs,
@@ -287,6 +292,7 @@ class LLMEngine:
             eos_token_ids=self.mcfg.eos_token_ids,
             admission_decode_tokens=cfg.admission_decode_tokens,
             max_running=cfg.max_running,
+            **sch.scheduler_fields(),
         )
         # The scheduler (engine/scheduler.py) runs the served prefix-cache rules for a recurrent model: a hit resumes from
         # the deepest state checkpoint at or below it, checkpoints are written inside prefill chunks and at every page
@@ -332,13 +338,24 @@ class LLMEngine:
         self._inflight: tuple[StepPlan, list[Any]] | None = None
 
     def add_request(
-        self, prompt_ids: list[int], params: SamplingParams, rid: str | None = None, session_id: str | None = None
+        self,
+        prompt_ids: list[int],
+        params: SamplingParams,
+        rid: str | None = None,
+        session_id: str | None = None,
+        priority: int | None = None,
     ) -> Request:
+        """Queue a request. ValueError for one the engine does not serve; scheduler.QueueFull when the waiting queue is
+        at its limit. A waiting request a higher-priority one displaced from a full queue ends with Request.error set."""
         why = unsupported(params)
         if why:  # before anything is built or queued: the request never reaches a step
             raise ValueError(f"{why} is not supported; send the request without it")
+        self.scheduling.check_priority(priority)
         req = Request(rid or f"req-{next(self._ids)}", list(prompt_ids), params, session_id=session_id)
-        self.scheduler.add(req)
+        req.priority = priority
+        displaced = self.scheduler.add(req)
+        if displaced is not None:
+            self.runner.forget(displaced)
         return req
 
     def flush_cache(self) -> None:
