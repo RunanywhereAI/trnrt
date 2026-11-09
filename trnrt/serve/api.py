@@ -46,6 +46,7 @@ from fastapi import Request as HTTPRequest
 from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
 
 from ..engine.request import Request, SamplingParams, Status
+from ..engine.scheduler import QueueFull
 from ..metrics import Metrics, kv_pages, spec_stats
 from .parsers import THINK_OPEN, StreamParser, chat_finish_reason, parse_full, template_messages, tool_choice_error
 
@@ -68,16 +69,24 @@ class _Stream:
 @dataclass
 class _Submit:
     """A request on its way to the engine thread. `out` receives, in order: ("accepted", Request), or ("error", why,
-    HTTP status) if it was not accepted; then ("tokens", new ids, finish reason or None, their logprobs or None) until
-    the finish reason is set, or ("error", why, HTTP status) if the engine fails. The status is 400 for a request the
-    engine refuses, 500 for an internal error that leaves the engine serving and 503 once the engine has failed."""
+    HTTP status[, queue full]) if it was not accepted; then ("tokens", new ids, finish reason or None, their logprobs or
+    None) until the finish reason is set, or ("error", why, HTTP status[, queue full]) if the engine fails or displaces
+    it. The status is 400 for a request the engine refuses, 500 for an internal error that leaves the engine serving, and
+    503 once the engine has failed or for a request a full queue refused or displaced (queue full: True, and the response
+    carries QUEUE_FULL_HEADER so the router does not take the engine for failed)."""
 
     rid: str
     prompt_ids: list[int]
     params: SamplingParams
     loop: asyncio.AbstractEventLoop
     session_id: str | None = None
+    priority: int | None = None
     out: asyncio.Queue = field(default_factory=asyncio.Queue)
+
+
+# Set on a 503 that answers a full waiting queue (scheduler.QueueFull) or a request displaced from it: the engine is
+# serving, unlike every other 503 it sends, so the router (serve/router.py) passes the answer on and keeps routing to it.
+QUEUE_FULL_HEADER = "x-trnrt-queue-full"
 
 
 # Engine loops of this process, held weakly: at exit each loop's thread stops after its step, then its engine closes
@@ -164,7 +173,9 @@ class EngineLoop:
                 raise HTTPException(status_code=503, detail=f"engine failed: {err}")
             self.inbox.put((kind, payload))
 
-    def submit(self, prompt_ids: list[int], params: SamplingParams, session_id: str | None = None) -> _Submit:
+    def submit(
+        self, prompt_ids: list[int], params: SamplingParams, session_id: str | None = None, priority: int | None = None
+    ) -> _Submit:
         # Checked here, before the engine sees the request: an id outside the vocabulary fails the step, and at tp > 1
         # one failed step fails the engine for every request (_fail).
         if not prompt_ids or not all(type(t) is int and 0 <= t < self.vocab for t in prompt_ids):
@@ -173,7 +184,7 @@ class EngineLoop:
             )
         if session_id is not None and not isinstance(session_id, str):
             raise HTTPException(status_code=400, detail="session_id must be a string")
-        sub = _Submit(uuid.uuid4().hex, prompt_ids, params, asyncio.get_running_loop(), session_id)
+        sub = _Submit(uuid.uuid4().hex, prompt_ids, params, asyncio.get_running_loop(), session_id, priority)
         self._put("add", sub)
         return sub
 
@@ -189,10 +200,14 @@ class EngineLoop:
             kind, payload = item
             if kind == "add":
                 post = payload.loop.call_soon_threadsafe
+                # priority only when sent: an engine without priority scheduling refuses any value (LLMEngine.add_request)
+                extra = {} if payload.priority is None else {"priority": payload.priority}
                 try:
                     req = self.engine.add_request(
-                        payload.prompt_ids, payload.params, rid=payload.rid, session_id=payload.session_id
+                        payload.prompt_ids, payload.params, rid=payload.rid, session_id=payload.session_id, **extra
                     )
+                except QueueFull as e:
+                    post(payload.out.put_nowait, ("error", str(e), 503, True))
                 except ValueError as e:
                     post(payload.out.put_nowait, ("error", str(e), 400))
                 except Exception as e:  # noqa: BLE001  add_request raised before the request reached the scheduler
@@ -302,6 +317,10 @@ class EngineLoop:
                 with_lp = req.params.logprobs is not None
                 # With logprobs on, only the tokens whose logprobs are recorded go out, so every token carries its own.
                 ready = len(out) if finished or not with_lp else min(len(out), len(req.logprobs))
+                if finished and req.error is not None:  # ended unserved: displaced from a full queue
+                    batch.setdefault(st.loop, []).append((st.out, ("error", req.error[1], req.error[0], True)))
+                    del self.streams[rid]
+                    continue
                 if ready > st.sent or finished:
                     new = out[st.sent : ready]
                     lps = req.logprobs[st.sent : ready] if with_lp else None
@@ -459,6 +478,12 @@ _INT64_MAX = 2**63 - 1
 
 def _bad(detail: str) -> HTTPException:
     return HTTPException(status_code=400, detail=detail)
+
+
+def _error(detail: str, status: int, queue_full: bool = False) -> HTTPException:
+    """The HTTP error of an engine's ("error", detail, status[, queue_full]) (_Submit): a full queue's 503 carries
+    QUEUE_FULL_HEADER."""
+    return HTTPException(status_code=status, detail=detail, headers={QUEUE_FULL_HEADER: "1"} if queue_full else None)
 
 
 def _int(body: dict, key: str, default, lo: int, hi: int = _INT64_MAX):
@@ -820,12 +845,14 @@ def build_app(engine: LLMEngine, model_name: str) -> FastAPI:
         stream = _flag(body, "stream")
         opts = body.get("stream_options") or {}
         include_usage = isinstance(opts, dict) and _flag(opts, "include_usage")
-        sub = loop_.submit(prompt_ids, params, body.get("session_id"))
-        # Admission errors (a prompt that does not fit, an unsupported parameter) arrive before any token: surface
-        # them as HTTP status codes rather than inside a 200 stream.
+        # SGLang's per-request priority (engine/scheduler.py); an engine without priority scheduling refuses it (400)
+        priority = _int(body, "priority", None, -_INT64_MAX - 1)
+        sub = loop_.submit(prompt_ids, params, body.get("session_id"), priority)
+        # Admission errors (a prompt that does not fit, an unsupported parameter, a full queue) arrive before any token:
+        # surface them as HTTP status codes rather than inside a 200 stream.
         first = await sub.out.get()
         if first[0] == "error":
-            raise HTTPException(status_code=first[2], detail=first[1])
+            raise _error(*first[1:])
         req = first[1]
         created = int(time.time())
         oid = ("chatcmpl-" if chat else "cmpl-") + sub.rid
@@ -950,7 +977,7 @@ def build_app(engine: LLMEngine, model_name: str) -> FastAPI:
             while finish is None:
                 kind, *rest = await sub.out.get()
                 if kind == "error":
-                    raise HTTPException(status_code=rest[1], detail=rest[0])
+                    raise _error(*rest)
                 ids, finish, lps = rest
                 n_out += len(ids)
                 if lps is not None:
