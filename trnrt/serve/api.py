@@ -4,6 +4,8 @@
   output's reasoning (`reasoning_content`) and tool calls (`tool_calls`) parsed out of it (serve/parsers.py), as one
   response or as server-sent events;
 - POST /v1/completions: a prompt as text or token ids, through the same generation path;
+- POST /v1/responses (serve/responses.py) and POST /v1/messages, /v1/messages/count_tokens (serve/anthropic.py): the
+  OpenAI Responses and Anthropic Messages APIs, translated into the chat path;
 - POST /tokenize and /detokenize (also under /v1);
 - GET /v1/models;
 - GET /health: 200 while the engine can serve, 503 with the reason once it cannot;
@@ -1384,5 +1386,41 @@ def build_app(engine: LLMEngine, model_name: str) -> FastAPI:
     async def detokenize_route(http: HTTPRequest):
         body = await _body(http)
         return await asyncio.get_running_loop().run_in_executor(prompt_pool, detokenize, body)
+
+    # The Responses and Messages APIs, translated into the chat path (start_chat). Imported here: both import this module.
+    from . import anthropic, responses
+
+    @app.post("/v1/responses")
+    async def responses_route(http: HTTPRequest):
+        body = await _body(http)
+        return await responses.respond(http, body, start_chat, model_name)
+
+    @app.get("/v1/responses/{response_id}")
+    @app.delete("/v1/responses/{response_id}")
+    @app.post("/v1/responses/{response_id}/cancel")
+    async def stored_response(response_id: str):
+        raise responses.not_stored(response_id)
+
+    @app.post("/v1/messages")
+    async def messages_route(http: HTTPRequest):
+        try:
+            body = await _body(http)
+            return await anthropic.respond(http, body, start_chat, model_name)
+        except HTTPException as e:  # Anthropic's error shape
+            return anthropic.error_response(e)
+
+    def count_tokens(body: dict) -> dict:
+        """Anthropic's count_tokens: the prompt the same request to /v1/messages would send the engine, rendered on the
+        prompt thread as a chat prompt is (/tokenize counts the same way)."""
+        ids, _ = chat_prompt(prompt_tok, anthropic.to_chat(body))
+        return {"input_tokens": len(ids)}
+
+    @app.post("/v1/messages/count_tokens")
+    async def count_tokens_route(http: HTTPRequest):
+        try:
+            body = await _body(http)
+            return await asyncio.get_running_loop().run_in_executor(prompt_pool, count_tokens, body)
+        except HTTPException as e:
+            return anthropic.error_response(e)
 
     return app
