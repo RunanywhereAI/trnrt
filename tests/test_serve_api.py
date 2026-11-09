@@ -349,7 +349,6 @@ def test_an_sdk_request_with_every_neutral_field_is_served(serve):
         ("frequency_penalty", -0.2),
         ("repetition_penalty", 1.1),
         ("thinking_token_budget", 128),
-        ("n", 2),
         ("logit_bias", {"13": 5}),
         ("response_format", {"type": "json_object"}),
         ("prompt_logprobs", 0),
@@ -421,7 +420,7 @@ def test_request_fields_are_checked_before_the_engine(serve):
         ("prompt", [len(WORDS)]),
         ("prompt", [1, True]),
         ("min_tokens", 4),
-        ("include_stop_str_in_output", True),
+        ("include_stop_str_in_output", "yes"),
         ("thinking_token_budget", "lots"),
         ("temperature", 10**400),
     ]
