@@ -14,7 +14,7 @@ response, back into Anthropic content blocks:
 | `tools` (`name`, `description`, `input_schema`) | function tools |
 | `tool_choice` `auto` / `none`; `disable_parallel_tool_use` | `tool_choice` `auto` / `none`; `parallel_tool_calls` false |
 | `max_tokens` (required), `temperature`, `top_p`, `top_k`, `stop_sequences` | the same sampling fields; `stop` |
-| `thinking` `{"type": "disabled"}` / `{"type": "enabled", "budget_tokens": N}` | `enable_thinking` false / `thinking_token_budget` N, which the chat path refuses as it always does |
+| `thinking` `{"type": "disabled"}` / `{"type": "enabled", "budget_tokens": N}` | `enable_thinking` false / `thinking_token_budget` N, served by an engine started with `--structured-outputs` and refused otherwise |
 | `output_config.effort` | `reasoning_effort` |
 | output `reasoning_content`, `content`, `tool_calls` | `thinking`, `text` and `tool_use` blocks, in that order |
 
@@ -25,7 +25,7 @@ guided decoding and are refused, as the chat path refuses `required` and a named
 
 Errors use Anthropic's shape, `{"type": "error", "error": {"type": ..., "message": ...}}`. The translation follows
 SGLang's Anthropic adapter (python/sglang/srt/entrypoints/anthropic/serving.py), except that SGLang accepts and ignores a
-thinking budget, which this server refuses (AGENTS.md: unsupported fields are refused, never ignored).
+thinking budget, which this server enforces (with `--structured-outputs`) or refuses, never ignores (AGENTS.md).
 """
 
 from __future__ import annotations
