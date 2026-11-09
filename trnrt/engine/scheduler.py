@@ -34,11 +34,21 @@ before either computes it: the longest page-aligned prefix a request shares with
 running request becomes a checkpoint target of the one computing it first (at its admission, or, when
 the other arrives while it is still prefilling, added to its targets then), and the other waits until
 it can resume from it.
+
+Scheduling policies (SchedulerConfig.policy and the fields after it, all host only; the defaults schedule exactly as
+before they existed). The waiting queue is ordered before each admission round: fcfs keeps arrival order; lpm puts the
+longest cached prefix first; lof the longest max_new_tokens first; spf the shortest prompt first. With priority
+scheduling (SGLang --enable-priority-scheduling) a request's `priority` comes first, higher values first unless
+low_priority_first; preemption under KV pressure takes the worst priority first; and a waiting request better than the
+worst running one by more than priority_preemption_threshold takes that one's seat (SGLang preempt_to_schedule). A
+queue limit (max_queued_requests, max_queued_tokens) refuses a request with QueueFull; under priority scheduling a
+request better than the worst waiting one displaces it instead (SGLang _abort_on_queued_limit).
 """
 
 from __future__ import annotations
 
 import bisect
+import math
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -62,6 +72,22 @@ class NeedSync(Exception):
     recomputed from REAL tokens, so the caller commits the in-flight step and retries."""
 
 
+class QueueFull(Exception):
+    """The waiting queue is at its limit (SchedulerConfig.max_queued_requests / max_queued_tokens): the request is
+    refused before it is queued. SGLang answers this with 503 "The request queue is full." (scheduler.py
+    _abort_on_queued_limit)."""
+
+
+# SGLang's --schedule-policy names (managers/schedule_policy.py), the ones served here, plus spf; "priority" is fcfs with
+# priority scheduling on.
+POLICIES = ("fcfs", "lpm", "lof", "spf", "priority")
+# SGLang turns lpm's prefix matching off above this many waiting requests (SchedulePolicy._determine_active_policy):
+# each match walks the radix tree, once per waiting request per step.
+LPM_MAX_QUEUE = 128
+# Displaced from a full queue by a request of higher priority (SGLang's message).
+DISPLACED = "The request is aborted by a higher priority request."
+
+
 @dataclass
 class SchedulerConfig:
     page_size: int
@@ -78,6 +104,70 @@ class SchedulerConfig:
     admission_decode_tokens: int = 256
     # EngineConfig.max_running: running requests at most (None: max_num_seqs). Admission only, never the graphs' seats.
     max_running: int | None = None
+    # Scheduling policy (module docstring, POLICIES). Host only; the defaults are the scheduling without them.
+    policy: str = "fcfs"
+    priority_scheduling: bool = False
+    low_priority_first: bool = False  # SGLang --schedule-low-priority-values-first
+    priority_preemption: bool = True  # SGLang's default; --disable-priority-preemption turns it off
+    priority_preemption_threshold: int = 10  # SGLang --priority-scheduling-preemption-threshold's default
+    max_queued_requests: int | None = None  # SGLang --max-queued-requests
+    max_queued_tokens: int | None = None  # prompt tokens waiting, at most
+
+    def __post_init__(self) -> None:
+        if self.policy not in POLICIES:
+            raise ValueError(f"schedule policy must be one of {', '.join(POLICIES)}")
+        if self.policy == "priority":
+            self.policy, self.priority_scheduling = "fcfs", True
+        if self.priority_scheduling and self.policy == "lpm":
+            # SGLang's own check (server_args.py): an order by priority and one by cached prefix cannot both lead
+            raise ValueError("priority scheduling takes schedule policy fcfs, lof or spf, not lpm")
+        for name in ("max_queued_requests", "max_queued_tokens"):
+            v = getattr(self, name)
+            if v is not None and v < 1:
+                raise ValueError(f"{name} must be at least 1")
+
+
+@dataclass(frozen=True)
+class Scheduling:
+    """The host-only scheduling settings (the `serve` and `engine` scheduling flags, trnrt/__main__.py), kept out of
+    EngineConfig, whose fields the captured graphs are keyed on. The defaults schedule and evict exactly as an engine
+    built without them."""
+
+    policy: str = "fcfs"
+    priority_scheduling: bool = False
+    low_priority_first: bool = False
+    priority_preemption: bool = True
+    priority_preemption_threshold: int = 10
+    max_queued_requests: int | None = None
+    max_queued_tokens: int | None = None
+    eviction_policy: str = "lru"  # radix_cache.EVICTION_POLICIES
+    eviction_config: dict | None = None  # the eviction policy's own settings (radix_cache.POLICY_PARAMS)
+
+    @property
+    def takes_priority(self) -> bool:
+        """Whether a request's `priority` changes anything: priority scheduling (by the policy's name or the flag) or
+        the priority eviction. A request that sends one otherwise is refused, not silently ignored."""
+        return self.priority_scheduling or self.policy == "priority" or self.eviction_policy == "priority"
+
+    def check_priority(self, priority: int | None) -> None:
+        """ValueError (the API's 400) for a request's priority that these settings would ignore."""
+        if priority is not None and not self.takes_priority:
+            raise ValueError(
+                "priority needs priority scheduling (--enable-priority-scheduling) or the priority eviction "
+                "(--radix-eviction-policy priority); send the request without it"
+            )
+
+    def scheduler_fields(self) -> dict:
+        """The SchedulerConfig fields these settings give."""
+        return {
+            "policy": self.policy,
+            "priority_scheduling": self.priority_scheduling,
+            "low_priority_first": self.low_priority_first,
+            "priority_preemption": self.priority_preemption,
+            "priority_preemption_threshold": self.priority_preemption_threshold,
+            "max_queued_requests": self.max_queued_requests,
+            "max_queued_tokens": self.max_queued_tokens,
+        }
 
 
 def shared_pages(a: list[int], b: list[int], ps: int, limit: int) -> int:
@@ -211,6 +301,7 @@ class Scheduler:
         self.waiting: deque[Request] = deque()
         self.running: list[Request] = []  # admission order, oldest first
         self.num_preemptions = 0
+        self.num_priority_preemptions = 0  # of which for a waiting request of higher priority (_priority_preempt)
         # In-chunk checkpoints placed, and skipped for want of a free row (the chunk is not split instead).
         self.ckpt_mid_placed = 0
         self.ckpt_mid_skipped = 0
@@ -231,13 +322,52 @@ class Scheduler:
     def close_session(self, sid: str) -> bool:
         return self.radix.session_close(sid)
 
-    def add(self, req: Request) -> None:
+    def rank(self, req: Request) -> float:
+        """req's priority as a sort key, smaller first: higher priority values first (SGLang's default), lower ones with
+        low_priority_first; a request without one comes last (SGLang gives it the worst value, sys.maxsize)."""
+        p = req.priority
+        if p is None:
+            return math.inf
+        return float(p) if self.cfg.low_priority_first else -float(p)
+
+    def add(self, req: Request) -> Request | None:
+        """Queue `req`. Returns the waiting request it displaced from a full queue (already finished, finish_reason
+        "abort", Request.error set), or None; raises QueueFull when the queue is at its limit and nothing is displaced."""
         if req.num_tokens >= self.cfg.max_model_len:
             raise ValueError(f"prompt of {req.num_tokens} tokens does not fit max_model_len={self.cfg.max_model_len}")
+        displaced = self._queue_room(req)
         if req.session_id is not None:
             req.session_gen = self.radix.session_open(req.session_id)
         self._mark_running_junctions(req)
         self.waiting.append(req)
+        return displaced
+
+    def _importance(self, req: Request) -> float:
+        """req's priority for the priority eviction, larger kept longer: SGLang's request priority, 0 when it has none
+        (radix_cache.py _insert_helper), negated with low_priority_first so that eviction keeps what scheduling favours."""
+        p = req.priority or 0
+        return -float(p) if self.cfg.low_priority_first else float(p)
+
+    def _queue_room(self, req: Request) -> Request | None:
+        """Make room for `req` under the queue limits, or raise QueueFull. Over max_queued_requests with priority
+        scheduling, the worst waiting request (the newest among equals) is displaced if `req` ranks strictly better;
+        one that has already generated tokens (a preempted request, partly streamed) is never displaced."""
+        c = self.cfg
+        if c.max_queued_tokens is not None:
+            queued = sum(r.num_tokens for r in self.waiting)
+            if queued + req.num_tokens > c.max_queued_tokens:
+                raise QueueFull(f"The request queue is full: {queued} prompt tokens are waiting.")
+        if c.max_queued_requests is None or len(self.waiting) < c.max_queued_requests:
+            return None
+        if c.priority_scheduling:
+            fresh = [r for r in self.waiting if not r.output_ids]
+            if fresh:
+                worst = max(fresh, key=lambda r: (self.rank(r), r.arrival_time))
+                if self.rank(req) < self.rank(worst):
+                    self.abort(worst)
+                    worst.error = (503, DISPLACED)
+                    return worst
+        raise QueueFull("The request queue is full.")
 
     def has_work(self) -> bool:
         return bool(self.waiting or self.running)
@@ -393,14 +523,78 @@ class Scheduler:
         cap = self.cfg.max_running
         return self.cfg.max_num_seqs if cap is None else min(self.cfg.max_num_seqs, cap)
 
+    def _order_waiting(self) -> None:
+        """Sort the waiting queue by the scheduling policy (stable: arrival order among equals). fcfs without priority
+        scheduling leaves it as it is."""
+        c = self.cfg
+        if (c.policy == "fcfs" and not c.priority_scheduling) or len(self.waiting) < 2:
+            return
+        if c.policy == "lpm":
+            if len(self.waiting) > LPM_MAX_QUEUE:
+                return
+            ps = c.page_size
+            hit = {
+                id(r): self.radix.match_checkpoint(r.token_ids, self._prompt_pages(r, ps))[0].num_pages
+                for r in self.waiting
+            }
+            self.waiting = deque(sorted(self.waiting, key=lambda r: -hit[id(r)]))
+            return
+        self.waiting = deque(sorted(self.waiting, key=self._wait_key))
+
+    def _wait_key(self, req: Request) -> tuple[float, int]:
+        """The admission order of the fcfs, lof and spf policies, smallest first: the priority (priority scheduling),
+        then the longest max_new_tokens (lof) or the shortest prompt (spf)."""
+        c = self.cfg
+        rank = self.rank(req) if c.priority_scheduling else 0.0
+        if c.policy == "lof":
+            return (rank, -req.params.max_new_tokens)
+        if c.policy == "spf":
+            return (rank, req.num_tokens)
+        return (rank, 0)
+
+    def _victim_key(self, req: Request) -> tuple[float, float]:
+        """Preemption order under priority scheduling, the largest first: the worst priority, then the youngest."""
+        return (self.rank(req), req.arrival_time)
+
+    def _priority_preempt(self) -> None:
+        """Priority scheduling: when every seat is taken and the best waiting request (that is not waiting for a prefix
+        another request is computing) ranks better than the worst running one by more than
+        priority_preemption_threshold, that one is preempted for its seat (SGLang PrefillAdder.preempt_to_schedule,
+        which also requires the difference to exceed the threshold). Before anything is planned, so the victim is in no
+        entry of this step; with a step in flight, NeedSync first (a preempted request recomputes from real tokens)."""
+        c = self.cfg
+        if not (c.priority_scheduling and c.priority_preemption) or not self.waiting:
+            return
+        if len(self.running) < self._seats():
+            return
+        best = next((r for r in self.waiting if not self._prefix_in_progress(r)), None)
+        if best is None:
+            return
+        victim = self._youngest_running()
+        if not self.rank(victim) - self.rank(best) > c.priority_preemption_threshold:
+            return
+        if self.in_flight:
+            raise NeedSync()
+        self._preempt(victim)
+        self.num_priority_preemptions += 1
+
     def _schedule(self) -> StepPlan:
         plan = StepPlan()
         ps = self.cfg.page_size
+        preempted = self.num_preemptions
+        self._order_waiting()
+        self._priority_preempt()
 
         # 1. Every decoding sequence gets its one token, preempting the youngest if KV
         #    runs out. Iterating oldest-first while preempting youngest-first means a
-        #    victim is never a sequence already scheduled this step.
-        for req in list(self.running):
+        #    victim is never a sequence already scheduled this step. Under priority
+        #    scheduling the victim is the worst priority: the loop then visits the best
+        #    first (the same invariant) and the entries go back to running order.
+        order = list(self.running)
+        if self.cfg.priority_scheduling:
+            pos = {id(r): i for i, r in enumerate(order)}
+            order.sort(key=lambda r: (self._victim_key(r), pos[id(r)]))
+        for req in order:
             if req.status is not Status.RUNNING or not req.is_decoding:
                 continue
             draft = self.draft_fn(req) if self.draft_fn is not None else []
@@ -423,6 +617,9 @@ class Scheduler:
             if req.status is Status.RUNNING:
                 save = None if draft else self.track(req, req.num_computed, 1)
                 plan.decodes.append(ScheduledSeq(req, start, 1 + len(draft), True, draft, save=save))
+        if self.cfg.priority_scheduling:
+            at = {id(r): i for i, r in enumerate(self.running)}
+            plan.decodes.sort(key=lambda s: at[id(s.req)])
 
         # 2. Continue partial prefills, oldest first.
         budget = self.cfg.max_prefill_tokens
@@ -437,7 +634,10 @@ class Scheduler:
             plan.prefills.append(self._chunk(req, req.num_computed, n))
             budget -= n
 
-        # 3. Admit waiting requests, first come first served, while budget and capacity remain.
+        # 3. Admit waiting requests, first come first served (or in the policy's order), while budget and capacity
+        #    remain. A request preempted above went to the queue's head; the policy puts it where it ranks.
+        if self.num_preemptions != preempted:
+            self._order_waiting()
         owed = sum(self._still_needs(r) for r in self.running)
         deferred = []  # waiting for a running request to checkpoint the prefix they share
         while self.waiting and budget > 0 and len(self.running) < self._seats():
@@ -470,6 +670,8 @@ class Scheduler:
             self.waiting.popleft()
             req.pages = list(match.pages) + new_pages
             req.node = match.node
+            if self.radix.tracks_use:  # a hit on the prefix it resumes from (the lfu, slru and priority evictions)
+                self.radix.touch(match.node, self._importance(req))
             req.num_computed = cached
             if req.num_cached_tokens < 0:
                 req.num_cached_tokens = cached
@@ -533,7 +735,11 @@ class Scheduler:
         return True
 
     def _youngest_running(self) -> Request:
-        """Preemption victim: the youngest running request."""
+        """Preemption victim: the youngest running request, or under priority scheduling the worst priority (then the
+        youngest; _schedule visits the decodes in the order that keeps a victim out of the plan)."""
+        if self.cfg.priority_scheduling:
+            pos = {id(r): i for i, r in enumerate(self.running)}
+            return max(self.running, key=lambda r: (self._victim_key(r), pos[id(r)]))
         return max(self.running, key=lambda r: r.arrival_time)
 
     # -- recurrent-state checkpoints ------------------------------------------------------
@@ -712,6 +918,8 @@ class Scheduler:
         if n_full == 0:
             return
         res = self.radix.insert(req.token_ids[: n_full * ps], req.pages[:n_full])
+        if self.radix.tracks_use:
+            self.radix.touch(res.node, self._importance(req), hit=False)
         for i, page in enumerate(res.pages):
             if req.pages[i] != page:
                 self.pool.free([req.pages[i]])
