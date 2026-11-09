@@ -10,6 +10,23 @@ and versions follow [Semantic Versioning](https://semver.org/). Rebuild the comp
 - `/tokenize` and `/detokenize` (also under `/v1`), as SGLang and vLLM serve them. A chat request is counted exactly as
   `/v1/chat/completions` would send it to the engine. The router sends them to any live engine without touching its
   routing state ([docs/API.md](docs/API.md)).
+- `n` choices on `/v1/chat/completions` and `/v1/completions`, sharing the prompt through the prefix cache; a seed gives
+  choice i `seed + i`, as in vLLM ([docs/API.md](docs/API.md#sampling-extras)).
+- SGLang's `stop_regex`, and keeping the stop text with `include_stop_str_in_output` (vLLM) or `no_stop_trim` (SGLang).
+- `skip_special_tokens: false`, and SGLang's `matched_stop` on every finished choice.
+- The OpenAI Responses API, `POST /v1/responses`, stateless: reasoning, message and function-call items, and the
+  Responses stream events ([docs/API.md](docs/API.md#responses-api)).
+- The Anthropic Messages API, `POST /v1/messages` and `/v1/messages/count_tokens`: thinking, text and tool-use blocks,
+  Anthropic's stream events and error shape ([docs/API.md](docs/API.md#anthropic-messages-api)).
+- The router routes `/v1/responses` and `/v1/messages` by session and prefix as it routes chat, and sends
+  `/v1/messages/count_tokens` to any live engine.
+
+### Changed
+
+- The stop token that ends a request (EOS or a `stop_token_ids` entry) is no longer part of its text when the tokenizer
+  does not mark it special, as in vLLM and SGLang.
+- `min_new_tokens` (SGLang's name for `min_tokens`) and `spaces_between_special_tokens: false` are refused with 400;
+  they were ignored.
 
 ## [0.1.0] - 2026-11-08
 
