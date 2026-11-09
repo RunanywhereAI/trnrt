@@ -191,6 +191,7 @@ def test_generate_output_logprobs_in_sglangs_tuples(serve):
         ({"input_ids": [1], "sampling_params": {"n": 2}}, "not supported: n"),
         ({"input_ids": [1], "sampling_params": {"json_schema": "{}"}}, "not supported: json_schema"),
         ({"input_ids": [1], "sampling_params": {"no_stop_trim": True}}, "not supported: no_stop_trim"),
+        ({"input_ids": [1], "sampling_params": {"skip_special_tokens": False}}, "not supported: skip_special_tokens"),
         ({"input_ids": [1], "sampling_params": {"max_new_tokens": 0}}, "max_new_tokens must be"),
         ({"input_ids": [1], "sampling_params": {"sampling_seed": -1}}, "sampling_seed must be"),
         ({"input_ids": [1], "sampling_params": {"bogus": 1}}, "unknown sampling parameters: bogus"),
