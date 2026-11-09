@@ -48,6 +48,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse, Response, Streami
 from ..engine.request import Request, SamplingParams, Status
 from ..metrics import Metrics, kv_pages, spec_stats
 from .parsers import THINK_OPEN, StreamParser, chat_finish_reason, parse_full, template_messages, tool_choice_error
+from .structured import grammar_spec
 
 if TYPE_CHECKING:  # only annotations: importing this module does not load the engine and its model code
     from ..engine.engine import LLMEngine
@@ -419,24 +420,18 @@ class _Detok:
         return delta
 
 
-# Request fields that would change the output in a way no served graph computes (guided decoding, prompt logprobs,
-# several choices, logit biases, an echoed or suffixed prompt): refused with a 400, never ignored. Each is accepted at
-# its neutral values, absent or listed here, which OpenAI SDKs and agent harnesses send by default. A plain-text
-# response_format is neutral too; penalties and a thinking budget are the engine's to refuse (engine.unsupported),
-# also only when they would change the output.
+# Request fields that would change the output in a way no served graph computes (prompt logprobs, several choices, logit
+# biases, an echoed or suffixed prompt): refused with a 400, never ignored. Each is accepted at its neutral values, absent
+# or listed here, which OpenAI SDKs and agent harnesses send by default. Guided decoding (serve/structured.py), min_tokens,
+# penalties and a thinking budget go to the engine, which refuses them unless it was started with the graphs that serve
+# them (engine/request.py unsupported).
 _NEUTRAL: dict[str, tuple[object, ...]] = {
     "prompt_logprobs": (None,),
-    "guided_json": (None,),
-    "guided_regex": (None,),
-    "guided_choice": (None,),
-    "guided_grammar": (None,),
-    "structured_outputs": (None,),
     "n": (None, 1),
     "best_of": (None, 1),
     "logit_bias": (None, {}),
     "echo": (None, False),
     "suffix": (None, ""),
-    "min_tokens": (None, 0),
     "include_stop_str_in_output": (None, False),
     "add_generation_prompt": (None, True),
     "continue_final_message": (None, False),
@@ -447,11 +442,7 @@ _NEUTRAL: dict[str, tuple[object, ...]] = {
 
 
 def _refused(body: dict) -> list[str]:
-    out = [k for k, neutral in _NEUTRAL.items() if body.get(k) not in neutral]
-    rf = body.get("response_format")
-    if rf is not None and not (isinstance(rf, dict) and rf.get("type", "text") == "text"):
-        out.append("response_format")
-    return out
+    return [k for k, neutral in _NEUTRAL.items() if body.get(k) not in neutral]
 
 
 _INT64_MAX = 2**63 - 1
@@ -562,6 +553,13 @@ def _params(
     max_new = _int(body, "max_tokens", None, 1)
     if max_new is None:
         max_new = _int(body, "max_completion_tokens", default_max, 1)
+    min_tokens = _int(body, "min_tokens", 0, 0)
+    if min_tokens > max_new:  # vLLM's check
+        raise _bad(f"min_tokens ({min_tokens}) must be at most max_tokens ({max_new})")
+    try:
+        grammar = grammar_spec(body)
+    except ValueError as e:
+        raise _bad(str(e)) from None
     top_k = _int(body, "top_k", int(d.get("top_k", 0)), -1)  # -1 and 0 both turn it off (vLLM's -1, the engine's 0)
     return SamplingParams(
         max_new_tokens=max_new,
@@ -573,7 +571,9 @@ def _params(
         frequency_penalty=_num(body, "frequency_penalty", 0.0),
         presence_penalty=_num(body, "presence_penalty", 0.0),
         logprobs=logprobs,
-        thinking_token_budget=_int(body, "thinking_token_budget", None, 0),  # vLLM's; the engine refuses any value
+        thinking_token_budget=_int(body, "thinking_token_budget", None, 0),  # vLLM's
+        grammar=grammar,
+        min_tokens=min_tokens,
         stop=tuple(stop),
         stop_token_ids=tuple(stop_ids),
         ignore_eos=_flag(body, "ignore_eos"),
