@@ -372,6 +372,36 @@ def add_engine_args(ap: argparse.ArgumentParser) -> None:
         default=(2,),
         help="the decode row counts at which a dense MLP layer runs as the XLA graph instead of the dense half's kernel",
     )
+    add_host_sampling_args(ap)
+
+
+def add_host_sampling_args(ap: argparse.ArgumentParser) -> None:
+    """The graph variants with host inputs (engine/host_inputs.py), off by default: each adds graphs to warmup and to the
+    capture, and with both off every graph is the one an engine without them compiles."""
+    h = ap.add_argument_group(
+        "host-input sampling",
+        "graph variants that take inputs from the host (docs/API.md#structured-outputs-penalties-and-thinking-budgets). "
+        "Graph structure: they add graphs, so a capture must run with the same flags. Not with speculation at every "
+        "batch size (--spec-method without --spec-max-batch)",
+    )
+    h.add_argument(
+        "--structured-outputs",
+        action="store_true",
+        help="serve guided decoding (response_format, guided_*, json_schema / regex / ebnf; needs the xgrammar "
+        "package), thinking_token_budget and min_tokens: decode and prefill graphs that take a token mask",
+    )
+    h.add_argument(
+        "--penalties",
+        action="store_true",
+        help="serve repetition, frequency and presence penalties: decode and prefill graphs that take penalty inputs",
+    )
+    h.add_argument(
+        "--penalty-buckets",
+        type=_ints,
+        default=(1024, 16384),
+        help="with --penalties: the distinct-token counts a row's penalty inputs are compiled at (the vocabulary size "
+        "is always added as the last)",
+    )
 
 
 def _env_synth_al() -> float | None:
@@ -446,6 +476,9 @@ def engine_config(argv: list[str], core_base: int = 0):
         dyn_mtp_kv=a.dyn_mtp_kv,
         state_seats=a.state_seats,
         state_spec_seats=a.state_spec_seats,
+        structured_outputs=a.structured_outputs,
+        penalties=a.penalties,
+        penalty_buckets=tuple(a.penalty_buckets),
     )
 
 
