@@ -10,7 +10,8 @@ up to 12 per engine (16 seats, 12 running), 4,096-token prefill chunks, and 4 Gi
 prefix cache (`--preset batch12` names it). `--preset batch8` is the other supported configuration: decode batches of up
 to 8 per engine (PRESETS below). The bucket ladders and the decode kernel routes are graph structure: a server finds its
 graphs in the compile cache only if `compile capture` ran with the same arguments (the same --preset included).
---max-running (fewer requests running than the compiled seats) is host only. An engine compiles nothing on the serving
+--max-running (fewer requests running than the compiled seats) and the scheduling flags (--schedule-policy, priorities,
+queue limits, --radix-eviction-policy) are host only. An engine compiles nothing on the serving
 host: a graph missing from the cache ends its start-up with the likely cause (NEURON_LIBTORCH_ASSERT_CACHE_HIT=1;
 --allow-compile compiles it there instead, minutes to hours a graph). Before it starts, an engine on Neuron checks its
 host (engine/start_checks.py): its devices free of other processes, and enough contiguous free host memory for the
@@ -372,6 +373,106 @@ def add_engine_args(ap: argparse.ArgumentParser) -> None:
         default=(2,),
         help="the decode row counts at which a dense MLP layer runs as the XLA graph instead of the dense half's kernel",
     )
+    add_scheduling_args(ap)
+
+
+def _json_object(s: str) -> dict:
+    import json
+
+    try:
+        v = json.loads(s)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(f"not JSON: {e}") from None
+    if not isinstance(v, dict):
+        raise argparse.ArgumentTypeError("must be a JSON object")
+    return v
+
+
+def add_scheduling_args(ap: argparse.ArgumentParser) -> None:
+    """Each engine's scheduling, under SGLang's flag names wherever SGLang has the setting (engine/scheduler.py,
+    engine/radix_cache.py). Host only: none of them changes a graph, and the defaults schedule as an engine without
+    them."""
+    g = ap.add_argument_group(
+        "scheduling", "host only, per engine (no graph changes); the defaults are first come, first served and LRU"
+    )
+    g.add_argument(
+        "--schedule-policy",
+        default="fcfs",
+        choices=["fcfs", "lpm", "lof", "spf", "priority"],
+        help="the order waiting requests are admitted in: fcfs arrival, lpm longest cached prefix, lof longest "
+        "max_tokens, spf shortest prompt; priority is fcfs with --enable-priority-scheduling",
+    )
+    g.add_argument(
+        "--enable-priority-scheduling",
+        action="store_true",
+        help="admit by each request's `priority` first (higher values first), preempt the worst priority first",
+    )
+    g.add_argument(
+        "--schedule-low-priority-values-first",
+        action="store_true",
+        help="with priority scheduling: lower priority values first",
+    )
+    g.add_argument(
+        "--priority-scheduling-preemption-threshold",
+        type=_at_least(0),
+        default=10,
+        help="with priority scheduling: a waiting request takes a running one's seat when its priority is better by "
+        "more than this",
+    )
+    g.add_argument(
+        "--disable-priority-preemption",
+        action="store_true",
+        help="with priority scheduling: never preempt a running request for a waiting one of higher priority",
+    )
+    g.add_argument(
+        "--max-queued-requests",
+        type=_at_least(1),
+        default=None,
+        help="waiting requests per engine at most; past it a request is answered 503 (default: no limit)",
+    )
+    g.add_argument(
+        "--max-queued-tokens",
+        type=_at_least(1),
+        default=None,
+        help="prompt tokens waiting per engine at most; past it a request is answered 503 (default: no limit)",
+    )
+    g.add_argument(
+        "--radix-eviction-policy",
+        default="lru",
+        choices=["lru", "lfu", "slru", "priority", "tlru"],
+        help="which cached prefix the prefix cache evicts first",
+    )
+    g.add_argument(
+        "--radix-eviction-policy-config",
+        type=_json_object,
+        default=None,
+        help='the eviction policy\'s settings as JSON: slru {"protected_threshold": 2}; tlru {"threshold": N, '
+        '"next_prompt_estimate": M} (both required)',
+    )
+
+
+def scheduling(argv: list[str]):
+    """The engine's host-only scheduling settings (engine/scheduler.Scheduling) from the serve or engine arguments
+    `argv`. ValueError for a combination the scheduler or the prefix cache refuses."""
+    from .engine.radix_cache import policy_params
+    from .engine.scheduler import SchedulerConfig, Scheduling
+
+    a = parse_engine_args(argv)
+    s = Scheduling(
+        policy=a.schedule_policy,
+        priority_scheduling=a.enable_priority_scheduling,
+        low_priority_first=a.schedule_low_priority_values_first,
+        priority_preemption=not a.disable_priority_preemption,
+        priority_preemption_threshold=a.priority_scheduling_preemption_threshold,
+        max_queued_requests=a.max_queued_requests,
+        max_queued_tokens=a.max_queued_tokens,
+        eviction_policy=a.radix_eviction_policy,
+        eviction_config=a.radix_eviction_policy_config,
+    )
+    # the checks the engine would make at start-up, made here so that serve refuses before it starts any engine
+    SchedulerConfig(page_size=1, max_num_seqs=1, max_prefill_tokens=1, max_model_len=2, **s.scheduler_fields())
+    policy_params(s.eviction_policy, s.eviction_config)
+    return s
 
 
 def _env_synth_al() -> float | None:
@@ -504,6 +605,10 @@ def cmd_engine(argv: list[str]) -> int:
     add_compile_arg(ap)
     a = ap.parse_args(argv)
     cfg = engine_config(argv, a.core_base)
+    try:
+        sched = scheduling(argv)
+    except ValueError as e:
+        ap.error(str(e))
     apply_preset_env(argv)  # before anything imports trnrt.kernels; the ranks the engine spawns inherit it
     from .engine import start_checks
 
@@ -517,7 +622,7 @@ def cmd_engine(argv: list[str]) -> int:
 
     t = time.perf_counter()
     try:
-        eng = LLMEngine(cfg)
+        eng = LLMEngine(cfg, sched)
         print(
             f"engine up in {time.perf_counter() - t:.1f} s (cores {a.core_base}-{a.core_base + cfg.tp - 1})", flush=True
         )
@@ -623,6 +728,10 @@ def cmd_serve(argv: list[str]) -> int:
     )
     add_compile_arg(ap)
     a = ap.parse_args(argv)
+    try:
+        scheduling(argv)  # refused here, before any engine starts, rather than by every engine
+    except ValueError as e:
+        ap.error(str(e))
     # The engines start one at a time, each healthy (its weights loaded, every graph warmed) before the next starts. The
     # host-wide start lock stays on too (engine/start_lock.py: each graph's first call holds it): two engines whose
     # ranks load collective graphs at the same moment collide in the runtime's collectives bootstrap.
