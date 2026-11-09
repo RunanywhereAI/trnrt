@@ -20,6 +20,7 @@
 | `trnrt/serve/native.py` | SGLang's native API on one engine: `/generate`, the info and load endpoints, `/health_generate`, `/abort_request`, `/flush_cache`. |
 | `trnrt/serve/router.py` | The session-affine, prefix-aware router in front of the engines, with failover. |
 | `trnrt/serve/parsers.py` | GLM reasoning and tool-call parsing, streamed and whole. |
+| `trnrt/serve/responses.py`, `anthropic.py` | The OpenAI Responses API and the Anthropic Messages API, translated into the chat path. |
 | `trnrt/engine/engine.py` | `LLMEngine`: model build, the step loop, start and close. |
 | `trnrt/engine/scheduler.py` | Continuous batching, chunked prefill and prefix-cache restores. |
 | `trnrt/engine/model_runner.py` | Pads each step into a compiled bucket and runs its graph. |

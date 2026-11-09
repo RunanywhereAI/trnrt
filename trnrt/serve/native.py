@@ -27,7 +27,7 @@ import logging
 import math
 import os
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from fastapi import HTTPException
 from fastapi import Request as HTTPRequest
@@ -298,7 +298,7 @@ class _Run:
     async def run(self) -> None:
         """Read the engine's tokens until the request finishes; HTTPException on an engine error."""
         while self.finish is None:
-            kind, *rest = await self.sub.out.get()
+            kind, *rest = await cast("asyncio.Queue", self.sub.out).get()
             if kind == "error":
                 raise HTTPException(status_code=rest[1], detail=rest[0])
             self.push(*rest)
@@ -469,7 +469,7 @@ def add_routes(
 
         async def finished() -> str | None:
             while True:
-                kind, *rest = await sub.out.get()
+                kind, *rest = await cast("asyncio.Queue", sub.out).get()
                 if kind == "error":
                     return str(rest[0])
                 if kind == "tokens" and rest[1] is not None:
@@ -547,7 +547,8 @@ def add_routes(
             raise
         # Admission errors (a prompt that does not fit, a rid in use) arrive before any token: an HTTP status, not a
         # 200 stream, and the batch's other prompts are aborted.
-        firsts = [await s.out.get() for s in subs]
+        # /generate's requests own their queues (api._Submit.out is a _Tagged view only for `n` > 1 choices)
+        firsts = [await cast("asyncio.Queue", s.out).get() for s in subs]
         bad = next((f for f in firsts if f[0] == "error"), None)
         if bad is not None:
             for s, f in zip(subs, firsts):
@@ -588,7 +589,7 @@ async def _events(runs: list[_Run], single: bool, abort_unfinished):
 
     async def pump(i: int, r: _Run) -> None:
         while True:
-            m = await r.sub.out.get()
+            m = await cast("asyncio.Queue", r.sub.out).get()
             merged.put_nowait((i, m))
             if m[0] == "error" or m[2] is not None:
                 return

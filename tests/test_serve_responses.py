@@ -1,0 +1,280 @@
+"""The OpenAI Responses API, POST /v1/responses (trnrt/serve/responses.py), over the scripted engine of
+tests/test_serve_api.py: the same reasoning, answer and tool calls /v1/chat/completions gives, as Responses items and
+events; what a stateless server cannot do is refused with 400."""
+
+from __future__ import annotations
+
+import json
+
+import pytest
+
+pytest.importorskip("fastapi")
+pytest.importorskip("httpx")
+
+from tests.test_serve_api import PLAIN, TOOL_TURN, TOOLS, ScriptedEngine
+
+# The chat TOOLS as Responses function tools.
+R_TOOLS = [{"type": "function", **t["function"]} for t in TOOLS]
+
+
+@pytest.fixture
+def client():
+    from fastapi.testclient import TestClient
+
+    from trnrt.serve import api
+
+    started = []
+
+    def start(script, setup=None):
+        eng = ScriptedEngine(script)
+        if setup is not None:
+            setup(eng)
+        c = TestClient(api.build_app(eng, "glm"))
+        c.__enter__()
+        started.append((c, eng))
+        return c, eng
+
+    yield start
+    for c, eng in started:
+        c.__exit__(None, None, None)
+        for lp in [lp for lp in api._LOOPS if lp.engine is eng]:
+            lp.stop()
+
+
+def _sse(c, body) -> list[dict]:
+    with c.stream("POST", "/v1/responses", json={**body, "stream": True}) as r:
+        assert r.status_code == 200, r.read()
+        lines = list(r.iter_lines())
+    names = [ln[7:] for ln in lines if ln.startswith("event: ")]
+    data = [json.loads(ln[6:]) for ln in lines if ln.startswith("data: ")]
+    assert names == [d["type"] for d in data]
+    assert [d["sequence_number"] for d in data] == list(range(len(data)))
+    return data
+
+
+def _strip_ids(items: list[dict]) -> list[dict]:
+    return [{k: v for k, v in it.items() if k not in ("id", "call_id")} for it in items]
+
+
+def test_a_tool_turn_matches_the_chat_api(client):
+    """Reasoning, the answer and the call come back as reasoning, message and function_call items carrying what
+    /v1/chat/completions returns for the same request; usage counts the reasoning tokens (those before </think>)."""
+    c, eng = client(TOOL_TURN)
+    r = c.post("/v1/responses", json={"input": "weather?", "tools": R_TOOLS, "instructions": "Be brief."})
+    assert r.status_code == 200, r.text
+    resp = r.json()
+    chat = c.post(
+        "/v1/chat/completions",
+        json={
+            "messages": [{"role": "system", "content": "Be brief."}, {"role": "user", "content": "weather?"}],
+            "tools": TOOLS,
+        },
+    )
+    msg = chat.json()["choices"][0]["message"]
+    assert eng.added[0].prompt_ids == eng.added[1].prompt_ids  # the same prompt
+    reasoning, message, call = resp["output"]
+    assert reasoning["type"] == "reasoning" and reasoning["content"] == [
+        {"type": "reasoning_text", "text": msg["reasoning_content"]}
+    ]
+    assert reasoning["summary"] == [] and "encrypted_content" not in reasoning
+    assert message["type"] == "message" and message["role"] == "assistant" and message["status"] == "completed"
+    assert message["content"] == [{"type": "output_text", "text": msg["content"], "annotations": [], "logprobs": []}]
+    (tc,) = msg["tool_calls"]
+    assert call["type"] == "function_call" and call["name"] == tc["function"]["name"] == "get_weather"
+    assert json.loads(call["arguments"]) == json.loads(tc["function"]["arguments"]) == {"city": "Paris"}
+    assert call["call_id"].startswith("call_") and call["id"].startswith("fc_")
+    assert resp["status"] == "completed" and resp["object"] == "response" and resp["id"].startswith("resp_")
+    assert resp["store"] is False and resp["instructions"] == "Be brief." and resp["incomplete_details"] is None
+    n_prompt = len(eng.added[0].prompt_ids)
+    assert resp["usage"] == {
+        "input_tokens": n_prompt,
+        "input_tokens_details": {"cached_tokens": 2},
+        "output_tokens": len(TOOL_TURN),
+        "output_tokens_details": {"reasoning_tokens": 1},
+        "total_tokens": n_prompt + len(TOOL_TURN),
+    }
+
+
+def test_the_stream_sends_the_responses_events_and_the_same_items(client):
+    c, _ = client(TOOL_TURN)
+    body = {"input": "weather?", "tools": R_TOOLS}
+    whole = c.post("/v1/responses", json=body).json()
+    ev = _sse(c, body)
+    kinds = [e["type"] for e in ev]
+    assert kinds[:2] == ["response.created", "response.in_progress"] and kinds[-1] == "response.completed"
+    assert ev[0]["response"]["status"] == "in_progress" and ev[0]["response"]["output"] == []
+    expected = [
+        "response.output_item.added",
+        "response.reasoning_text.delta",
+        "response.reasoning_text.done",
+        "response.output_item.done",
+        "response.output_item.added",
+        "response.content_part.added",
+        "response.output_text.delta",
+        "response.output_text.done",
+        "response.content_part.done",
+        "response.output_item.done",
+        "response.output_item.added",
+        "response.function_call_arguments.delta",
+        "response.function_call_arguments.done",
+        "response.output_item.done",
+    ]
+    assert [k for k in kinds[2:-1] if not k.endswith(".delta")] == [k for k in expected if not k.endswith(".delta")]
+    final = ev[-1]["response"]
+    assert _strip_ids(final["output"]) == _strip_ids(whole["output"])  # each parse makes its own call id
+    args = "".join(e["delta"] for e in ev if e["type"] == "response.function_call_arguments.delta")
+    assert json.loads(args) == {"city": "Paris"}
+    added = [e["item"] for e in ev if e["type"] == "response.output_item.added"]
+    assert [a["status"] for a in added] == ["in_progress"] * 3
+    assert final["usage"] == whole["usage"]
+
+
+def test_length_is_incomplete(client):
+    c, _ = client(PLAIN)
+    r = c.post("/v1/responses", json={"input": "hi", "max_output_tokens": 2}).json()
+    assert r["status"] == "incomplete" and r["incomplete_details"] == {"reason": "max_output_tokens"}
+    assert r["usage"]["output_tokens"] == 2
+    ev = _sse(c, {"input": "hi", "max_output_tokens": 2})
+    assert ev[-1]["type"] == "response.incomplete" and ev[-1]["response"]["status"] == "incomplete"
+
+
+def test_a_reasoning_summary_and_encrypted_content_mirror_the_reasoning(client):
+    """reasoning.summary mirrors the reasoning into a summary part (as SGLang does: there is no summarizer), streamed
+    as reasoning_summary events; include reasoning.encrypted_content returns the reasoning text there, for a stateless
+    client to send back."""
+    c, _ = client(TOOL_TURN)
+    body = {
+        "input": "weather?",
+        "tools": R_TOOLS,
+        "reasoning": {"summary": "auto"},
+        "include": ["reasoning.encrypted_content"],
+    }
+    item = c.post("/v1/responses", json=body).json()["output"][0]
+    assert item["summary"] == [{"type": "summary_text", "text": "The user wants weather."}]
+    assert item["encrypted_content"] == "The user wants weather."
+    kinds = [e["type"] for e in _sse(c, body)]
+    assert "response.reasoning_summary_text.delta" in kinds and "response.reasoning_text.delta" not in kinds
+    assert "response.reasoning_summary_part.added" in kinds and "response.reasoning_summary_part.done" in kinds
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"store": True},
+        {"previous_response_id": "resp_1"},
+        {"background": True},
+        {"truncation": "auto"},
+        {"include": ["file_search_call.results"]},
+        {"text": {"format": {"type": "json_schema", "name": "x", "schema": {}}}},
+        {"tools": [{"type": "web_search"}]},
+        {"tool_choice": "required"},
+        {"tool_choice": {"type": "function", "name": "get_weather"}},
+        {"top_logprobs": 2},
+        {"max_tool_calls": 1},
+        {"n": 2},
+        {"max_tokens": 5},
+        {"messages": []},
+        {"reasoning": {"effort": "medium"}},
+        {"reasoning": {"summary": "long"}},
+        {"input": [{"role": "user", "content": [{"type": "input_image", "image_url": "x"}]}]},
+        {"input": [{"type": "item_reference", "id": "x"}]},
+        {"input": []},
+        {"input": 3},
+        {"stream": "yes"},
+    ],
+    ids=repr,
+)
+def test_what_cannot_be_served_is_refused(client, extra):
+    c, eng = client(PLAIN)
+    r = c.post("/v1/responses", json={"input": "hi", "tools": R_TOOLS, **extra})
+    assert r.status_code == 400, r.text
+    assert eng.added == []
+
+
+def test_neutral_fields_are_served(client):
+    """What an OpenAI SDK may send by default, or a stateless agent harness always sends."""
+    c, _ = client(PLAIN)
+    body = {
+        "input": "hi",
+        "store": False,
+        "truncation": "disabled",
+        "text": {"format": {"type": "text"}},
+        "include": [],
+        "tool_choice": "auto",
+        "parallel_tool_calls": True,
+        "metadata": {"k": "v"},
+        "user": "u-1",
+        "service_tier": "auto",
+        "top_logprobs": 0,
+        "prompt_cache_key": "conversation-1",
+    }
+    r = c.post("/v1/responses", json=body)
+    assert r.status_code == 200, r.text
+    assert r.json()["metadata"] == {"k": "v"}
+
+
+def test_stored_responses_are_not_found(client):
+    c, _ = client(PLAIN)
+    for method, path in (("GET", "/v1/responses/resp_1"), ("DELETE", "/v1/responses/resp_1")):
+        assert c.request(method, path).status_code == 404
+    assert c.post("/v1/responses/resp_1/cancel").status_code == 404
+
+
+def test_input_items_become_the_chat_messages():
+    """An assistant turn's items (reasoning, its message, its calls) join into one assistant message; a call's output
+    becomes a tool message; text parts join."""
+    from trnrt.serve.responses import input_messages
+
+    body = {
+        "instructions": "sys",
+        "input": [
+            {"role": "developer", "content": "dev"},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "a"}, {"text": "b"}]},
+            {"type": "reasoning", "summary": [], "content": [{"type": "reasoning_text", "text": "think"}]},
+            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "ok"}]},
+            {"type": "function_call", "call_id": "call_1", "name": "f", "arguments": '{"x": 1}'},
+            {"type": "function_call", "call_id": "call_2", "name": "g", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_1", "output": "r1"},
+            {"type": "function_call_output", "call_id": "call_2", "output": [{"type": "input_text", "text": "r2"}]},
+            {"type": "reasoning", "encrypted_content": "again"},
+            {"role": "assistant", "content": "done"},
+        ],
+    }
+    with pytest.raises(Exception, match="not supported"):  # a part without a type is not text
+        input_messages(body)
+    body["input"][1]["content"][1]["type"] = "input_text"
+    assert input_messages(body) == [
+        {"role": "system", "content": "sys"},
+        {"role": "developer", "content": "dev"},
+        {"role": "user", "content": "ab"},
+        {
+            "role": "assistant",
+            "content": "ok",
+            "reasoning_content": "think",
+            "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {"name": "f", "arguments": '{"x": 1}'}},
+                {"id": "call_2", "type": "function", "function": {"name": "g", "arguments": "{}"}},
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "r1"},
+        {"role": "tool", "tool_call_id": "call_2", "content": "r2"},
+        {"role": "assistant", "content": "done", "reasoning_content": "again"},
+    ]
+
+
+def _two_calls(eng) -> None:
+    """The turn calls the tool twice, a newline between the calls (an added token of the stand-in tokenizer)."""
+    eng.tokenizer.add_tokens(["\n"])
+    nl = eng.tokenizer.convert_tokens_to_ids("\n")
+    eng.script = [*TOOL_TURN, nl, *TOOL_TURN[3:]]
+
+
+def test_whitespace_between_two_calls_opens_no_message_item(client):
+    """The newline between two calls is content to the parser; streamed, it opens no message item, so the streamed
+    items are the non-streamed ones (where parse_full strips it)."""
+    c, _ = client(TOOL_TURN, _two_calls)
+    body = {"input": "weather?", "tools": R_TOOLS}
+    whole = c.post("/v1/responses", json=body).json()["output"]
+    assert [it["type"] for it in whole] == ["reasoning", "message", "function_call", "function_call"]
+    final = _sse(c, body)[-1]["response"]["output"]
+    assert _strip_ids(final) == _strip_ids(whole)
