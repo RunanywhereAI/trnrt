@@ -145,7 +145,8 @@ splits them. Streamed, the events are Anthropic's: `message_start`, each block's
 
 Errors use Anthropic's shape, `{"type": "error", "error": {"type": "invalid_request_error", "message": ...}}`. Refused
 with 400: `thinking` `{"type": "disabled"}` (the template cannot turn reasoning off), `{"type": "enabled"}` with
-`budget_tokens` (a thinking budget, which no served graph enforces), `tool_choice` `any` and `tool` (guided decoding),
+`budget_tokens` on an engine started without `--structured-outputs` (with it, the budget is enforced as
+`thinking_token_budget`), `tool_choice` `any` and `tool` (a tool-call grammar for GLM's format is not built),
 image and document blocks, `redacted_thinking`, server tools, `mcp_servers`, `container` and `context_management`.
 
 ## Tokenize and detokenize
