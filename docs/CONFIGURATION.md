@@ -114,6 +114,32 @@ other than a preset's changes the graphs and needs its own capture. The `mtp-*` 
 which changes the kernels' DMA form. A speculative engine serves temperature and top-p sampling as the plain engine does (verification
 is the rejection sampler's, so the output distribution is unchanged), and refuses the requests the plain engine refuses.
 
+## Structured outputs, penalties and thinking budgets
+
+These need graphs that take inputs from the host, so an engine serves them only when started with the flag. Each flag adds
+graphs to warmup and to the capture: capture with the flags you serve with. With both off, every graph is the one an
+engine without them compiles. They are refused with speculation at every batch size (`mtp-always`): its verify graph
+takes no mask or penalties. Under the other `mtp-*` presets the engine steps every request plain while one that uses
+them runs.
+
+| Argument | Default | |
+|---|---|---|
+| `--structured-outputs` | off | guided decoding (needs the `xgrammar` package: `pip install 'trnrt[grammar]'`), `thinking_token_budget` and `min_tokens`: decode and prefill graphs that take a token mask |
+| `--penalties` | off | repetition, frequency and presence penalties: decode and prefill graphs that take penalty inputs |
+| `--penalty-buckets` | 1024,16384 | with `--penalties`: the distinct-token counts per request the penalty graphs are compiled at; the vocabulary size is always added as the last |
+
+Graphs each flag adds (decode graphs at the plain decode buckets times the page buckets; prefill graphs are the sampling
+step only, one per prefill bucket):
+
+| Configuration | `--structured-outputs` | `--penalties` (3 rungs) | both |
+|---|---|---|---|
+| default (batch 12) | 18 decode, 4 prefill | 54 decode, 12 prefill | 72 decode, 16 prefill |
+| `--preset batch8` | 15 decode, 4 prefill | 45 decode, 12 prefill | 60 decode, 16 prefill |
+| `mtp-batch8`, `mtp-batch12` | 9 decode, 4 prefill | 27 decode, 12 prefill | 36 decode, 16 prefill |
+| `mtp-batch24` | 6 decode, 4 prefill | 18 decode, 12 prefill | 24 decode, 16 prefill |
+
+These counts follow from the bucket ladders; the variants' device cost (compile time, HBM, step time) is not measured yet.
+
 ## Supported scope
 
 The supported configurations are the default (batch 12), `--preset batch8`, the four `mtp-*` presets, and any of them
