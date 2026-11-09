@@ -50,6 +50,10 @@ The tree is text-level, like SGLang's router, so it needs no tokenizer; it is pr
 evicting least-recently-used leaves (128M characters: above 32 sessions of a 1M-token context's ~4 MB of text, so long
 sessions' prefixes are not evicted under load).
 
+The Responses API's and the Messages API's requests (/v1/responses, /v1/messages) carry a conversation as a chat's do:
+its instructions or system part leads it as its system messages, so they are routed by session and prefix the same way
+(_conversation). /v1/messages/count_tokens, like /tokenize, goes to any live worker and touches no routing state.
+
 The router's own endpoints:
 - GET /health: 200 {"status": "ok"} while every worker is up; 200 {"status": "degraded"} while some are (requests and
   sessions go to the live ones, so a load balancer in front keeps sending); 503 {"status": "down"} once none is. Each
@@ -86,10 +90,12 @@ SESSION_FIELD = "session_id"  # the request body field naming the session (serve
 # without it.
 LOG_SESSIONS_ENV = "TRNRT_ROUTER_LOG_SESSIONS"
 SESSION_KEY_CHARS = 4096
-ROUTES = ("/v1/completions", "/v1/chat/completions")
+# The generation routes: each carries a conversation (a chat's messages, a Responses request's instructions and input, a
+# Messages request's system and messages; _conversation) or a prompt, routed by its session or its prefix.
+ROUTES = ("/v1/completions", "/v1/chat/completions", "/v1/responses", "/v1/messages")
 # Every worker answers these the same (one model, one tokenizer), so they go to the least loaded live worker and touch
 # no prefix tree and no session: a /tokenize of an agent's context must not steer where its next turn is routed.
-STATELESS_ROUTES = ("/tokenize", "/v1/tokenize", "/detokenize", "/v1/detokenize")
+STATELESS_ROUTES = ("/tokenize", "/v1/tokenize", "/detokenize", "/v1/detokenize", "/v1/messages/count_tokens")
 
 
 class _Node:
@@ -463,12 +469,29 @@ def _leading_system(msgs: list) -> int:
     return k
 
 
+def _conversation(path: str, body: dict) -> list | None:
+    """A request's conversation as a list of chat-like messages (the system part first), None for a prompt. The
+    Responses API's instructions and Anthropic's system lead as a system message, so each API's conversation grows at
+    its end like a chat's and its system part is the shared head."""
+    if path.endswith("chat/completions"):
+        return body.get("messages", [])
+    if path.endswith("/responses"):
+        ins, inp = body.get("instructions"), body.get("input")
+        head = [{"role": "system", "content": ins}] if ins else []
+        return head + (inp if isinstance(inp, list) else [{"role": "user", "content": inp}] if inp else [])
+    if path.endswith("/messages"):
+        system, msgs = body.get("system"), body.get("messages")
+        head = [{"role": "system", "content": system}] if system else []
+        return head + (msgs if isinstance(msgs, list) else [])
+    return None
+
+
 def _request_head(path: str, body: dict) -> int:
-    """The length of _request_text's prefix through a chat request's leading system messages (0 for a prompt): the part
+    """The length of _request_text's prefix through a conversation's leading system messages (0 for a prompt): the part
     every session of one client shares (its instructions, environment and file tree)."""
-    if not path.endswith("chat/completions"):
+    msgs = _conversation(path, body)
+    if not msgs or not isinstance(msgs, list):
         return 0
-    msgs = body.get("messages") or []
     k = _leading_system(msgs)
     return len(json.dumps(msgs[:k], ensure_ascii=False)) - 1 if k else 0  # "[A, B" is a prefix of "[A, B, C]"
 
@@ -480,10 +503,11 @@ def _session_key(path: str, body: dict) -> tuple[str, str]:
     under another system prompt (a title or summary request), first_hash under another conversation start (a
     compaction). No dump of the whole request (~1 MB at 200K tokens)."""
     h = lambda b: hashlib.sha1(b.encode("utf-8", "replace"), usedforsecurity=False).hexdigest()  # noqa: E731
-    if not path.endswith("chat/completions"):
+    msgs = _conversation(path, body)
+    if msgs is None:
         p = body.get("prompt", "")
         return h(""), h((p if isinstance(p, str) else json.dumps(p))[:SESSION_KEY_CHARS])
-    msgs = body.get("messages") or []
+    msgs = msgs if isinstance(msgs, list) else []
     k = _leading_system(msgs)
     first = msgs[k] if k < len(msgs) and isinstance(msgs[k], dict) else {}
     c = first.get("content")
@@ -492,8 +516,9 @@ def _session_key(path: str, body: dict) -> tuple[str, str]:
 
 
 def _request_text(path: str, body: dict) -> str:
-    if path.endswith("chat/completions"):
-        return json.dumps(body.get("messages", []), ensure_ascii=False)
+    msgs = _conversation(path, body)
+    if msgs is not None:
+        return json.dumps(msgs, ensure_ascii=False)
     p = body.get("prompt", "")
     return p if isinstance(p, str) else json.dumps(p)
 
