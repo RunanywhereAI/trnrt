@@ -6,8 +6,14 @@
 - POST /v1/completions: a prompt as text or token ids, through the same generation path;
 - GET /v1/models;
 - GET /health: 200 while the engine can serve, 503 with the reason once it cannot;
-- GET /v1/stats: the KV-cache gauges the router (serve/router.py) uses to break ties between engines;
+- GET /v1/stats: the KV-cache gauges the router (serve/router.py) uses to break ties between engines, the engine's live
+  state, and request rates and latency percentiles over recent windows (serve/stats.py);
+- GET /dashboard: a page drawing /v1/stats (serve/dashboard.py);
 - GET /metrics: Prometheus counters and histograms (trnrt/metrics.py).
+
+TRNRT_PROD_DIR keeps each finished request's record and the gauges on disk (serve/prodlog.py), and
+TRNRT_PROMPT_CACHE_MB builds a chat turn's prompt ids from the previous turn's (serve/prompt_cache.py); both are off
+unless set.
 
 A request may carry a `session_id` (a string): the engine keeps that session's prefix referenced in its prefix cache,
 and the router pins the session to one engine.
@@ -23,6 +29,7 @@ import asyncio
 import atexit
 import contextlib
 import copy
+import dataclasses
 import functools
 import json
 import logging
@@ -43,12 +50,16 @@ from typing import TYPE_CHECKING, cast
 
 from fastapi import FastAPI, HTTPException
 from fastapi import Request as HTTPRequest
-from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response, StreamingResponse
 
 from ..engine.request import Request, SamplingParams, Status
 from ..engine.scheduler import QueueFull
 from ..metrics import Metrics, kv_pages, spec_stats
+from .dashboard import PAGE as DASHBOARD_PAGE
 from .parsers import THINK_OPEN, StreamParser, chat_finish_reason, parse_full, template_messages, tool_choice_error
+from .prodlog import ProdLog
+from .prompt_cache import PromptCache
+from .stats import Stats
 
 if TYPE_CHECKING:  # only annotations: importing this module does not load the engine and its model code
     from ..engine.engine import LLMEngine
@@ -64,6 +75,8 @@ class _Stream:
     loop: asyncio.AbstractEventLoop
     out: asyncio.Queue
     sent: int = 0
+    stream: bool = False  # the HTTP response streams (GET /v1/stats's records)
+    at_arrival: tuple[int, int] | None = None  # (running, waiting) when the engine took it
 
 
 @dataclass
@@ -82,6 +95,7 @@ class _Submit:
     session_id: str | None = None
     priority: int | None = None
     out: asyncio.Queue = field(default_factory=asyncio.Queue)
+    stream: bool = False
 
 
 # Set on a 503 that answers a full waiting queue (scheduler.QueueFull) or a request displaced from it: the engine is
@@ -123,8 +137,18 @@ class EngineLoop:
     """Owns the engine: one thread runs its step loop and is the only one that touches it. Handlers hand it requests
     and aborts through `inbox`; it hands each request's tokens to that request's asyncio queue after every step."""
 
-    def __init__(self, engine: LLMEngine):
+    def __init__(self, engine: LLMEngine, name: str = "engine"):
         self.engine = engine
+        # GET /v1/stats and /dashboard (serve/stats.py), and with TRNRT_PROD_DIR the production log (serve/prodlog.py),
+        # under `name`, this engine's own directory. Fed on this loop's thread through _hook, which never raises.
+        self.stats = Stats()
+        self.stats.kv = lambda: kv_pages(engine)
+        self.stats_errors = 0
+        self._stats_err_t = float("-inf")
+        self.prodlog = ProdLog.from_env(name, self.stats)
+        if self.prodlog is not None:
+            prodlog = self.prodlog
+            self.stats.on_bucket = lambda g: prodlog.put("gauges", g)
         self._stopping = threading.Event()
         self.metrics = Metrics()
         self.vocab = engine.mcfg.vocab_size  # the embedding's rows: a prompt id outside them fails the step
@@ -153,6 +177,8 @@ class EngineLoop:
             self.thread.join(wait)
             if self.thread.is_alive():
                 logger.warning("trnrt: the engine thread did not stop within %.0f s; closing the engine anyway", wait)
+        if self.prodlog is not None:
+            self.prodlog.close()
 
     def health_error(self) -> str | None:
         """Why the engine cannot serve, or None. A worker that died while this loop waits in a step (a device collective
@@ -174,7 +200,12 @@ class EngineLoop:
             self.inbox.put((kind, payload))
 
     def submit(
-        self, prompt_ids: list[int], params: SamplingParams, session_id: str | None = None, priority: int | None = None
+        self,
+        prompt_ids: list[int],
+        params: SamplingParams,
+        session_id: str | None = None,
+        priority: int | None = None,
+        stream: bool = False,
     ) -> _Submit:
         # Checked here, before the engine sees the request: an id outside the vocabulary fails the step, and at tp > 1
         # one failed step fails the engine for every request (_fail).
@@ -185,11 +216,37 @@ class EngineLoop:
         if session_id is not None and not isinstance(session_id, str):
             raise HTTPException(status_code=400, detail="session_id must be a string")
         sub = _Submit(uuid.uuid4().hex, prompt_ids, params, asyncio.get_running_loop(), session_id, priority)
+        sub.stream = stream
         self._put("add", sub)
         return sub
 
     def abort(self, rid: str) -> None:
         self.inbox.put(("abort", rid))
+
+    def _hook(self, fn, *args) -> None:
+        """Run a statistics or recording hook on the engine thread: an exception is counted and logged (at most once a
+        minute), never raised, so recording cannot stop serving (GET /v1/stats shows the count as stats_errors)."""
+        try:
+            fn(*args)
+        except Exception:  # the statistics must never fail a step or a request
+            self.stats_errors += 1
+            now = time.monotonic()
+            if now - self._stats_err_t >= 60:
+                self._stats_err_t = now
+                logger.exception("trnrt: a statistics hook failed (%d so far)", self.stats_errors)
+
+    def _tick(self, tokens: int) -> None:
+        s = self.engine.scheduler
+        self._hook(self.stats.tick, time.monotonic(), tokens, len(s.running), len(s.waiting))
+
+    def _finished(self, st: _Stream, finish: str | None = None) -> None:
+        """A request's end: its record into the live statistics and the production log (O(1), never blocks)."""
+        self._hook(self._finished_hook, st, finish)
+
+    def _finished_hook(self, st: _Stream, finish: str | None) -> None:
+        rec = self.stats.record(st.req, st.stream, st.at_arrival, finish)
+        if self.prodlog is not None:
+            self.prodlog.put("requests", rec)
 
     def _drain(self, block: bool) -> None:
         try:
@@ -202,24 +259,30 @@ class EngineLoop:
                 post = payload.loop.call_soon_threadsafe
                 # priority only when sent: an engine without priority scheduling refuses any value (LLMEngine.add_request)
                 extra = {} if payload.priority is None else {"priority": payload.priority}
+                sch = self.engine.scheduler
+                at_arrival = (len(sch.running), len(sch.waiting))
                 try:
                     req = self.engine.add_request(
                         payload.prompt_ids, payload.params, rid=payload.rid, session_id=payload.session_id, **extra
                     )
                 except QueueFull as e:
                     post(payload.out.put_nowait, ("error", str(e), 503, True))
+                    self._hook(self.stats.failed, "queue_full")
                 except ValueError as e:
                     post(payload.out.put_nowait, ("error", str(e), 400))
+                    self._hook(self.stats.failed, "refused")
                 except Exception as e:  # noqa: BLE001  add_request raised before the request reached the scheduler
                     traceback.print_exc()  # (its last step): that request fails, the engine keeps serving
                     post(payload.out.put_nowait, ("error", f"request refused: {e!r}", 500))
+                    self._hook(self.stats.failed, "error")
                 else:
-                    self.streams[payload.rid] = _Stream(req, payload.loop, payload.out)
+                    self.streams[payload.rid] = _Stream(req, payload.loop, payload.out, 0, payload.stream, at_arrival)
                     post(payload.out.put_nowait, ("accepted", req))
             elif kind == "abort":
                 st = self.streams.pop(payload, None)
                 if st is not None and st.req.status is not Status.FINISHED:
                     self.engine.abort(st.req)
+                    self._finished(st, "abort")
             # "wake": nothing to do, the loop re-checks whether it is stopping
             try:
                 item = self.inbox.get_nowait()
@@ -275,6 +338,7 @@ class EngineLoop:
         streams, self.streams = self.streams, {}
         for st in streams.values():
             st.loop.call_soon_threadsafe(st.out.put_nowait, ("error", f"engine failed: {reason}", 503))
+            self._hook(self.stats.failed, "engine")
         while True:
             try:
                 kind, payload = self.inbox.get_nowait()
@@ -292,6 +356,7 @@ class EngineLoop:
             self._drain(block=not self.engine.has_work())
             if not self.engine.has_work():
                 self._read_local_k()
+                self._tick(0)
                 continue
             self._local_k_stale = True
             try:
@@ -307,8 +372,10 @@ class EngineLoop:
                     st.loop.call_soon_threadsafe(st.out.put_nowait, ("error", f"engine step failed: {e}", 500))
                     if st.req.status is not Status.FINISHED:
                         self.engine.abort(st.req)
+                    self._hook(self.stats.failed, "engine")
                 self.streams.clear()
                 continue
+            handed = 0  # output tokens handed out by this step (GET /v1/stats: the aggregate output tok/s)
             batch: dict = {}  # one cross-thread call per event loop and step, not one per stream
             for rid, st in list(self.streams.items()):
                 req = st.req
@@ -320,9 +387,11 @@ class EngineLoop:
                 if finished and req.error is not None:  # ended unserved: displaced from a full queue
                     batch.setdefault(st.loop, []).append((st.out, ("error", req.error[1], req.error[0], True)))
                     del self.streams[rid]
+                    self._hook(self.stats.failed, "displaced")
                     continue
                 if ready > st.sent or finished:
                     new = out[st.sent : ready]
+                    handed += len(new)
                     lps = req.logprobs[st.sent : ready] if with_lp else None
                     st.sent = ready
                     batch.setdefault(st.loop, []).append(
@@ -331,8 +400,10 @@ class EngineLoop:
                 if finished:
                     del self.streams[rid]
                     self.metrics.on_finish(req)
+                    self._finished(st)
             for loop, items in batch.items():
                 loop.call_soon_threadsafe(_deliver, items)
+            self._tick(handed)
 
 
 def _deliver(items) -> None:
@@ -719,10 +790,25 @@ def template_kwargs(tok, body: dict) -> tuple[dict, bool | None]:
     return kw, thinking
 
 
-def chat_prompt(tok, body: dict) -> tuple[list[int], dict]:
+def _cached_ids(tok, messages: list, kwargs: dict, cache: PromptCache, session) -> list[int]:
+    """_template_ids through the prompt token cache: the template renders the text, and the cache encodes it from the
+    session's (or the same system prompt's) previous text, giving the ids _template_ids would (or, on an audit that
+    finds otherwise, those ids, and the cache turns itself off)."""
+    import jinja2
+
+    try:
+        text = tok.apply_chat_template(messages, add_generation_prompt=True, tokenize=False, **kwargs)
+    except jinja2.TemplateError as e:
+        raise _bad(f"the chat template refused the messages: {e}") from None
+    key = session if isinstance(session, str) else None
+    return cache.encode(text, key, served=lambda: _template_ids(tok, messages, kwargs))
+
+
+def chat_prompt(tok, body: dict, cache: PromptCache | None = None) -> tuple[list[int], dict]:
     """A /v1/chat/completions request's prompt ids, rendered by the model's chat template from its messages (assistant
     tool_calls arguments as objects: parsers.template_messages), and the StreamParser / parse_full arguments its output
-    is parsed with. HTTPException 400 on a malformed request."""
+    is parsed with. HTTPException 400 on a malformed request. With `cache` (TRNRT_PROMPT_CACHE_MB) the ids come through
+    the prompt token cache, the same ids."""
     messages = body.get("messages")
     if not messages:
         raise HTTPException(status_code=400, detail="messages is required")
@@ -738,7 +824,10 @@ def chat_prompt(tok, body: dict) -> tuple[list[int], dict]:
     tools = body.get("tools") if tool_choice != "none" else None
     if tools:
         kwargs["tools"] = tools
-    ids = _template_ids(tok, messages, kwargs)
+    if cache is not None and cache.off is None:
+        ids = _cached_ids(tok, messages, kwargs, cache, body.get("session_id"))
+    else:
+        ids = _template_ids(tok, messages, kwargs)
     # With thinking on, the template opens the reasoning block in the prompt and the output starts inside it; with
     # thinking off it closes the block there, and the output starts with the answer.
     tail = tok.decode(ids[-4:]).rstrip()
@@ -795,15 +884,20 @@ async def _unless_disconnected(http: HTTPRequest, aw):
     return task.result()
 
 
-def build_app(engine: LLMEngine, model_name: str) -> FastAPI:
+def build_app(engine: LLMEngine, model_name: str, name: str = "engine") -> FastAPI:
+    """The engine's API. `name` names its directory in the production log (TRNRT_PROD_DIR): `serve` gives each engine
+    its own, by port."""
     app = FastAPI(title="TrnRT")
-    loop_ = EngineLoop(engine)
+    loop_ = EngineLoop(engine, name)
     tok = engine.tokenizer
     # A chat request's prompt is rendered and tokenized on one worker thread with its own tokenizer, not on the event
     # loop: GLM-5.3-Flash's template takes tens of milliseconds at 100K tokens, which would stall every other request's
     # stream, and two threads in one Hugging Face fast tokenizer can raise "Already borrowed".
     prompt_pool = ThreadPoolExecutor(1, thread_name_prefix="trnrt-prompt")
     prompt_tok = copy.deepcopy(tok)
+    # TRNRT_PROMPT_CACHE_MB (serve/prompt_cache.py): a chat prompt's ids from the previous turn's; used on prompt_pool's
+    # thread only, by the chat endpoint (/tokenize renders without it)
+    prompt_cache = PromptCache.from_env(prompt_tok)
     gen_defaults = generation_defaults(getattr(engine, "model_path", None))
     if gen_defaults:
         logger.info("trnrt: sampling defaults from the checkpoint's generation_config.json: %s", gen_defaults)
@@ -815,15 +909,44 @@ def build_app(engine: LLMEngine, model_name: str) -> FastAPI:
             return JSONResponse(status_code=503, content={"status": "failed", "error": err})
         return {"status": "ok"}
 
-    @app.get("/v1/stats")
-    async def stats():
-        """The router's tie-break between engines: KV pages in use and usable (metrics.kv_pages)."""
+    def live_gauges() -> dict:
+        """GET /v1/stats's live state. kv_pages_used and kv_pages_total are the router's tie-break between engines
+        (metrics.kv_pages); the rest is the scheduler, the speculation, the scheduling settings, the prompt token cache
+        and the production log. Read without the engine thread: counts and settings only, nothing changed."""
         used, total = kv_pages(engine)
         gauges: dict = {"kv_pages_used": used, "kv_pages_total": total}
         spec = spec_stats(engine)
         if spec is not None:
             gauges["spec"] = spec
-        return {"gauges": gauges}
+        s, cfg = engine.scheduler, engine.cfg
+        sch = getattr(engine, "scheduling", None)
+        gauges.update(
+            running=len(s.running),
+            waiting=len(s.waiting),
+            seats=getattr(cfg, "max_num_seqs", None),
+            cap=getattr(cfg, "max_running", None),
+            kv_used_pct=100.0 * used / total if total else None,
+            preemptions=getattr(s, "num_preemptions", 0),
+            model=model_name,
+            max_model_len=cfg.max_model_len,
+            tp=cfg.tp,
+            scheduling=dataclasses.asdict(sch) if sch is not None else None,
+            prompt_cache=prompt_cache.stats() if prompt_cache is not None else {"on": False},
+            prod=loop_.prodlog.status() if loop_.prodlog is not None else {"on": False},
+            stats_errors=loop_.stats_errors,
+        )
+        return gauges
+
+    @app.get("/v1/stats")
+    async def stats():
+        """The live gauges, and request rates and percentiles over recent windows, a 30-minute series and the recent
+        requests (serve/stats.py), computed in a worker thread: sorting up to stats.RING records must not hold the
+        event loop that delivers every stream's tokens."""
+        return JSONResponse(await asyncio.to_thread(loop_.stats.snapshot, live_gauges()))
+
+    @app.get("/dashboard")
+    async def dashboard():
+        return HTMLResponse(DASHBOARD_PAGE)
 
     @app.get("/metrics")
     async def metrics():
@@ -847,7 +970,7 @@ def build_app(engine: LLMEngine, model_name: str) -> FastAPI:
         include_usage = isinstance(opts, dict) and _flag(opts, "include_usage")
         # SGLang's per-request priority (engine/scheduler.py); an engine without priority scheduling refuses it (400)
         priority = _int(body, "priority", None, -_INT64_MAX - 1)
-        sub = loop_.submit(prompt_ids, params, body.get("session_id"), priority)
+        sub = loop_.submit(prompt_ids, params, body.get("session_id"), priority, stream=stream)
         # Admission errors (a prompt that does not fit, an unsupported parameter, a full queue) arrive before any token:
         # surface them as HTTP status codes rather than inside a 200 stream.
         first = await sub.out.get()
@@ -1033,7 +1156,9 @@ def build_app(engine: LLMEngine, model_name: str) -> FastAPI:
     @app.post("/v1/chat/completions")
     async def chat(http: HTTPRequest):
         body = await _body(http)
-        ids, parse = await asyncio.get_running_loop().run_in_executor(prompt_pool, chat_prompt, prompt_tok, body)
+        ids, parse = await asyncio.get_running_loop().run_in_executor(
+            prompt_pool, chat_prompt, prompt_tok, body, prompt_cache
+        )
         # max_tokens defaults to the rest of the context (vLLM's default): reasoning at the template's default effort
         # (Max) can run long, and a smaller hidden default would cut the answer off
         room = max(engine.cfg.max_model_len - len(ids), 1)
