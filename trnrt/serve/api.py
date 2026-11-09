@@ -7,7 +7,9 @@
 - GET /v1/models;
 - GET /health: 200 while the engine can serve, 503 with the reason once it cannot;
 - GET /v1/stats: the KV-cache gauges the router (serve/router.py) uses to break ties between engines;
-- GET /metrics: Prometheus counters and histograms (trnrt/metrics.py).
+- GET /metrics: Prometheus counters and histograms (trnrt/metrics.py);
+- SGLang's native API (serve/native.py): POST /generate, the info endpoints /model_info and /server_info, /get_load,
+  /health_generate, /abort_request and /flush_cache.
 
 A request may carry a `session_id` (a string): the engine keeps that session's prefix referenced in its prefix cache,
 and the router pins the session to one engine.
@@ -63,6 +65,7 @@ class _Stream:
     loop: asyncio.AbstractEventLoop
     out: asyncio.Queue
     sent: int = 0
+    metrics: bool = True  # counted in /metrics when it finishes (a /health_generate probe is not)
 
 
 @dataclass
@@ -70,7 +73,8 @@ class _Submit:
     """A request on its way to the engine thread. `out` receives, in order: ("accepted", Request), or ("error", why,
     HTTP status) if it was not accepted; then ("tokens", new ids, finish reason or None, their logprobs or None) until
     the finish reason is set, or ("error", why, HTTP status) if the engine fails. The status is 400 for a request the
-    engine refuses, 500 for an internal error that leaves the engine serving and 503 once the engine has failed."""
+    engine refuses, 500 for an internal error that leaves the engine serving and 503 once the engine has failed. An
+    aborted request (EngineLoop.abort, abort_all) ends with ("tokens", its undelivered ids, "abort", their logprobs)."""
 
     rid: str
     prompt_ids: list[int]
@@ -78,6 +82,22 @@ class _Submit:
     loop: asyncio.AbstractEventLoop
     session_id: str | None = None
     out: asyncio.Queue = field(default_factory=asyncio.Queue)
+    metrics: bool = True
+
+
+@dataclass
+class _Flush:
+    """A /flush_cache on its way to the engine thread, which answers `fut` with (flushed, message): at once when the
+    engine is idle, else once it is idle, or with a refusal past `deadline` (time.monotonic())."""
+
+    deadline: float
+    loop: asyncio.AbstractEventLoop
+    fut: asyncio.Future
+
+
+def _resolve(fut: asyncio.Future, value) -> None:
+    if not fut.done():  # its handler may have been cancelled (the client went away)
+        fut.set_result(value)
 
 
 # Engine loops of this process, held weakly: at exit each loop's thread stops after its step, then its engine closes
@@ -129,6 +149,10 @@ class EngineLoop:
         # the engine has them at all (an engine without context-parallel row groups has none).
         self._local_k_stale = True
         self._local_k_none = False
+        # time.monotonic() at the end of the last step that ran (/health_generate: a step that ends after a probe was
+        # sent shows the engine is serving), and the /flush_cache waiting for the engine to be idle, if any.
+        self.last_step = 0.0
+        self._flush: _Flush | None = None
         self.thread = threading.Thread(target=self._run, name="trnrt-engine", daemon=True)
         self.thread.start()
         if engine.cfg.tp > 1:
@@ -164,7 +188,16 @@ class EngineLoop:
                 raise HTTPException(status_code=503, detail=f"engine failed: {err}")
             self.inbox.put((kind, payload))
 
-    def submit(self, prompt_ids: list[int], params: SamplingParams, session_id: str | None = None) -> _Submit:
+    def submit(
+        self,
+        prompt_ids: list[int],
+        params: SamplingParams,
+        session_id: str | None = None,
+        rid: str | None = None,
+        metrics: bool = True,
+    ) -> _Submit:
+        """Queue a request for the engine thread. `rid`: the client's request id (SGLang's), which /abort_request
+        names; a new one when None. `metrics`: whether /metrics counts it."""
         # Checked here, before the engine sees the request: an id outside the vocabulary fails the step, and at tp > 1
         # one failed step fails the engine for every request (_fail).
         if not prompt_ids or not all(type(t) is int and 0 <= t < self.vocab for t in prompt_ids):
@@ -173,12 +206,28 @@ class EngineLoop:
             )
         if session_id is not None and not isinstance(session_id, str):
             raise HTTPException(status_code=400, detail="session_id must be a string")
-        sub = _Submit(uuid.uuid4().hex, prompt_ids, params, asyncio.get_running_loop(), session_id)
+        if rid is not None and not (isinstance(rid, str) and rid):
+            raise HTTPException(status_code=400, detail="rid must be a non-empty string")
+        sub = _Submit(
+            rid or uuid.uuid4().hex, prompt_ids, params, asyncio.get_running_loop(), session_id, metrics=metrics
+        )
         self._put("add", sub)
         return sub
 
     def abort(self, rid: str) -> None:
         self.inbox.put(("abort", rid))
+
+    def abort_all(self) -> None:
+        """Abort every request the engine holds, and those queued for it before this call."""
+        self.inbox.put(("abort_all", None))
+
+    def flush(self, timeout_s: float) -> _Flush:
+        """Ask the engine thread to drop its prefix cache (LLMEngine.flush_cache) once it is idle, waiting up to
+        `timeout_s` for that (SGLang's /flush_cache: 0 flushes only an engine idle when the request arrives)."""
+        loop = asyncio.get_running_loop()
+        f = _Flush(time.monotonic() + timeout_s, loop, loop.create_future())
+        self._put("flush", f)
+        return f
 
     def _drain(self, block: bool) -> None:
         try:
@@ -188,28 +237,83 @@ class EngineLoop:
         while True:
             kind, payload = item
             if kind == "add":
-                post = payload.loop.call_soon_threadsafe
-                try:
-                    req = self.engine.add_request(
-                        payload.prompt_ids, payload.params, rid=payload.rid, session_id=payload.session_id
-                    )
-                except ValueError as e:
-                    post(payload.out.put_nowait, ("error", str(e), 400))
-                except Exception as e:  # noqa: BLE001  add_request raised before the request reached the scheduler
-                    traceback.print_exc()  # (its last step): that request fails, the engine keeps serving
-                    post(payload.out.put_nowait, ("error", f"request refused: {e!r}", 500))
-                else:
-                    self.streams[payload.rid] = _Stream(req, payload.loop, payload.out)
-                    post(payload.out.put_nowait, ("accepted", req))
+                self._add(payload)
             elif kind == "abort":
                 st = self.streams.pop(payload, None)
-                if st is not None and st.req.status is not Status.FINISHED:
-                    self.engine.abort(st.req)
+                if st is not None:
+                    self._abort(st)
+            elif kind == "abort_all":
+                streams, self.streams = self.streams, {}
+                for st in streams.values():
+                    self._abort(st)
+            elif kind == "flush":
+                self._start_flush(payload)
             # "wake": nothing to do, the loop re-checks whether it is stopping
             try:
                 item = self.inbox.get_nowait()
             except queue.Empty:
                 return
+
+    def _add(self, sub: _Submit) -> None:
+        post = sub.loop.call_soon_threadsafe
+        if sub.rid in self.streams:  # a client's rid (SGLang's /generate) names one request at a time
+            post(sub.out.put_nowait, ("error", f"rid {sub.rid!r} is already in use", 400))
+            return
+        try:
+            req = self.engine.add_request(sub.prompt_ids, sub.params, rid=sub.rid, session_id=sub.session_id)
+        except ValueError as e:
+            post(sub.out.put_nowait, ("error", str(e), 400))
+        except Exception as e:  # noqa: BLE001  add_request raised before the request reached the scheduler
+            traceback.print_exc()  # (its last step): that request fails, the engine keeps serving
+            post(sub.out.put_nowait, ("error", f"request refused: {e!r}", 500))
+        else:
+            self.streams[sub.rid] = _Stream(req, sub.loop, sub.out, metrics=sub.metrics)
+            post(sub.out.put_nowait, ("accepted", req))
+
+    def _abort(self, st: _Stream) -> None:
+        """Abort a request taken out of `streams`. Its handler, if still listening (an /abort_request; a disconnected
+        client's is gone), gets the tokens not yet delivered and the finish reason "abort"."""
+        req = st.req
+        if req.status is not Status.FINISHED:
+            self.engine.abort(req)
+        out = req.output_ids
+        with_lp = req.params.logprobs is not None
+        ready = min(len(out), len(req.logprobs)) if with_lp else len(out)
+        new = out[st.sent : ready]
+        lps = req.logprobs[st.sent : ready] if with_lp else None
+        st.loop.call_soon_threadsafe(st.out.put_nowait, ("tokens", new, "abort", lps))
+
+    def _start_flush(self, f: _Flush) -> None:
+        """A /flush_cache, in inbox order: done now if the engine is idle, refused if another is waiting or the request
+        set no time to wait, else kept until the engine is idle or its deadline passes (_check_flush; SGLang's
+        scheduler_components/flush_wrapper.py)."""
+        if self._flush is not None:
+            f.loop.call_soon_threadsafe(_resolve, f.fut, (False, "Another flush_cache is already in progress."))
+            return
+        self._flush = f
+        self._check_flush()
+
+    def _check_flush(self) -> None:
+        f = self._flush
+        if f is None:
+            return
+        if not self.engine.has_work():
+            self._flush = None
+            try:
+                self.engine.flush_cache()
+            except Exception as e:  # noqa: BLE001  a failed flush is the request's answer, never the engine's end
+                traceback.print_exc()
+                result = (False, f"flush_cache failed: {e!r}")
+            else:
+                logger.info("trnrt: prefix cache flushed")
+                result = (True, "")
+            f.loop.call_soon_threadsafe(_resolve, f.fut, result)
+        elif time.monotonic() >= f.deadline:
+            self._flush = None
+            busy = len(self.engine.scheduler.running) + len(self.engine.scheduler.waiting)
+            f.loop.call_soon_threadsafe(
+                _resolve, f.fut, (False, f"Cache not flushed: {busy} requests are running or waiting.")
+            )
 
     def _run(self) -> None:
         try:
@@ -260,6 +364,8 @@ class EngineLoop:
         streams, self.streams = self.streams, {}
         for st in streams.values():
             st.loop.call_soon_threadsafe(st.out.put_nowait, ("error", f"engine failed: {reason}", 503))
+        flushes = [self._flush] if self._flush is not None else []
+        self._flush = None
         while True:
             try:
                 kind, payload = self.inbox.get_nowait()
@@ -267,6 +373,10 @@ class EngineLoop:
                 break
             if kind == "add":
                 payload.loop.call_soon_threadsafe(payload.out.put_nowait, ("error", f"engine failed: {reason}", 503))
+            elif kind == "flush":
+                flushes.append(payload)
+        for f in flushes:
+            f.loop.call_soon_threadsafe(_resolve, f.fut, (False, f"engine failed: {reason}"))
         try:
             self.engine.close_failed()
         except Exception:  # noqa: BLE001  the requests are answered; a teardown error must not hide the reason
@@ -275,6 +385,7 @@ class EngineLoop:
     def _loop(self) -> None:
         while not self._stopping.is_set() and self.failed is None:
             self._drain(block=not self.engine.has_work())
+            self._check_flush()
             if not self.engine.has_work():
                 self._read_local_k()
                 continue
@@ -294,6 +405,7 @@ class EngineLoop:
                         self.engine.abort(st.req)
                 self.streams.clear()
                 continue
+            self.last_step = time.monotonic()
             batch: dict = {}  # one cross-thread call per event loop and step, not one per stream
             for rid, st in list(self.streams.items()):
                 req = st.req
@@ -311,7 +423,8 @@ class EngineLoop:
                     )
                 if finished:
                     del self.streams[rid]
-                    self.metrics.on_finish(req)
+                    if st.metrics:
+                        self.metrics.on_finish(req)
             for loop, items in batch.items():
                 loop.call_soon_threadsafe(_deliver, items)
 
@@ -770,7 +883,8 @@ async def _unless_disconnected(http: HTTPRequest, aw):
     return task.result()
 
 
-def build_app(engine: LLMEngine, model_name: str) -> FastAPI:
+def build_app(engine: LLMEngine, model_name: str, preset: str | None = None) -> FastAPI:
+    """The server of one engine. `preset`: the --preset it was started with, for /server_info."""
     app = FastAPI(title="TrnRT")
     loop_ = EngineLoop(engine)
     tok = engine.tokenizer
@@ -1074,4 +1188,15 @@ def build_app(engine: LLMEngine, model_name: str) -> FastAPI:
         body = await _body(http)
         return await asyncio.get_running_loop().run_in_executor(prompt_pool, detokenize, body)
 
+    from . import native  # here, not at the top: native imports this module
+
+    native.add_routes(
+        app,
+        loop_,
+        model_name=model_name,
+        preset=preset,
+        prompt_pool=prompt_pool,
+        prompt_tok=prompt_tok,
+        gen_defaults=gen_defaults,
+    )
     return app
