@@ -22,6 +22,7 @@ from .sampler import NUM_TOP_LOGPROBS, unpack
 from .scheduler import BLIND, NeedSync, Scheduler, SchedulerConfig, StepPlan
 
 if TYPE_CHECKING:
+    from .guided import HostSampling
     from .host_cache import HostTier
 
 logger = logging.getLogger(__name__)
@@ -219,6 +220,10 @@ def build_shard(cfg: EngineConfig, path: str, num_pages: int, rank: int = 0):
 
 
 class LLMEngine:
+    # Guided decoding, thinking budgets and min_tokens (engine/guided.py), set in __init__; None on an engine assembled
+    # without it (the tests' fake engines), which then serves none of them.
+    host_sampling: HostSampling | None = None
+
     def __init__(self, cfg: EngineConfig):
         self.cfg = cfg
         self.t_start = time.perf_counter()  # startup_seconds counts from here to the end of warmup()
@@ -343,7 +348,8 @@ class LLMEngine:
         if why:  # before anything is built or queued: the request never reaches a step
             raise ValueError(f"{why} is not supported; send the request without it")
         req = Request(rid or f"req-{next(self._ids)}", list(prompt_ids), params, session_id=session_id)
-        self.host_sampling.admit(req)  # its grammar matcher and thinking-budget state (ValueError: a 400)
+        if self.host_sampling is not None:
+            self.host_sampling.admit(req)  # its grammar matcher and thinking-budget state (ValueError: a 400)
         self.scheduler.add(req)
         return req
 
@@ -731,7 +737,8 @@ class LLMEngine:
                 del s.req.logprobs[len(s.req.output_ids) :]
         finished += self._check_stop_strings(plan.seqs(), finished)
         # Thinking budgets count, and grammars accept, the committed tokens; a grammar that terminated finishes its request.
-        finished += self.host_sampling.advance(plan.seqs(), self.scheduler.finish_now)
+        if self.host_sampling is not None:
+            finished += self.host_sampling.advance(plan.seqs(), self.scheduler.finish_now)
         for r in finished:
             self.runner.forget(r)
         return finished
