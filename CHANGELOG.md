@@ -10,6 +10,12 @@ and versions follow [Semantic Versioning](https://semver.org/). Rebuild the comp
 - `/tokenize` and `/detokenize` (also under `/v1`), as SGLang and vLLM serve them. A chat request is counted exactly as
   `/v1/chat/completions` would send it to the engine. The router sends them to any live engine without touching its
   routing state ([docs/API.md](docs/API.md)).
+- SGLang's native `/generate` (also PUT): `text` or `input_ids`, one prompt or a batch, SGLang's `sampling_params`,
+  streaming, output logprobs and request ids. The router routes it by its prompt or session
+  ([docs/API.md](docs/API.md#generate)).
+- SGLang's `/model_info`, `/server_info`, `/get_load`, `/health_generate`, `/abort_request` and `/flush_cache` (and
+  their `get_` names), on each engine and on the router, which asks one engine or all of them
+  ([docs/API.md](docs/API.md#info-and-admin-endpoints)).
 
 ## [0.1.0] - 2026-11-08
 
