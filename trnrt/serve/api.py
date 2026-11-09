@@ -236,8 +236,12 @@ class EngineLoop:
                 logger.exception("trnrt: a statistics hook failed (%d so far)", self.stats_errors)
 
     def _tick(self, tokens: int) -> None:
-        s = self.engine.scheduler
-        self._hook(self.stats.tick, time.monotonic(), tokens, len(s.running), len(s.waiting))
+        self._hook(self._tick_hook, tokens)
+
+    def _tick_hook(self, tokens: int) -> None:
+        s = getattr(self.engine, "scheduler", None)  # an engine stand-in may have none
+        running, waiting = (len(s.running), len(s.waiting)) if s is not None else (0, 0)
+        self.stats.tick(time.monotonic(), tokens, running, waiting)
 
     def _finished(self, st: _Stream, finish: str | None = None) -> None:
         """A request's end: its record into the live statistics and the production log (O(1), never blocks)."""
@@ -259,8 +263,8 @@ class EngineLoop:
                 post = payload.loop.call_soon_threadsafe
                 # priority only when sent: an engine without priority scheduling refuses any value (LLMEngine.add_request)
                 extra = {} if payload.priority is None else {"priority": payload.priority}
-                sch = self.engine.scheduler
-                at_arrival = (len(sch.running), len(sch.waiting))
+                sch = getattr(self.engine, "scheduler", None)
+                at_arrival = (len(sch.running), len(sch.waiting)) if sch is not None else None
                 try:
                     req = self.engine.add_request(
                         payload.prompt_ids, payload.params, rid=payload.rid, session_id=payload.session_id, **extra
