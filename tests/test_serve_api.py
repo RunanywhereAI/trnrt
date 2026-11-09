@@ -1,8 +1,8 @@
 """The HTTP layer (trnrt/serve/api.py) over a scripted stand-in for the engine, so it runs anywhere in seconds.
 
-The stand-in implements exactly the engine API the server uses (add_request, has_work, step, abort, dead_ranks,
-close_failed, close, tokenizer, cfg.tp, cfg.max_model_len, mcfg.vocab_size, scheduler, pool, radix) with real Request
-objects, and generates a fixed GLM-format output one token per step. Its tokenizer is a word-level one whose words are
+The stand-in implements exactly the engine API the server uses (add_request, has_work, step, abort, flush_cache,
+dead_ranks, close_failed, close, tokenizer, cfg.tp, cfg.max_model_len, cfg.page_size, cfg.model_path, mcfg.vocab_size,
+scheduler, pool, radix) with real Request objects, and generates a fixed GLM-format output one token per step. Its tokenizer is a word-level one whose words are
 GLM's tags and a few phrases, decoded by plain concatenation, and whose chat template opens `<think>` in the prompt
 unless enable_thinking is false. That switch is the stand-in's: GLM-5.3-Flash's own template has no enable_thinking and
 always opens `<think>` (tests/test_glm53_template.py runs the server on it). The real engine behind the same server:
@@ -94,7 +94,7 @@ class ScriptedEngine:
 
     def __init__(self, script: list[int]):
         self.tokenizer = _tokenizer()
-        self.cfg = types.SimpleNamespace(tp=1, max_model_len=64)
+        self.cfg = types.SimpleNamespace(tp=1, max_model_len=64, page_size=4, model_path="org/glm-test")
         self.mcfg = types.SimpleNamespace(vocab_size=len(self.tokenizer))
         self.scheduler = types.SimpleNamespace(running=[], waiting=[], num_preemptions=0)
         self.pool = types.SimpleNamespace(num_usable=100, num_free=90)
@@ -105,6 +105,7 @@ class ScriptedEngine:
         self.added: list[Request] = []
         self.closed = False
         self.step_delay = 0.0
+        self.flushes: list[int] = []  # at each flush_cache: the requests the engine held (LLMEngine.flush_cache)
 
     def add_request(self, prompt_ids, params, rid=None, session_id=None):
         why = unsupported(params)  # the engine's own refusal (LLMEngine.add_request)
@@ -142,6 +143,9 @@ class ScriptedEngine:
         self.aborted.append(req.rid)
         self.scheduler.running.remove(req)
         req.status, req.finish_reason = Status.FINISHED, "abort"
+
+    def flush_cache(self) -> None:
+        self.flushes.append(len(self.scheduler.running) + len(self.scheduler.waiting))
 
     def dead_ranks(self) -> list[int]:
         return list(self.dead)
