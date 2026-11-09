@@ -420,7 +420,8 @@ def test_request_fields_are_checked_before_the_engine(serve):
         ("prompt", [-1]),
         ("prompt", [len(WORDS)]),
         ("prompt", [1, True]),
-        ("min_tokens", 4),
+        ("min_tokens", -1),
+        ("min_tokens", 100),  # above max_tokens (16, the completions default)
         ("include_stop_str_in_output", True),
         ("thinking_token_budget", "lots"),
         ("temperature", 10**400),
