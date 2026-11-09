@@ -935,10 +935,11 @@ class EngineError(Exception):
 
 class Run:
     """The engine requests of one HTTP request: `n` choices of one prompt (OpenAI's `n`), each its own engine request,
-    sharing the prompt. The prefix cache makes the copies cheap: the scheduler sees the requests queued together, makes
-    their shared prompt pages a checkpoint target of the first one it admits, and holds the others until they can resume
-    from it (engine/scheduler.py: _junctions_ahead, _prefix_in_progress), so the prompt is computed once and each other
-    choice computes only its last partial page. Their tokens arrive tagged with the choice's index on one queue.
+    sharing the prompt. The prefix cache makes the copies cheap: their shared prompt pages become a checkpoint target of
+    the first one the scheduler admits (_junctions_ahead when they are queued together; _mark_running_junctions when one
+    arrives while the first prefills), and the others wait until they can resume from it (_prefix_in_progress,
+    engine/scheduler.py), so the prompt is computed once and each other choice computes only its last partial page.
+    Their tokens arrive tagged with the choice's index on one queue.
 
     Each choice has its own detokenizer (stop strings, stop_regex, skip_special_tokens) and, for a chat request, its own
     GLM parser. A choice the host stops (a stop_regex match) is aborted in the engine. Whatever ends the run early (an
