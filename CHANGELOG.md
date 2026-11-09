@@ -10,6 +10,12 @@ and versions follow [Semantic Versioning](https://semver.org/). Rebuild the comp
 - `/tokenize` and `/detokenize` (also under `/v1`), as SGLang and vLLM serve them. A chat request is counted exactly as
   `/v1/chat/completions` would send it to the engine. The router sends them to any live engine without touching its
   routing state ([docs/API.md](docs/API.md)).
+- Structured outputs through xgrammar, an optional dependency: `response_format` `json_object` and `json_schema`, vLLM's
+  `guided_*` and `structured_outputs`, and SGLang's `json_schema`, `regex` and `ebnf`. Also `min_tokens` and
+  `thinking_token_budget`. They need `--structured-outputs`, which adds graphs that take a token mask
+  ([docs/API.md](docs/API.md#structured-outputs-penalties-and-thinking-budgets)).
+- Repetition, frequency and presence penalties, with `--penalties` and `--penalty-buckets`, which add graphs that take
+  penalty inputs ([docs/CONFIGURATION.md](docs/CONFIGURATION.md#structured-outputs-penalties-and-thinking-budgets)).
 
 ## [0.1.0] - 2026-11-08
 
