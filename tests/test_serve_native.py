@@ -189,7 +189,8 @@ def test_generate_output_logprobs_in_sglangs_tuples(serve):
         ({"input_ids": [1], "lora_path": "adapter"}, "not supported: lora_path"),
         ({"input_ids": [1], "priority": 2}, "not supported: priority"),
         ({"input_ids": [1], "sampling_params": {"n": 2}}, "not supported: n"),
-        ({"input_ids": [1], "sampling_params": {"json_schema": "{}"}}, "not supported: json_schema"),
+        # served through the engine's guided decoding, which an engine without --structured-outputs refuses
+        ({"input_ids": [1], "sampling_params": {"json_schema": "{}"}}, "--structured-outputs"),
         ({"input_ids": [1], "sampling_params": {"no_stop_trim": True}}, "not supported: no_stop_trim"),
         ({"input_ids": [1], "sampling_params": {"skip_special_tokens": False}}, "not supported: skip_special_tokens"),
         ({"input_ids": [1], "sampling_params": {"max_new_tokens": 0}}, "max_new_tokens must be"),
