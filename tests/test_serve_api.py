@@ -367,7 +367,8 @@ def test_an_sdk_request_with_every_neutral_field_is_served(serve):
 def test_health_stats_models_and_metrics(serve):
     client, _ = serve(PLAIN)
     assert client.get("/health").json() == {"status": "ok"}
-    assert client.get("/v1/stats").json() == {"gauges": {"kv_pages_used": 6, "kv_pages_total": 100}}
+    gauges = client.get("/v1/stats").json()["gauges"]
+    assert (gauges["kv_pages_used"], gauges["kv_pages_total"]) == (6, 100) and "spec" not in gauges  # the router's
     assert client.get("/v1/models").json()["data"][0]["id"] == "glm"
     client.post("/v1/completions", json={"prompt": [1, 2]})
     m = client.get("/metrics").text

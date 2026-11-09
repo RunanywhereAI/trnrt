@@ -501,7 +501,7 @@ async def respond(http: HTTPRequest, body: dict, start_chat: Callable[[dict], Aw
         if not await run.wait(http):
             return Response(status_code=499)  # the client went away; nobody reads it
     except EngineError as e:
-        raise HTTPException(status_code=e.status, detail=e.detail) from None
+        raise e.http() from None
     msg, finish = run.message(0)
     status = "incomplete" if finish == "length" else "completed"
     return JSONResponse(_response(body, model, run.rid, run.created, status, output_items(msg, info), _usage(run)))

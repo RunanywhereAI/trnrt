@@ -59,6 +59,10 @@ class Request:
     # session (soft eviction protection) until the session is closed.
     session_id: str | None = None
     session_gen: int = -1
+    # SGLang's per-request priority (engine/scheduler.py: priority scheduling, the priority eviction); None: none given.
+    priority: int | None = None
+    # (HTTP status, message) when the scheduler ended the request without serving it (a full queue's displacement).
+    error: tuple[int, str] | None = None
 
     # Prompt followed by generated tokens. After a preemption the whole list is the
     # "prompt" of the recompute, so it is kept as one list.

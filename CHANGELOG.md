@@ -26,6 +26,16 @@ and versions follow [Semantic Versioning](https://semver.org/). Rebuild the comp
   Anthropic's stream events and error shape ([docs/API.md](docs/API.md#anthropic-messages-api)).
 - The router routes `/v1/responses` and `/v1/messages` by session and prefix as it routes chat, and sends
   `/v1/messages/count_tokens` to any live engine.
+- Scheduling flags with SGLang's names, host only and per engine: `--schedule-policy` (`fcfs`, `lpm`, `lof`, `spf`),
+  priority scheduling with the request field `priority` and priority preemption, `--max-queued-requests` and
+  `--max-queued-tokens` (a full queue answers 503), and `--radix-eviction-policy` (`lru`, `lfu`, `slru`, `priority`,
+  `tlru`). The defaults schedule as before ([docs/CONFIGURATION.md](docs/CONFIGURATION.md#scheduling)).
+- `GET /v1/stats` adds the engine's live state and request rates, TTFT, decode-speed and end-to-end percentiles over
+  recent windows, and `GET /dashboard` draws them; the router serves both for each engine
+  ([docs/API.md](docs/API.md#statistics-and-the-dashboard)). The fields the router reads are unchanged.
+- `TRNRT_PROD_DIR`: an opt-in on-disk log of request records (counts and times only) and gauges.
+- `TRNRT_PROMPT_CACHE_MB`: an opt-in prompt token cache that builds a chat turn's prompt ids from the previous turn's,
+  with the same ids as a full encode or none.
 
 ### Changed
 

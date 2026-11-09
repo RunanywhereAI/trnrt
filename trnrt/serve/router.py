@@ -71,6 +71,10 @@ The router's own endpoints:
   | /health_generate | all | 200 "ok" when each generated, "degraded" when some did, 503 "down" when none did |
   | /abort_request | all | 200 once any took it: only the worker holding the rid has it, so no rid map is kept |
   | /flush_cache | all | 200 when every one flushed (its prefix tree here is cleared too), else 400 naming the others |
+- GET /v1/stats: every worker's /v1/stats ({"engines": [{"url", "up", "stats"}], "router": the /health counters}), or
+  with ?engine=i worker i's alone, with a "router" block naming the engines;
+- GET /dashboard: the engines' page (serve/dashboard.py), one engine at a time (?engine=i): the engines listen on
+  127.0.0.1 only, so the router is where a browser can reach it.
 
     python -m trnrt.serve.router --worker-urls http://127.0.0.1:8111,http://127.0.0.1:8112 --port 8000
 """
@@ -88,9 +92,17 @@ import time
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
+from fastapi.responses import (
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    RedirectResponse,
+    Response,
+    StreamingResponse,
+)
 
 from .. import log
+from .dashboard import PAGE as DASHBOARD_PAGE
 
 logger = log.get("router")
 
@@ -107,6 +119,10 @@ ROUTES = ("/v1/completions", "/v1/chat/completions", "/generate", "/v1/responses
 # Every worker answers these the same (one model, one tokenizer), so they go to the least loaded live worker and touch
 # no prefix tree and no session: a /tokenize of an agent's context must not steer where its next turn is routed.
 STATELESS_ROUTES = ("/tokenize", "/v1/tokenize", "/detokenize", "/v1/detokenize", "/v1/messages/count_tokens")
+# An engine's 503 for a full waiting queue carries this header (serve/api.py QUEUE_FULL_HEADER): the engine is serving,
+# so the answer goes to the client as it is (SGLang's 503 "The request queue is full.") and the engine stays up. Another
+# engine is not tried: a session belongs on its own, and one without a session was routed where its prefix is cached.
+QUEUE_FULL_HEADER = "x-trnrt-queue-full"
 
 
 class _Node:
@@ -770,6 +786,52 @@ def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: floa
             return PlainTextResponse("Cache not flushed on every engine.\n" + "\n".join(failed) + "\n", status_code=400)
         return PlainTextResponse(rs[0].text if rs[0] is not None else "")
 
+    def engines() -> list[dict]:
+        return [{"url": u, "up": ok} for u, ok in zip(router.workers, router.up)]
+
+    async def worker_stats(w: int) -> dict:
+        """Worker w's GET /v1/stats; HTTPException 503 when it does not answer with one."""
+        try:
+            r = await client.get(router.workers[w] + "/v1/stats", timeout=health_timeout_s)
+            if r.status_code == 200:
+                body = r.json()
+                if isinstance(body, dict):
+                    return body
+        except (httpx.HTTPError, ValueError):
+            pass
+        raise HTTPException(status_code=503, detail=f"engine {w} did not answer /v1/stats")
+
+    def engine_index(raw: str | None) -> int | None:
+        if raw is None:
+            return None
+        if not raw.isdigit() or int(raw) >= len(router.workers):
+            raise HTTPException(status_code=400, detail=f"engine must be an integer in [0, {len(router.workers)})")
+        return int(raw)
+
+    @app.get("/v1/stats")
+    async def stats(engine: str | None = None):
+        """Every engine's statistics (serve/stats.py), or engine i's with ?engine=i. Read only: no routing state."""
+        w = engine_index(engine)
+        if w is not None:
+            body = await worker_stats(w)
+            body["router"] = {"engine": w, "engines": engines()}
+            return JSONResponse(body)
+        out = []
+        for i, e in enumerate(engines()):
+            try:
+                out.append({**e, "stats": await worker_stats(i)})
+            except HTTPException as x:
+                out.append({**e, "stats": None, "error": x.detail})
+        return JSONResponse({"engines": out, "router": router.health()})
+
+    @app.get("/dashboard")
+    async def dashboard(engine: str | None = None):
+        """The engines' page, for one engine: without ?engine, the first live one's."""
+        if engine_index(engine) is None:
+            live = router._live()
+            return RedirectResponse(f"dashboard?engine={live[0] if live else 0}", status_code=307)
+        return HTMLResponse(DASHBOARD_PAGE)
+
     async def proxy(path: str, http: Request):
         body = await _json_object(http)
         sid = router.session_of(body)
@@ -811,7 +873,16 @@ def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: floa
             except BaseException:
                 router.load[w] -= 1
                 raise
-            if (resp if body.get("stream") else r).status_code == 503:
+            got = resp if body.get("stream") else r  # a streamed 503 was read whole above
+            if got.status_code == 503 and got.headers.get(QUEUE_FULL_HEADER):
+                router.load[w] -= 1
+                return Response(
+                    got.content,
+                    status_code=503,
+                    media_type=got.headers.get("content-type"),
+                    headers={QUEUE_FULL_HEADER: "1"},
+                )
+            if got.status_code == 503:
                 router.load[w] -= 1
                 router.note_failure(w, hard=True)
                 if attempt == 1 or all(not ok for ok in router.up):

@@ -21,6 +21,9 @@
 | `trnrt/serve/router.py` | The session-affine, prefix-aware router in front of the engines, with failover. |
 | `trnrt/serve/parsers.py` | GLM reasoning and tool-call parsing, streamed and whole. |
 | `trnrt/serve/responses.py`, `anthropic.py` | The OpenAI Responses API and the Anthropic Messages API, translated into the chat path. |
+| `trnrt/serve/stats.py`, `trnrt/serve/dashboard.py` | `GET /v1/stats`'s request rates, latency percentiles and time series per engine, and the page `GET /dashboard` draws from them. |
+| `trnrt/serve/prodlog.py` | The opt-in production log (`TRNRT_PROD_DIR`): request records and gauges on disk. |
+| `trnrt/serve/prompt_cache.py` | The opt-in prompt token cache (`TRNRT_PROMPT_CACHE_MB`): a chat turn's prompt ids from the previous turn's. |
 | `trnrt/engine/engine.py` | `LLMEngine`: model build, the step loop, start and close. |
 | `trnrt/engine/scheduler.py` | Continuous batching, chunked prefill and prefix-cache restores. |
 | `trnrt/engine/model_runner.py` | Pads each step into a compiled bucket and runs its graph. |

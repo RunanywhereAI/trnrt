@@ -71,8 +71,9 @@ def error_body(status: int, detail) -> dict:
 
 
 def error_response(e: HTTPException) -> JSONResponse:
-    """An HTTPException in Anthropic's error shape, at its status."""
-    return JSONResponse(error_body(e.status_code, e.detail), status_code=e.status_code)
+    """An HTTPException in Anthropic's error shape, at its status and with its headers (a full queue's 503 keeps
+    api.QUEUE_FULL_HEADER, so the router does not take the engine for failed)."""
+    return JSONResponse(error_body(e.status_code, e.detail), status_code=e.status_code, headers=e.headers)
 
 
 def _text_of(content, where: str) -> str:
@@ -300,7 +301,7 @@ async def respond(http: HTTPRequest, body: dict, start_chat: Callable[[dict], Aw
         if not await run.wait(http):
             return Response(status_code=499)  # the client went away; nobody reads it
     except EngineError as e:
-        raise HTTPException(status_code=e.status, detail=e.detail) from None
+        raise e.http() from None
     msg, finish = run.message(0)
     reason, seq = _stop(run, finish, stops)
     return JSONResponse(

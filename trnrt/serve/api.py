@@ -9,12 +9,18 @@
 - POST /tokenize and /detokenize (also under /v1);
 - GET /v1/models;
 - GET /health: 200 while the engine can serve, 503 with the reason once it cannot;
-- GET /v1/stats: the KV-cache gauges the router (serve/router.py) uses to break ties between engines;
+- GET /v1/stats: the KV-cache gauges the router (serve/router.py) uses to break ties between engines, the engine's live
+  state, and request rates and latency percentiles over recent windows (serve/stats.py);
+- GET /dashboard: a page drawing /v1/stats (serve/dashboard.py);
 - GET /metrics: Prometheus counters and histograms (trnrt/metrics.py);
 - SGLang's native API (serve/native.py): POST /generate, the info endpoints /model_info and /server_info, /get_load,
   /health_generate, /abort_request and /flush_cache.
 
 A request may ask for `n` choices: each is its own engine request (Run), sharing the prompt through the prefix cache.
+
+TRNRT_PROD_DIR keeps each finished request's record and the gauges on disk (serve/prodlog.py), and
+TRNRT_PROMPT_CACHE_MB builds a chat turn's prompt ids from the previous turn's (serve/prompt_cache.py); both are off
+unless set.
 
 A request may carry a `session_id` (a string): the engine keeps that session's prefix referenced in its prefix cache,
 and the router pins the session to one engine.
@@ -52,10 +58,12 @@ from typing import TYPE_CHECKING, cast
 
 from fastapi import FastAPI, HTTPException
 from fastapi import Request as HTTPRequest
-from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response, StreamingResponse
 
 from ..engine.request import Request, SamplingParams, Status
+from ..engine.scheduler import QueueFull
 from ..metrics import Metrics, kv_pages, spec_stats
+from .dashboard import PAGE as DASHBOARD_PAGE
 from .parsers import (
     THINK_CLOSE,
     THINK_OPEN,
@@ -65,6 +73,9 @@ from .parsers import (
     template_messages,
     tool_choice_error,
 )
+from .prodlog import ProdLog
+from .prompt_cache import PromptCache
+from .stats import Stats
 
 if TYPE_CHECKING:  # only annotations: importing this module does not load the engine and its model code
     from ..engine.engine import LLMEngine
@@ -81,23 +92,34 @@ class _Stream:
     out: asyncio.Queue | _Tagged
     sent: int = 0
     metrics: bool = True  # counted in /metrics when it finishes (a /health_generate probe is not)
+    stream: bool = False  # the HTTP response streams (GET /v1/stats's records)
+    at_arrival: tuple[int, int] | None = None  # (running, waiting) when the engine took it
 
 
 @dataclass
 class _Submit:
     """A request on its way to the engine thread. `out` receives, in order: ("accepted", Request), or ("error", why,
-    HTTP status) if it was not accepted; then ("tokens", new ids, finish reason or None, their logprobs or None) until
-    the finish reason is set, or ("error", why, HTTP status) if the engine fails. The status is 400 for a request the
-    engine refuses, 500 for an internal error that leaves the engine serving and 503 once the engine has failed. An
-    aborted request (EngineLoop.abort, abort_all) ends with ("tokens", its undelivered ids, "abort", their logprobs)."""
+    HTTP status[, queue full]) if it was not accepted; then ("tokens", new ids, finish reason or None, their logprobs or
+    None) until the finish reason is set, or ("error", why, HTTP status[, queue full]) if the engine fails or displaces
+    it. The status is 400 for a request the engine refuses, 500 for an internal error that leaves the engine serving, and
+    503 once the engine has failed or for a request a full queue refused or displaced (queue full: True, and the response
+    carries QUEUE_FULL_HEADER so the router does not take the engine for failed). An aborted request (EngineLoop.abort,
+    abort_all) ends with ("tokens", its undelivered ids, "abort", their logprobs)."""
 
     rid: str
     prompt_ids: list[int]
     params: SamplingParams
     loop: asyncio.AbstractEventLoop
     session_id: str | None = None
+    priority: int | None = None
     out: asyncio.Queue | _Tagged = field(default_factory=asyncio.Queue)
     metrics: bool = True
+    stream: bool = False
+
+
+# Set on a 503 that answers a full waiting queue (scheduler.QueueFull) or a request displaced from it: the engine is
+# serving, unlike every other 503 it sends, so the router (serve/router.py) passes the answer on and keeps routing to it.
+QUEUE_FULL_HEADER = "x-trnrt-queue-full"
 
 
 class _Tagged:
@@ -161,8 +183,18 @@ class EngineLoop:
     """Owns the engine: one thread runs its step loop and is the only one that touches it. Handlers hand it requests
     and aborts through `inbox`; it hands each request's tokens to that request's asyncio queue after every step."""
 
-    def __init__(self, engine: LLMEngine):
+    def __init__(self, engine: LLMEngine, name: str = "engine"):
         self.engine = engine
+        # GET /v1/stats and /dashboard (serve/stats.py), and with TRNRT_PROD_DIR the production log (serve/prodlog.py),
+        # under `name`, this engine's own directory. Fed on this loop's thread through _hook, which never raises.
+        self.stats = Stats()
+        self.stats.kv = lambda: kv_pages(engine)
+        self.stats_errors = 0
+        self._stats_err_t = float("-inf")
+        self.prodlog = ProdLog.from_env(name, self.stats)
+        if self.prodlog is not None:
+            prodlog = self.prodlog
+            self.stats.on_bucket = lambda g: prodlog.put("gauges", g)
         self._stopping = threading.Event()
         self.metrics = Metrics()
         self.vocab = engine.mcfg.vocab_size  # the embedding's rows: a prompt id outside them fails the step
@@ -195,6 +227,8 @@ class EngineLoop:
             self.thread.join(wait)
             if self.thread.is_alive():
                 logger.warning("trnrt: the engine thread did not stop within %.0f s; closing the engine anyway", wait)
+        if self.prodlog is not None:
+            self.prodlog.close()
 
     def health_error(self) -> str | None:
         """Why the engine cannot serve, or None. A worker that died while this loop waits in a step (a device collective
@@ -223,10 +257,13 @@ class EngineLoop:
         rid: str | None = None,
         metrics: bool = True,
         out: _Tagged | None = None,
+        priority: int | None = None,
+        stream: bool = False,
     ) -> _Submit:
         """Queue a request for the engine thread. `rid`: the client's request id (SGLang's), which /abort_request
-        names; a new one when None. `metrics`: whether /metrics counts it. `out`: a choice's view of a shared queue
-        (`n` > 1), instead of its own."""
+        names; a new one when None. `metrics`: whether /metrics and /v1/stats count it. `out`: a choice's view of a
+        shared queue (`n` > 1), instead of its own. `priority`: SGLang's per-request priority. `stream`: whether the HTTP
+        response streams (GET /v1/stats's records)."""
         # Checked here, before the engine sees the request: an id outside the vocabulary fails the step, and at tp > 1
         # one failed step fails the engine for every request (_fail).
         if not prompt_ids or not all(type(t) is int and 0 <= t < self.vocab for t in prompt_ids):
@@ -238,7 +275,14 @@ class EngineLoop:
         if rid is not None and not (isinstance(rid, str) and rid):
             raise HTTPException(status_code=400, detail="rid must be a non-empty string")
         sub = _Submit(
-            rid or uuid.uuid4().hex, prompt_ids, params, asyncio.get_running_loop(), session_id, metrics=metrics
+            rid or uuid.uuid4().hex,
+            prompt_ids,
+            params,
+            asyncio.get_running_loop(),
+            session_id,
+            priority=priority,
+            metrics=metrics,
+            stream=stream,
         )
         if out is not None:
             sub.out = out
@@ -260,6 +304,35 @@ class EngineLoop:
         self._put("flush", f)
         return f
 
+    def _hook(self, fn, *args) -> None:
+        """Run a statistics or recording hook on the engine thread: an exception is counted and logged (at most once a
+        minute), never raised, so recording cannot stop serving (GET /v1/stats shows the count as stats_errors)."""
+        try:
+            fn(*args)
+        except Exception:  # the statistics must never fail a step or a request
+            self.stats_errors += 1
+            now = time.monotonic()
+            if now - self._stats_err_t >= 60:
+                self._stats_err_t = now
+                logger.exception("trnrt: a statistics hook failed (%d so far)", self.stats_errors)
+
+    def _tick(self, tokens: int) -> None:
+        self._hook(self._tick_hook, tokens)
+
+    def _tick_hook(self, tokens: int) -> None:
+        s = getattr(self.engine, "scheduler", None)  # an engine stand-in may have none
+        running, waiting = (len(s.running), len(s.waiting)) if s is not None else (0, 0)
+        self.stats.tick(time.monotonic(), tokens, running, waiting)
+
+    def _finished(self, st: _Stream, finish: str | None = None) -> None:
+        """A request's end: its record into the live statistics and the production log (O(1), never blocks)."""
+        self._hook(self._finished_hook, st, finish)
+
+    def _finished_hook(self, st: _Stream, finish: str | None) -> None:
+        rec = self.stats.record(st.req, st.stream, st.at_arrival, finish)
+        if self.prodlog is not None:
+            self.prodlog.put("requests", rec)
+
     def _drain(self, block: bool) -> None:
         try:
             item = self.inbox.get(timeout=0.05) if block else self.inbox.get_nowait()
@@ -273,10 +346,12 @@ class EngineLoop:
                 st = self.streams.pop(payload, None)
                 if st is not None:
                     self._abort(st)
+                    self._finished(st, "abort")
             elif kind == "abort_all":
                 streams, self.streams = self.streams, {}
                 for st in streams.values():
                     self._abort(st)
+                    self._finished(st, "abort")
             elif kind == "flush":
                 self._start_flush(payload)
             # "wake": nothing to do, the loop re-checks whether it is stopping
@@ -290,15 +365,26 @@ class EngineLoop:
         if sub.rid in self.streams:  # a client's rid (SGLang's /generate) names one request at a time
             post(sub.out.put_nowait, ("error", f"rid {sub.rid!r} is already in use", 400))
             return
+        # priority only when sent: an engine without priority scheduling refuses any value (LLMEngine.add_request)
+        extra = {} if sub.priority is None else {"priority": sub.priority}
+        sch = getattr(self.engine, "scheduler", None)
+        at_arrival = (len(sch.running), len(sch.waiting)) if sch is not None else None
         try:
-            req = self.engine.add_request(sub.prompt_ids, sub.params, rid=sub.rid, session_id=sub.session_id)
+            req = self.engine.add_request(sub.prompt_ids, sub.params, rid=sub.rid, session_id=sub.session_id, **extra)
+        except QueueFull as e:
+            post(sub.out.put_nowait, ("error", str(e), 503, True))
+            self._hook(self.stats.failed, "queue_full")
         except ValueError as e:
             post(sub.out.put_nowait, ("error", str(e), 400))
+            self._hook(self.stats.failed, "refused")
         except Exception as e:  # noqa: BLE001  add_request raised before the request reached the scheduler
             traceback.print_exc()  # (its last step): that request fails, the engine keeps serving
             post(sub.out.put_nowait, ("error", f"request refused: {e!r}", 500))
+            self._hook(self.stats.failed, "error")
         else:
-            self.streams[sub.rid] = _Stream(req, sub.loop, sub.out, metrics=sub.metrics)
+            self.streams[sub.rid] = _Stream(
+                req, sub.loop, sub.out, metrics=sub.metrics, stream=sub.stream, at_arrival=at_arrival
+            )
             post(sub.out.put_nowait, ("accepted", req))
 
     def _abort(self, st: _Stream) -> None:
@@ -395,6 +481,7 @@ class EngineLoop:
         streams, self.streams = self.streams, {}
         for st in streams.values():
             st.loop.call_soon_threadsafe(st.out.put_nowait, ("error", f"engine failed: {reason}", 503))
+            self._hook(self.stats.failed, "engine")
         flushes = [self._flush] if self._flush is not None else []
         self._flush = None
         while True:
@@ -419,6 +506,7 @@ class EngineLoop:
             self._check_flush()
             if not self.engine.has_work():
                 self._read_local_k()
+                self._tick(0)
                 continue
             self._local_k_stale = True
             try:
@@ -434,9 +522,11 @@ class EngineLoop:
                     st.loop.call_soon_threadsafe(st.out.put_nowait, ("error", f"engine step failed: {e}", 500))
                     if st.req.status is not Status.FINISHED:
                         self.engine.abort(st.req)
+                    self._hook(self.stats.failed, "engine")
                 self.streams.clear()
                 continue
             self.last_step = time.monotonic()
+            handed = 0  # output tokens handed out by this step (GET /v1/stats: the aggregate output tok/s)
             batch: dict = {}  # one cross-thread call per event loop and step, not one per stream
             for rid, st in list(self.streams.items()):
                 req = st.req
@@ -445,8 +535,14 @@ class EngineLoop:
                 with_lp = req.params.logprobs is not None
                 # With logprobs on, only the tokens whose logprobs are recorded go out, so every token carries its own.
                 ready = len(out) if finished or not with_lp else min(len(out), len(req.logprobs))
+                if finished and req.error is not None:  # ended unserved: displaced from a full queue
+                    batch.setdefault(st.loop, []).append((st.out, ("error", req.error[1], req.error[0], True)))
+                    del self.streams[rid]
+                    self._hook(self.stats.failed, "displaced")
+                    continue
                 if ready > st.sent or finished:
                     new = out[st.sent : ready]
+                    handed += len(new)
                     lps = req.logprobs[st.sent : ready] if with_lp else None
                     st.sent = ready
                     batch.setdefault(st.loop, []).append(
@@ -454,10 +550,12 @@ class EngineLoop:
                     )
                 if finished:
                     del self.streams[rid]
-                    if st.metrics:
+                    if st.metrics:  # a /health_generate probe is counted in neither /metrics nor /v1/stats
                         self.metrics.on_finish(req)
+                        self._finished(st)
             for loop, items in batch.items():
                 loop.call_soon_threadsafe(_deliver, items)
+            self._tick(handed)
 
 
 def _deliver(items) -> None:
@@ -661,6 +759,12 @@ _INT64_MAX = 2**63 - 1
 
 def _bad(detail: str) -> HTTPException:
     return HTTPException(status_code=400, detail=detail)
+
+
+def _error(detail: str, status: int, queue_full: bool = False) -> HTTPException:
+    """The HTTP error of an engine's ("error", detail, status[, queue_full]) (_Submit): a full queue's 503 carries
+    QUEUE_FULL_HEADER."""
+    return HTTPException(status_code=status, detail=detail, headers={QUEUE_FULL_HEADER: "1"} if queue_full else None)
 
 
 def _int(body: dict, key: str, default, lo: int, hi: int = _INT64_MAX):
@@ -962,10 +1066,25 @@ def template_kwargs(tok, body: dict) -> tuple[dict, bool | None]:
     return kw, thinking
 
 
-def chat_prompt(tok, body: dict) -> tuple[list[int], dict]:
+def _cached_ids(tok, messages: list, kwargs: dict, cache: PromptCache, session) -> list[int]:
+    """_template_ids through the prompt token cache: the template renders the text, and the cache encodes it from the
+    session's (or the same system prompt's) previous text, giving the ids _template_ids would (or, on an audit that
+    finds otherwise, those ids, and the cache turns itself off)."""
+    import jinja2
+
+    try:
+        text = tok.apply_chat_template(messages, add_generation_prompt=True, tokenize=False, **kwargs)
+    except jinja2.TemplateError as e:
+        raise _bad(f"the chat template refused the messages: {e}") from None
+    key = session if isinstance(session, str) else None
+    return cache.encode(text, key, served=lambda: _template_ids(tok, messages, kwargs))
+
+
+def chat_prompt(tok, body: dict, cache: PromptCache | None = None) -> tuple[list[int], dict]:
     """A /v1/chat/completions request's prompt ids, rendered by the model's chat template from its messages (assistant
     tool_calls arguments as objects: parsers.template_messages), and the StreamParser / parse_full arguments its output
-    is parsed with. HTTPException 400 on a malformed request."""
+    is parsed with. HTTPException 400 on a malformed request. With `cache` (TRNRT_PROMPT_CACHE_MB) the ids come through
+    the prompt token cache, the same ids."""
     messages = body.get("messages")
     if not messages:
         raise HTTPException(status_code=400, detail="messages is required")
@@ -981,7 +1100,10 @@ def chat_prompt(tok, body: dict) -> tuple[list[int], dict]:
     tools = body.get("tools") if tool_choice != "none" else None
     if tools:
         kwargs["tools"] = tools
-    ids = _template_ids(tok, messages, kwargs)
+    if cache is not None and cache.off is None:
+        ids = _cached_ids(tok, messages, kwargs, cache, body.get("session_id"))
+    else:
+        ids = _template_ids(tok, messages, kwargs)
     # With thinking on, the template opens the reasoning block in the prompt and the output starts inside it; with
     # thinking off it closes the block there, and the output starts with the answer.
     tail = tok.decode(ids[-4:]).rstrip()
@@ -1039,11 +1161,16 @@ async def _unless_disconnected(http: HTTPRequest, aw):
 
 
 class EngineError(Exception):
-    """An engine request failed after it was accepted: `detail` and the HTTP `status` (_Submit)."""
+    """An engine request failed after it was accepted: `detail`, the HTTP `status` and whether a full queue displaced it
+    (_Submit)."""
 
-    def __init__(self, detail: str, status: int):
+    def __init__(self, detail: str, status: int, queue_full: bool = False):
         super().__init__(detail)
-        self.detail, self.status = detail, status
+        self.detail, self.status, self.queue_full = detail, status, queue_full
+
+    def http(self) -> HTTPException:
+        """The HTTPException a non-streaming handler raises for it (a displaced request's 503 keeps QUEUE_FULL_HEADER)."""
+        return _error(self.detail, self.status, self.queue_full)
 
 
 class Run:
@@ -1068,8 +1195,11 @@ class Run:
         rules: StopRules,
         eos: tuple[int, ...] = (),
         parse: dict | None = None,
+        priority: int | None = None,
+        stream: bool = False,
     ):
         self.loop_, self.tok, self.prompt_ids, self.params = loop_, tok, prompt_ids, params
+        self.priority, self.stream = priority, stream
         self.session_id, self.rules, self.parse = session_id, rules, parse
         n = len(params)
         self.q: asyncio.Queue = asyncio.Queue()
@@ -1101,12 +1231,21 @@ class Run:
         not: the others are aborted, so no choice runs for a request that is answered with an error."""
         try:
             for i, p in enumerate(self.params):
-                self.subs.append(self.loop_.submit(self.prompt_ids, p, self.session_id, out=_Tagged(self.q, i)))
+                self.subs.append(
+                    self.loop_.submit(
+                        self.prompt_ids,
+                        p,
+                        self.session_id,
+                        out=_Tagged(self.q, i),
+                        priority=self.priority,
+                        stream=self.stream,
+                    )
+                )
             waiting = set(range(self.n))
             while waiting:
                 i, item = await self.q.get()
                 if item[0] == "error":
-                    raise HTTPException(status_code=item[2], detail=item[1])
+                    raise _error(*item[1:])  # a full queue's 503 keeps QUEUE_FULL_HEADER
                 if item[0] == "accepted":
                     self.reqs[i] = item[1]
                     waiting.discard(i)
@@ -1143,7 +1282,7 @@ class Run:
             while self._open:
                 i, item = self._early.pop(0) if self._early else await self.q.get()
                 if item[0] == "error":
-                    raise EngineError(item[1], item[2])
+                    raise EngineError(*item[1:])
                 if self.finish[i] is not None:  # a choice the host stopped: the tokens it made before its abort
                     continue
                 _, ids, finish, lps = item
@@ -1246,16 +1385,20 @@ def _tag_id(tok, tag: str) -> int | None:
     return ids[0] if len(ids) == 1 else None
 
 
-def build_app(engine: LLMEngine, model_name: str, preset: str | None = None) -> FastAPI:
-    """The server of one engine. `preset`: the --preset it was started with, for /server_info."""
+def build_app(engine: LLMEngine, model_name: str, preset: str | None = None, name: str = "engine") -> FastAPI:
+    """The server of one engine. `preset`: the --preset it was started with, for /server_info. `name` names its
+    directory in the production log (TRNRT_PROD_DIR): `serve` gives each engine its own, by port."""
     app = FastAPI(title="TrnRT")
-    loop_ = EngineLoop(engine)
+    loop_ = EngineLoop(engine, name)
     tok = engine.tokenizer
     # A chat request's prompt is rendered and tokenized on one worker thread with its own tokenizer, not on the event
     # loop: GLM-5.3-Flash's template takes tens of milliseconds at 100K tokens, which would stall every other request's
     # stream, and two threads in one Hugging Face fast tokenizer can raise "Already borrowed".
     prompt_pool = ThreadPoolExecutor(1, thread_name_prefix="trnrt-prompt")
     prompt_tok = copy.deepcopy(tok)
+    # TRNRT_PROMPT_CACHE_MB (serve/prompt_cache.py): a chat prompt's ids from the previous turn's; used on prompt_pool's
+    # thread only, by the chat endpoint (/tokenize renders without it)
+    prompt_cache = PromptCache.from_env(prompt_tok)
     gen_defaults = generation_defaults(getattr(engine, "model_path", None))
     if gen_defaults:
         logger.info("trnrt: sampling defaults from the checkpoint's generation_config.json: %s", gen_defaults)
@@ -1267,15 +1410,44 @@ def build_app(engine: LLMEngine, model_name: str, preset: str | None = None) -> 
             return JSONResponse(status_code=503, content={"status": "failed", "error": err})
         return {"status": "ok"}
 
-    @app.get("/v1/stats")
-    async def stats():
-        """The router's tie-break between engines: KV pages in use and usable (metrics.kv_pages)."""
+    def live_gauges() -> dict:
+        """GET /v1/stats's live state. kv_pages_used and kv_pages_total are the router's tie-break between engines
+        (metrics.kv_pages); the rest is the scheduler, the speculation, the scheduling settings, the prompt token cache
+        and the production log. Read without the engine thread: counts and settings only, nothing changed."""
         used, total = kv_pages(engine)
         gauges: dict = {"kv_pages_used": used, "kv_pages_total": total}
         spec = spec_stats(engine)
         if spec is not None:
             gauges["spec"] = spec
-        return {"gauges": gauges}
+        s, cfg = engine.scheduler, engine.cfg
+        sch = getattr(engine, "scheduling", None)
+        gauges.update(
+            running=len(s.running),
+            waiting=len(s.waiting),
+            seats=getattr(cfg, "max_num_seqs", None),
+            cap=getattr(cfg, "max_running", None),
+            kv_used_pct=100.0 * used / total if total else None,
+            preemptions=getattr(s, "num_preemptions", 0),
+            model=model_name,
+            max_model_len=cfg.max_model_len,
+            tp=cfg.tp,
+            scheduling=dataclasses.asdict(sch) if sch is not None else None,
+            prompt_cache=prompt_cache.stats() if prompt_cache is not None else {"on": False},
+            prod=loop_.prodlog.status() if loop_.prodlog is not None else {"on": False},
+            stats_errors=loop_.stats_errors,
+        )
+        return gauges
+
+    @app.get("/v1/stats")
+    async def stats():
+        """The live gauges, and request rates and percentiles over recent windows, a 30-minute series and the recent
+        requests (serve/stats.py), computed in a worker thread: sorting up to stats.RING records must not hold the
+        event loop that delivers every stream's tokens."""
+        return JSONResponse(await asyncio.to_thread(loop_.stats.snapshot, live_gauges()))
+
+    @app.get("/dashboard")
+    async def dashboard():
+        return HTMLResponse(DASHBOARD_PAGE)
 
     @app.get("/metrics")
     async def metrics():
@@ -1292,14 +1464,20 @@ def build_app(engine: LLMEngine, model_name: str, preset: str | None = None) -> 
         (chat_prompt), None for a completion. Every request field is checked before anything is queued."""
         rules = _stop_rules(body)
         choices = _fanout(body, params)
-        run = Run(loop_, tok, prompt_ids, choices, body.get("session_id"), rules, eos, parse)
+        # SGLang's per-request priority (engine/scheduler.py); an engine without priority scheduling refuses it (400)
+        priority = _int(body, "priority", None, -_INT64_MAX - 1)
+        run = Run(
+            loop_, tok, prompt_ids, choices, body.get("session_id"), rules, eos, parse, priority, _flag(body, "stream")
+        )
         await run.start()
         return run
 
     async def start_chat(body: dict) -> Run:
         """A /v1/chat/completions body's run: its prompt rendered on the prompt thread, its sampling checked, its choices
         accepted. The Responses and Messages APIs (serve/responses.py, serve/anthropic.py) translate into this."""
-        ids, parse = await asyncio.get_running_loop().run_in_executor(prompt_pool, chat_prompt, prompt_tok, body)
+        ids, parse = await asyncio.get_running_loop().run_in_executor(
+            prompt_pool, chat_prompt, prompt_tok, body, prompt_cache
+        )
         # max_tokens defaults to the rest of the context (vLLM's default): reasoning at the template's default effort
         # (Max) can run long, and a smaller hidden default would cut the answer off
         room = max(engine.cfg.max_model_len - len(ids), 1)
@@ -1403,7 +1581,7 @@ def build_app(engine: LLMEngine, model_name: str, preset: str | None = None) -> 
             if not await run.wait(http):
                 return Response(status_code=499)  # nginx's "client closed request"; nobody reads it
         except EngineError as e:
-            raise HTTPException(status_code=e.status, detail=e.detail) from None
+            raise e.http() from None
         choices = []
         for i in range(run.n):
             if chat:

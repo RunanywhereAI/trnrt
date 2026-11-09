@@ -1,6 +1,6 @@
 # API
 
-The router on `--port` (default 8000) speaks the OpenAI API: `/v1/chat/completions`, `/v1/completions`, `/v1/models` and `/health`, plus `/tokenize` and `/detokenize` ([below](#tokenize-and-detokenize)). Any OpenAI client works with `base_url="http://<host>:8000/v1"`. It also speaks SGLang's native API: [`/generate`](#generate) and the [info and admin endpoints](#info-and-admin-endpoints). It also serves the OpenAI Responses API ([below](#responses-api)) and the Anthropic Messages API ([below](#anthropic-messages-api)).
+The router on `--port` (default 8000) speaks the OpenAI API: `/v1/chat/completions`, `/v1/completions`, `/v1/models` and `/health`, plus `/tokenize` and `/detokenize` ([below](#tokenize-and-detokenize)), and serves each engine's statistics and dashboard ([below](#statistics-and-the-dashboard)). Any OpenAI client works with `base_url="http://<host>:8000/v1"`. It also speaks SGLang's native API: [`/generate`](#generate) and the [info and admin endpoints](#info-and-admin-endpoints). It also serves the OpenAI Responses API ([below](#responses-api)) and the Anthropic Messages API ([below](#anthropic-messages-api)).
 
 ## Example
 
@@ -31,8 +31,9 @@ curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -
   be incomplete.
 - A client that disconnects aborts its request, streamed or not.
 - Endpoints on `--port` (the router): `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/messages`,
-  `/v1/messages/count_tokens`, `/v1/models`, `/health`, `/tokenize`, `/detokenize`, and SGLang's `/generate`,
-  `/model_info`, `/server_info`, `/get_load`, `/health_generate`, `/abort_request` and `/flush_cache`. Each
+  `/v1/messages/count_tokens`, `/v1/models`, `/health`, `/tokenize`, `/detokenize`, `/v1/stats`, `/dashboard`, and
+  SGLang's `/generate`, `/model_info`, `/server_info`, `/get_load`, `/health_generate`, `/abort_request` and
+  `/flush_cache`. Each
   engine also serves Prometheus metrics at `/metrics` on its own port (8001 and 8002 with the default `--port`), on
   127.0.0.1 only, among them the sparse-attention selection's counters (`trnrt:dsa_local_k_*`,
   [KNOWN_ISSUES.md](KNOWN_ISSUES.md)).
@@ -48,7 +49,32 @@ curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -
   host instead would put it in the output and let the model write past it.
 - Status codes: 400 for a request that cannot be served as sent (a field of the wrong type or out of range, a prompt
   longer than the context, a chat template variable the template never reads); 500 for an error inside the engine;
-  503 once the engine has failed, with the reason on `/health`.
+  503 once the engine has failed, with the reason on `/health`, and 503 for a full queue
+  ([Scheduling](#scheduling-and-priority)).
+
+## Scheduling and priority
+
+Each engine schedules its own requests; the flags are in [CONFIGURATION.md](CONFIGURATION.md#scheduling). The default
+is first come, first served, with no queue limit.
+
+| Field or answer | Behaviour |
+|---|---|
+| `priority` (integer, on `/v1/chat/completions` and `/v1/completions`) | SGLang's request field. With `--enable-priority-scheduling`, a waiting request with a higher value starts first (`--schedule-low-priority-values-first`: a lower one), and a request without one starts last. With `--radix-eviction-policy priority`, the prefix cache keeps the prefixes of high-priority requests longer. Without either flag the field is refused with 400, since nothing would use it |
+| A full queue | Past `--max-queued-requests` or `--max-queued-tokens` waiting on an engine, a request is answered 503 `{"detail": "The request queue is full."}`, as SGLang answers it, with the header `x-trnrt-queue-full: 1`. The router passes it on and keeps routing to that engine; OpenAI clients retry a 503 |
+| Displaced from a full queue | With priority scheduling, a request better than the worst one waiting takes its place. The displaced request gets 503 `The request is aborted by a higher priority request.` (as an error event if it streams). A request that has already generated tokens is never displaced |
+| Preempted for priority | With priority scheduling, when every seat is taken, a waiting request whose priority beats a running one's by more than `--priority-scheduling-preemption-threshold` (10) takes that one's seat. The preempted request waits and later resumes from its cached prefix; its client sees only a pause |
+
+## Statistics and the dashboard
+
+| Endpoint | Where | Answer |
+|---|---|---|
+| `GET /v1/stats` | each engine | `gauges` (live: `kv_pages_used`, `kv_pages_total`, `running`, `waiting`, `seats`, `cap`, `kv_used_pct`, `preemptions`, `scheduling`, `prompt_cache`, `prod`, and `spec` under speculation); `windows` (`1m`, `5m`, `15m`, `start`, and `today` with the production log on: requests, RPM, TPM, prefix-cache hit %, output tok/s, TTFT, per-stream decode tok/s and end-to-end percentiles); `totals`; `series` (30 minutes of 10-s points); `recent` (the last 50 finished requests) |
+| `GET /v1/stats` | the router | every engine's answer, as `{"engines": [{"url", "up", "stats"}], "router": ...}`; with `?engine=i`, engine i's alone, with a `router` block naming the engines |
+| `GET /dashboard` | each engine, and the router | one self-contained page (no CDN) that draws `/v1/stats` every 2 s. The router's shows one engine at a time, with a link to each (`?engine=i`) |
+
+The times are measured inside the engine, from when it receives a request (after the chat template and tokenization)
+to its last token, so they exclude the client's network round trip. A record holds counts and times, never a prompt or
+an output. Like the rest of the router, these endpoints have no authentication.
 
 ## Sampling extras
 
