@@ -90,6 +90,10 @@ ROUTES = ("/v1/completions", "/v1/chat/completions")
 # Every worker answers these the same (one model, one tokenizer), so they go to the least loaded live worker and touch
 # no prefix tree and no session: a /tokenize of an agent's context must not steer where its next turn is routed.
 STATELESS_ROUTES = ("/tokenize", "/v1/tokenize", "/detokenize", "/v1/detokenize")
+# An engine's 503 for a full waiting queue carries this header (serve/api.py QUEUE_FULL_HEADER): the engine is serving,
+# so the answer goes to the client as it is (SGLang's 503 "The request queue is full.") and the engine stays up. Another
+# engine is not tried: a session belongs on its own, and one without a session was routed where its prefix is cached.
+QUEUE_FULL_HEADER = "x-trnrt-queue-full"
 
 
 class _Node:
@@ -657,7 +661,16 @@ def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: floa
             except BaseException:
                 router.load[w] -= 1
                 raise
-            if (resp if body.get("stream") else r).status_code == 503:
+            got = resp if body.get("stream") else r  # a streamed 503 was read whole above
+            if got.status_code == 503 and got.headers.get(QUEUE_FULL_HEADER):
+                router.load[w] -= 1
+                return Response(
+                    got.content,
+                    status_code=503,
+                    media_type=got.headers.get("content-type"),
+                    headers={QUEUE_FULL_HEADER: "1"},
+                )
+            if got.status_code == 503:
                 router.load[w] -= 1
                 router.note_failure(w, hard=True)
                 if attempt == 1 or all(not ok for ok in router.up):
