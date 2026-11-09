@@ -20,7 +20,7 @@ Two forms of the same draw:
   0.44 ms at batch 1 and 1.70 ms at batch 2 per decode step: the gather is bf16 [B, 154,880] and
   the sampler reads it in at least three full passes from HBM. The candidates, the token and the
   top N are the same as sample()'s; the log-sum-exp is combined from the shards', so a logprob may
-  differ in its last fp32 bits. A call with penalties samples from the gathered logits (sample()).
+  differ in its last fp32 bits. A call with penalties or a token mask samples from the gathered logits (sample()).
 
 The graph returns ONE fp32 tensor per call, so a step is a single device-to-host read:
     out[:, 0]          sampled token id (exact in fp32 for ids < 2**24)
@@ -144,20 +144,20 @@ def sample(
     penalties: tuple | None = None,
 ) -> torch.Tensor:
     """logits [B, V] fp32; temperature/top_p/min_p [B] fp32; top_k [B] int64 (0 = off);
-    noise [B, K] uniform in (0, 1); bitmask: always None (no guided decoding; the parameter keeps
-    the models' call sites); penalties: optional (hist_ids, out_counts, rep, freq, pres) for
-    apply_penalties, which shape what is sampled, never the reported raw logprobs.
+    noise [B, K] uniform in (0, 1); bitmask: optional packed token mask, int32 [B, ceil(V / 32)]
+    (engine/grammar.py); penalties: optional (hist_ids, out_counts, rep, freq, pres) for
+    apply_penalties. Both shape what is sampled, never the reported raw logprobs (shaped_logits).
     Returns [B, 2 + 2N] fp32."""
-    if bitmask is not None:
-        raise ValueError("guided decoding (a token bitmask) is not supported")
     K = noise.shape[1]
     N = NUM_TOP_LOGPROBS
     lse = logsumexp_large(logits)
     raw_vals, raw_idx = topk_large(logits, max(K, N))  # sorted descending
-    if penalties is None:
+    if penalties is None and bitmask is None:
         vals, idx = raw_vals, raw_idx
     else:
-        vals, idx = topk_large(apply_penalties(logits, *penalties), max(K, 1))
+        # shaped_logits sits at the end of this module: no traced line above it moved when it was added (the compile
+        # cache key holds each op's source line), so every graph without a mask or penalties keeps its key
+        vals, idx = topk_large(shaped_logits(logits, bitmask, penalties), max(K, 1))
     greedy = idx[:, 0]
     if K > 1:
         sampled, _ = _draw(vals[:, :K], idx[:, :K], temperature, top_p, top_k, min_p, noise)
@@ -283,3 +283,22 @@ def unpack(out, n: int):
         out[:, 2 : 2 + N].long().tolist(),
         out[:, 2 + N : 2 + 2 * N].tolist(),
     )
+
+
+def unpack_bitmask(bitmask: torch.Tensor, vocab: int) -> torch.Tensor:
+    """A packed token mask, int32 [B, ceil(V / 32)] with bit t % 32 of word t // 32 set when token t is allowed
+    (xgrammar's layout, engine/grammar.py), as bool [B, vocab]."""
+    shifts = torch.arange(32, dtype=torch.int32, device=bitmask.device)
+    bits = torch.bitwise_and(torch.bitwise_right_shift(bitmask.unsqueeze(-1), shifts), 1)
+    return bits.reshape(bitmask.shape[0], -1)[:, :vocab] != 0
+
+
+def shaped_logits(logits: torch.Tensor, bitmask: torch.Tensor | None, penalties: tuple | None) -> torch.Tensor:
+    """The logits sample() draws from when a call carries host inputs: the penalties applied (apply_penalties), then
+    every token the mask forbids at -1e30, so a penalty never brings a forbidden token back. The candidates of a row
+    with fewer allowed tokens than K hold forbidden ones at -1e30, whose probability is 0 and whose draw score is
+    -inf: never drawn (the best candidate, an allowed one, is always kept)."""
+    out = logits if penalties is None else apply_penalties(logits, *penalties)
+    if bitmask is not None:
+        out = torch.where(unpack_bitmask(bitmask, logits.shape[1]), out, torch.full_like(out, -1e30))
+    return out
