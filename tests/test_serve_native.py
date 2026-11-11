@@ -380,6 +380,25 @@ def test_a_full_queue_503_from_generate_keeps_the_queue_full_header(stream):
             lp.stop()
 
 
+def test_no_logs_keeps_a_request_out_of_the_production_log(serve, monkeypatch, tmp_path):
+    """SGLang's no_logs: true writes nothing of the request to disk (TRNRT_PROD_DIR); /v1/stats still counts it, as
+    /metrics does (log_metrics is the field for those)."""
+    from trnrt.serve import api
+    from trnrt.serve import prodlog as PL
+
+    monkeypatch.setenv(PL.ENV, str(tmp_path))
+    client, eng = serve(PLAIN)
+    for rid, no_logs in (("quiet", True), ("logged", False)):
+        r = client.post("/generate", json={"input_ids": [1], "rid": rid, "no_logs": no_logs})
+        assert r.status_code == 200, r.text
+    (lp,) = [lp for lp in api._LOOPS if lp.engine is eng]
+    _wait_for(lambda: lp.stats.counts["ok"] == 2 and lp.prodlog.written["requests"] == 1)
+    lp.stop()
+    (path,) = tmp_path.rglob("requests.jsonl")
+    assert [rec["rid"] for rec in PL.read_jsonl(str(path))] == ["logged"]
+    assert client.post("/generate", json={"input_ids": [1], "no_logs": "yes"}).status_code == 400
+
+
 def test_load_and_info_endpoints(serve):
     client, eng = serve(PLAIN, preset="batch12")
     eng.scheduler.waiting.append(Request("w", [1, 2, 3], SamplingParams()))

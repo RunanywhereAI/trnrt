@@ -537,10 +537,11 @@ def add_routes(
         )
         t0 = time.perf_counter()
         subs: list[_Submit] = []
-        log_metrics = _flag(body, "log_metrics", True)
+        log_metrics, logs = _flag(body, "log_metrics", True), not _flag(body, "no_logs")
         try:  # extend() keeps the requests queued before one raised: they are aborted
             subs.extend(
-                loop_.submit(it.ids, it.params, body.get("session_id"), rid=it.rid, metrics=log_metrics) for it in items
+                loop_.submit(it.ids, it.params, body.get("session_id"), rid=it.rid, metrics=log_metrics, logs=logs)
+                for it in items
             )
         except HTTPException:
             for s in subs:

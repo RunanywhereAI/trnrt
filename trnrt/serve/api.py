@@ -95,6 +95,7 @@ class _Stream:
     sent: int = 0
     metrics: bool = True  # counted in /metrics when it finishes (a /health_generate probe is not)
     stream: bool = False  # the HTTP response streams (GET /v1/stats's records)
+    logs: bool = True  # its record goes to the production log (SGLang's no_logs turns it off)
     at_arrival: tuple[int, int] | None = None  # (running, waiting) when the engine took it
 
 
@@ -117,6 +118,7 @@ class _Submit:
     out: asyncio.Queue | _Tagged = field(default_factory=asyncio.Queue)
     metrics: bool = True
     stream: bool = False
+    logs: bool = True
 
 
 # Set on a 503 that answers a full waiting queue (scheduler.QueueFull) or a request displaced from it: the engine is
@@ -261,11 +263,13 @@ class EngineLoop:
         out: _Tagged | None = None,
         priority: int | None = None,
         stream: bool = False,
+        logs: bool = True,
     ) -> _Submit:
         """Queue a request for the engine thread. `rid`: the client's request id (SGLang's), which /abort_request
         names; a new one when None. `metrics`: whether /metrics and /v1/stats count it. `out`: a choice's view of a
         shared queue (`n` > 1), instead of its own. `priority`: SGLang's per-request priority. `stream`: whether the HTTP
-        response streams (GET /v1/stats's records)."""
+        response streams (GET /v1/stats's records). `logs`: whether its record goes to the production log (SGLang's
+        no_logs: false)."""
         # Checked here, before the engine sees the request: an id outside the vocabulary fails the step, and at tp > 1
         # one failed step fails the engine for every request (_fail).
         if not prompt_ids or not all(type(t) is int and 0 <= t < self.vocab for t in prompt_ids):
@@ -285,6 +289,7 @@ class EngineLoop:
             priority=priority,
             metrics=metrics,
             stream=stream,
+            logs=logs,
         )
         if out is not None:
             sub.out = out
@@ -339,7 +344,7 @@ class EngineLoop:
 
     def _finished_hook(self, st: _Stream, finish: str | None) -> None:
         rec = self.stats.record(st.req, st.stream, st.at_arrival, finish)
-        if self.prodlog is not None:
+        if self.prodlog is not None and st.logs:
             self.prodlog.put("requests", rec)
 
     def _drain(self, block: bool) -> None:
@@ -392,7 +397,7 @@ class EngineLoop:
             self._failed("error", sub.metrics)
         else:
             self.streams[sub.rid] = _Stream(
-                req, sub.loop, sub.out, metrics=sub.metrics, stream=sub.stream, at_arrival=at_arrival
+                req, sub.loop, sub.out, metrics=sub.metrics, stream=sub.stream, at_arrival=at_arrival, logs=sub.logs
             )
             post(sub.out.put_nowait, ("accepted", req))
 
