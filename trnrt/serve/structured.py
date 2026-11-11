@@ -21,6 +21,14 @@ from ..engine.grammar import GrammarSpec
 
 OBJECT = '{"type": "object"}'
 _VLLM_KEYS = ("json", "regex", "choice", "grammar", "json_object")
+# vLLM's other StructuredOutputsParams fields (vllm/sampling_params.py), accepted only at their defaults: a client that
+# sends the whole dataclass sends them. Any other key is refused whatever its value.
+_VLLM_NEUTRAL: dict[str, tuple[object, ...]] = {
+    "disable_any_whitespace": (None, False),
+    "disable_additional_properties": (None, False),
+    "whitespace_pattern": (None,),
+    "structural_tag": (None,),
+}
 
 
 def _schema_text(v, where: str) -> str:
@@ -72,7 +80,7 @@ def _vllm(so) -> list[GrammarSpec]:
         return []
     if not isinstance(so, dict):
         raise ValueError("structured_outputs must be an object")
-    unknown = sorted(k for k, v in so.items() if v is not None and v is not False and k not in _VLLM_KEYS)
+    unknown = sorted(k for k, v in so.items() if k not in _VLLM_KEYS and v not in _VLLM_NEUTRAL.get(k, ()))
     if unknown:
         raise ValueError(f"structured_outputs.{unknown[0]} is not supported: {', '.join(_VLLM_KEYS)}")
     out = []

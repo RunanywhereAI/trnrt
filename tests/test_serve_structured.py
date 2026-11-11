@@ -74,6 +74,22 @@ SCHEMA = {"type": "object", "properties": {"a": {"type": "integer"}}}
         ({"guided_choice": ["yes", "no"]}, GrammarSpec("regex", "(yes|no)")),
         ({"regex": "[0-9]+"}, GrammarSpec("regex", "[0-9]+")),
         ({"ebnf": 'root ::= "a"'}, GrammarSpec("ebnf", 'root ::= "a"')),
+        (  # vLLM's whole StructuredOutputsParams, its other fields at their defaults
+            {
+                "structured_outputs": {
+                    "json": SCHEMA,
+                    "regex": None,
+                    "choice": None,
+                    "grammar": None,
+                    "json_object": None,
+                    "disable_any_whitespace": False,
+                    "disable_additional_properties": False,
+                    "whitespace_pattern": None,
+                    "structural_tag": None,
+                }
+            },
+            GrammarSpec("json_schema", json.dumps(SCHEMA)),
+        ),
         ({"structured_outputs": {"json_object": True}}, GrammarSpec("json_schema", OBJECT)),
         ({"structured_outputs": {"json_object": False}, "regex": "a"}, GrammarSpec("regex", "a")),
     ],
@@ -110,6 +126,9 @@ def test_min_tokens_penalties_and_a_thinking_budget_reach_the_engine(client):
         {"guided_choice": "yes"},
         {"structured_outputs": {"json_object": "false"}},  # not a boolean: refused, not taken as true
         {"structured_outputs": {"json_object": 1}},
+        {"structured_outputs": {"bogus": None}},  # an unknown key, whatever its value
+        {"structured_outputs": {"bogus": False}},
+        {"structured_outputs": {"disable_any_whitespace": True}},  # vLLM's option, not at its default
         {"min_tokens": 9},  # above max_tokens
         {"prompt_logprobs": 1},  # still not served (docs/API.md)
     ],
