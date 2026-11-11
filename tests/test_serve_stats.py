@@ -93,6 +93,35 @@ def test_windows_count_requests_by_their_finish_and_tokens_as_handed_out():
     assert sum(p["rpm"] or 0 for p in series) * S.BUCKET_S / 60 == 3  # each ok request in its finish bucket
 
 
+def test_the_start_and_today_windows_count_past_the_ring():
+    """ "start" and "today" count every request, as their ok and token totals do, not only the ring's newest."""
+    c = Clock()
+    st = S.Stats(ring=3, clock=c.wall, mono=c.mono_)
+    earlier = [
+        S.derive(
+            {
+                "rid": f"e{i}",
+                "arrival": T0 - 50,
+                "first": None,
+                "done": T0 - 40,
+                "prompt": 1,
+                "cached": 0,
+                "output": 0,
+                "finish": "abort",
+            }
+        )
+        for i in range(4)
+    ]
+    st.merge_day(earlier, [], T0 - 3600)
+    c.mono = 1060.0
+    for i in range(5):
+        st.record(req(f"r{i}", 1001, 1002, 1003 + i), stream=False, at_arrival=None)
+    w = st.snapshot({}, now=c.wall(), ttl=0)["windows"]
+    assert len(st.records) == 3 and w["1m"]["n"] == 3  # a window inside the ring counts what it holds
+    assert (w["start"]["n"], w["start"]["ok"]) == (5, 5)
+    assert (w["today"]["n"], w["today"]["ok"]) == (9, 5)
+
+
 def test_the_snapshot_is_shared_for_its_ttl_but_the_gauges_are_live():
     st, _c = stats()
     a = st.snapshot({"g": 1}, now=T0 + 5, ttl=1.0)
