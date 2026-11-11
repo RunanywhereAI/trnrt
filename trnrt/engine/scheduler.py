@@ -335,11 +335,20 @@ class Scheduler:
             return math.inf
         return p if self.cfg.low_priority_first else -p
 
+    def check_add(self, req: Request) -> None:
+        """Raise what add(req) would (ValueError, QueueFull), changing nothing: the engine calls it before it builds a
+        request's grammar matcher, so a refused request costs none."""
+        self._check_len(req)
+        self._queue_room(req, apply=False)
+
+    def _check_len(self, req: Request) -> None:
+        if req.num_tokens >= self.cfg.max_model_len:
+            raise ValueError(f"prompt of {req.num_tokens} tokens does not fit max_model_len={self.cfg.max_model_len}")
+
     def add(self, req: Request) -> Request | None:
         """Queue `req`. Returns the waiting request it displaced from a full queue (already finished, finish_reason
         "abort", Request.error set), or None; raises QueueFull when the queue is at its limit and nothing is displaced."""
-        if req.num_tokens >= self.cfg.max_model_len:
-            raise ValueError(f"prompt of {req.num_tokens} tokens does not fit max_model_len={self.cfg.max_model_len}")
+        self._check_len(req)
         displaced = self._queue_room(req)
         if req.session_id is not None:
             req.session_gen = self.radix.session_open(req.session_id)
@@ -353,10 +362,11 @@ class Scheduler:
         p = req.priority or 0
         return -p if self.cfg.low_priority_first else p  # an int, exact as rank's
 
-    def _queue_room(self, req: Request) -> Request | None:
+    def _queue_room(self, req: Request, apply: bool = True) -> Request | None:
         """Make room for `req` under the queue limits, or raise QueueFull. Over max_queued_requests with priority
         scheduling, the worst waiting request (the newest among equals) is displaced if `req` ranks strictly better;
-        one that has already generated tokens (a preempted request, partly streamed) is never displaced."""
+        one that has already generated tokens (a preempted request, partly streamed) is never displaced. With apply
+        False nothing is displaced: the request that would be is returned."""
         c = self.cfg
         if c.max_queued_tokens is not None:
             queued = sum(r.num_tokens for r in self.waiting)
@@ -369,6 +379,8 @@ class Scheduler:
             if fresh:
                 worst = max(fresh, key=lambda r: (self.rank(r), r.arrival_time))
                 if self.rank(req) < self.rank(worst):
+                    if not apply:
+                        return worst
                     self.abort(worst)
                     worst.error = (503, DISPLACED)
                     return worst

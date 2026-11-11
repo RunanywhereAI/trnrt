@@ -363,6 +363,9 @@ class LLMEngine:
         req = Request(rid or f"req-{next(self._ids)}", list(prompt_ids), params, session_id=session_id)
         req.priority = priority
         if self.host_sampling is not None:
+            # A request the queue refuses (QueueFull, a 503) is refused before its grammar matcher is built, and one
+            # admit refuses (ValueError, a 400) is refused before it displaces a waiting request.
+            self.scheduler.check_add(req)
             self.host_sampling.admit(req)  # its grammar matcher and thinking-budget state (ValueError: a 400)
         displaced = self.scheduler.add(req)
         if displaced is not None:
