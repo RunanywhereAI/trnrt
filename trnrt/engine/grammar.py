@@ -14,11 +14,15 @@ nothing else needs it.
 from __future__ import annotations
 
 import re
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 
+# Compiled grammars kept, the least recently used dropped first: an agent sends the same few schemas on every turn, and
+# a client sending a new schema each request must not grow the engine's memory without end.
+CACHE_SIZE = 32
 MISSING = "guided decoding needs the xgrammar package on the engine's host: pip install 'trnrt[grammar]'"
 
 
@@ -70,8 +74,10 @@ def allowed(row: np.ndarray, token: int) -> bool:
 
 
 class GrammarBackend:
-    """xgrammar's compiler over the engine's tokenizer, with compiled grammars cached by spec (an agent sends the same
-    schema on every turn). Built on the first guided request; raises ValueError(MISSING) without xgrammar."""
+    """xgrammar's compiler over the engine's tokenizer, with the last CACHE_SIZE compiled grammars cached by spec (an
+    agent sends the same schema on every turn). xgrammar's own compiler cache is turned off (GrammarCompiler
+    cache_enabled, where the installed xgrammar has it), so this bound holds for both. Built on the first guided
+    request; raises ValueError(MISSING) without xgrammar."""
 
     def __init__(self, tokenizer, vocab_size: int, stop_ids=()):
         try:
@@ -87,12 +93,16 @@ class GrammarBackend:
         info = xgr.TokenizerInfo.from_huggingface(
             tokenizer, vocab_size=vocab_size, stop_token_ids=list(stop_ids) or None
         )
-        self.compiler = xgr.GrammarCompiler(info)
-        self._cache: dict[GrammarSpec, Any] = {}
+        try:
+            self.compiler = xgr.GrammarCompiler(info, cache_enabled=False)
+        except TypeError:  # an xgrammar without the setting
+            self.compiler = xgr.GrammarCompiler(info)
+        self._cache: OrderedDict[GrammarSpec, Any] = OrderedDict()
 
     def compile(self, spec: GrammarSpec):
         hit = self._cache.get(spec)
         if hit is not None:
+            self._cache.move_to_end(spec)
             return hit
         c = self.compiler
         try:
@@ -105,6 +115,8 @@ class GrammarBackend:
         except Exception as e:  # xgrammar raises RuntimeError (and others) on a malformed spec
             raise ValueError(f"invalid {spec.kind} for guided decoding: {e}") from e
         self._cache[spec] = g
+        if len(self._cache) > CACHE_SIZE:
+            self._cache.popitem(last=False)
         return g
 
     def matcher(self, spec: GrammarSpec):

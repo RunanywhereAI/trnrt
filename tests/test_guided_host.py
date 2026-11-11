@@ -3,16 +3,20 @@ min_tokens (engine/engine.py), driven token by token with a stand-in tokenizer a
 
 - a grammar's dead end ends its request as "stop", with or without ignore_eos;
 - a thinking budget reached on a partial close tag forces only the rest of the tag;
-- a stop string that ended among the first min_tokens tokens never ends the request later.
+- a stop string that ended among the first min_tokens tokens never ends the request later;
+- the compiled-grammar cache keeps the most recently used grammars, CACHE_SIZE at most (a stand-in xgrammar).
 """
 
 from __future__ import annotations
 
+import sys
 from types import SimpleNamespace
 
 import pytest
 
+from trnrt.engine import grammar
 from trnrt.engine.engine import LLMEngine
+from trnrt.engine.grammar import GrammarBackend, GrammarSpec
 from trnrt.engine.guided import HostSampling
 from trnrt.engine.request import Request, SamplingParams, Status
 
@@ -164,3 +168,42 @@ def test_a_speculative_step_past_min_tokens_trims_to_its_own_stop_string_not_a_p
     emit(r, 20, 7, 21)  # one speculative step of three tokens: its stop token is the middle one
     assert stop_check(r, draft=True) == [r]
     assert r.output_ids == [7, 8, 9, 20, 7], "trimmed past the protected stop token"
+
+
+class FakeXgr:
+    """The parts of xgrammar GrammarBackend calls, counting compilations."""
+
+    def __init__(self):
+        self.compiled: list[str] = []
+        self.compiler_kw: dict = {}
+        outer = self
+
+        class TokenizerInfo:
+            @staticmethod
+            def from_huggingface(tokenizer, vocab_size, stop_token_ids):
+                return "info"
+
+        class GrammarCompiler:
+            def __init__(self, info, **kw):
+                outer.compiler_kw = kw
+
+            def compile_regex(self, value):
+                outer.compiled.append(value)
+                return ("compiled", value)
+
+        self.TokenizerInfo, self.GrammarCompiler = TokenizerInfo, GrammarCompiler
+
+
+def test_the_compiled_grammar_cache_is_a_bounded_lru(monkeypatch):
+    xgr = FakeXgr()
+    monkeypatch.setitem(sys.modules, "xgrammar", xgr)
+    monkeypatch.setattr(grammar, "CACHE_SIZE", 3)
+    be = GrammarBackend(object(), 64, (EOS,))
+    assert xgr.compiler_kw == {"cache_enabled": False}, "xgrammar's own unbounded cache stays off"
+    spec = [GrammarSpec("regex", f"r{i}") for i in range(5)]
+    for i in (0, 1, 2, 0, 3):  # r0 used again before r3 arrives: r1 is the least recent, and goes
+        be.compile(spec[i])
+    assert xgr.compiled == ["r0", "r1", "r2", "r3"] and len(be._cache) == 3
+    be.compile(spec[0])
+    be.compile(spec[1])  # recompiled: it was dropped
+    assert xgr.compiled == ["r0", "r1", "r2", "r3", "r1"] and len(be._cache) == 3
