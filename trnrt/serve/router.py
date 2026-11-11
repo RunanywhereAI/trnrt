@@ -537,6 +537,40 @@ def _prompt(path: str, body: dict):
     return body.get("prompt", "")
 
 
+def _json_head(x, k: int):
+    """x cut to its first k items and string characters, counted in document order at every level: its JSON text
+    starts with the same k characters as x's, since each one kept writes at least one character before the first that
+    differs. A key reads that much of a prompt of any size (a 200K-token input_ids list, a batch of them) without
+    writing all of it on the event loop."""
+    left = k
+
+    def cut(v):
+        nonlocal left
+        if isinstance(v, str):
+            n = max(0, min(len(v), left))
+            left -= n
+            return v[:n]
+        if isinstance(v, list):
+            out = []
+            for item in v:
+                if left <= 0:
+                    break
+                left -= 1
+                out.append(cut(item))
+            return out
+        if isinstance(v, dict):
+            d = {}
+            for key, item in v.items():
+                if left <= 0:
+                    break
+                left -= 1
+                d[key] = cut(item)
+            return d
+        return v
+
+    return cut(x)
+
+
 def _session_key(path: str, body: dict) -> tuple[str, str]:
     """A session request's history key, (sys_hash, first_hash): hashes of its leading system messages and of the first
     SESSION_KEY_CHARS characters of the first message after them (for a completion: "" and its prompt's first
@@ -547,12 +581,14 @@ def _session_key(path: str, body: dict) -> tuple[str, str]:
     msgs = _conversation(path, body)
     if msgs is None:
         p = _prompt(path, body)
-        return h(""), h((p if isinstance(p, str) else json.dumps(p))[:SESSION_KEY_CHARS])
+        p = p if isinstance(p, str) else json.dumps(_json_head(p, SESSION_KEY_CHARS))
+        return h(""), h(p[:SESSION_KEY_CHARS])
     msgs = msgs if isinstance(msgs, list) else []
     k = _leading_system(msgs)
     first = msgs[k] if k < len(msgs) and isinstance(msgs[k], dict) else {}
     c = first.get("content")
-    c = c if isinstance(c, str) else "" if c is None else json.dumps(c, ensure_ascii=False)
+    if not isinstance(c, str):
+        c = "" if c is None else json.dumps(_json_head(c, SESSION_KEY_CHARS), ensure_ascii=False)
     return h(json.dumps(msgs[:k], ensure_ascii=False)), h(str(first.get("role", "")) + "\x00" + c[:SESSION_KEY_CHARS])
 
 

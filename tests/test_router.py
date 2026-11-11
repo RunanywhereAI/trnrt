@@ -585,6 +585,37 @@ def test_each_conversation_api_routes_by_its_conversation(path):
     assert r.pick(t2, head=head) == home and r.routed["sticky"] == 1
 
 
+def test_a_session_key_reads_only_the_start_of_a_long_prompt(monkeypatch):
+    """A session request's key hashes the first SESSION_KEY_CHARS characters of its prompt's JSON text, on the event
+    loop: written from the prompt's start only, never the whole prompt (a 200K-token input_ids list), with the same key
+    as the whole prompt's text cut there."""
+    import hashlib
+    import json
+
+    from trnrt.serve import router as R
+
+    K = R.SESSION_KEY_CHARS
+    h = lambda b: hashlib.sha1(b.encode("utf-8", "replace"), usedforsecurity=False).hexdigest()  # noqa: E731
+    ids = list(range(200_000))
+    prompts = [
+        ("/generate", {"input_ids": ids}, ids),
+        ("/generate", {"input_ids": [ids, ids]}, [ids, ids]),
+        ("/generate", {"input_ids": [[7] * 3, ids]}, [[7] * 3, ids]),  # a short first prompt: the next one is read too
+        ("/generate", {"text": ["x" * 100_000, "y"]}, ["x" * 100_000, "y"]),
+        ("/v1/completions", {"prompt": ["\u00e9\U0001f642" * 50_000]}, ["\u00e9\U0001f642" * 50_000]),
+    ]
+    want = [(h(""), h(json.dumps(p)[:K])) for _, _, p in prompts]
+    content = [{"type": "text", "text": "z" * 100_000}, {"type": "text", "text": "w"}]
+    chat = {"messages": [{"role": "system", "content": "s"}, {"role": "user", "content": content}]}
+    want_chat = h("user\x00" + json.dumps(content, ensure_ascii=False)[:K])
+    sizes: list[int] = []
+    real = json.dumps
+    monkeypatch.setattr(R.json, "dumps", lambda *a, **kw: sizes.append(len(out := real(*a, **kw))) or out)
+    assert [R._session_key(path, body) for path, body, _ in prompts] == want
+    assert R._session_key("/v1/chat/completions", chat)[1] == want_chat
+    assert max(sizes) < 16 * K  # a cut prompt's text (up to 12 characters an item): never the 1.3 MB of the list
+
+
 def test_the_router_proxies_responses_and_messages_with_their_sessions():
     """/v1/responses and /v1/messages go through the proxy: a session_id pins them as it pins a chat."""
     import asyncio
