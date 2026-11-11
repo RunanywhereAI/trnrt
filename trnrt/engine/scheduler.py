@@ -125,6 +125,10 @@ class SchedulerConfig:
             v = getattr(self, name)
             if v is not None and v < 1:
                 raise ValueError(f"{name} must be at least 1")
+        if self.priority_preemption_threshold < 0:
+            # As the CLI (--priority-scheduling-preemption-threshold): below 0, a waiting request would preempt a running
+            # one of equal priority, which would preempt it back, recomputing both prefills without end.
+            raise ValueError("priority_preemption_threshold must be at least 0")
 
 
 @dataclass(frozen=True)

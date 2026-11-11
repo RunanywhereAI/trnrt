@@ -130,6 +130,9 @@ def test_config_validation():
         SchedulerConfig(1, 1, 1, 2, policy="lpm", priority_scheduling=True)
     with pytest.raises(ValueError, match="at least 1"):
         SchedulerConfig(1, 1, 1, 2, max_queued_requests=0)
+    with pytest.raises(ValueError, match="priority_preemption_threshold must be at least 0"):
+        SchedulerConfig(1, 1, 1, 2, **Scheduling(priority_preemption_threshold=-1).scheduler_fields())
+    assert SchedulerConfig(1, 1, 1, 2, priority_preemption_threshold=0).priority_preemption_threshold == 0
 
 
 def test_fcfs_spf_and_lof_admission_orders():
