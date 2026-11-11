@@ -261,11 +261,12 @@ def _stop(run: Run, finish: str | None, stops: list[str]) -> tuple[str | None, s
 
 
 def content_blocks(msg: dict) -> list[dict]:
-    """A parsed chat message (parsers.parse_full) as Anthropic content blocks: thinking, text, then tool_use."""
+    """A parsed chat message (parsers.parse_full) as Anthropic content blocks: thinking, text, then tool_use. A
+    whitespace-only answer makes no text block, as the stream opens none for it (_events)."""
     out: list[dict] = []
     if msg.get("reasoning_content"):
         out.append({"type": "thinking", "thinking": msg["reasoning_content"], "signature": ""})
-    if msg.get("content"):
+    if msg.get("content") and msg["content"].strip():
         out.append({"type": "text", "text": msg["content"]})
     for tc in msg.get("tool_calls") or ():
         fn = tc["function"]

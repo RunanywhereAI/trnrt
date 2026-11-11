@@ -282,3 +282,16 @@ def test_whitespace_between_two_calls_opens_no_text_block(client):
     assert [{k: v for k, v in b.items() if k != "id"} for b in got] == [
         {k: v for k, v in b.items() if k != "id"} for b in whole
     ]
+
+
+def test_a_whitespace_only_answer_makes_no_text_block(client):
+    """An answer of whitespace alone (thinking off, so parse_full keeps it) makes no text block, streamed or not."""
+
+    def newline(eng) -> None:
+        eng.tokenizer.add_tokens(["\n"])
+        eng.script = [eng.tokenizer.convert_tokens_to_ids("\n")]
+
+    c, _ = client(PLAIN, newline)
+    body = {**ASK, "thinking": {"type": "disabled"}}
+    assert c.post("/v1/messages", json=body).json()["content"] == []
+    assert _blocks(_sse(c, body)) == []
