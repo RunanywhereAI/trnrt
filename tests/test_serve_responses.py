@@ -293,3 +293,17 @@ def test_whitespace_between_two_calls_opens_no_message_item(client):
     assert [it["type"] for it in whole] == ["reasoning", "message", "function_call", "function_call"]
     final = _sse(c, body)[-1]["response"]["output"]
     assert _strip_ids(final) == _strip_ids(whole)
+
+
+def test_a_whitespace_only_answer_makes_no_message_item(client):
+    """An answer of whitespace alone (thinking off, so parse_full keeps it) makes no message item, streamed or not."""
+
+    def newline(eng) -> None:
+        eng.tokenizer.add_tokens(["\n"])
+        eng.script = [eng.tokenizer.convert_tokens_to_ids("\n")]
+
+    c, _ = client(PLAIN, newline)
+    body = {"input": "hi", "chat_template_kwargs": {"enable_thinking": False}}
+    whole = c.post("/v1/responses", json=body).json()["output"]
+    assert whole == []
+    assert _sse(c, body)[-1]["response"]["output"] == []

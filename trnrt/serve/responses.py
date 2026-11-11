@@ -314,11 +314,12 @@ def _call_item(item_id: str, call_id: str, name: str, arguments: str, status: st
 
 
 def output_items(msg: dict, info: dict) -> list[dict]:
-    """A parsed chat message (parsers.parse_full) as Responses output items: reasoning, the answer, then the calls."""
+    """A parsed chat message (parsers.parse_full) as Responses output items: reasoning, the answer, then the calls. A
+    whitespace-only answer makes no message item, as the stream opens none for it (_Stream)."""
     out = []
     if msg.get("reasoning_content"):
         out.append(_reasoning_item(_id("rs_"), msg["reasoning_content"], info))
-    if msg.get("content"):
+    if msg.get("content") and msg["content"].strip():
         out.append(_message_item(_id("msg_"), msg["content"]))
     for tc in msg.get("tool_calls") or ():
         fn = tc["function"]
