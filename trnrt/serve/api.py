@@ -326,8 +326,15 @@ class EngineLoop:
         self.stats.tick(time.monotonic(), tokens, running, waiting)
 
     def _finished(self, st: _Stream, finish: str | None = None) -> None:
-        """A request's end: its record into the live statistics and the production log (O(1), never blocks)."""
-        self._hook(self._finished_hook, st, finish)
+        """A request's end: its record into the live statistics and the production log (O(1), never blocks). None for
+        a request submitted with metrics=False (a /health_generate probe), however it ends: finished or aborted."""
+        if st.metrics:
+            self._hook(self._finished_hook, st, finish)
+
+    def _failed(self, kind: str, metrics: bool) -> None:
+        """A request that never ran or that a failure ended, counted in /v1/stats unless submitted with metrics=False."""
+        if metrics:
+            self._hook(self.stats.failed, kind)
 
     def _finished_hook(self, st: _Stream, finish: str | None) -> None:
         rec = self.stats.record(st.req, st.stream, st.at_arrival, finish)
@@ -374,14 +381,14 @@ class EngineLoop:
             req = self.engine.add_request(sub.prompt_ids, sub.params, rid=sub.rid, session_id=sub.session_id, **extra)
         except QueueFull as e:
             post(sub.out.put_nowait, ("error", str(e), 503, True))
-            self._hook(self.stats.failed, "queue_full")
+            self._failed("queue_full", sub.metrics)
         except ValueError as e:
             post(sub.out.put_nowait, ("error", str(e), 400))
-            self._hook(self.stats.failed, "refused")
+            self._failed("refused", sub.metrics)
         except Exception as e:  # noqa: BLE001  add_request raised before the request reached the scheduler
             traceback.print_exc()  # (its last step): that request fails, the engine keeps serving
             post(sub.out.put_nowait, ("error", f"request refused: {e!r}", 500))
-            self._hook(self.stats.failed, "error")
+            self._failed("error", sub.metrics)
         else:
             self.streams[sub.rid] = _Stream(
                 req, sub.loop, sub.out, metrics=sub.metrics, stream=sub.stream, at_arrival=at_arrival
@@ -482,7 +489,7 @@ class EngineLoop:
         streams, self.streams = self.streams, {}
         for st in streams.values():
             st.loop.call_soon_threadsafe(st.out.put_nowait, ("error", f"engine failed: {reason}", 503))
-            self._hook(self.stats.failed, "engine")
+            self._failed("engine", st.metrics)
         flushes = [self._flush] if self._flush is not None else []
         self._flush = None
         while True:
@@ -523,7 +530,7 @@ class EngineLoop:
                     st.loop.call_soon_threadsafe(st.out.put_nowait, ("error", f"engine step failed: {e}", 500))
                     if st.req.status is not Status.FINISHED:
                         self.engine.abort(st.req)
-                    self._hook(self.stats.failed, "engine")
+                    self._failed("engine", st.metrics)
                 self.streams.clear()
                 continue
             self.last_step = time.monotonic()
@@ -539,7 +546,7 @@ class EngineLoop:
                 if finished and req.error is not None:  # ended unserved: displaced from a full queue
                     batch.setdefault(st.loop, []).append((st.out, ("error", req.error[1], req.error[0], True)))
                     del self.streams[rid]
-                    self._hook(self.stats.failed, "displaced")
+                    self._failed("displaced", st.metrics)
                     continue
                 if ready > st.sent or finished:
                     new = out[st.sent : ready]
@@ -553,7 +560,7 @@ class EngineLoop:
                     del self.streams[rid]
                     if st.metrics:  # a /health_generate probe is counted in neither /metrics nor /v1/stats
                         self.metrics.on_finish(req)
-                        self._finished(st)
+                    self._finished(st)
             for loop, items in batch.items():
                 loop.call_soon_threadsafe(_deliver, items)
             self._tick(handed)

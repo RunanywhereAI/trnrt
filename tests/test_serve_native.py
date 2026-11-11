@@ -307,10 +307,10 @@ def test_flush_cache_flushes_only_an_idle_engine():
 
 def test_health_generate_runs_a_token_through_the_engine(monkeypatch):
     """Idle: the probe (prompt [0], one greedy token) runs, and /metrics does not count it. Stuck in a step past the
-    timeout: 503, and the probe is aborted."""
+    timeout: 503, and the probe is aborted. /v1/stats counts neither probe."""
     import httpx
 
-    from trnrt.serve import native
+    from trnrt.serve import api, native
 
     eng = ScriptedEngine(PLAIN)
     with _uvicorn(eng) as base, httpx.Client(base_url=base, timeout=30) as c:
@@ -332,6 +332,15 @@ def test_health_generate_runs_a_token_through_the_engine(monkeypatch):
         assert r.status_code == 503 and "no engine step ended" in r.json()["error"], r.text
         assert started().status_code == 200
         _wait_for(lambda: len(eng.added) == 4 and eng.aborted == [eng.added[3].rid])
+        # neither probe is a request in /v1/stats or the production log, the aborted one included: the engine thread
+        # handled the abort before this later request, so once its record is in, an abort record would be too
+        eng.step_delay = 0.0
+        assert c.post("/v1/completions", json={"prompt": [1]}).status_code == 200
+        (lp,) = [lp for lp in api._LOOPS if lp.engine is eng]
+        _wait_for(lambda: lp.stats.counts["ok"] == 3)
+        assert lp.stats.counts == {"ok": 3, "aborted": 0, "failed": 0}
+        probes = {eng.added[0].rid, eng.added[3].rid}
+        assert len(lp.stats.records) == 3 and not probes & {r["rid"] for r in lp.stats.records}
 
 
 def test_health_generate_is_503_once_a_rank_died(serve):
