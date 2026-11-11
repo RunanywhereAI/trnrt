@@ -536,6 +536,8 @@ class Scheduler:
             return
         if c.policy == "lpm":
             if len(self.waiting) > LPM_MAX_QUEUE:
+                # Arrival order, as documented: the queue may still be in an earlier round's cache-hit order.
+                self.waiting = deque(sorted(self.waiting, key=lambda r: r.arrival_time))
                 return
             ps = c.page_size
             hit = {

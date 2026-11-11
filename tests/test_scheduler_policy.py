@@ -24,7 +24,7 @@ from tests.test_scheduler import (
 )
 from tests.test_scheduler_spec import K, emitted, speculating
 from trnrt.engine.request import Request, SamplingParams, Status
-from trnrt.engine.scheduler import DISPLACED, NeedSync, QueueFull, SchedulerConfig, Scheduling
+from trnrt.engine.scheduler import DISPLACED, LPM_MAX_QUEUE, NeedSync, QueueFull, SchedulerConfig, Scheduling
 
 
 def policy(sched, **kw):
@@ -155,6 +155,20 @@ def test_lpm_admits_the_longest_cached_prefix_first():
     got, hot = order(policy(make(max_seqs=1, budget=64), policy="lpm"))
     assert got == ["hot", "blk", "cold"] and hot.num_cached_tokens == len(system)
     assert order(make(max_seqs=1, budget=64))[0] == ["blk", "cold", "hot"]  # the control: arrival order
+
+
+def test_lpm_past_its_queue_limit_returns_to_arrival_order():
+    """Above LPM_MAX_QUEUE waiting requests lpm stops matching prefixes and orders by arrival (SGLang's fcfs then); a
+    queue an earlier round sorted by cache hits does not stay in that order."""
+    sched = policy(make(), policy="lpm")
+    reqs = [req(f"r{i}", 4) for i in range(LPM_MAX_QUEUE + 1)]
+    for i, r in enumerate(reqs):
+        r.arrival_time = float(i)
+    shuffled = reqs[:]
+    random.Random(0).shuffle(shuffled)
+    sched.waiting = deque(shuffled)  # as a cache-hit order an earlier round left
+    sched._order_waiting()
+    assert list(sched.waiting) == reqs
 
 
 def test_priority_scheduling_orders_by_priority_both_ways_and_none_last():
