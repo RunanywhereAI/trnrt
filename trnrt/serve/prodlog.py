@@ -27,7 +27,10 @@ import queue
 import shutil
 import threading
 import time
+import zlib
 from typing import IO, TYPE_CHECKING
+
+from .stats import BUCKET_S
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -48,7 +51,8 @@ def utc_day(t: float) -> str:
 
 
 def read_jsonl(path: str) -> list[dict]:
-    """A .jsonl or .jsonl.gz file's records; a torn line (a write cut short) is skipped."""
+    """A .jsonl or .jsonl.gz file's records; a torn line (a write cut short) is skipped, and a truncated or corrupt .gz
+    (EOFError, zlib.error) keeps the records read before it."""
     out = []
     opener = gzip.open if path.endswith(".gz") else open
     try:
@@ -60,7 +64,7 @@ def read_jsonl(path: str) -> list[dict]:
                     continue
                 if isinstance(rec, dict):
                     out.append(rec)
-    except OSError:
+    except (OSError, EOFError, zlib.error):
         pass
     return out
 
@@ -70,12 +74,14 @@ def day_files(day_dir: str, kind: str) -> list[str]:
     current one."""
     stem = NAMES[kind][: -len(".jsonl")]
     try:
-        names = os.listdir(day_dir)
+        names = set(os.listdir(day_dir))
     except OSError:
         return []
     segs: list[tuple[float, str]] = []
     for n in names:
         base = n.removesuffix(".gz")
+        if n != base and base in names:  # a restart between gzip_file's rename and its remove: read one copy
+            continue
         if base == NAMES[kind]:
             segs.append((float("inf"), n))
         elif base.startswith(stem + ".") and base.endswith(".jsonl"):
@@ -86,12 +92,18 @@ def day_files(day_dir: str, kind: str) -> list[str]:
 
 
 def gzip_file(path: str) -> None:
+    """path as path.gz, which appears only once complete (written as a .tmp, then renamed), then path removed. A
+    process killed meanwhile leaves the source whole, and day_files reads it alone."""
+    tmp = path + ".gz.tmp"
     try:
-        with open(path, "rb") as f, gzip.open(path + ".gz", "wb") as g:
+        with open(path, "rb") as f, gzip.open(tmp, "wb") as g:
             shutil.copyfileobj(f, g, 1 << 20)
+        os.replace(tmp, path + ".gz")
         os.remove(path)
     except OSError as e:
         logger.warning("production log: could not gzip %s: %s", path, e)
+        with contextlib.suppress(OSError):
+            os.remove(tmp)
 
 
 class ProdLog:
@@ -282,11 +294,12 @@ class ProdLog:
         now = self.clock()
         day = utc_day(now)
         d = os.path.join(self.root, day)
+        start = calendar.timegm(time.strptime(day, "%Y-%m-%d"))  # UTC midnight
         recs = [r for p in day_files(d, "requests") for r in read_jsonl(p) if isinstance(r.get("done"), (int, float))]
-        gauges = [
-            g
-            for p in day_files(d, "gauges")
-            for g in read_jsonl(p)
-            if isinstance(g.get("t"), (int, float)) and g["t"] >= now - GAUGES_RELOAD_S
-        ]
-        stats.merge_day(recs, gauges, calendar.timegm(time.strptime(day, "%Y-%m-%d")))  # from UTC midnight
+        gauges = [g for p in day_files(d, "gauges") for g in read_jsonl(p) if isinstance(g.get("t"), (int, float))]
+        # the "today" output tok/s counts every gauge of the day (a bucket closed just after midnight is yesterday's);
+        # the series reads back only its own 30 minutes
+        out_tok_s = (g.get("out_tok_s") for g in gauges if g["t"] >= start)
+        handed = BUCKET_S * sum(x for x in out_tok_s if isinstance(x, (int, float)))
+        recent = [g for g in gauges if g["t"] >= now - GAUGES_RELOAD_S]
+        stats.merge_day(recs, recent, start, handed=handed)

@@ -93,6 +93,45 @@ def test_windows_count_requests_by_their_finish_and_tokens_as_handed_out():
     assert sum(p["rpm"] or 0 for p in series) * S.BUCKET_S / 60 == 3  # each ok request in its finish bucket
 
 
+def test_the_start_and_today_windows_count_past_the_ring():
+    """ "start" and "today" count every request, as their ok and token totals do, not only the ring's newest."""
+    c = Clock()
+    st = S.Stats(ring=3, clock=c.wall, mono=c.mono_)
+    earlier = [
+        S.derive(
+            {
+                "rid": f"e{i}",
+                "arrival": T0 - 50,
+                "first": None,
+                "done": T0 - 40,
+                "prompt": 1,
+                "cached": 0,
+                "output": 0,
+                "finish": "abort",
+            }
+        )
+        for i in range(4)
+    ]
+    st.merge_day(earlier, [], T0 - 3600)
+    c.mono = 1060.0
+    for i in range(5):
+        st.record(req(f"r{i}", 1001, 1002, 1003 + i), stream=False, at_arrival=None)
+    w = st.snapshot({}, now=c.wall(), ttl=0)["windows"]
+    assert len(st.records) == 3 and w["1m"]["n"] == 3  # a window inside the ring counts what it holds
+    assert (w["start"]["n"], w["start"]["ok"]) == (5, 5)
+    assert (w["today"]["n"], w["today"]["ok"]) == (9, 5)
+
+
+def test_the_current_series_point_rates_over_its_elapsed_seconds():
+    """The newest point is a bucket still filling: its RPM, like its output tok/s, divides by the seconds it has run."""
+    st, _ = stats()
+    st.tick(1000.5, 20, 1, 0)
+    st.record(req("a", 1000.2, 1000.4, 1001.0), stream=False, at_arrival=None)
+    last = st.snapshot({}, now=T0 + 2.5, ttl=0)["series"][-1]
+    assert last["t"] == T0 and last["out_tok_s"] == pytest.approx(20 / 2.5)
+    assert last["rpm"] == pytest.approx(60 / 2.5)
+
+
 def test_the_snapshot_is_shared_for_its_ttl_but_the_gauges_are_live():
     st, _c = stats()
     a = st.snapshot({"g": 1}, now=T0 + 5, ttl=1.0)
@@ -145,16 +184,66 @@ def test_the_production_log_writes_reloads_and_rotates(tmp_path):
     assert log2.status()["on"] and "requests.jsonl" in "".join(log2.status()["files"])
 
 
+def test_today_counts_the_output_of_earlier_processes_all_day(tmp_path):
+    """After a restart, "today"'s output tok/s counts every gauge of the day, not only the 30 minutes the series reads
+    back."""
+    day = tmp_path / "engine-8001" / PL.utc_day(T0)
+    day.mkdir(parents=True)
+    rec = {"rid": "a", "arrival": T0 - 3700, "first": T0 - 3699, "done": T0 - 3690, "prompt": 5, "cached": 0}
+    (day / "requests.jsonl").write_text(json.dumps({**rec, "output": 3, "finish": "stop"}) + "\n")
+    gauges = [{"t": T0 - 3600, "out_tok_s": 5.0}, {"t": T0 - 60, "out_tok_s": 2.0}]  # an hour ago, and a minute ago
+    (day / "gauges.jsonl").write_text("".join(json.dumps(g) + "\n" for g in gauges))
+    st, c = stats()
+    c.mono = 1100.0
+    PL.ProdLog(str(tmp_path / "engine-8001"), stats=st, clock=c.wall).close()
+    today = st.snapshot({}, now=c.wall(), ttl=0)["windows"]["today"]
+    assert today["first"] == T0 - 3700
+    assert today["out_tok_s"] == pytest.approx((50 + 20) / (T0 + 100 - (T0 - 3700)))
+    assert set(st.past) == {int((T0 - 60) // S.BUCKET_S)}  # the series still reads back 30 minutes only
+
+
 def test_a_torn_line_and_a_full_queue_lose_only_themselves(tmp_path):
     p = tmp_path / "x.jsonl.gz"
     with gzip.open(p, "wt") as f:
         f.write('{"a": 1}\n{"b": 2')
     assert PL.read_jsonl(str(p)) == [{"a": 1}]
+    cut = tmp_path / "cut.jsonl.gz"  # a gzip stream cut short, or a disk that lost its tail
+    with gzip.open(cut, "wt") as f:
+        f.writelines(json.dumps({"i": i, "pad": os.urandom(64).hex()}) + "\n" for i in range(200))
+    data = cut.read_bytes()
+    cut.write_bytes(data[: len(data) // 2])
+    got = PL.read_jsonl(str(cut))
+    assert 0 < len(got) < 200 and [r["i"] for r in got] == list(range(len(got)))
     log = PL.ProdLog.__new__(PL.ProdLog)
     import queue
 
     log.q, log.dropped = queue.Queue(1), dict.fromkeys(PL.NAMES, 0)
     assert log.put("requests", {}) and not log.put("requests", {}) and log.dropped["requests"] == 1
+
+
+def test_a_segment_is_read_once_while_gzip_runs_or_after_it_was_cut_short(tmp_path, monkeypatch):
+    """gzip_file publishes the .gz only once complete; a restart between its rename and its remove leaves both copies,
+    and day_files reads one."""
+    seg = tmp_path / "requests.1.jsonl"
+    seg.write_text('{"rid": "a"}\n{"rid": "b"}\n')
+
+    def cut_short(f, g, n):
+        g.write(f.read(5))
+        assert not os.path.exists(str(seg) + ".gz"), "a partial .gz is never visible under its name"
+        raise OSError("killed")
+
+    monkeypatch.setattr(PL.shutil, "copyfileobj", cut_short)
+    PL.gzip_file(str(seg))
+    assert sorted(os.listdir(tmp_path)) == ["requests.1.jsonl"]  # the source whole, no partial copy left
+    monkeypatch.undo()
+    with gzip.open(str(seg) + ".gz", "wb") as g:  # the rename done, the remove not
+        g.write(seg.read_bytes())
+    (tmp_path / "requests.jsonl").write_text('{"rid": "c"}\n')
+    files = PL.day_files(str(tmp_path), "requests")
+    assert files == [str(seg), str(tmp_path / "requests.jsonl")]
+    assert [r["rid"] for p in files for r in PL.read_jsonl(p)] == ["a", "b", "c"]
+    PL.gzip_file(str(seg))
+    assert sorted(os.listdir(tmp_path)) == ["requests.1.jsonl.gz", "requests.jsonl"]
 
 
 def test_the_production_log_is_off_unless_set(monkeypatch, tmp_path):

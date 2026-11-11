@@ -10,7 +10,7 @@ response, back into Anthropic content blocks:
 | `text` blocks | message content |
 | an assistant's `thinking` blocks | its `reasoning_content` (GLM's template replays it) |
 | an assistant's `tool_use` blocks | its `tool_calls` |
-| a user's `tool_result` blocks | `tool` messages, in their place among the user's text |
+| a user's `tool_result` blocks | `tool` messages, in their place among the user's text (`is_error` true is refused) |
 | `tools` (`name`, `description`, `input_schema`) | function tools |
 | `tool_choice` `auto` / `none`; `disable_parallel_tool_use` | `tool_choice` `auto` / `none`; `parallel_tool_calls` false |
 | `max_tokens` (required), `temperature`, `top_p`, `top_k`, `stop_sequences` | the same sampling fields; `stop` |
@@ -125,8 +125,9 @@ def messages(body: dict) -> list[dict]:
             if kind == "text" and isinstance(b.get("text"), str):
                 text.append(b["text"])
             elif kind == "thinking" and role == "assistant":
-                if isinstance(b.get("thinking"), str):
-                    thinking.append(b["thinking"])
+                if not isinstance(b.get("thinking"), str):  # dropping it would generate from another history
+                    raise _bad(f"{at}: thinking must be a string")
+                thinking.append(b["thinking"])
             elif kind == "tool_use" and role == "assistant":
                 name, args = b.get("name"), b.get("input", {})
                 if not isinstance(name, str) or not name or not isinstance(args, dict):
@@ -139,6 +140,10 @@ def messages(body: dict) -> list[dict]:
                     }
                 )
             elif kind == "tool_result" and role == "user":
+                # GLM's template has no slot for a failed call, so the model would read the error as a result (SGLang's
+                # adapter drops the flag that way); the client can say so in the content instead
+                if b.get("is_error") not in (None, False):
+                    raise _bad(f"{at}: tool_result is_error is not supported; send the error in its content")
                 if text:  # the user's text before the result stays before it
                     out.append({"role": "user", "content": "".join(text)})
                     text = []
@@ -260,11 +265,12 @@ def _stop(run: Run, finish: str | None, stops: list[str]) -> tuple[str | None, s
 
 
 def content_blocks(msg: dict) -> list[dict]:
-    """A parsed chat message (parsers.parse_full) as Anthropic content blocks: thinking, text, then tool_use."""
+    """A parsed chat message (parsers.parse_full) as Anthropic content blocks: thinking, text, then tool_use. A
+    whitespace-only answer makes no text block, as the stream opens none for it (_events)."""
     out: list[dict] = []
     if msg.get("reasoning_content"):
         out.append({"type": "thinking", "thinking": msg["reasoning_content"], "signature": ""})
-    if msg.get("content"):
+    if msg.get("content") and msg["content"].strip():
         out.append({"type": "text", "text": msg["content"]})
     for tc in msg.get("tool_calls") or ():
         fn = tc["function"]

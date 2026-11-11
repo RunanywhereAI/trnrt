@@ -103,6 +103,7 @@ class Stats:
         self.started = clock()
         self.records: collections.deque = collections.deque(maxlen=ring)
         self.counts = {"ok": 0, "aborted": 0, "failed": 0}
+        self.recorded = 0  # finished requests recorded since start (the ring keeps only the newest RING)
         self.failed_kinds: dict[str, int] = {}
         self.tokens = {"prompt": 0, "cached": 0, "output": 0}
         # Earlier processes' records of today (the production log's reload): totals and the first record's time.
@@ -144,6 +145,7 @@ class Stats:
         kind = _kind(rec["finish"])
         with self.lock:
             self.records.append(rec)
+            self.recorded += 1
             self.counts[kind] += 1
             if kind == "failed":
                 self.failed_kinds[rec["finish"]] = self.failed_kinds.get(rec["finish"], 0) + 1
@@ -205,8 +207,9 @@ class Stats:
 
     # -- the production log's reload, at start ------------------------------------------------------------------------
 
-    def merge_day(self, records: list[dict], gauges: list[dict], day_start: float) -> None:
-        """Today's records and gauges from earlier processes: the "today" window, the ring's older end, the series."""
+    def merge_day(self, records: list[dict], gauges: list[dict], day_start: float, handed: float = 0.0) -> None:
+        """Today's records and gauges from earlier processes: the "today" window, the ring's older end, the series.
+        `handed`: the output tokens their gauges counted all day (gauges holds only the series' last 30 minutes)."""
         for r in records:
             derive(r)
         n_ok = sum(1 for r in records if r.get("finish") in OK_FINISH)
@@ -223,6 +226,8 @@ class Stats:
                 "ok": n_ok,
                 "aborted": n_abort,
                 "failed": len(records) - n_ok - n_abort,
+                "n": len(records),
+                "handed": handed,
                 **{k: sum(r.get(k, 0) for r in records) for k in ("prompt", "cached", "output")},
             }
             for g in gauges:
@@ -246,7 +251,7 @@ class Stats:
             recs = list(self.records)
             buckets = [list(b) for b in self.buckets if b is not None]
             counts, failed_kinds, tokens = dict(self.counts), dict(self.failed_kinds), dict(self.tokens)
-            handed = self.handed
+            handed, recorded = self.handed, self.recorded
             day, past = (dict(self.day) if self.day else None), dict(self.past)
         out: dict = {
             "now": now,
@@ -272,17 +277,19 @@ class Stats:
         span = now - self.started
         start_sel = [r for r in recs if r["done"] >= self.started]
         windows["start"] = self._window(
-            start_sel, span, handed / span if span > 0 else None, totals=(counts["ok"], tokens)
+            start_sel, span, handed / span if span > 0 else None, totals=(recorded, counts["ok"], tokens)
         )
         if day is not None and now - day["start"] < 86400:  # a process that ran past midnight (UTC) drops "today"
             first = day["first"] if day["first"] is not None else self.started
             dspan = now - first
             dtok = {k: day[k] + tokens[k] for k in ("prompt", "cached", "output")}
             dsel = [r for r in recs if r["done"] >= day["start"]]
-            # handed out today: earlier processes' gauges (out_tok_s x BUCKET_S each) plus this process's
-            dhanded = handed + BUCKET_S * sum(g.get("out_tok_s") or 0 for g in past.values() if g["t"] >= day["start"])
+            dhanded = handed + day["handed"]  # handed out today: this process's, plus earlier processes' all day
             windows["today"] = self._window(
-                dsel, dspan, dhanded / dspan if dspan > 0 else None, totals=(day["ok"] + counts["ok"], dtok)
+                dsel,
+                dspan,
+                dhanded / dspan if dspan > 0 else None,
+                totals=(day["n"] + recorded, day["ok"] + counts["ok"], dtok),
             )
             windows["today"]["first"] = first
         out["windows"] = windows
@@ -292,14 +299,15 @@ class Stats:
 
     @staticmethod
     def _window(sel: list[dict], span: float, out_tok_s: float | None, totals=None) -> dict:
-        """One window: rates over `span` seconds, and the percentiles of the requests that finished in it."""
+        """One window: rates over `span` seconds, and the percentiles of the requests that finished in it. `totals`
+        (requests, ok requests, tokens) counts a window longer than the ring holds ("start", "today")."""
         minutes = span / 60 if span > 0 else None
         ok = [r for r in sel if r["finish"] in OK_FINISH]
         if totals is None:
-            n_ok = len(ok)
+            n, n_ok = len(sel), len(ok)
             prompt, cached, output = (sum(r[k] for r in sel) for k in ("prompt", "cached", "output"))
         else:
-            n_ok, t = totals
+            n, n_ok, t = totals
             prompt, cached, output = t["prompt"], t["cached"], t["output"]
 
         def per_min(x: float) -> float | None:
@@ -308,7 +316,7 @@ class Stats:
         itl = [r["itl"] for r in ok if r["itl"] is not None]
         return {
             "span_s": span,
-            "n": len(sel),
+            "n": n,
             "ok": n_ok,
             "rpm": per_min(n_ok),
             "tpm": {
@@ -341,8 +349,8 @@ class Stats:
             t0 = k * BUCKET_S
             b, g, rs = by_bucket.get(k), past.get(k), done.get(k, [])
             pt: dict = {"t": t0}
+            width = min(BUCKET_S, now - t0) if k == last else BUCKET_S  # the current bucket has run `width` s so far
             if b is not None:
-                width = min(BUCKET_S, now - t0) if k == last else BUCKET_S
                 pt.update(
                     running=b[2] / b[1],
                     running_max=b[3],
@@ -353,7 +361,7 @@ class Stats:
             else:
                 pt.update({x: g.get(x) if g is not None else None for x in gauge_keys})
             if b is not None or rs:
-                pt["rpm"] = len(rs) * 60 / BUCKET_S
+                pt["rpm"] = len(rs) * 60 / width if width > 0 else None
             else:
                 pt["rpm"] = g.get("rpm") if g is not None else None
             ttft = [r["ttft"] for r in rs if r["ttft"] is not None]

@@ -36,7 +36,11 @@ from .api import EngineError, Run
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
-# The Responses fields translated here. Any other field goes to the chat path as it is.
+# The Responses fields translated here. Any other field goes to the chat path as it is. Four are dropped because they
+# change nothing a client gets back: `metadata` and `user` (echoed), `safety_identifier` (names the end user for OpenAI's
+# abuse monitoring, as `user` does) and `prompt_cache_key` (a hint for OpenAI's prompt-cache routing; the prefix cache
+# here matches every prompt by its tokens, and the router routes by session_id or prefix). `service_tier` is served
+# only as "auto" or "default" (to_chat).
 _OWN = frozenset(
     {
         "input",
@@ -220,7 +224,12 @@ def to_chat(body: dict) -> tuple[dict, dict]:
         raise _bad("max_tool_calls is not supported")
     if body.get("top_logprobs") not in (None, 0):
         raise _bad("top_logprobs is not supported on /v1/responses")
-    include = body.get("include") or []
+    # flex, priority and scale are processing classes with their own latency, which one engine's queue does not have
+    if body.get("service_tier") not in (None, "auto", "default"):
+        raise _bad('service_tier is not supported; send "auto" or "default", or leave it out')
+    include = body.get("include")
+    if include is None:
+        include = []
     if not isinstance(include, list) or any(x not in _INCLUDE for x in include):
         raise _bad(f"include supports only {', '.join(sorted(_INCLUDE))}")
     text = body.get("text")
@@ -237,6 +246,9 @@ def to_chat(body: dict) -> tuple[dict, dict]:
     if reasoning is not None and not isinstance(reasoning, dict):
         raise _bad("reasoning must be an object")
     reasoning = reasoning or {}
+    extra = sorted(k for k in reasoning if k not in ("effort", "summary", "generate_summary"))
+    if extra:
+        raise _bad(f"reasoning.{extra[0]} is not supported: reasoning takes effort and summary")
     summary = reasoning.get("summary", reasoning.get("generate_summary"))
     if summary not in (None, "auto", "concise", "detailed"):
         raise _bad('reasoning.summary must be "auto", "concise" or "detailed"')
@@ -302,11 +314,12 @@ def _call_item(item_id: str, call_id: str, name: str, arguments: str, status: st
 
 
 def output_items(msg: dict, info: dict) -> list[dict]:
-    """A parsed chat message (parsers.parse_full) as Responses output items: reasoning, the answer, then the calls."""
+    """A parsed chat message (parsers.parse_full) as Responses output items: reasoning, the answer, then the calls. A
+    whitespace-only answer makes no message item, as the stream opens none for it (_Stream)."""
     out = []
     if msg.get("reasoning_content"):
         out.append(_reasoning_item(_id("rs_"), msg["reasoning_content"], info))
-    if msg.get("content"):
+    if msg.get("content") and msg["content"].strip():
         out.append(_message_item(_id("msg_"), msg["content"]))
     for tc in msg.get("tool_calls") or ():
         fn = tc["function"]

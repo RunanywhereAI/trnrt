@@ -119,8 +119,11 @@ item's `response.output_item.added`, deltas and `.done` events, then `response.c
 `response.failed` on an engine error).
 
 Nothing is stored. Refused with 400: `store: true`, `previous_response_id`, `background`, `truncation: "auto"`,
-`max_tool_calls`, `top_logprobs`, `text.format` other than text, other `include` values, item references, non-text
-input parts and tools other than functions. `GET`, `DELETE` and `cancel` of a response answer 404.
+`max_tool_calls`, `top_logprobs`, `text.format` other than text, other `include` values, `reasoning` fields other than
+`effort` and `summary`, `service_tier` other than `"auto"` or `"default"`, item references, non-text input parts and
+tools other than functions. `metadata`, `user`, `safety_identifier` and `prompt_cache_key` are accepted and change
+nothing: the prefix cache matches every prompt by its tokens, with no key. `GET`, `DELETE` and `cancel` of a response
+answer 404.
 
 ## Anthropic Messages API
 
@@ -147,7 +150,8 @@ Errors use Anthropic's shape, `{"type": "error", "error": {"type": "invalid_requ
 with 400: `thinking` `{"type": "disabled"}` (the template cannot turn reasoning off), `{"type": "enabled"}` with
 `budget_tokens` on an engine started without `--structured-outputs` (with it, the budget is enforced as
 `thinking_token_budget`), `tool_choice` `any` and `tool` (a tool-call grammar for GLM's format is not built),
-image and document blocks, `redacted_thinking`, server tools, `mcp_servers`, `container` and `context_management`.
+image and document blocks, `redacted_thinking`, a `tool_result` with `is_error` true (GLM's chat template cannot mark a
+failed call; put the error in the result's content), server tools, `mcp_servers`, `container` and `context_management`.
 
 ## Tokenize and detokenize
 
@@ -178,7 +182,7 @@ client that disconnects aborts its request. The router routes it like a completi
 | Request field | Meaning |
 |---|---|
 | `text` or `input_ids` | One prompt (a string, or a list of token ids), or a batch (a list of either). Exactly one of the two. |
-| `sampling_params` | SGLang's names: `max_new_tokens` (default 128), `temperature`, `top_p`, `top_k`, `min_p`, `stop`, `stop_token_ids`, `ignore_eos`, `sampling_seed`. A batch may send one object per prompt. Defaults come from the checkpoint's `generation_config.json`, as on the OpenAI routes. |
+| `sampling_params` | SGLang's names: `max_new_tokens` (default 128), `temperature`, `top_p`, `top_k`, `min_p`, `stop`, `stop_token_ids`, `ignore_eos`, `sampling_seed`; with `--structured-outputs`, `json_schema`, `regex`, `ebnf` and `min_new_tokens`; with `--penalties`, `frequency_penalty`, `presence_penalty` and `repetition_penalty`. A batch may send one object per prompt. Defaults come from the checkpoint's `generation_config.json`, as on the OpenAI routes. |
 | `stream` | Server-sent events, then `data: [DONE]`. Each event carries the output so far (SGLang's default): `text`, `output_ids` and `meta_info`. A batch's events also carry their prompt's `index`. |
 | `return_logprob`, `top_logprobs_num` (0 to 20), `return_text_in_logprobs` | Output-token logprobs in `meta_info`. |
 | `logprob_start_len` | `-1` (or absent) only, when `return_logprob` is set. |
@@ -201,11 +205,16 @@ The response is one object for one prompt and a list for a batch:
 | `meta_info.output_top_logprobs` | With `top_logprobs_num` > 0: a list of `[logprob, token_id, text or null]` per output token. |
 | `meta_info.input_token_logprobs`, `input_top_logprobs` | Always `[]`: prompt logprobs are not computed. |
 
-Answered with 400, naming the field: prompt logprobs (`logprob_start_len` >= 0 with `return_logprob`), `n` > 1,
-guided decoding (`json_schema`, `regex`, `ebnf`, `structural_tag`), `min_new_tokens`, `no_stop_trim`, `logit_bias`,
-`skip_special_tokens` false, penalties, multimodal input, LoRA, hidden states, `priority`, `session_params` and the
-other GenerateReqInput fields this server does not serve. An unknown `sampling_params` key is refused too, as SGLang
-does. Each is accepted at its neutral value.
+Guided decoding (`json_schema`, `regex`, `ebnf`), `min_new_tokens` and the penalties are served as on the OpenAI
+routes, by an engine started with `--structured-outputs` or `--penalties`
+([below](#structured-outputs-penalties-and-thinking-budgets)); otherwise they are answered with 400, naming the flag.
+
+Answered with 400, naming the field: prompt logprobs (`logprob_start_len` >= 0 with `return_logprob`); in
+`sampling_params`, `n` > 1, `structural_tag`, `stop_regex`, `no_stop_trim`, `skip_special_tokens` false,
+`spaces_between_special_tokens` false, `logit_bias`, `stream_interval` or `beam_width` other than 1, and
+`custom_params`; and multimodal input, LoRA, hidden states, `priority`, `session_params` and the other
+GenerateReqInput fields this server does not serve. An unknown `sampling_params` key is refused too, as SGLang does.
+Each is accepted at its neutral value.
 
 ```bash
 curl -s localhost:8000/generate -H 'Content-Type: application/json' \

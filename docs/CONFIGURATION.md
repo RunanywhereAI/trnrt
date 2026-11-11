@@ -137,8 +137,9 @@ is the rejection sampler's, so the output distribution is unchanged), and refuse
 ## Structured outputs, penalties and thinking budgets
 
 These need graphs that take inputs from the host, so an engine serves them only when started with the flag. Each flag adds
-graphs to warmup and to the capture: capture with the flags you serve with. With both off, every graph is the one an
-engine without them compiles. They are refused with speculation at every batch size (`mtp-always`): its verify graph
+graphs to warmup and to the capture: capture with the flags you serve with. With both off, the graphs are meant to be
+the ones an engine without the flags compiles; the graph-equivalence check of that, and a Trainium2 run of the variants,
+are pending (they are tested on CPU). They are refused with speculation at every batch size (`mtp-always`): its verify graph
 takes no mask or penalties. Under the other `mtp-*` presets the engine steps every request plain while one that uses
 them runs.
 

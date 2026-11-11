@@ -119,7 +119,9 @@ def test_the_stream_sends_the_responses_events_and_the_same_items(client):
         "response.function_call_arguments.done",
         "response.output_item.done",
     ]
-    assert [k for k in kinds[2:-1] if not k.endswith(".delta")] == [k for k in expected if not k.endswith(".delta")]
+    # each item's deltas in their place: a run of one delta kind counts once (the script sends one or more)
+    mid = kinds[2:-1]
+    assert [k for i, k in enumerate(mid) if i == 0 or not (k.endswith(".delta") and k == mid[i - 1])] == expected
     final = ev[-1]["response"]
     assert _strip_ids(final["output"]) == _strip_ids(whole["output"])  # each parse makes its own call id
     args = "".join(e["delta"] for e in ev if e["type"] == "response.function_call_arguments.delta")
@@ -158,36 +160,44 @@ def test_a_reasoning_summary_and_encrypted_content_mirror_the_reasoning(client):
 
 
 @pytest.mark.parametrize(
-    "extra",
+    ("extra", "why"),
     [
-        {"store": True},
-        {"previous_response_id": "resp_1"},
-        {"background": True},
-        {"truncation": "auto"},
-        {"include": ["file_search_call.results"]},
-        {"text": {"format": {"type": "json_schema", "name": "x", "schema": {}}}},
-        {"tools": [{"type": "web_search"}]},
-        {"tool_choice": "required"},
-        {"tool_choice": {"type": "function", "name": "get_weather"}},
-        {"top_logprobs": 2},
-        {"max_tool_calls": 1},
-        {"n": 2},
-        {"max_tokens": 5},
-        {"messages": []},
-        {"reasoning": {"effort": "medium"}},
-        {"reasoning": {"summary": "long"}},
-        {"input": [{"role": "user", "content": [{"type": "input_image", "image_url": "x"}]}]},
-        {"input": [{"type": "item_reference", "id": "x"}]},
-        {"input": []},
-        {"input": 3},
-        {"stream": "yes"},
+        ({"store": True}, "store is not supported"),
+        ({"previous_response_id": "resp_1"}, "previous_response_id is not supported"),
+        ({"background": True}, "background is not supported"),
+        ({"truncation": "auto"}, "truncation is not supported"),
+        ({"include": ["file_search_call.results"]}, "include supports only"),
+        ({"include": ""}, "include supports only"),  # a falsy non-list is malformed, not an empty list
+        ({"include": False}, "include supports only"),
+        ({"include": {}}, "include supports only"),
+        ({"text": {"format": {"type": "json_schema", "name": "x", "schema": {}}}}, "text.format"),
+        ({"tools": [{"type": "web_search"}]}, "tool type 'web_search' is not supported"),
+        ({"tool_choice": "required"}, "tool_choice"),
+        ({"tool_choice": {"type": "function", "name": "get_weather"}}, "tool_choice"),
+        ({"top_logprobs": 2}, "top_logprobs is not supported"),
+        ({"max_tool_calls": 1}, "max_tool_calls is not supported"),
+        ({"n": 2}, "n is not a /v1/responses field"),
+        ({"max_tokens": 5}, "max_tokens is not a /v1/responses field"),
+        ({"messages": []}, "messages is not a /v1/responses field"),
+        ({"reasoning": {"effort": "medium"}}, "reasoning_effort"),
+        ({"reasoning": {"summary": "long"}}, "reasoning.summary must be"),
+        ({"reasoning": {"summary": "auto", "budget": 5}}, "reasoning.budget is not supported"),
+        ({"service_tier": "flex"}, "service_tier is not supported"),
+        ({"service_tier": "priority"}, "service_tier is not supported"),
+        ({"input": [{"role": "user", "content": [{"type": "input_image", "image_url": "x"}]}]}, "'input_image'"),
+        ({"input": [{"type": "item_reference", "id": "x"}]}, "item_reference is not supported"),
+        ({"input": []}, "input must be"),
+        ({"input": 3}, "input must be"),
+        ({"stream": "yes"}, "stream must be true or false"),
     ],
     ids=repr,
 )
-def test_what_cannot_be_served_is_refused(client, extra):
+def test_what_cannot_be_served_is_refused(client, extra, why):
+    """Each refusal is a 400 whose detail says why (AGENTS.md), and nothing reaches the engine."""
     c, eng = client(PLAIN)
     r = c.post("/v1/responses", json={"input": "hi", "tools": R_TOOLS, **extra})
     assert r.status_code == 400, r.text
+    assert why in r.json()["detail"], r.text
     assert eng.added == []
 
 
@@ -207,6 +217,8 @@ def test_neutral_fields_are_served(client):
         "service_tier": "auto",
         "top_logprobs": 0,
         "prompt_cache_key": "conversation-1",
+        "safety_identifier": "user-hash-1",
+        "reasoning": {"summary": None, "generate_summary": None},
     }
     r = c.post("/v1/responses", json=body)
     assert r.status_code == 200, r.text
@@ -223,6 +235,8 @@ def test_stored_responses_are_not_found(client):
 def test_input_items_become_the_chat_messages():
     """An assistant turn's items (reasoning, its message, its calls) join into one assistant message; a call's output
     becomes a tool message; text parts join."""
+    from fastapi import HTTPException
+
     from trnrt.serve.responses import input_messages
 
     body = {
@@ -240,8 +254,9 @@ def test_input_items_become_the_chat_messages():
             {"role": "assistant", "content": "done"},
         ],
     }
-    with pytest.raises(Exception, match="not supported"):  # a part without a type is not text
+    with pytest.raises(HTTPException, match="not supported") as e:  # a part without a type is not text
         input_messages(body)
+    assert e.value.status_code == 400
     body["input"][1]["content"][1]["type"] = "input_text"
     assert input_messages(body) == [
         {"role": "system", "content": "sys"},
@@ -278,3 +293,17 @@ def test_whitespace_between_two_calls_opens_no_message_item(client):
     assert [it["type"] for it in whole] == ["reasoning", "message", "function_call", "function_call"]
     final = _sse(c, body)[-1]["response"]["output"]
     assert _strip_ids(final) == _strip_ids(whole)
+
+
+def test_a_whitespace_only_answer_makes_no_message_item(client):
+    """An answer of whitespace alone (thinking off, so parse_full keeps it) makes no message item, streamed or not."""
+
+    def newline(eng) -> None:
+        eng.tokenizer.add_tokens(["\n"])
+        eng.script = [eng.tokenizer.convert_tokens_to_ids("\n")]
+
+    c, _ = client(PLAIN, newline)
+    body = {"input": "hi", "chat_template_kwargs": {"enable_thinking": False}}
+    whole = c.post("/v1/responses", json=body).json()["output"]
+    assert whole == []
+    assert _sse(c, body)[-1]["response"]["output"] == []

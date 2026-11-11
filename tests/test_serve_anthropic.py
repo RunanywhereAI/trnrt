@@ -155,6 +155,28 @@ def test_stop_sequences_and_max_tokens(client):
         {**ASK, "messages": [{"role": "system", "content": "x"}]},
         {**ASK, "messages": [{"role": "user", "content": [{"type": "image", "source": {}}]}]},
         {**ASK, "messages": [{"role": "assistant", "content": [{"type": "redacted_thinking", "data": "x"}]}]},
+        {
+            **ASK,
+            "messages": [
+                {"role": "user", "content": "x"},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "thinking", "thinking": None}, {"type": "text", "text": "a"}],
+                },
+                {"role": "user", "content": "y"},
+            ],
+        },
+        {
+            **ASK,
+            "messages": [
+                {"role": "user", "content": "x"},
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "f", "input": {}}]},
+                {
+                    "role": "user",
+                    "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "boom", "is_error": True}],
+                },
+            ],
+        },
         {**ASK, "tools": A_TOOLS, "tool_choice": {"type": "any"}},
         {**ASK, "tools": A_TOOLS, "tool_choice": {"type": "tool", "name": "get_weather"}},
         {**ASK, "tools": [{"type": "web_search_20250305", "name": "web_search"}]},
@@ -174,8 +196,7 @@ def test_refusals_are_400_in_anthropics_error_shape(client, body):
     assert r.status_code == 400, r.text
     err = r.json()
     assert err["type"] == "error" and err["error"]["type"] == "invalid_request_error" and err["error"]["message"]
-    assert all(q.status.name == "FINISHED" for q in eng.added)  # a refusal leaves nothing running
-    assert eng.scheduler.running == []
+    assert eng.added == [] and eng.scheduler.running == []  # a refusal never reaches the engine
 
 
 def test_a_malformed_body_and_an_engine_failure_answer_in_anthropics_shape(client):
@@ -237,7 +258,12 @@ def test_the_messages_become_the_chat_messages():
                 "role": "user",
                 "content": [
                     {"type": "text", "text": "before"},
-                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": [{"type": "text", "text": "r"}]},
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_1",
+                        "content": [{"type": "text", "text": "r"}],
+                        "is_error": False,
+                    },
                     {"type": "text", "text": "after"},
                 ],
             },
@@ -271,3 +297,16 @@ def test_whitespace_between_two_calls_opens_no_text_block(client):
     assert [{k: v for k, v in b.items() if k != "id"} for b in got] == [
         {k: v for k, v in b.items() if k != "id"} for b in whole
     ]
+
+
+def test_a_whitespace_only_answer_makes_no_text_block(client):
+    """An answer of whitespace alone (thinking off, so parse_full keeps it) makes no text block, streamed or not."""
+
+    def newline(eng) -> None:
+        eng.tokenizer.add_tokens(["\n"])
+        eng.script = [eng.tokenizer.convert_tokens_to_ids("\n")]
+
+    c, _ = client(PLAIN, newline)
+    body = {**ASK, "thinking": {"type": "disabled"}}
+    assert c.post("/v1/messages", json=body).json()["content"] == []
+    assert _blocks(_sse(c, body)) == []
