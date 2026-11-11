@@ -248,7 +248,7 @@ Each needs graphs that take inputs from the host. An engine serves them only whe
 | `response_format` `{"type": "json_schema", "json_schema": {"schema": ...}}` | `--structured-outputs` | JSON matching the schema |
 | vLLM `guided_json`, `guided_regex`, `guided_choice`, `guided_grammar`; `structured_outputs` `{json, regex, choice, grammar, json_object}` | `--structured-outputs` | a schema, a regular expression, one of the strings, an EBNF grammar |
 | SGLang `json_schema` (a string), `regex`, `ebnf` | `--structured-outputs` | the same |
-| `min_tokens` | `--structured-outputs` | no end-of-sequence or `stop_token_ids` id, and no stop string, among the first `min_tokens` tokens |
+| `min_tokens` | `--structured-outputs` | no end-of-sequence or `stop_token_ids` id among the first `min_tokens` tokens; a stop string that ends among them does not end the request (vLLM) |
 | `thinking_token_budget` | `--structured-outputs` | at most this many reasoning tokens after `<think>`; then `</think>` is forced |
 | `repetition_penalty`, `frequency_penalty`, `presence_penalty` | `--penalties` | vLLM's formulas: repetition over prompt and output tokens, frequency and presence over the output |
 
