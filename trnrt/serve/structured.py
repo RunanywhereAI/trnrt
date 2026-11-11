@@ -84,7 +84,10 @@ def _vllm(so) -> list[GrammarSpec]:
         out.append(_choice(so["choice"], "structured_outputs.choice"))
     if so.get("grammar") is not None:
         out.append(GrammarSpec("ebnf", _text(so["grammar"], "structured_outputs.grammar")))
-    if so.get("json_object"):
+    json_object = so.get("json_object")
+    if json_object is not None and not isinstance(json_object, bool):  # the string "false" must not turn it on
+        raise ValueError("structured_outputs.json_object must be true or false")
+    if json_object:
         out.append(GrammarSpec("json_schema", OBJECT))
     return out
 

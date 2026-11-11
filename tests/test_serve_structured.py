@@ -74,6 +74,8 @@ SCHEMA = {"type": "object", "properties": {"a": {"type": "integer"}}}
         ({"guided_choice": ["yes", "no"]}, GrammarSpec("regex", "(yes|no)")),
         ({"regex": "[0-9]+"}, GrammarSpec("regex", "[0-9]+")),
         ({"ebnf": 'root ::= "a"'}, GrammarSpec("ebnf", 'root ::= "a"')),
+        ({"structured_outputs": {"json_object": True}}, GrammarSpec("json_schema", OBJECT)),
+        ({"structured_outputs": {"json_object": False}, "regex": "a"}, GrammarSpec("regex", "a")),
     ],
 )
 def test_each_constraint_field_reaches_the_engine(client, extra, want):
@@ -106,6 +108,8 @@ def test_min_tokens_penalties_and_a_thinking_budget_reach_the_engine(client):
         {"response_format": {"type": "json_object"}, "guided_regex": "a"},
         {"response_format": {"type": "structural_tag"}},
         {"guided_choice": "yes"},
+        {"structured_outputs": {"json_object": "false"}},  # not a boolean: refused, not taken as true
+        {"structured_outputs": {"json_object": 1}},
         {"min_tokens": 9},  # above max_tokens
         {"prompt_logprobs": 1},  # still not served (docs/API.md)
     ],
