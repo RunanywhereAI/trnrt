@@ -25,7 +25,7 @@ def test_generate_prompts_are_the_routing_text():
     assert _session_key("/generate", {"text": "abc"}) != _session_key("/generate", {"text": "abd"})
 
 
-def _native_worker(i: int, flush_status: int = 200, health_status: int = 200):
+def _native_worker(i: int, flush_status: int = 200, health_status: int = 200, flush_s: float = 0.0):
     """A worker with SGLang's native routes: it answers each with its index, and records what it was sent. (No
     `from __future__ import annotations` in this module: FastAPI resolves a handler's `req: Request` in the module's
     globals, where this local import is not, and would take `req` for a query parameter.)"""
@@ -75,6 +75,10 @@ def _native_worker(i: int, flush_status: int = 200, health_status: int = 200):
     @app.api_route("/flush_cache", methods=["GET", "POST"])
     async def flush_cache(req: Request):
         app.state.seen.append(("flush", req.method, req.url.query))
+        await asyncio.sleep(flush_s)
+        hold = getattr(app.state, "hold", None)  # an asyncio.Event a test sets: a flush stuck until then
+        if hold is not None:
+            await hold.wait()
         if flush_status != 200:
             return PlainTextResponse("Cache not flushed: 2 requests are running or waiting.\n", status_code=400)
         return PlainTextResponse("Cache flushed.\n")
@@ -210,3 +214,34 @@ def test_flush_cache_flushes_every_worker_and_their_prefix_trees():
         assert all(t.size == 0 for t in router.trees)
 
     _run([_native_worker(0), _native_worker(1)], ok)
+
+
+def test_flush_cache_bounds_its_wait_by_the_timeout_it_passes_on():
+    """An engine answers /flush_cache once it flushed or its `timeout` passed, so one that has not answered timeout +
+    health_timeout_s seconds after it was asked is stuck: the router answers 400 naming it ("no answer") instead of
+    waiting on it for ever, and still waits out a timeout an engine may use."""
+    import time
+
+    import httpx
+
+    async def main() -> None:
+        ports = [_free_port() for _ in range(4)]
+        workers = [_native_worker(0, flush_s=0.6), _native_worker(1)]
+        workers[1].state.hold = asyncio.Event()
+        router = Router([f"http://127.0.0.1:{p}" for p in ports[:2]])
+        apps = [*zip(workers, ports), (build_router_app(router, poll_s=0, health_timeout_s=0.3), ports[2])]
+        servers, tasks = await _start(apps)
+        try:
+            async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{ports[2]}", timeout=60) as c:
+                t0 = time.monotonic()
+                r = await c.post("/flush_cache?timeout=0.5")
+                took = time.monotonic() - t0
+                assert r.status_code == 400 and r.text.endswith("engine 1: no answer\n"), r.text
+                assert "engine 0" not in r.text  # it took 0.6 s, within its 0.5 s timeout + 0.3 s
+                assert 0.75 <= took < 10, took
+                assert router.up == [True, True]  # a stuck flush is not a failed engine
+        finally:
+            workers[1].state.hold.set()
+            await _stop(servers, tasks)
+
+    asyncio.run(main())

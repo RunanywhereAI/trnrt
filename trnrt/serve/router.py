@@ -86,6 +86,7 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import math
 import os
 import threading
 import time
@@ -808,9 +809,16 @@ def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: floa
     async def flush_cache(http: Request):
         """Every engine's prefix cache flushed (each only while idle; `timeout` passed on). 200 when every engine
         flushed, else 400 naming the engines that did not and why. A flushed engine's prefix tree here is cleared:
-        the tree stands for what its cache holds."""
+        the tree stands for what its cache holds. An engine that has not answered `timeout` + health_timeout_s seconds
+        after it was asked is one that did not flush ("no answer"): an engine answers once it flushed or its timeout
+        passed, so only one that is stuck takes longer."""
         query = http.url.query
-        rs = await each(http.method, "/flush_cache" + (f"?{query}" if query else ""), None)
+        try:
+            wait = float(http.query_params.get("timeout", "0"))
+        except ValueError:
+            wait = 0.0  # each engine answers a malformed timeout with 400 at once
+        wait = wait if math.isfinite(wait) and wait >= 0 else 0.0
+        rs = await each(http.method, "/flush_cache" + (f"?{query}" if query else ""), wait + health_timeout_s)
         failed = []
         for w, r in enumerate(rs):
             if r is not None and r.status_code == 200:
