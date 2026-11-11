@@ -85,7 +85,7 @@ These fields work on `/v1/chat/completions` and `/v1/completions`, as vLLM and S
 | `n` | Up to 128 choices of one prompt, each its own engine request. The prefix cache computes the shared prompt once: the scheduler holds the other choices until they can resume from the first one's prompt checkpoint. Each choice has its `index`, streamed chunks included. `usage` counts the prompt once and every choice's output; `cached_tokens` is the fewest any choice read from the cache. A client that disconnects aborts every choice. |
 | `best_of` | Accepted only equal to `n` (ranking extra candidates needs their logprobs, which no request returns). |
 | `seed` with `n` | Choice i samples with `seed + i`, as vLLM does, so the choices differ and each is reproducible. |
-| `stop_regex` | SGLang's: a pattern or a list of up to 16, matched on the output text. The output ends at the end of the first match, the matched text included (as in SGLang), with `finish_reason` `"stop"`. |
+| `stop_regex` | SGLang's: a pattern or a list of up to 16, matched on the output text. The output ends at the end of the first match, the matched text included (as in SGLang), with `finish_reason` `"stop"`. A match must start within 2048 characters of the newest text. A pattern whose search can take exponential or polynomial time (nested or overlapping repeats, such as `(a+)+` or `a*a*`) is refused with 400. |
 | `include_stop_str_in_output`, `no_stop_trim` | vLLM's and SGLang's names for one switch: keep the stop string, or the stop token's text, in the output. |
 | `skip_special_tokens` | `false` keeps special tokens in the output text. |
 | `stop_token_ids` | Tokens that end the request. As in vLLM and SGLang, the stop token (or EOS) is not part of the text. |
@@ -190,6 +190,7 @@ client that disconnects aborts its request. The router routes it like a completi
 | `session_id` | As on the OpenAI routes: the router pins the session to one engine. |
 | `return_prompt_token_ids` | Adds `prompt_token_ids` to the response. |
 | `log_metrics` | `false` leaves the request out of `/metrics`. |
+| `no_logs` | `true` keeps the request's record out of the production log (`TRNRT_PROD_DIR`); it is still counted in `/v1/stats`. |
 
 The response is one object for one prompt and a list for a batch:
 
@@ -231,9 +232,9 @@ all of them:
 | `GET /model_info`, `/get_model_info` | `model_path` (as passed to `--model`), `served_model_name`, `is_generation`, `preferred_sampling_params` (the checkpoint's defaults), `reasoning_parser` and `tool_call_parser` (SGLang's names for the equivalent parsers: `glm45`, `glm47`), `model_type`, `architectures` | The first live engine |
 | `GET /server_info`, `/get_server_info` | The engine's configuration (every `EngineConfig` field), `tp_size`, `dp_size`, `context_length`, `preset`, `version`, `startup_seconds`, and `internal_states` (its `/get_load` entry) | The first answer, with `dp_size` the number of engines and `internal_states` one entry per engine |
 | `GET /get_load` | `[{dp_rank, num_reqs, num_running_reqs, num_waiting_reqs, num_tokens, num_pending_tokens, token_usage, ts_tic}]`: `num_tokens` is the KV tokens in use plus the waiting requests' tokens | Every engine's entry, `dp_rank` its index |
-| `GET /health_generate` | 200 once a step ends after a one-token probe is sent (the probe itself on an idle engine); 503 if none ends within 20 s, or once the engine failed. The probe is not counted in `/metrics` | Every engine: 200 `"ok"` or `"degraded"` while any generated, 503 `"down"` when none did, naming the engines down |
+| `GET /health_generate` | 200 once a step ends after a one-token probe is sent (the probe itself on an idle engine); 503 if none ends within 20 s, or once the engine failed. The probe is not counted in `/metrics` | Every engine: 200 `"ok"` or `"degraded"` while any generated, 503 `"down"` when none did, naming the engines down. An engine's 503 counts toward the router's `down_after`, as a stalled `/health` does, rather than marking it down at once |
 | `POST /abort_request` | `{"rid": ...}` aborts that request (an exact match); `{"abort_all": true}` aborts every request. The aborted request answers with its output so far and finish reason `abort`. 200 whether or not the rid runs | Every engine: only the one holding the rid has it. 200 once any engine took it |
-| `GET` or `POST /flush_cache` | Drops the prefix cache (device pages, state checkpoints and the host-memory tier), only while no request runs or waits. `?timeout=<s>` (default 0) waits up to that long for the engine to be idle. 200 when flushed, 400 with the reason when not | Every engine; 200 only when all flushed. The router also forgets a flushed engine's prefixes |
+| `GET` or `POST /flush_cache` | Drops the prefix cache (device pages, state checkpoints and the host-memory tier), only while no request runs or waits. `?timeout=<s>` (default 0) waits up to that long for the engine to be idle. 200 when flushed, 400 with the reason when not | Every engine; 200 only when all flushed. The router also forgets a flushed engine's prefixes. An engine with no answer after `timeout` plus the health timeout is named "no answer" in the 400 |
 
 None of these returns a secret or a host path the operator did not pass.
 
