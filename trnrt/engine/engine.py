@@ -19,9 +19,10 @@ from .model_runner import ModelRunner
 from .radix_cache import RadixCache
 from .request import Request, SamplingParams, Status, unsupported
 from .sampler import NUM_TOP_LOGPROBS, unpack
-from .scheduler import BLIND, NeedSync, Scheduler, SchedulerConfig, StepPlan
+from .scheduler import BLIND, NeedSync, Scheduler, SchedulerConfig, Scheduling, StepPlan
 
 if TYPE_CHECKING:
+    from .guided import HostSampling
     from .host_cache import HostTier
 
 logger = logging.getLogger(__name__)
@@ -219,8 +220,15 @@ def build_shard(cfg: EngineConfig, path: str, num_pages: int, rank: int = 0):
 
 
 class LLMEngine:
-    def __init__(self, cfg: EngineConfig):
+    scheduling = Scheduling()  # the defaults, for an engine assembled without __init__ (the tests' stand-ins)
+    # Guided decoding, thinking budgets and min_tokens (engine/guided.py), set in __init__; None on an engine assembled
+    # without it (the tests' fake engines), which then serves none of them.
+    host_sampling: HostSampling | None = None
+
+    def __init__(self, cfg: EngineConfig, scheduling: Scheduling | None = None):
         self.cfg = cfg
+        # Host-only scheduling settings (policy, priorities, queue limits, eviction): outside cfg, which keys the graphs.
+        self.scheduling = scheduling or Scheduling()
         self.t_start = time.perf_counter()  # startup_seconds counts from here to the end of warmup()
         self.startup_seconds: float | None = None
         path = resolve_model_path(cfg.model_path, cfg.model_revision)
@@ -272,13 +280,19 @@ class LLMEngine:
         except (OSError, ValueError, TypeError):
             self.tokenizer = None  # token-id-only use; stop strings need one
         self.device = self.runner.device
+        # Guided decoding, thinking budgets and min_tokens (engine/guided.py): the reasoning tags' ids and, from the first
+        # guided request, the grammar backend.
+        from .guided import HostSampling
+
+        self.host_sampling = HostSampling(self.tokenizer, self.mcfg.vocab_size, self.mcfg.eos_token_ids, self.runner)
         if cfg.tp > 1:
             from . import tp
 
             self.runner.tp_send = tp.send
             _OPEN.add(self)
         self.pool = PagePool(num_pages)
-        self.radix = RadixCache(self.pool, cfg.page_size)
+        sch = self.scheduling
+        self.radix = RadixCache(self.pool, cfg.page_size, sch.eviction_policy, sch.eviction_config)
         scfg = SchedulerConfig(
             page_size=cfg.page_size,
             max_num_seqs=cfg.max_num_seqs,
@@ -287,6 +301,7 @@ class LLMEngine:
             eos_token_ids=self.mcfg.eos_token_ids,
             admission_decode_tokens=cfg.admission_decode_tokens,
             max_running=cfg.max_running,
+            **sch.scheduler_fields(),
         )
         # The scheduler (engine/scheduler.py) runs the served prefix-cache rules for a recurrent model: a hit resumes from
         # the deepest state checkpoint at or below it, checkpoints are written inside prefill chunks and at every page
@@ -332,13 +347,29 @@ class LLMEngine:
         self._inflight: tuple[StepPlan, list[Any]] | None = None
 
     def add_request(
-        self, prompt_ids: list[int], params: SamplingParams, rid: str | None = None, session_id: str | None = None
+        self,
+        prompt_ids: list[int],
+        params: SamplingParams,
+        rid: str | None = None,
+        session_id: str | None = None,
+        priority: int | None = None,
     ) -> Request:
-        why = unsupported(params)
+        """Queue a request. ValueError for one the engine does not serve; scheduler.QueueFull when the waiting queue is
+        at its limit. A waiting request a higher-priority one displaced from a full queue ends with Request.error set."""
+        why = unsupported(params, self.cfg.structured_outputs, self.cfg.penalties)
         if why:  # before anything is built or queued: the request never reaches a step
             raise ValueError(f"{why} is not supported; send the request without it")
+        self.scheduling.check_priority(priority)
         req = Request(rid or f"req-{next(self._ids)}", list(prompt_ids), params, session_id=session_id)
-        self.scheduler.add(req)
+        req.priority = priority
+        if self.host_sampling is not None:
+            # A request the queue refuses (QueueFull, a 503) is refused before its grammar matcher is built, and one
+            # admit refuses (ValueError, a 400) is refused before it displaces a waiting request.
+            self.scheduler.check_add(req)
+            self.host_sampling.admit(req)  # its grammar matcher and thinking-budget state (ValueError: a 400)
+        displaced = self.scheduler.add(req)
+        if displaced is not None:
+            self.runner.forget(displaced)
         return req
 
     def flush_cache(self) -> None:
@@ -496,6 +527,8 @@ class LLMEngine:
         most limit - h decode). With speculative seats fewer than the running cap, a verify needs one: plain -> speculative
         only when every running request can sit in a speculative seat (the flip moves them), and in speculative mode a
         request admitted into a plain seat (no speculative seat was free) is stepped plain, never moved blind."""
+        if any(r.needs_host_inputs for r in self.scheduler.running if r.status is Status.RUNNING):
+            return True  # a mask or penalties ride only the plain decode graph: such a request never speculates
         n = sum(1 for r in self.scheduler.running if r.status is Status.RUNNING and r.is_decoding)
         m = self.cfg.spec_max_batch
         want = n > (m - max(self.cfg.spec_hysteresis, 0) if self._dyn_plain else m)
@@ -722,6 +755,9 @@ class LLMEngine:
             if s.draft and s.req.params.logprobs is not None:
                 del s.req.logprobs[len(s.req.output_ids) :]
         finished += self._check_stop_strings(plan.seqs(), finished)
+        # Thinking budgets count, and grammars accept, the committed tokens; a grammar that terminated finishes its request.
+        if self.host_sampling is not None:
+            finished += self.host_sampling.advance(plan.seqs(), self.scheduler.finish_now)
         for r in finished:
             self.runner.forget(r)
         return finished
@@ -737,11 +773,13 @@ class LLMEngine:
             ended_here = s.draft and id(req) in ended
             if not stops or not s.sample or (req.status is not Status.RUNNING and not ended_here):
                 continue
+            out = req.output_ids
+            if len(out) <= req.params.min_tokens:  # vLLM checks stop strings from min_tokens on
+                continue
             # Only the tail can newly contain a stop string; decode enough of it to cover
             # the longest one plus multi-token characters.
             w = max(len(x) for x in stops) + 8
-            tail = self.tokenizer.decode(req.output_ids[-w:])
-            if any(x in tail for x in stops):
+            if self._stop_in(out, len(out), stops, w, req.params.min_tokens):
                 if s.draft:
                     self._trim_past_stop(req, stops, w)
                 if ended_here:
@@ -751,13 +789,22 @@ class LLMEngine:
                     done.append(req)
         return done
 
+    def _stop_in(self, out: list[int], n: int, stops, w: int, protect: int) -> bool:
+        """Whether the last w tokens of out[:n] decode to text holding a stop string that ends past the first `protect`
+        tokens (min_tokens). vLLM matches only the newly decoded text, so a stop string that ended among the protected
+        tokens stays in the output and never ends the request later."""
+        start = max(0, n - w)
+        tail = self.tokenizer.decode(out[start:n])
+        head = len(self.tokenizer.decode(out[start : min(protect, n)])) if start < protect else 0
+        return any(tail.find(x, max(0, head - len(x) + 1)) >= 0 for x in stops)
+
     def _trim_past_stop(self, req: Request, stops, w: int) -> None:
         """A speculative step appends up to 1 + spec_k tokens at once, so the stop string can end before its newest one.
         Drop the tokens past it, and their logprobs, so the output (and its usage count) is what one-token steps would
         have stopped at: the shortest prefix whose last w tokens decode to a stop string."""
         out = req.output_ids
         n = len(out)
-        while n > 1 and any(x in self.tokenizer.decode(out[max(0, n - 1 - w) : n - 1]) for x in stops):
+        while n > 1 and self._stop_in(out, n - 1, stops, w, req.params.min_tokens):
             n -= 1
         if n < len(out):
             del req.token_ids[req.num_prompt + n :]

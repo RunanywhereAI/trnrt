@@ -153,6 +153,13 @@ class EngineConfig:
     # state_spec_seats hold 1 + spec_k rows each (the ones that speculate) and the rest one row (None: all of them).
     state_seats: int | None = None
     state_spec_seats: int | None = None
+    # Graph variants with host inputs (engine/host_inputs.py), off by default: with them off every graph is the one an
+    # engine without them compiles. structured_outputs: decode and prefill-post graphs that take a token mask (guided
+    # decoding, thinking budgets, min_tokens); penalties: graphs that take penalty inputs at each of penalty_buckets'
+    # distinct-token counts, the vocabulary size always added as the last.
+    structured_outputs: bool = False
+    penalties: bool = False
+    penalty_buckets: tuple[int, ...] = (1024, 16384)
 
     def __post_init__(self):
         if self.max_running is not None and self.max_running < 1:
@@ -208,6 +215,12 @@ class EngineConfig:
             raise ValueError(
                 f"state_spec_seats={self.state_spec_seats} must cover spec_max_batch {self.spec_max_batch} and fit the "
                 f"{self.state_seats or self.max_num_seqs} seats")
+        if (self.structured_outputs or self.penalties) and self.spec_method and not self.spec_max_batch:
+            raise ValueError(
+                "structured_outputs and penalties need plain decode steps, and speculation at every batch size "
+                "(spec_method without spec_max_batch) has none: its verify graph takes no token mask or penalties")
+        if any(m < 1 for m in self.penalty_buckets):
+            raise ValueError(f"penalty_buckets={self.penalty_buckets}: positive distinct-token counts")
 
     def resolved_moe_kernel(self) -> str:
         return self.moe_kernel or ("nki" if self.device in ("neuron", "meta") else "xla")

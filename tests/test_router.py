@@ -10,7 +10,7 @@ import pytest
 for _m in ("httpx", "fastapi", "uvicorn"):  # the router's stack
     pytest.importorskip(_m)
 
-from trnrt.serve.router import PrefixTree, Router  # noqa: E402
+from trnrt.serve.router import STATELESS_ROUTES, PrefixTree, Router  # noqa: E402
 
 
 def test_prefix_tree_match_insert_and_prune():
@@ -167,13 +167,13 @@ async def _stop(servers, tasks, i=None):
 
 
 def _stub_worker(i: int, chat_status: int = 200):
-    """A worker that answers /health, /v1/models and /v1/chat/completions (with chat_status: 503 is a failed engine,
-    whose serve/api.py refuses every request before it queues it), streaming or not."""
+    """A worker that answers /health, /v1/models, /v1/chat/completions and STATELESS_ROUTES (with chat_status: 503 is a
+    failed engine, whose serve/api.py refuses every request before it queues it), streaming or not."""
     from fastapi import FastAPI, HTTPException, Request
     from fastapi.responses import StreamingResponse
 
     app = FastAPI()
-    app.state.chats, app.state.status = 0, chat_status
+    app.state.chats, app.state.toks, app.state.status = 0, 0, chat_status
 
     @app.get("/health")
     async def health():
@@ -200,6 +200,14 @@ def _stub_worker(i: int, chat_status: int = 200):
             return StreamingResponse(stream(), media_type="text/event-stream")
         return {"choices": [{"message": {"role": "assistant", "content": f"w{i}"}}]}
 
+    async def stateless(req: Request):
+        app.state.toks += 1
+        if app.state.status != 200:
+            raise HTTPException(status_code=app.state.status, detail="engine failed: rank 3 exited")
+        return {"worker": i, "body": await req.json()}
+
+    for path in STATELESS_ROUTES:
+        app.add_api_route(path, stateless, methods=["POST"])
     return app
 
 
@@ -255,7 +263,9 @@ def test_router_health_and_models_follow_the_workers():
     asyncio.run(main())
 
 
-@pytest.mark.parametrize("path", ["/v1/chat/completions", "/v1/completions"])
+@pytest.mark.parametrize(
+    "path", ["/v1/chat/completions", "/v1/completions", "/v1/responses", "/v1/messages", "/tokenize", "/v1/detokenize"]
+)
 @pytest.mark.parametrize("body", [b"{not json", b"[1, 2]", b'"text"', b"null", b"true", b"3", b"", b"\xff\xfe"])
 def test_a_body_that_is_not_a_json_object_is_answered_400_and_reaches_no_worker(path, body):
     """The router refuses a malformed body, or JSON that is not an object, with 400, as each engine does, instead of
@@ -277,7 +287,43 @@ def test_a_body_that_is_not_a_json_object_is_answered_400_and_reaches_no_worker(
                 )
                 assert r.status_code == 400, r.text
                 assert r.json()["detail"] == "the request body must be a JSON object"
-                assert router.load == [0] and worker.state.chats == 0
+                assert router.load == [0] and worker.state.chats == 0 and worker.state.toks == 0
+        finally:
+            await _stop(servers, tasks)
+
+    asyncio.run(main())
+
+
+@pytest.mark.parametrize("path", STATELESS_ROUTES)
+def test_tokenize_and_detokenize_go_to_a_live_worker_and_change_no_routing_state(path):
+    """STATELESS_ROUTES go to the least loaded live worker and touch no prefix tree, no session and no load count: a
+    /tokenize of an agent's context must not steer where its next turn goes. A refused connection or a 503 marks the
+    worker down and the next one is asked; 503 once none answers."""
+    import asyncio
+
+    import httpx
+
+    from trnrt.serve.router import build_router_app
+
+    async def main() -> None:
+        ports = [_free_port() for _ in range(4)]  # ports[0] serves nothing: a dead worker
+        router = Router([f"http://127.0.0.1:{p}" for p in ports[:3]])
+        failed, ok = _stub_worker(1, chat_status=503), _stub_worker(2)
+        servers, tasks = await _start(
+            [(failed, ports[1]), (ok, ports[2]), (build_router_app(router, poll_s=0), ports[3])]
+        )
+        body = {"messages": [{"role": "user", "content": "x" * 64}], "session_id": "s1"}
+        try:
+            async with httpx.AsyncClient(timeout=30) as c:
+                r = await c.post(f"http://127.0.0.1:{ports[3]}{path}", json=body)
+                assert r.status_code == 200, r.text
+                assert r.json() == {"worker": 2, "body": body}
+                assert router.up == [False, False, True]  # refused, then 503: both marked down
+                assert failed.state.toks == 1 and ok.state.toks == 1
+                assert router.sessions == {} and all(t.size == 0 for t in router.trees) and router.load == [0, 0, 0]
+                await _stop(servers, tasks, 1)
+                r = await c.post(f"http://127.0.0.1:{ports[3]}{path}", json=body)
+                assert r.status_code == 503 and r.json()["detail"] == f"no engine answered {path}", r.text
         finally:
             await _stop(servers, tasks)
 
@@ -489,6 +535,140 @@ def test_a_plain_client_that_disconnects_from_the_router_aborts_its_request_on_t
             while router.load != [0] and time.monotonic() < deadline:
                 await asyncio.sleep(0.05)
             assert router.load == [0]
+        finally:
+            await _stop(servers, tasks)
+
+    asyncio.run(main())
+
+
+# One conversation in each API that carries one: a long shared system part, then the turns.
+SYSTEM = "You are a coding agent. Environment and file tree follow. " + "src/x.py " * 4500
+TURNS = [
+    {"role": "user", "content": "task 0: fix the bug"},
+    {"role": "assistant", "content": "reading files " * 3000},
+]
+
+
+def _bodies(turns: list) -> dict[str, dict]:
+    return {
+        "/v1/chat/completions": {"messages": [{"role": "system", "content": SYSTEM}, *turns]},
+        "/v1/responses": {"instructions": SYSTEM, "input": turns},
+        "/v1/messages": {"system": SYSTEM, "messages": turns, "max_tokens": 8},
+    }
+
+
+@pytest.mark.parametrize("path", ["/v1/chat/completions", "/v1/responses", "/v1/messages"])
+def test_each_conversation_api_routes_by_its_conversation(path):
+    """A Responses request's instructions and input, and a Messages request's system and messages, are its
+    conversation as a chat's messages are: its routing text grows at its end as the conversation does (so its prefix
+    sticks to the worker holding it), its head is the system part (so a shared system prompt does not pin new sessions),
+    and its session key is stable while it grows and differs by system prompt."""
+    from trnrt.serve.router import _request_head, _request_text, _session_key
+
+    first, later = _bodies(TURNS[:1])[path], _bodies([*TURNS, {"role": "user", "content": "next"}])[path]
+    t1, t2 = _request_text(path, first), _request_text(path, later)
+    head = _request_head(path, first)
+    assert head > 40_000 and SYSTEM[:1000] in t1[:head] and "task 0" not in t1[:head]
+    assert t2.startswith(t1[:-1])  # "[A, B" is a prefix of "[A, B, C]"
+    assert _request_head(path, later) == head
+    assert _session_key(path, first) == _session_key(path, later)
+    other = dict(first, **({"instructions": "Write a title."} if path == "/v1/responses" else {}))
+    if path == "/v1/messages":
+        other["system"] = "Write a title."
+    elif path == "/v1/chat/completions":
+        other = {"messages": [{"role": "system", "content": "Write a title."}, *TURNS[:1]]}
+    assert _session_key(path, other)[0] != _session_key(path, first)[0]
+    assert _session_key(path, other)[1] == _session_key(path, first)[1]
+    r = Router(["a", "b"], balance_abs=1, balance_rel=1.0, sticky_chars=32_768)
+    home = r.pick(_request_text(path, _bodies(TURNS)[path]), head=head)
+    r.load[home] += 20  # far past balance_abs: only the sticky rule keeps the conversation home
+    assert r.pick(t2, head=head) == home and r.routed["sticky"] == 1
+
+
+def test_a_session_key_reads_only_the_start_of_a_long_prompt(monkeypatch):
+    """A session request's key hashes the first SESSION_KEY_CHARS characters of its prompt's JSON text, on the event
+    loop: written from the prompt's start only, never the whole prompt (a 200K-token input_ids list), with the same key
+    as the whole prompt's text cut there."""
+    import hashlib
+    import json
+
+    from trnrt.serve import router as R
+
+    K = R.SESSION_KEY_CHARS
+    h = lambda b: hashlib.sha1(b.encode("utf-8", "replace"), usedforsecurity=False).hexdigest()  # noqa: E731
+    ids = list(range(200_000))
+    prompts = [
+        ("/generate", {"input_ids": ids}, ids),
+        ("/generate", {"input_ids": [ids, ids]}, [ids, ids]),
+        ("/generate", {"input_ids": [[7] * 3, ids]}, [[7] * 3, ids]),  # a short first prompt: the next one is read too
+        ("/generate", {"text": ["x" * 100_000, "y"]}, ["x" * 100_000, "y"]),
+        ("/v1/completions", {"prompt": ["\u00e9\U0001f642" * 50_000]}, ["\u00e9\U0001f642" * 50_000]),
+    ]
+    want = [(h(""), h(json.dumps(p)[:K])) for _, _, p in prompts]
+    content = [{"type": "text", "text": "z" * 100_000}, {"type": "text", "text": "w"}]
+    chat = {"messages": [{"role": "system", "content": "s"}, {"role": "user", "content": content}]}
+    want_chat = h("user\x00" + json.dumps(content, ensure_ascii=False)[:K])
+    sizes: list[int] = []
+    real = json.dumps
+    monkeypatch.setattr(R.json, "dumps", lambda *a, **kw: sizes.append(len(out := real(*a, **kw))) or out)
+    assert [R._session_key(path, body) for path, body, _ in prompts] == want
+    assert R._session_key("/v1/chat/completions", chat)[1] == want_chat
+    assert max(sizes) < 16 * K  # a cut prompt's text (up to 12 characters an item): never the 1.3 MB of the list
+
+
+@pytest.mark.parametrize("raw", ["\u00b2", "\u0663", "1" * 5000, "2", "-1", "x", ""])
+def test_an_engine_index_that_is_not_one_is_a_400(raw):
+    """?engine= takes an ASCII integer below the engine count: a superscript or Arabic-Indic digit (str.isdigit's, not
+    int's), or more digits than int reads, is a 400 like any other bad index, never a 500."""
+    from fastapi.testclient import TestClient
+
+    from trnrt.serve.router import build_router_app
+
+    with TestClient(build_router_app(Router(["http://127.0.0.1:9", "http://127.0.0.1:9"]), poll_s=0)) as c:
+        for path in ("/v1/stats", "/dashboard"):
+            r = c.get(path, params={"engine": raw}, follow_redirects=False)
+            assert r.status_code == 400 and "engine must be an integer in [0, 2)" in r.text, (path, r.text)
+
+
+def test_the_router_proxies_responses_and_messages_with_their_sessions():
+    """/v1/responses and /v1/messages go through the proxy: a session_id pins them as it pins a chat."""
+    import asyncio
+
+    import httpx
+    from fastapi import FastAPI, Request
+
+    from trnrt.serve.router import build_router_app
+
+    def worker(i: int) -> FastAPI:
+        app = FastAPI()
+
+        @app.get("/health")
+        async def health():
+            return {"status": "ok"}
+
+        async def answer(req: Request):
+            return {"worker": i, "body": await req.json()}
+
+        for path in ("/v1/responses", "/v1/messages"):
+            app.add_api_route(path, answer, methods=["POST"])
+        return app
+
+    async def main() -> None:
+        ports = [_free_port() for _ in range(3)]
+        router = Router([f"http://127.0.0.1:{p}" for p in ports[:2]])
+        servers, tasks = await _start(
+            [(worker(0), ports[0]), (worker(1), ports[1]), (build_router_app(router, poll_s=0), ports[2])]
+        )
+        base = f"http://127.0.0.1:{ports[2]}"
+        try:
+            async with httpx.AsyncClient(timeout=30) as c:
+                for path, conversation in _bodies(TURNS[:1]).items():
+                    if path == "/v1/chat/completions":
+                        continue
+                    body = {**conversation, "session_id": "s-" + path}
+                    got = {(await c.post(base + path, json=body)).json()["worker"] for _ in range(3)}
+                    assert got == {router.sessions["s-" + path]}, (path, got)
+                assert router.load == [0, 0] and all(t.size == 0 for t in router.trees)  # session requests: no tree
         finally:
             await _stop(servers, tasks)
 

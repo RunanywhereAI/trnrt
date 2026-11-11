@@ -4,10 +4,23 @@
   output's reasoning (`reasoning_content`) and tool calls (`tool_calls`) parsed out of it (serve/parsers.py), as one
   response or as server-sent events;
 - POST /v1/completions: a prompt as text or token ids, through the same generation path;
+- POST /v1/responses (serve/responses.py) and POST /v1/messages, /v1/messages/count_tokens (serve/anthropic.py): the
+  OpenAI Responses and Anthropic Messages APIs, translated into the chat path;
+- POST /tokenize and /detokenize (also under /v1);
 - GET /v1/models;
 - GET /health: 200 while the engine can serve, 503 with the reason once it cannot;
-- GET /v1/stats: the KV-cache gauges the router (serve/router.py) uses to break ties between engines;
-- GET /metrics: Prometheus counters and histograms (trnrt/metrics.py).
+- GET /v1/stats: the KV-cache gauges the router (serve/router.py) uses to break ties between engines, the engine's live
+  state, and request rates and latency percentiles over recent windows (serve/stats.py);
+- GET /dashboard: a page drawing /v1/stats (serve/dashboard.py);
+- GET /metrics: Prometheus counters and histograms (trnrt/metrics.py);
+- SGLang's native API (serve/native.py): POST /generate, the info endpoints /model_info and /server_info, /get_load,
+  /health_generate, /abort_request and /flush_cache.
+
+A request may ask for `n` choices: each is its own engine request (Run), sharing the prompt through the prefix cache.
+
+TRNRT_PROD_DIR keeps each finished request's record and the gauges on disk (serve/prodlog.py), and
+TRNRT_PROMPT_CACHE_MB builds a chat turn's prompt ids from the previous turn's (serve/prompt_cache.py); both are off
+unless set.
 
 A request may carry a `session_id` (a string): the engine keeps that session's prefix referenced in its prefix cache,
 and the router pins the session to one engine.
@@ -21,9 +34,12 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import bisect
 import contextlib
 import copy
+import dataclasses
 import functools
+import importlib
 import json
 import logging
 import math
@@ -43,11 +59,25 @@ from typing import TYPE_CHECKING, cast
 
 from fastapi import FastAPI, HTTPException
 from fastapi import Request as HTTPRequest
-from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response, StreamingResponse
 
 from ..engine.request import Request, SamplingParams, Status
+from ..engine.scheduler import QueueFull
 from ..metrics import Metrics, kv_pages, spec_stats
-from .parsers import THINK_OPEN, StreamParser, chat_finish_reason, parse_full, template_messages, tool_choice_error
+from .dashboard import PAGE as DASHBOARD_PAGE
+from .parsers import (
+    THINK_CLOSE,
+    THINK_OPEN,
+    StreamParser,
+    chat_finish_reason,
+    parse_full,
+    template_messages,
+    tool_choice_error,
+)
+from .prodlog import ProdLog
+from .prompt_cache import PromptCache
+from .stats import Stats
+from .structured import grammar_spec
 
 if TYPE_CHECKING:  # only annotations: importing this module does not load the engine and its model code
     from ..engine.engine import LLMEngine
@@ -61,23 +91,66 @@ class _Stream:
 
     req: Request
     loop: asyncio.AbstractEventLoop
-    out: asyncio.Queue
+    out: asyncio.Queue | _Tagged
     sent: int = 0
+    metrics: bool = True  # counted in /metrics when it finishes (a /health_generate probe is not)
+    stream: bool = False  # the HTTP response streams (GET /v1/stats's records)
+    logs: bool = True  # its record goes to the production log (SGLang's no_logs turns it off)
+    at_arrival: tuple[int, int] | None = None  # (running, waiting) when the engine took it
 
 
 @dataclass
 class _Submit:
     """A request on its way to the engine thread. `out` receives, in order: ("accepted", Request), or ("error", why,
-    HTTP status) if it was not accepted; then ("tokens", new ids, finish reason or None, their logprobs or None) until
-    the finish reason is set, or ("error", why, HTTP status) if the engine fails. The status is 400 for a request the
-    engine refuses, 500 for an internal error that leaves the engine serving and 503 once the engine has failed."""
+    HTTP status[, queue full]) if it was not accepted; then ("tokens", new ids, finish reason or None, their logprobs or
+    None) until the finish reason is set, or ("error", why, HTTP status[, queue full]) if the engine fails or displaces
+    it. The status is 400 for a request the engine refuses, 500 for an internal error that leaves the engine serving, and
+    503 once the engine has failed or for a request a full queue refused or displaced (queue full: True, and the response
+    carries QUEUE_FULL_HEADER so the router does not take the engine for failed). An aborted request (EngineLoop.abort,
+    abort_all) ends with ("tokens", its undelivered ids, "abort", their logprobs)."""
 
     rid: str
     prompt_ids: list[int]
     params: SamplingParams
     loop: asyncio.AbstractEventLoop
     session_id: str | None = None
-    out: asyncio.Queue = field(default_factory=asyncio.Queue)
+    priority: int | None = None
+    out: asyncio.Queue | _Tagged = field(default_factory=asyncio.Queue)
+    metrics: bool = True
+    stream: bool = False
+    logs: bool = True
+
+
+# Set on a 503 that answers a full waiting queue (scheduler.QueueFull) or a request displaced from it: the engine is
+# serving, unlike every other 503 it sends, so the router (serve/router.py) passes the answer on and keeps routing to it.
+QUEUE_FULL_HEADER = "x-trnrt-queue-full"
+
+
+class _Tagged:
+    """One choice's view of a shared queue: each item put here arrives on `q` as (index, item). The engine thread only
+    ever calls put_nowait on a request's queue (on its event loop), so the n requests of one HTTP request (`n` > 1) can
+    share one queue and be read in arrival order."""
+
+    def __init__(self, q: asyncio.Queue, index: int):
+        self.q, self.index = q, index
+
+    def put_nowait(self, item) -> None:
+        self.q.put_nowait((self.index, item))
+
+
+@dataclass
+class _Flush:
+    """A /flush_cache on its way to the engine thread, which answers `fut` with (flushed, message): at once when the
+    engine is idle, else once it is idle, or with a refusal past `deadline` (time.monotonic())."""
+
+    deadline: float
+    loop: asyncio.AbstractEventLoop
+    fut: asyncio.Future
+
+
+def _resolve(fut: asyncio.Future, value) -> None:
+    if not fut.done():  # its handler may have been cancelled (the client went away)
+        fut.set_result(value)
 
 
 # Engine loops of this process, held weakly: at exit each loop's thread stops after its step, then its engine closes
@@ -114,8 +187,18 @@ class EngineLoop:
     """Owns the engine: one thread runs its step loop and is the only one that touches it. Handlers hand it requests
     and aborts through `inbox`; it hands each request's tokens to that request's asyncio queue after every step."""
 
-    def __init__(self, engine: LLMEngine):
+    def __init__(self, engine: LLMEngine, name: str = "engine"):
         self.engine = engine
+        # GET /v1/stats and /dashboard (serve/stats.py), and with TRNRT_PROD_DIR the production log (serve/prodlog.py),
+        # under `name`, this engine's own directory. Fed on this loop's thread through _hook, which never raises.
+        self.stats = Stats()
+        self.stats.kv = lambda: kv_pages(engine)
+        self.stats_errors = 0
+        self._stats_err_t = float("-inf")
+        self.prodlog = ProdLog.from_env(name, self.stats)
+        if self.prodlog is not None:
+            prodlog = self.prodlog
+            self.stats.on_bucket = lambda g: prodlog.put("gauges", g)
         self._stopping = threading.Event()
         self.metrics = Metrics()
         self.vocab = engine.mcfg.vocab_size  # the embedding's rows: a prompt id outside them fails the step
@@ -129,6 +212,10 @@ class EngineLoop:
         # the engine has them at all (an engine without context-parallel row groups has none).
         self._local_k_stale = True
         self._local_k_none = False
+        # time.monotonic() at the end of the last step that ran (/health_generate: a step that ends after a probe was
+        # sent shows the engine is serving), and the /flush_cache waiting for the engine to be idle, if any.
+        self.last_step = 0.0
+        self._flush: _Flush | None = None
         self.thread = threading.Thread(target=self._run, name="trnrt-engine", daemon=True)
         self.thread.start()
         if engine.cfg.tp > 1:
@@ -144,6 +231,8 @@ class EngineLoop:
             self.thread.join(wait)
             if self.thread.is_alive():
                 logger.warning("trnrt: the engine thread did not stop within %.0f s; closing the engine anyway", wait)
+        if self.prodlog is not None:
+            self.prodlog.close()
 
     def health_error(self) -> str | None:
         """Why the engine cannot serve, or None. A worker that died while this loop waits in a step (a device collective
@@ -164,7 +253,23 @@ class EngineLoop:
                 raise HTTPException(status_code=503, detail=f"engine failed: {err}")
             self.inbox.put((kind, payload))
 
-    def submit(self, prompt_ids: list[int], params: SamplingParams, session_id: str | None = None) -> _Submit:
+    def submit(
+        self,
+        prompt_ids: list[int],
+        params: SamplingParams,
+        session_id: str | None = None,
+        rid: str | None = None,
+        metrics: bool = True,
+        out: _Tagged | None = None,
+        priority: int | None = None,
+        stream: bool = False,
+        logs: bool = True,
+    ) -> _Submit:
+        """Queue a request for the engine thread. `rid`: the client's request id (SGLang's), which /abort_request
+        names; a new one when None. `metrics`: whether /metrics and /v1/stats count it. `out`: a choice's view of a
+        shared queue (`n` > 1), instead of its own. `priority`: SGLang's per-request priority. `stream`: whether the HTTP
+        response streams (GET /v1/stats's records). `logs`: whether its record goes to the production log (SGLang's
+        no_logs: false)."""
         # Checked here, before the engine sees the request: an id outside the vocabulary fails the step, and at tp > 1
         # one failed step fails the engine for every request (_fail).
         if not prompt_ids or not all(type(t) is int and 0 <= t < self.vocab for t in prompt_ids):
@@ -173,12 +278,74 @@ class EngineLoop:
             )
         if session_id is not None and not isinstance(session_id, str):
             raise HTTPException(status_code=400, detail="session_id must be a string")
-        sub = _Submit(uuid.uuid4().hex, prompt_ids, params, asyncio.get_running_loop(), session_id)
+        if rid is not None and not (isinstance(rid, str) and rid):
+            raise HTTPException(status_code=400, detail="rid must be a non-empty string")
+        sub = _Submit(
+            rid or uuid.uuid4().hex,
+            prompt_ids,
+            params,
+            asyncio.get_running_loop(),
+            session_id,
+            priority=priority,
+            metrics=metrics,
+            stream=stream,
+            logs=logs,
+        )
+        if out is not None:
+            sub.out = out
         self._put("add", sub)
         return sub
 
     def abort(self, rid: str) -> None:
         self.inbox.put(("abort", rid))
+
+    def abort_all(self) -> None:
+        """Abort every request the engine holds, and those queued for it before this call."""
+        self.inbox.put(("abort_all", None))
+
+    def flush(self, timeout_s: float) -> _Flush:
+        """Ask the engine thread to drop its prefix cache (LLMEngine.flush_cache) once it is idle, waiting up to
+        `timeout_s` for that (SGLang's /flush_cache: 0 flushes only an engine idle when the request arrives)."""
+        loop = asyncio.get_running_loop()
+        f = _Flush(time.monotonic() + timeout_s, loop, loop.create_future())
+        self._put("flush", f)
+        return f
+
+    def _hook(self, fn, *args) -> None:
+        """Run a statistics or recording hook on the engine thread: an exception is counted and logged (at most once a
+        minute), never raised, so recording cannot stop serving (GET /v1/stats shows the count as stats_errors)."""
+        try:
+            fn(*args)
+        except Exception:  # the statistics must never fail a step or a request
+            self.stats_errors += 1
+            now = time.monotonic()
+            if now - self._stats_err_t >= 60:
+                self._stats_err_t = now
+                logger.exception("trnrt: a statistics hook failed (%d so far)", self.stats_errors)
+
+    def _tick(self, tokens: int) -> None:
+        self._hook(self._tick_hook, tokens)
+
+    def _tick_hook(self, tokens: int) -> None:
+        s = getattr(self.engine, "scheduler", None)  # an engine stand-in may have none
+        running, waiting = (len(s.running), len(s.waiting)) if s is not None else (0, 0)
+        self.stats.tick(time.monotonic(), tokens, running, waiting)
+
+    def _finished(self, st: _Stream, finish: str | None = None) -> None:
+        """A request's end: its record into the live statistics and the production log (O(1), never blocks). None for
+        a request submitted with metrics=False (a /health_generate probe), however it ends: finished or aborted."""
+        if st.metrics:
+            self._hook(self._finished_hook, st, finish)
+
+    def _failed(self, kind: str, metrics: bool) -> None:
+        """A request that never ran or that a failure ended, counted in /v1/stats unless submitted with metrics=False."""
+        if metrics:
+            self._hook(self.stats.failed, kind)
+
+    def _finished_hook(self, st: _Stream, finish: str | None) -> None:
+        rec = self.stats.record(st.req, st.stream, st.at_arrival, finish)
+        if self.prodlog is not None and st.logs:
+            self.prodlog.put("requests", rec)
 
     def _drain(self, block: bool) -> None:
         try:
@@ -188,28 +355,96 @@ class EngineLoop:
         while True:
             kind, payload = item
             if kind == "add":
-                post = payload.loop.call_soon_threadsafe
-                try:
-                    req = self.engine.add_request(
-                        payload.prompt_ids, payload.params, rid=payload.rid, session_id=payload.session_id
-                    )
-                except ValueError as e:
-                    post(payload.out.put_nowait, ("error", str(e), 400))
-                except Exception as e:  # noqa: BLE001  add_request raised before the request reached the scheduler
-                    traceback.print_exc()  # (its last step): that request fails, the engine keeps serving
-                    post(payload.out.put_nowait, ("error", f"request refused: {e!r}", 500))
-                else:
-                    self.streams[payload.rid] = _Stream(req, payload.loop, payload.out)
-                    post(payload.out.put_nowait, ("accepted", req))
+                self._add(payload)
             elif kind == "abort":
                 st = self.streams.pop(payload, None)
-                if st is not None and st.req.status is not Status.FINISHED:
-                    self.engine.abort(st.req)
+                if st is not None:
+                    self._abort(st)
+                    self._finished(st, "abort")
+            elif kind == "abort_all":
+                streams, self.streams = self.streams, {}
+                for st in streams.values():
+                    self._abort(st)
+                    self._finished(st, "abort")
+            elif kind == "flush":
+                self._start_flush(payload)
             # "wake": nothing to do, the loop re-checks whether it is stopping
             try:
                 item = self.inbox.get_nowait()
             except queue.Empty:
                 return
+
+    def _add(self, sub: _Submit) -> None:
+        post = sub.loop.call_soon_threadsafe
+        if sub.rid in self.streams:  # a client's rid (SGLang's /generate) names one request at a time
+            post(sub.out.put_nowait, ("error", f"rid {sub.rid!r} is already in use", 400))
+            return
+        # priority only when sent: an engine without priority scheduling refuses any value (LLMEngine.add_request)
+        extra = {} if sub.priority is None else {"priority": sub.priority}
+        sch = getattr(self.engine, "scheduler", None)
+        at_arrival = (len(sch.running), len(sch.waiting)) if sch is not None else None
+        try:
+            req = self.engine.add_request(sub.prompt_ids, sub.params, rid=sub.rid, session_id=sub.session_id, **extra)
+        except QueueFull as e:
+            post(sub.out.put_nowait, ("error", str(e), 503, True))
+            self._failed("queue_full", sub.metrics)
+        except ValueError as e:
+            post(sub.out.put_nowait, ("error", str(e), 400))
+            self._failed("refused", sub.metrics)
+        except Exception as e:  # noqa: BLE001  add_request raised before the request reached the scheduler
+            traceback.print_exc()  # (its last step): that request fails, the engine keeps serving
+            post(sub.out.put_nowait, ("error", f"request refused: {e!r}", 500))
+            self._failed("error", sub.metrics)
+        else:
+            self.streams[sub.rid] = _Stream(
+                req, sub.loop, sub.out, metrics=sub.metrics, stream=sub.stream, at_arrival=at_arrival, logs=sub.logs
+            )
+            post(sub.out.put_nowait, ("accepted", req))
+
+    def _abort(self, st: _Stream) -> None:
+        """Abort a request taken out of `streams`. Its handler, if still listening (an /abort_request; a disconnected
+        client's is gone), gets the tokens not yet delivered and the finish reason "abort"."""
+        req = st.req
+        if req.status is not Status.FINISHED:
+            self.engine.abort(req)
+        out = req.output_ids
+        with_lp = req.params.logprobs is not None
+        ready = min(len(out), len(req.logprobs)) if with_lp else len(out)
+        new = out[st.sent : ready]
+        lps = req.logprobs[st.sent : ready] if with_lp else None
+        st.loop.call_soon_threadsafe(st.out.put_nowait, ("tokens", new, "abort", lps))
+
+    def _start_flush(self, f: _Flush) -> None:
+        """A /flush_cache, in inbox order: done now if the engine is idle, refused if another is waiting or the request
+        set no time to wait, else kept until the engine is idle or its deadline passes (_check_flush; SGLang's
+        scheduler_components/flush_wrapper.py)."""
+        if self._flush is not None:
+            f.loop.call_soon_threadsafe(_resolve, f.fut, (False, "Another flush_cache is already in progress."))
+            return
+        self._flush = f
+        self._check_flush()
+
+    def _check_flush(self) -> None:
+        f = self._flush
+        if f is None:
+            return
+        if not self.engine.has_work():
+            self._flush = None
+            try:
+                self.engine.flush_cache()
+            except Exception as e:  # noqa: BLE001  a failed flush is the request's answer, never the engine's end
+                traceback.print_exc()
+                result = (False, f"flush_cache failed: {e!r}")
+            else:
+                logger.info("trnrt: prefix cache flushed")
+                result = (True, "")
+            f.loop.call_soon_threadsafe(_resolve, f.fut, result)
+        elif time.monotonic() >= f.deadline:
+            self._flush = None
+            busy = len(self.engine.scheduler.running) + len(self.engine.scheduler.waiting)
+            f.loop.call_soon_threadsafe(
+                _resolve, f.fut, (False, f"Cache not flushed: {busy} requests are running or waiting.")
+            )
 
     def _run(self) -> None:
         try:
@@ -260,6 +495,9 @@ class EngineLoop:
         streams, self.streams = self.streams, {}
         for st in streams.values():
             st.loop.call_soon_threadsafe(st.out.put_nowait, ("error", f"engine failed: {reason}", 503))
+            self._failed("engine", st.metrics)
+        flushes = [self._flush] if self._flush is not None else []
+        self._flush = None
         while True:
             try:
                 kind, payload = self.inbox.get_nowait()
@@ -267,6 +505,10 @@ class EngineLoop:
                 break
             if kind == "add":
                 payload.loop.call_soon_threadsafe(payload.out.put_nowait, ("error", f"engine failed: {reason}", 503))
+            elif kind == "flush":
+                flushes.append(payload)
+        for f in flushes:
+            f.loop.call_soon_threadsafe(_resolve, f.fut, (False, f"engine failed: {reason}"))
         try:
             self.engine.close_failed()
         except Exception:  # noqa: BLE001  the requests are answered; a teardown error must not hide the reason
@@ -275,8 +517,10 @@ class EngineLoop:
     def _loop(self) -> None:
         while not self._stopping.is_set() and self.failed is None:
             self._drain(block=not self.engine.has_work())
+            self._check_flush()
             if not self.engine.has_work():
                 self._read_local_k()
+                self._tick(0)
                 continue
             self._local_k_stale = True
             try:
@@ -292,8 +536,11 @@ class EngineLoop:
                     st.loop.call_soon_threadsafe(st.out.put_nowait, ("error", f"engine step failed: {e}", 500))
                     if st.req.status is not Status.FINISHED:
                         self.engine.abort(st.req)
+                    self._failed("engine", st.metrics)
                 self.streams.clear()
                 continue
+            self.last_step = time.monotonic()
+            handed = 0  # output tokens handed out by this step (GET /v1/stats: the aggregate output tok/s)
             batch: dict = {}  # one cross-thread call per event loop and step, not one per stream
             for rid, st in list(self.streams.items()):
                 req = st.req
@@ -302,8 +549,14 @@ class EngineLoop:
                 with_lp = req.params.logprobs is not None
                 # With logprobs on, only the tokens whose logprobs are recorded go out, so every token carries its own.
                 ready = len(out) if finished or not with_lp else min(len(out), len(req.logprobs))
+                if finished and req.error is not None:  # ended unserved: displaced from a full queue
+                    batch.setdefault(st.loop, []).append((st.out, ("error", req.error[1], req.error[0], True)))
+                    del self.streams[rid]
+                    self._failed("displaced", st.metrics)
+                    continue
                 if ready > st.sent or finished:
                     new = out[st.sent : ready]
+                    handed += len(new)
                     lps = req.logprobs[st.sent : ready] if with_lp else None
                     st.sent = ready
                     batch.setdefault(st.loop, []).append(
@@ -311,9 +564,12 @@ class EngineLoop:
                     )
                 if finished:
                     del self.streams[rid]
-                    self.metrics.on_finish(req)
+                    if st.metrics:  # a /health_generate probe is counted in neither /metrics nor /v1/stats
+                        self.metrics.on_finish(req)
+                    self._finished(st)
             for loop, items in batch.items():
                 loop.call_soon_threadsafe(_deliver, items)
+            self._tick(handed)
 
 
 def _deliver(items) -> None:
@@ -334,14 +590,36 @@ class _Detok:
     Never emits half of a multi-byte character, and with stop strings it holds back the
     last `max(len(stop)) - 1` characters until they cannot start a stop string, so a stop
     sequence is never partially streamed. Output is cut before the first stop string, as
-    the OpenAI API specifies.
+    the OpenAI API specifies, or after it with `keep` (vLLM's include_stop_str_in_output,
+    SGLang's no_stop_trim).
+
+    `regexes` are SGLang's stop_regex patterns, as (compiled, the longest text a match can span or None): the output
+    ends at the end of the first match, the matched text included, as SGLang's does (its trim looks for the pattern
+    itself in the text, which a pattern rarely is). A match starts at most STOP_REGEX_SPAN characters before the text
+    already searched. A match never takes back text already streamed. `matched`: the stop string or pattern that ended
+    the output, None until one does.
     """
 
-    def __init__(self, tokenizer, stops: tuple[str, ...] = (), incremental: bool = False, rid: str = ""):
+    def __init__(
+        self,
+        tokenizer,
+        stops: tuple[str, ...] = (),
+        incremental: bool = False,
+        rid: str = "",
+        regexes: tuple[tuple[re.Pattern, int | None], ...] = (),
+        keep: bool = False,
+        skip_special: bool = True,
+    ):
         self.tok = tokenizer
         self.rid = rid
         self.stops = stops
-        self.hold = max((len(x) for x in stops), default=1) - 1
+        self.keep = keep
+        # With keep the text up to a stop string's end is emitted either way, so nothing needs holding back.
+        self.hold = 0 if keep else max((len(x) for x in stops), default=1) - 1
+        self.regexes = regexes
+        self.skip_special = skip_special
+        self.matched: str | None = None
+        self._searched = 0  # how much of the text the regexes have been searched over
         self.ids: list[int] = []
         self.emitted = 0
         self.stopped = False
@@ -360,7 +638,7 @@ class _Detok:
         stream ended without a stop string. `full`: that decode when the caller has it (the final push), else decoded
         here."""
         if full is None:
-            full = self.tok.decode(self.ids, skip_special_tokens=True)
+            full = self.tok.decode(self.ids, skip_special_tokens=self.skip_special)
         got = "".join(self._streamed or ())  # set for an incremental stream, the only caller (push)
         DETOK_CHECK["checked"] += 1
         if full.startswith(got) and (self.stopped or got == full):
@@ -379,10 +657,11 @@ class _Detok:
         )
 
     def _decoded(self, final: bool) -> str:
+        skip = self.skip_special
         if final or not self.incremental:
-            return self.tok.decode(self.ids, skip_special_tokens=True)
-        prefix = self.tok.decode(self.ids[self._po : self._ro], skip_special_tokens=True)
-        new = self.tok.decode(self.ids[self._po :], skip_special_tokens=True)
+            return self.tok.decode(self.ids, skip_special_tokens=skip)
+        prefix = self.tok.decode(self.ids[self._po : self._ro], skip_special_tokens=skip)
+        new = self.tok.decode(self.ids[self._po :], skip_special_tokens=skip)
         if new.startswith(prefix) and len(new) > len(prefix) and not new.endswith("\ufffd"):
             self._text += new[len(prefix) :]
             self._po, self._ro = self._ro, len(self.ids)
@@ -395,13 +674,43 @@ class _Detok:
             return self._text + new[len(prefix) :]
         return self._text + "\ufffd"  # an incomplete character: held back below, as the full decode's would be
 
-    def push(self, ids: list[int], final: bool) -> str:
+    def _stop_at(self, text: str, final: bool) -> int | None:
+        """Where the output ends, if a stop string or a stop regex is in `text`: the earliest to start wins (a stop
+        string on a tie). Sets `matched`."""
+        best: tuple[int, int, str] | None = None  # (start, end of the output, what matched)
+        for x in self.stops:
+            i = text.find(x)
+            if i >= 0 and (best is None or i < best[0]):
+                best = (i, i + len(x) if self.keep else i, x)
+        if self.regexes:
+            # An incomplete character's U+FFFD is not text yet: a pattern must not match it.
+            body = text if final else text.rstrip("\ufffd")
+            for rx, width in self.regexes:
+                # Only a match that ends in the new text is new, and a bounded one starts at most `width` before it;
+                # none is looked for more than STOP_REGEX_SPAN characters back (the search's cost, see there).
+                # Searching from a position (not a slice) keeps anchors and lookbehinds reading the whole text.
+                span = STOP_REGEX_SPAN if width is None else min(width, STOP_REGEX_SPAN)
+                start = max(0, self._searched - span - 8)
+                m = rx.search(body, start)
+                if m is not None and (best is None or m.start() < best[0]):
+                    best = (m.start(), m.end(), rx.pattern)
+            self._searched = len(body)
+        if best is None:
+            return None
+        self.matched = best[2]
+        return max(best[1], self.emitted)
+
+    def push(self, ids: list[int], final: bool, drop_last: bool = False) -> str:
+        """The text these ids add. drop_last: the last id is the stop token that ended the request (EOS or a
+        stop_token_ids entry), which is not part of the text (vLLM and SGLang leave it out)."""
         if self.stopped:
             return ""
         self.ids.extend(ids)
+        if drop_last and ids:
+            self.ids.pop()
         text = self._decoded(final)
-        cut = min((i for i in (text.find(x) for x in self.stops) if i >= 0), default=-1)
-        if cut >= 0:
+        cut = self._stop_at(text, final)
+        if cut is not None:
             self.stopped = True
             end = cut
         elif final:
@@ -419,39 +728,36 @@ class _Detok:
         return delta
 
 
-# Request fields that would change the output in a way no served graph computes (guided decoding, prompt logprobs,
-# several choices, logit biases, an echoed or suffixed prompt): refused with a 400, never ignored. Each is accepted at
-# its neutral values, absent or listed here, which OpenAI SDKs and agent harnesses send by default. A plain-text
-# response_format is neutral too; penalties and a thinking budget are the engine's to refuse (engine.unsupported),
-# also only when they would change the output.
+# Request fields that would change the output in a way no served graph computes (prompt logprobs, logit biases, an
+# echoed or suffixed prompt, SGLang's min_new_tokens on the OpenAI endpoints): refused with a 400, never ignored. Each is
+# accepted at its neutral values, absent or listed here, which OpenAI SDKs and agent harnesses send by default. Guided
+# decoding (serve/structured.py), min_tokens, penalties and a thinking budget go to the engine, which refuses them unless
+# it was started with the graphs that serve them (engine/request.py unsupported).
 _NEUTRAL: dict[str, tuple[object, ...]] = {
     "prompt_logprobs": (None,),
-    "guided_json": (None,),
-    "guided_regex": (None,),
-    "guided_choice": (None,),
-    "guided_grammar": (None,),
-    "structured_outputs": (None,),
-    "n": (None, 1),
-    "best_of": (None, 1),
     "logit_bias": (None, {}),
     "echo": (None, False),
     "suffix": (None, ""),
-    "min_tokens": (None, 0),
-    "include_stop_str_in_output": (None, False),
+    "min_new_tokens": (None, 0),
     "add_generation_prompt": (None, True),
     "continue_final_message": (None, False),
-    "skip_special_tokens": (None, True),
+    # A slow tokenizer's decode option; the fast tokenizer the server decodes with has no such switch.
+    "spaces_between_special_tokens": (None, True),
     "functions": (None, []),
     "function_call": (None, "none", "auto"),
+    # One tier of service: "flex" and "priority" would promise a latency or price class this server does not have.
+    "service_tier": (None, "auto", "default"),
 }
 
 
+def _stream_flags(body: dict) -> tuple[bool, bool]:
+    """stream, and stream_options.include_usage."""
+    opts = body.get("stream_options") or {}
+    return _flag(body, "stream"), isinstance(opts, dict) and _flag(opts, "include_usage")
+
+
 def _refused(body: dict) -> list[str]:
-    out = [k for k, neutral in _NEUTRAL.items() if body.get(k) not in neutral]
-    rf = body.get("response_format")
-    if rf is not None and not (isinstance(rf, dict) and rf.get("type", "text") == "text"):
-        out.append("response_format")
-    return out
+    return [k for k, neutral in _NEUTRAL.items() if body.get(k) not in neutral]
 
 
 _INT64_MAX = 2**63 - 1
@@ -459,6 +765,12 @@ _INT64_MAX = 2**63 - 1
 
 def _bad(detail: str) -> HTTPException:
     return HTTPException(status_code=400, detail=detail)
+
+
+def _error(detail: str, status: int, queue_full: bool = False) -> HTTPException:
+    """The HTTP error of an engine's ("error", detail, status[, queue_full]) (_Submit): a full queue's 503 carries
+    QUEUE_FULL_HEADER."""
+    return HTTPException(status_code=status, detail=detail, headers={QUEUE_FULL_HEADER: "1"} if queue_full else None)
 
 
 def _int(body: dict, key: str, default, lo: int, hi: int = _INT64_MAX):
@@ -562,6 +874,13 @@ def _params(
     max_new = _int(body, "max_tokens", None, 1)
     if max_new is None:
         max_new = _int(body, "max_completion_tokens", default_max, 1)
+    min_tokens = _int(body, "min_tokens", 0, 0)
+    if min_tokens > max_new:  # vLLM's check
+        raise _bad(f"min_tokens ({min_tokens}) must be at most max_tokens ({max_new})")
+    try:
+        grammar = grammar_spec(body)
+    except ValueError as e:
+        raise _bad(str(e)) from None
     top_k = _int(body, "top_k", int(d.get("top_k", 0)), -1)  # -1 and 0 both turn it off (vLLM's -1, the engine's 0)
     return SamplingParams(
         max_new_tokens=max_new,
@@ -573,12 +892,319 @@ def _params(
         frequency_penalty=_num(body, "frequency_penalty", 0.0),
         presence_penalty=_num(body, "presence_penalty", 0.0),
         logprobs=logprobs,
-        thinking_token_budget=_int(body, "thinking_token_budget", None, 0),  # vLLM's; the engine refuses any value
+        thinking_token_budget=_int(body, "thinking_token_budget", None, 0),  # vLLM's
+        grammar=grammar,
+        min_tokens=min_tokens,
         stop=tuple(stop),
         stop_token_ids=tuple(stop_ids),
         ignore_eos=_flag(body, "ignore_eos"),
         seed=_int(body, "seed", None, 0),
     )
+
+
+# `n` choices per request at most: each is its own engine request, holding a decode seat.
+MAX_N = 128
+# stop_regex: patterns per request, and characters per pattern, at most. Each pattern is searched on the event loop at
+# every streamed piece of text, over the new text and the longest span a match can have, at most STOP_REGEX_SPAN
+# characters before it. CPython's re holds the GIL through a search and cannot be stopped, so its cost is bounded
+# before it runs: _backtracking refuses the shapes whose search time grows faster than the square of the text's length,
+# and the span bounds the text. The worst admitted shape, one repeat over a broad class (`\w+@\w+\.\w+` over a run of
+# letters), measured 13 ms per search at 2048 characters and 51 ms at 4096 (CPython 3.14, one Apple M3 Max core). The
+# matches are SGLang's (its tail search reads the whole output for an unbounded pattern) but for one that starts more
+# than the span before the newest text, which a stop pattern's match rarely does.
+MAX_STOP_REGEX = 16
+MAX_STOP_REGEX_CHARS = 1024
+STOP_REGEX_SPAN = 2048
+
+
+@dataclass(frozen=True)
+class StopRules:
+    """A request's host-side stop rules (the engine matches stop strings and stop tokens itself): SGLang's stop_regex
+    as (compiled, the longest text a match spans or None); keep: the stop text stays in the output (vLLM's
+    include_stop_str_in_output, SGLang's no_stop_trim); skip_special: skip_special_tokens."""
+
+    regexes: tuple[tuple[re.Pattern, int | None], ...] = ()
+    keep: bool = False
+    skip_special: bool = True
+
+
+def _match_width(pattern: str) -> int | None:
+    """The longest text a match of `pattern` can span, None if unbounded (or unknown): the window a new match can start
+    in. Read from the regex parser's own width (SGLang computes the same bound, sampling_params.get_max_seq_length)."""
+    try:
+        parser = importlib.import_module("re._parser")
+        hi = parser.parse(pattern).getwidth()[1]
+    except Exception:  # noqa: BLE001  a private module: without it every pattern is searched over the whole text
+        return None
+    return int(hi) if hi < 1 << 20 else None
+
+
+# The characters two character sets are compared on (_backtracking): Latin, the common spaces and line separators, and a
+# digit, letter and symbol from other scripts, plus every literal and range end of the pattern itself.
+_STOP_REGEX_PROBES = [chr(c) for c in range(0x300)] + list("\u00a0\u2028\u3000\u0663\u4e2d\u0416\U0001f642")
+_STOP_REGEX_CATEGORY = {
+    "DIGIT": re.compile(r"\d"),
+    "NOT_DIGIT": re.compile(r"\D"),
+    "SPACE": re.compile(r"\s"),
+    "NOT_SPACE": re.compile(r"\S"),
+    "WORD": re.compile(r"\w"),
+    "NOT_WORD": re.compile(r"\W"),
+    "LINEBREAK": re.compile("\n"),
+    "NOT_LINEBREAK": re.compile("[^\n]"),
+}
+
+
+class _Backtracking(Exception):
+    pass
+
+
+def _backtracking(pattern: str) -> str | None:
+    """Why Python's backtracking matcher could take more than about quadratic time on some text to search `pattern`,
+    or None. Two shapes do, and stop_regex refuses them (a linear-time engine would be a new dependency, and CPython's
+    re holds the GIL through a search, so a worker thread or a timeout cannot bound one):
+    - a repeat that can iterate more than once over a part that can match more than one way (a variable length or an
+      alternation): `(a+)+b`, `(a|a)*b`, `(a{1,3}){1,10}b`, exponential in the text's length;
+    - two repeats in a row that can take the same characters (nothing they cannot both match between them): `a*a*b`,
+      `\\d+\\s*\\d+`, `.*x.*y`, a power of the length per repeat.
+    An alternation whose branches start with characters no other branch starts with is one way only, as is a single
+    repeat over a fixed part: `\\d+\\.\\d+`, `Answer:\\s*\\d+`, `(?:foo|bar)+`, `\\n\\n+` all pass."""
+    try:
+        parser = importlib.import_module("re._parser")
+        c = importlib.import_module("re._constants")
+        tree = parser.parse(pattern)
+    except Exception as e:  # noqa: BLE001  a private module: without it no pattern can be checked
+        return f"it cannot be checked for backtracking ({type(e).__name__})"
+    probes = set(_STOP_REGEX_PROBES)
+
+    def collect(items) -> None:  # every literal and range end, so two overlapping ranges share a probe
+        for op, av in items:
+            if op in (c.LITERAL, c.NOT_LITERAL):
+                probes.update({chr(av), chr(av).lower(), chr(av).upper()})
+            elif op is c.RANGE:
+                probes.update({chr(av[0]), chr(av[1])})
+            elif op is c.IN or isinstance(av, parser.SubPattern):
+                collect(av)
+            elif isinstance(av, (tuple, list)):
+                for x in av:
+                    if isinstance(x, parser.SubPattern):
+                        collect(x)
+                    elif isinstance(x, list):
+                        for y in x:
+                            if isinstance(y, parser.SubPattern):
+                                collect(y)
+
+    collect(tree)
+
+    ordered = sorted(probes)
+    ords = [ord(p) for p in ordered]
+    categories: dict[str, frozenset] = {}
+    fold = bool(tree.state.flags & re.IGNORECASE) or "(?" in pattern  # a case-blind part may be scoped: (?i:...)
+
+    def member(op, av) -> frozenset:
+        """The character set of the one-character item (op, av), as the probes it matches (either case under
+        IGNORECASE)."""
+        if op is c.LITERAL:
+            return frozenset({chr(av), chr(av).lower(), chr(av).upper()} if fold else {chr(av)})
+        if op is c.NOT_LITERAL:
+            return frozenset(probes - {chr(av)})
+        if op is c.ANY:
+            return frozenset(probes)
+        hit: set = set()
+        neg = False
+        for o, a in av:  # IN
+            if o is c.NEGATE:
+                neg = True
+            elif o is c.LITERAL:
+                hit.add(chr(a))
+            elif o is c.RANGE:
+                hit.update(ordered[bisect.bisect_left(ords, a[0]) : bisect.bisect_right(ords, a[1])])
+            elif o is c.CATEGORY:
+                name = str(a).removeprefix("CATEGORY_").removeprefix("UNI_").removeprefix("LOC_")
+                if name not in categories:
+                    rx = _STOP_REGEX_CATEGORY.get(name)
+                    categories[name] = frozenset(probes if rx is None else (p for p in probes if rx.match(p)))
+                hit |= categories[name]
+            else:
+                hit |= probes
+        if fold:
+            hit |= {y for x in hit for y in (x.lower(), x.upper())}
+        return frozenset(probes - hit if neg else probes & hit)
+
+    everything = frozenset(probes)
+
+    def chars(items) -> frozenset:
+        """Every character `items` can consume."""
+        out: set = set()
+        for op, av in items:
+            if op in (c.LITERAL, c.NOT_LITERAL, c.ANY, c.IN):
+                out |= member(op, av)
+            elif op is c.SUBPATTERN:
+                out |= chars(av[3])
+            elif op is c.ATOMIC_GROUP:
+                out |= chars(av)
+            elif op in (c.MAX_REPEAT, c.MIN_REPEAT, c.POSSESSIVE_REPEAT):
+                out |= chars(av[2])
+            elif op is c.BRANCH:
+                for alt in av[1]:
+                    out |= chars(alt)
+            elif op is c.GROUPREF_EXISTS:
+                out |= chars(av[1]) | (chars(av[2]) if av[2] is not None else frozenset())
+            elif op is c.GROUPREF:
+                out |= everything
+        return frozenset(out)
+
+    def one_way(items) -> bool:
+        """Whether `items` can match a given text in one way only: a fixed length, no back reference, and every
+        alternation's branches starting with characters no other branch starts with."""
+        lo, hi = items.getwidth()
+        if lo != hi:
+            return False
+        for op, av in items:
+            if op is c.SUBPATTERN and not one_way(av[3]):
+                return False
+            if op in (c.GROUPREF, c.GROUPREF_EXISTS):
+                return False
+            if op in (c.MAX_REPEAT, c.MIN_REPEAT, c.POSSESSIVE_REPEAT) and not one_way(av[2]):
+                return False
+            if op is c.BRANCH:
+                firsts = [first(alt) for alt in av[1]]
+                if any(not f for f in firsts) or any(
+                    firsts[i] & firsts[j] for i in range(len(firsts)) for j in range(i)
+                ):
+                    return False
+                if not all(one_way(alt) for alt in av[1]):
+                    return False
+        return True
+
+    def first(items) -> frozenset:
+        """The characters a match of `items` can start with (empty when it matches only the empty text)."""
+        out: set = set()
+        for op, av in items:
+            if op in (c.LITERAL, c.NOT_LITERAL, c.ANY, c.IN):
+                return frozenset(out | member(op, av))
+            if op is c.SUBPATTERN:
+                out |= first(av[3])
+            elif op is c.ATOMIC_GROUP:
+                out |= first(av)
+            elif op in (c.MAX_REPEAT, c.MIN_REPEAT, c.POSSESSIVE_REPEAT):
+                out |= first(av[2])
+            elif op is c.BRANCH:
+                for alt in av[1]:
+                    out |= first(alt)
+            elif op is c.GROUPREF or op is c.GROUPREF_EXISTS:
+                return everything  # conservative
+            if parser.SubPattern(tree.state, [(op, av)]).getwidth()[0] > 0:
+                return frozenset(out)
+        return frozenset(out)
+
+    def scan(items, live: list[frozenset]) -> list[frozenset]:
+        """Walk `items` left to right with the character sets of the variable repeats still able to take more (`live`):
+        raise _Backtracking at a shape above; return what is live after them."""
+        for op, av in items:
+            if op in (c.LITERAL, c.NOT_LITERAL, c.ANY, c.IN):
+                s = member(op, av)
+                live = [x for x in live if x & s]  # a character neither repeat can take ends it
+            elif op is c.AT:
+                pass
+            elif op is c.SUBPATTERN:
+                live = scan(av[3], live)
+            elif op in (c.ASSERT, c.ASSERT_NOT):
+                scan(av[1], [])
+            elif op is c.ATOMIC_GROUP:
+                scan(av, [])
+            elif op is c.BRANCH:
+                out: list[frozenset] = []
+                for alt in av[1]:
+                    out += [x for x in scan(alt, list(live)) if x not in out]
+                live = out
+            elif op is c.GROUPREF_EXISTS:
+                out = []
+                for alt in (av[1], av[2]):
+                    if alt is not None:
+                        out += [x for x in scan(alt, list(live)) if x not in out]
+                live = out
+            elif op in (c.MAX_REPEAT, c.MIN_REPEAT, c.POSSESSIVE_REPEAT):
+                lo, hi, body = av
+                if lo == hi == 1:
+                    live = scan(body, live)
+                    continue
+                if hi > 1 and body.getwidth()[1] == 0:
+                    raise _Backtracking("it repeats a part that matches only the empty text")
+                if hi > 1 and not one_way(body):
+                    raise _Backtracking(
+                        "it repeats a part that can match more than one way (as (a+)+ or (a|a)* do), which Python's "
+                        "backtracking matcher can take exponential time over"
+                    )
+                scan(body, [])
+                s = first(body)  # a character a live repeat cannot take ends it, so only the first one can be shared
+                if lo == hi or op is c.POSSESSIVE_REPEAT:
+                    if lo > 0:
+                        live = [x for x in live if x & s]
+                    continue
+                if any(x & s for x in live):
+                    raise _Backtracking(
+                        "it has two repeats in a row that can take the same characters (as a*a* or \\d+\\s*\\d+ do), "
+                        "which Python's backtracking matcher can take time over that grows with a power of the text's "
+                        "length"
+                    )
+                live = ([] if lo > 0 else live) + [chars(body)]  # none live overlaps s: a mandatory one ends them
+            elif op is c.GROUPREF:
+                if live:
+                    raise _Backtracking(
+                        "it has a back reference after a repeat that can take the same characters, which Python's "
+                        "backtracking matcher can take time over that grows with a power of the text's length"
+                    )
+                live = [everything]
+            else:
+                raise _Backtracking(f"it uses {op}, which the backtracking check does not know")
+        return live
+
+    try:
+        scan(tree, [])
+    except _Backtracking as e:
+        return str(e)
+    except RecursionError:
+        return "it nests too deeply to be checked for backtracking"
+    return None
+
+
+def _stop_rules(body: dict) -> StopRules:
+    """The request's StopRules, checked: 400 for a pattern that does not compile, and for keep or skip_special_tokens
+    that is not a boolean."""
+    rx = body.get("stop_regex")
+    rx = [] if rx is None else [rx] if isinstance(rx, str) else rx
+    if not (isinstance(rx, list) and all(isinstance(x, str) and x for x in rx)):
+        raise _bad("stop_regex must be a non-empty string or a list of them")
+    if len(rx) > MAX_STOP_REGEX or any(len(x) > MAX_STOP_REGEX_CHARS for x in rx):
+        raise _bad(f"stop_regex takes at most {MAX_STOP_REGEX} patterns of at most {MAX_STOP_REGEX_CHARS} characters")
+    compiled = []
+    for x in rx:
+        try:
+            compiled.append((re.compile(x), _match_width(x)))
+        except (re.error, RecursionError, OverflowError) as e:
+            raise _bad(f"stop_regex {x!r} is not a valid regular expression: {e}") from None
+        why = _backtracking(x)
+        if why is not None:
+            raise _bad(f"stop_regex {x!r} is refused: {why}")
+    include, no_trim = _flag(body, "include_stop_str_in_output"), _flag(body, "no_stop_trim")  # both checked, always
+    keep = include or no_trim
+    return StopRules(tuple(compiled), keep, _flag(body, "skip_special_tokens", True))
+
+
+def _fanout(body: dict, params: SamplingParams) -> list[SamplingParams]:
+    """One SamplingParams per choice (`n`, default 1). best_of is accepted only when it asks for no more than n (it would
+    rank extra candidates by their logprob, which no request here returns). A seed gives choice i the seed + i, as vLLM
+    does (v1/engine/parallel_sampling.py), so the choices differ and each is reproducible; without one each choice draws
+    its own noise, keyed by its own request id."""
+    n = _int(body, "n", 1, 1, MAX_N)
+    best_of = _int(body, "best_of", n, 1)
+    if best_of != n:
+        raise _bad(f"not supported: best_of {best_of} with n {n}; send best_of equal to n, or leave it out")
+    if params.seed is not None and params.seed + n - 1 > _INT64_MAX:
+        raise _bad(f"seed must be at most {_INT64_MAX - n + 1} with n {n}: choice i draws with seed + i")
+    if n == 1:
+        return [params]
+    return [params if params.seed is None else dataclasses.replace(params, seed=params.seed + i) for i in range(n)]
 
 
 # A role test naming "developer" in a Jinja template: `m.role == 'developer'`, `message['role'] != "developer"`,
@@ -694,10 +1320,25 @@ def template_kwargs(tok, body: dict) -> tuple[dict, bool | None]:
     return kw, thinking
 
 
-def chat_prompt(tok, body: dict) -> tuple[list[int], dict]:
+def _cached_ids(tok, messages: list, kwargs: dict, cache: PromptCache, session) -> list[int]:
+    """_template_ids through the prompt token cache: the template renders the text, and the cache encodes it from the
+    session's (or the same system prompt's) previous text, giving the ids _template_ids would (or, on an audit that
+    finds otherwise, those ids, and the cache turns itself off)."""
+    import jinja2
+
+    try:
+        text = tok.apply_chat_template(messages, add_generation_prompt=True, tokenize=False, **kwargs)
+    except jinja2.TemplateError as e:
+        raise _bad(f"the chat template refused the messages: {e}") from None
+    key = session if isinstance(session, str) else None
+    return cache.encode(text, key, served=lambda: _template_ids(tok, messages, kwargs))
+
+
+def chat_prompt(tok, body: dict, cache: PromptCache | None = None) -> tuple[list[int], dict]:
     """A /v1/chat/completions request's prompt ids, rendered by the model's chat template from its messages (assistant
     tool_calls arguments as objects: parsers.template_messages), and the StreamParser / parse_full arguments its output
-    is parsed with. HTTPException 400 on a malformed request."""
+    is parsed with. HTTPException 400 on a malformed request. With `cache` (TRNRT_PROMPT_CACHE_MB) the ids come through
+    the prompt token cache, the same ids."""
     messages = body.get("messages")
     if not messages:
         raise HTTPException(status_code=400, detail="messages is required")
@@ -713,7 +1354,10 @@ def chat_prompt(tok, body: dict) -> tuple[list[int], dict]:
     tools = body.get("tools") if tool_choice != "none" else None
     if tools:
         kwargs["tools"] = tools
-    ids = _template_ids(tok, messages, kwargs)
+    if cache is not None and cache.off is None:
+        ids = _cached_ids(tok, messages, kwargs, cache, body.get("session_id"))
+    else:
+        ids = _template_ids(tok, messages, kwargs)
     # With thinking on, the template opens the reasoning block in the prompt and the output starts inside it; with
     # thinking off it closes the block there, and the output starts with the answer.
     tail = tok.decode(ids[-4:]).rstrip()
@@ -770,15 +1414,245 @@ async def _unless_disconnected(http: HTTPRequest, aw):
     return task.result()
 
 
-def build_app(engine: LLMEngine, model_name: str) -> FastAPI:
+class EngineError(Exception):
+    """An engine request failed after it was accepted: `detail`, the HTTP `status` and whether a full queue displaced it
+    (_Submit)."""
+
+    def __init__(self, detail: str, status: int, queue_full: bool = False):
+        super().__init__(detail)
+        self.detail, self.status, self.queue_full = detail, status, queue_full
+
+    def http(self) -> HTTPException:
+        """The HTTPException a non-streaming handler raises for it (a displaced request's 503 keeps QUEUE_FULL_HEADER)."""
+        return _error(self.detail, self.status, self.queue_full)
+
+
+class Run:
+    """The engine requests of one HTTP request: `n` choices of one prompt (OpenAI's `n`), each its own engine request,
+    sharing the prompt. The prefix cache makes the copies cheap: their shared prompt pages become a checkpoint target of
+    the first one the scheduler admits (_junctions_ahead when they are queued together; _mark_running_junctions when one
+    arrives while the first prefills), and the others wait until they can resume from it (_prefix_in_progress,
+    engine/scheduler.py), so the prompt is computed once and each other choice computes only its last partial page.
+    Their tokens arrive tagged with the choice's index on one queue.
+
+    Each choice has its own detokenizer (stop strings, stop_regex, skip_special_tokens) and, for a chat request, its own
+    GLM parser. A choice the host stops (a stop_regex match) is aborted in the engine. Whatever ends the run early (an
+    error, a client gone, a consumer that stops reading) aborts every choice still running (close)."""
+
+    def __init__(
+        self,
+        loop_: EngineLoop,
+        tok,
+        prompt_ids: list[int],
+        params: list[SamplingParams],
+        session_id,
+        rules: StopRules,
+        eos: tuple[int, ...] = (),
+        parse: dict | None = None,
+        priority: int | None = None,
+        stream: bool = False,
+    ):
+        self.loop_, self.tok, self.prompt_ids, self.params = loop_, tok, prompt_ids, params
+        self.priority, self.stream = priority, stream
+        self.session_id, self.rules, self.parse = session_id, rules, parse
+        n = len(params)
+        self.q: asyncio.Queue = asyncio.Queue()
+        self.subs: list[_Submit] = []
+        self.reqs: list[Request | None] = [None] * n
+        self.detoks: list[_Detok] = []
+        self.parsers = [StreamParser(**parse) for _ in range(n)] if parse is not None else []
+        # The ids whose token ends a request without being part of its text (EOS and the request's stop ids).
+        self.stop_ids = [frozenset(eos) | frozenset(p.stop_token_ids) for p in params]
+        self.ids: list[list[int]] = [[] for _ in range(n)]
+        self.text = [""] * n
+        self.lps: list[list] = [[] for _ in range(n)]
+        self.finish: list[str | None] = [None] * n
+        self.created = int(time.time())
+        self._early: list = []  # tokens that arrived while start() still waited for another choice's acceptance
+        self._open = n
+        self.completed = False
+
+    @property
+    def n(self) -> int:
+        return len(self.params)
+
+    @property
+    def rid(self) -> str:
+        return self.subs[0].rid
+
+    async def start(self) -> None:
+        """Hand every choice to the engine and wait until each is accepted. HTTPException (the engine's status) if one is
+        not: the others are aborted, so no choice runs for a request that is answered with an error."""
+        try:
+            for i, p in enumerate(self.params):
+                self.subs.append(
+                    self.loop_.submit(
+                        self.prompt_ids,
+                        p,
+                        self.session_id,
+                        out=_Tagged(self.q, i),
+                        priority=self.priority,
+                        stream=self.stream,
+                    )
+                )
+            waiting = set(range(self.n))
+            while waiting:
+                i, item = await self.q.get()
+                if item[0] == "error":
+                    raise _error(*item[1:])  # a full queue's 503 keeps QUEUE_FULL_HEADER
+                if item[0] == "accepted":
+                    self.reqs[i] = item[1]
+                    waiting.discard(i)
+                else:
+                    self._early.append((i, item))
+        except BaseException:
+            self.close()
+            raise
+        for sub in self.subs:
+            self.detoks.append(
+                _Detok(
+                    self.tok,
+                    sub.params.stop,
+                    incremental=True,
+                    rid=sub.rid,
+                    regexes=self.rules.regexes,
+                    keep=self.rules.keep,
+                    skip_special=self.rules.skip_special,
+                )
+            )
+
+    def close(self) -> None:
+        """Abort every choice that has not finished (idempotent; nothing once the run completed)."""
+        if self.completed:
+            return
+        for i, sub in enumerate(self.subs):
+            if self.finish[i] is None:
+                self.loop_.abort(sub.rid)
+
+    async def deliveries(self):
+        """(choice index, new text, finish reason or None, (id, logprob entry) pairs or None) per delivery, until every
+        choice has finished. EngineError if the engine fails a choice; close() runs on any early exit."""
+        try:
+            while self._open:
+                i, item = self._early.pop(0) if self._early else await self.q.get()
+                if item[0] == "error":
+                    raise EngineError(*item[1:])
+                if self.finish[i] is not None:  # a choice the host stopped: the tokens it made before its abort
+                    continue
+                _, ids, finish, lps = item
+                self.ids[i] += ids
+                if lps is not None:
+                    self.lps[i] += zip(ids, lps)
+                d = self.detoks[i]
+                drop = finish == "stop" and not self.rules.keep and bool(ids) and ids[-1] in self.stop_ids[i]
+                text = d.push(ids, finish is not None, drop_last=drop)
+                if d.matched is not None:
+                    if finish is None:  # a stop_regex match: the engine knows nothing of it
+                        self.loop_.abort(self.subs[i].rid)
+                    finish = "stop"
+                self.text[i] += text
+                if finish is not None:
+                    self.finish[i] = finish
+                    self._open -= 1
+                yield i, text, finish, (list(zip(ids, lps)) if lps is not None else None)
+            self.completed = True
+        finally:
+            self.close()
+
+    async def parsed(self):
+        """A chat run's deliveries through each choice's GLM parser: (index, delta dicts (StreamParser.push), finish
+        reason as the chat API gives it (chat_finish_reason), logprob pairs or None)."""
+        async for i, text, finish, pairs in self.deliveries():
+            p = self.parsers[i]
+            deltas = p.push(text, finish is not None)
+            yield i, deltas, chat_finish_reason(finish, p.saw_tool), pairs
+
+    async def wait(self, http: HTTPRequest) -> bool:
+        """Every choice to its end (non-streaming); False if the client disconnected first (every choice is then
+        aborted). EngineError if the engine fails one."""
+
+        async def drain() -> bool:
+            async for _ in self.deliveries():
+                pass
+            return True
+
+        try:
+            done = await _unless_disconnected(http, drain())
+        except BaseException:
+            self.close()
+            raise
+        return done is not None
+
+    def message(self, i: int) -> tuple[dict, str | None]:
+        """A finished chat choice's message (parse_full of its whole text, as the non-streaming chat API returns it) and
+        its finish reason."""
+        msg = parse_full(self.text[i], **(self.parse or {}))
+        return msg, chat_finish_reason(self.finish[i], bool(msg.get("tool_calls")))
+
+    def matched_stop(self, i: int) -> str | int | None:
+        """SGLang's matched_stop for a finished choice: the stop string or stop_regex pattern that ended it, else the
+        token id (EOS or a stop id) that did, else None (a length or an abort)."""
+        d = self.detoks[i] if i < len(self.detoks) else None
+        if d is not None and d.matched is not None:
+            return d.matched
+        ids = self.ids[i]
+        if self.finish[i] == "stop" and ids and ids[-1] in self.stop_ids[i]:
+            return ids[-1]
+        return None
+
+    def cached_tokens(self) -> int:
+        """The prompt tokens resumed from the prefix cache: the fewest of any choice's, since the prompt is counted once
+        (the choice that computed it)."""
+        return min((max(r.num_cached_tokens, 0) for r in self.reqs if r is not None), default=0)
+
+    def usage(self) -> dict:
+        """OpenAI usage: the prompt counted once (as OpenAI counts it for n choices), every choice's output tokens."""
+        out = sum(len(x) for x in self.ids)
+        return {
+            "prompt_tokens": len(self.prompt_ids),
+            "completion_tokens": out,
+            "total_tokens": len(self.prompt_ids) + out,
+            "prompt_tokens_details": {"cached_tokens": self.cached_tokens()},
+        }
+
+    def reasoning_tokens(self, i: int) -> int | None:
+        """The output tokens choice i spent reasoning: those before its first `</think>` (between `<think>` and it
+        when the prompt did not open the block), counted on its ids; None if the tokenizer has no single id for the
+        tags."""
+        close = _tag_id(self.tok, THINK_CLOSE)
+        ids = self.ids[i]
+        if close is None:
+            return None
+        start = 0
+        if not (self.parse or {}).get("thinking_open"):
+            opening = _tag_id(self.tok, THINK_OPEN)
+            if opening is None or opening not in ids:
+                return 0
+            start = ids.index(opening) + 1
+        end = ids.index(close, start) if close in ids[start:] else len(ids)
+        return end - start
+
+
+def _tag_id(tok, tag: str) -> int | None:
+    """The id of a tag the tokenizer holds as one token (GLM's `<think>` and `</think>` are added tokens), else None."""
+    ids = tok.encode(tag, add_special_tokens=False)
+    return ids[0] if len(ids) == 1 else None
+
+
+def build_app(engine: LLMEngine, model_name: str, preset: str | None = None, name: str = "engine") -> FastAPI:
+    """The server of one engine. `preset`: the --preset it was started with, for /server_info. `name` names its
+    directory in the production log (TRNRT_PROD_DIR): `serve` gives each engine its own, by port."""
     app = FastAPI(title="TrnRT")
-    loop_ = EngineLoop(engine)
+    loop_ = EngineLoop(engine, name)
     tok = engine.tokenizer
     # A chat request's prompt is rendered and tokenized on one worker thread with its own tokenizer, not on the event
     # loop: GLM-5.3-Flash's template takes tens of milliseconds at 100K tokens, which would stall every other request's
     # stream, and two threads in one Hugging Face fast tokenizer can raise "Already borrowed".
     prompt_pool = ThreadPoolExecutor(1, thread_name_prefix="trnrt-prompt")
     prompt_tok = copy.deepcopy(tok)
+    # TRNRT_PROMPT_CACHE_MB (serve/prompt_cache.py): a chat prompt's ids from the previous turn's; used on prompt_pool's
+    # thread only, by the chat endpoint (/tokenize renders without it)
+    prompt_cache = PromptCache.from_env(prompt_tok)
     gen_defaults = generation_defaults(getattr(engine, "model_path", None))
     if gen_defaults:
         logger.info("trnrt: sampling defaults from the checkpoint's generation_config.json: %s", gen_defaults)
@@ -790,15 +1664,44 @@ def build_app(engine: LLMEngine, model_name: str) -> FastAPI:
             return JSONResponse(status_code=503, content={"status": "failed", "error": err})
         return {"status": "ok"}
 
-    @app.get("/v1/stats")
-    async def stats():
-        """The router's tie-break between engines: KV pages in use and usable (metrics.kv_pages)."""
+    def live_gauges() -> dict:
+        """GET /v1/stats's live state. kv_pages_used and kv_pages_total are the router's tie-break between engines
+        (metrics.kv_pages); the rest is the scheduler, the speculation, the scheduling settings, the prompt token cache
+        and the production log. Read without the engine thread: counts and settings only, nothing changed."""
         used, total = kv_pages(engine)
         gauges: dict = {"kv_pages_used": used, "kv_pages_total": total}
         spec = spec_stats(engine)
         if spec is not None:
             gauges["spec"] = spec
-        return {"gauges": gauges}
+        s, cfg = engine.scheduler, engine.cfg
+        sch = getattr(engine, "scheduling", None)
+        gauges.update(
+            running=len(s.running),
+            waiting=len(s.waiting),
+            seats=getattr(cfg, "max_num_seqs", None),
+            cap=getattr(cfg, "max_running", None),
+            kv_used_pct=100.0 * used / total if total else None,
+            preemptions=getattr(s, "num_preemptions", 0),
+            model=model_name,
+            max_model_len=cfg.max_model_len,
+            tp=cfg.tp,
+            scheduling=dataclasses.asdict(sch) if sch is not None else None,
+            prompt_cache=prompt_cache.stats() if prompt_cache is not None else {"on": False},
+            prod=loop_.prodlog.status() if loop_.prodlog is not None else {"on": False},
+            stats_errors=loop_.stats_errors,
+        )
+        return gauges
+
+    @app.get("/v1/stats")
+    async def stats():
+        """The live gauges, and request rates and percentiles over recent windows, a 30-minute series and the recent
+        requests (serve/stats.py), computed in a worker thread: sorting up to stats.RING records must not hold the
+        event loop that delivers every stream's tokens."""
+        return JSONResponse(await asyncio.to_thread(loop_.stats.snapshot, live_gauges()))
+
+    @app.get("/dashboard")
+    async def dashboard():
+        return HTMLResponse(DASHBOARD_PAGE)
 
     @app.get("/metrics")
     async def metrics():
@@ -808,39 +1711,39 @@ def build_app(engine: LLMEngine, model_name: str) -> FastAPI:
     async def models():
         return {"object": "list", "data": [{"id": model_name, "object": "model", "owned_by": "trnrt"}]}
 
-    async def _generate(
-        http: HTTPRequest,
-        body: dict,
-        prompt_ids: list[int],
-        params: SamplingParams,
-        chat: bool,
-        parse: dict | None = None,
-    ):
-        parse_args = parse or {}
-        stream = _flag(body, "stream")
-        opts = body.get("stream_options") or {}
-        include_usage = isinstance(opts, dict) and _flag(opts, "include_usage")
-        sub = loop_.submit(prompt_ids, params, body.get("session_id"))
-        # Admission errors (a prompt that does not fit, an unsupported parameter) arrive before any token: surface
-        # them as HTTP status codes rather than inside a 200 stream.
-        first = await sub.out.get()
-        if first[0] == "error":
-            raise HTTPException(status_code=first[2], detail=first[1])
-        req = first[1]
-        created = int(time.time())
-        oid = ("chatcmpl-" if chat else "cmpl-") + sub.rid
-        obj = "chat.completion" if chat else "text_completion"
-        detok = _Detok(tok, params.stop, incremental=True, rid=sub.rid)
+    eos = tuple(getattr(engine.mcfg, "eos_token_ids", ()) or ())
 
-        def usage_of(n_out: int) -> dict:
-            """OpenAI usage, with prompt_tokens_details.cached_tokens: the prompt tokens this request resumed from the
-            prefix cache (0 cold). Final once the request has finished."""
-            return {
-                "prompt_tokens": len(prompt_ids),
-                "completion_tokens": n_out,
-                "total_tokens": len(prompt_ids) + n_out,
-                "prompt_tokens_details": {"cached_tokens": max(req.num_cached_tokens, 0)},
-            }
+    async def start_run(body: dict, prompt_ids: list[int], params: SamplingParams, parse: dict | None = None) -> Run:
+        """A request's choices handed to the engine and accepted (Run.start). parse: a chat request's parser arguments
+        (chat_prompt), None for a completion. Every request field is checked before anything is queued."""
+        rules = _stop_rules(body)
+        choices = _fanout(body, params)
+        # SGLang's per-request priority (engine/scheduler.py); an engine without priority scheduling refuses it (400)
+        priority = _int(body, "priority", None, -_INT64_MAX - 1)
+        run = Run(
+            loop_, tok, prompt_ids, choices, body.get("session_id"), rules, eos, parse, priority, _flag(body, "stream")
+        )
+        await run.start()
+        return run
+
+    async def start_chat(body: dict) -> Run:
+        """A /v1/chat/completions body's run: its prompt rendered on the prompt thread, its sampling checked, its choices
+        accepted. The Responses and Messages APIs (serve/responses.py, serve/anthropic.py) translate into this."""
+        ids, parse = await asyncio.get_running_loop().run_in_executor(
+            prompt_pool, chat_prompt, prompt_tok, body, prompt_cache
+        )
+        # max_tokens defaults to the rest of the context (vLLM's default): reasoning at the template's default effort
+        # (Max) can run long, and a smaller hidden default would cut the answer off
+        room = max(engine.cfg.max_model_len - len(ids), 1)
+        return await start_run(
+            body, ids, _params(body, room, chat=True, vocab=loop_.vocab, defaults=gen_defaults), parse
+        )
+
+    async def _generate(http: HTTPRequest, body: dict, run: Run, chat: bool):
+        stream, include_usage = _stream_flags(body)  # checked before the run started: raises nothing here
+        created = run.created
+        oid = ("chatcmpl-" if chat else "cmpl-") + run.rid
+        obj = "chat.completion" if chat else "text_completion"
 
         def lp_block(lps):
             """OpenAI logprobs from (token id, (logprob, top ids, top logprobs)) pairs."""
@@ -864,13 +1767,15 @@ def build_app(engine: LLMEngine, model_name: str) -> FastAPI:
                 "top_logprobs": [{tok.decode([i]): v for i, v in zip(ti, tl)} for _, (_, ti, tl) in lps],
             }
 
-        def chunk(text: str, finish: str | None, lps=None) -> dict:
+        def chunk(i: int, text: str, finish: str | None, lps=None) -> dict:
             if chat:
-                choice = {"index": 0, "delta": {"content": text} if text else {}, "finish_reason": finish}
+                choice = {"index": i, "delta": {"content": text} if text else {}, "finish_reason": finish}
             else:
-                choice = {"index": 0, "text": text, "finish_reason": finish}
+                choice = {"index": i, "text": text, "finish_reason": finish}
             if lps is not None:
                 choice["logprobs"] = lp_block(lps)
+            if finish is not None:
+                choice["matched_stop"] = run.matched_stop(i)  # SGLang's field
             return {
                 "id": oid,
                 "object": obj + (".chunk" if chat else ""),
@@ -879,112 +1784,77 @@ def build_app(engine: LLMEngine, model_name: str) -> FastAPI:
                 "choices": [choice],
             }
 
-        sparser = StreamParser(**parse_args) if chat else None
-
-        def chat_chunks(text: str, finish: str | None, pairs):
-            if sparser is None:  # only a chat request builds chunks through the parser
-                raise ValueError("no stream parser for a completions request")
-            deltas = sparser.push(text, finish is not None)
-            finish = chat_finish_reason(finish, sparser.saw_tool)
+        def chat_chunks(i: int, deltas: list[dict], finish: str | None, pairs) -> list[dict]:
             if not deltas:
-                return [chunk("", finish, pairs)] if (finish or pairs) else []
+                return [chunk(i, "", finish, pairs)] if (finish or pairs) else []
             out = []
-            for i, d in enumerate(deltas):
-                last = i == len(deltas) - 1
-                c = chunk("", finish if last else None, pairs if last else None)
+            for k, d in enumerate(deltas):
+                last = k == len(deltas) - 1
+                c = chunk(i, "", finish if last else None, pairs if last else None)
                 c["choices"][0]["delta"] = d
                 out.append(c)
             return out
 
         async def events():
-            completed = False
-            n_streamed = 0
             try:
-                if chat:  # OpenAI's first chunk names the role
-                    c = chunk("", None)
-                    c["choices"][0]["delta"] = {"role": "assistant", "content": ""}
-                    yield f"data: {json.dumps(c)}\n\n"
-                while True:
-                    kind, *rest = await sub.out.get()
-                    if kind == "error":
-                        completed = True
-                        yield f"data: {json.dumps({'error': {'message': rest[0], 'code': rest[1]}})}\n\n"
-                        return
-                    ids, finish, lps = rest
-                    n_streamed += len(ids)
-                    text = detok.push(ids, finish is not None)
-                    pairs = list(zip(ids, lps)) if lps is not None else None
-                    if text or finish or pairs:
-                        for c in chat_chunks(text, finish, pairs) if chat else [chunk(text, finish, pairs)]:
+                if chat:  # OpenAI's first chunk of each choice names the role
+                    for i in range(run.n):
+                        c = chunk(i, "", None)
+                        c["choices"][0]["delta"] = {"role": "assistant", "content": ""}
+                        yield f"data: {json.dumps(c)}\n\n"
+                if chat:
+                    async for i, deltas, finish, pairs in run.parsed():
+                        for c in chat_chunks(i, deltas, finish, pairs):
                             yield f"data: {json.dumps(c)}\n\n"
-                    if finish is not None:
-                        completed = True
-                        if include_usage:  # OpenAI stream_options.include_usage: one last chunk, no choices
-                            yield (
-                                "data: "
-                                + json.dumps(
-                                    {
-                                        "id": oid,
-                                        "object": obj + (".chunk" if chat else ""),
-                                        "created": created,
-                                        "model": model_name,
-                                        "choices": [],
-                                        "usage": usage_of(n_streamed),
-                                    }
-                                )
-                                + "\n\n"
-                            )
-                        yield "data: [DONE]\n\n"
-                        return
+                else:
+                    async for i, text, finish, pairs in run.deliveries():
+                        if text or finish or pairs:
+                            yield f"data: {json.dumps(chunk(i, text, finish, pairs))}\n\n"
+                if include_usage:  # OpenAI stream_options.include_usage: one last chunk, no choices
+                    last = {
+                        "id": oid,
+                        "object": obj + (".chunk" if chat else ""),
+                        "created": created,
+                        "model": model_name,
+                        "choices": [],
+                        "usage": run.usage(),
+                    }
+                    yield f"data: {json.dumps(last)}\n\n"
+                yield "data: [DONE]\n\n"
+            except EngineError as e:
+                yield f"data: {json.dumps({'error': {'message': e.detail, 'code': e.status}})}\n\n"
             finally:
-                # The generator is closed early when the client goes away.
-                if not completed:
-                    loop_.abort(sub.rid)
+                run.close()  # the generator is closed early when the client goes away: abort what still runs
 
         if stream:  # StreamingResponse closes events() when the client goes away, and its finally aborts
             return StreamingResponse(events(), media_type="text/event-stream")
 
-        async def collect():
-            text, finish, n_out = "", None, 0
-            all_lps: list[tuple[int, tuple[float, list[int], list[float]]]] = []
-            while finish is None:
-                kind, *rest = await sub.out.get()
-                if kind == "error":
-                    raise HTTPException(status_code=rest[1], detail=rest[0])
-                ids, finish, lps = rest
-                n_out += len(ids)
-                if lps is not None:
-                    all_lps.extend(zip(ids, lps))
-                text += detok.push(ids, finish is not None)
-            return text, finish, n_out, all_lps
-
         # Nothing cancels a plain response's handler when its client disconnects, so the request would hold its seat
-        # until max_tokens: watch for the disconnect, and abort.
+        # until max_tokens: Run.wait watches for the disconnect, and aborts.
         try:
-            done = await _unless_disconnected(http, collect())
-        except asyncio.CancelledError:
-            loop_.abort(sub.rid)
-            raise
-        if done is None:
-            loop_.abort(sub.rid)
-            return Response(status_code=499)  # nginx's "client closed request"; nobody reads it
-        text, finish, n_out, all_lps = done
-        if chat:
-            msg = parse_full(text, **parse_args)
-            finish = chat_finish_reason(finish, bool(msg.get("tool_calls")))
-            choice = {"index": 0, "message": msg, "finish_reason": finish}
-        else:
-            choice = {"index": 0, "text": text, "finish_reason": finish}
-        if params.logprobs is not None:
-            choice["logprobs"] = lp_block(all_lps)
+            if not await run.wait(http):
+                return Response(status_code=499)  # nginx's "client closed request"; nobody reads it
+        except EngineError as e:
+            raise e.http() from None
+        choices = []
+        for i in range(run.n):
+            if chat:
+                msg, finish = run.message(i)
+                choice = {"index": i, "message": msg, "finish_reason": finish}
+            else:
+                choice = {"index": i, "text": run.text[i], "finish_reason": run.finish[i]}
+            if run.params[i].logprobs is not None:
+                choice["logprobs"] = lp_block(run.lps[i])
+            choice["matched_stop"] = run.matched_stop(i)
+            choices.append(choice)
         return JSONResponse(
             {
                 "id": oid,
                 "object": obj,
                 "created": created,
                 "model": model_name,
-                "choices": [choice],
-                "usage": usage_of(n_out),
+                "choices": choices,
+                "usage": run.usage(),
             }
         )
 
@@ -999,24 +1869,117 @@ def build_app(engine: LLMEngine, model_name: str) -> FastAPI:
         else:
             raise HTTPException(status_code=400, detail="prompt must be a string or a list of token ids")
         # max_tokens defaults to 16, the OpenAI completions API's default
-        return await _generate(
-            http, body, ids, _params(body, 16, chat=False, vocab=loop_.vocab, defaults=gen_defaults), chat=False
-        )
+        params = _params(body, 16, chat=False, vocab=loop_.vocab, defaults=gen_defaults)
+        _stream_flags(body)  # checked before anything is queued
+        return await _generate(http, body, await start_run(body, ids, params), chat=False)
 
     @app.post("/v1/chat/completions")
     async def chat(http: HTTPRequest):
         body = await _body(http)
-        ids, parse = await asyncio.get_running_loop().run_in_executor(prompt_pool, chat_prompt, prompt_tok, body)
-        # max_tokens defaults to the rest of the context (vLLM's default): reasoning at the template's default effort
-        # (Max) can run long, and a smaller hidden default would cut the answer off
-        room = max(engine.cfg.max_model_len - len(ids), 1)
-        return await _generate(
-            http,
-            body,
-            ids,
-            _params(body, room, chat=True, vocab=loop_.vocab, defaults=gen_defaults),
-            chat=True,
-            parse=parse,
-        )
+        _stream_flags(body)  # checked before anything is queued
+        return await _generate(http, body, await start_chat(body), chat=True)
+
+    # SGLang's and vLLM's /tokenize and /detokenize (also under /v1). A chat request is rendered exactly as
+    # /v1/chat/completions renders it (chat_prompt), so `count` is what the engine would be sent; a prompt is encoded as
+    # /v1/completions encodes it. Both run on the prompt thread with its tokenizer, as a chat prompt does: never on the
+    # event loop, and never in a second thread inside one tokenizer.
+    def tokenize(body: dict) -> dict:
+        if (body.get("prompt") is None) == (body.get("messages") is None):
+            raise _bad("exactly one of prompt or messages is required")
+        if body.get("messages") is not None:
+            # The fields chat refuses unless neutral (_NEUTRAL) and that change the rendered prompt.
+            for key in ("add_generation_prompt", "continue_final_message"):
+                if body.get(key) not in _NEUTRAL[key]:
+                    raise _bad(f"{key} is not supported; send the request without it")
+            ids, _ = chat_prompt(prompt_tok, body)
+            seqs, batch = [ids], False
+        else:
+            prompt = body["prompt"]
+            batch = isinstance(prompt, list)
+            texts = prompt if batch else [prompt]
+            if not texts or not all(isinstance(t, str) for t in texts):
+                raise _bad("prompt must be a string or a non-empty list of strings")
+            special = _flag(body, "add_special_tokens", True)
+            seqs = [list(prompt_tok(t, add_special_tokens=special)["input_ids"]) for t in texts]
+        out: dict = {
+            "tokens": seqs if batch else seqs[0],
+            "count": [len(s) for s in seqs] if batch else len(seqs[0]),
+            "max_model_len": engine.cfg.max_model_len,
+        }
+        if _flag(body, "return_token_strs"):  # vLLM's
+            strs = [prompt_tok.convert_ids_to_tokens(s) for s in seqs]
+            out["token_strs"] = strs if batch else strs[0]
+        return out
+
+    def detokenize(body: dict) -> dict:
+        tokens = body.get("tokens")
+        batch = isinstance(tokens, list) and bool(tokens) and all(isinstance(s, list) for s in tokens)
+        seqs: list = cast("list", tokens) if batch else [tokens]
+        if not all(isinstance(s, list) and all(type(t) is int and 0 <= t < loop_.vocab for t in s) for s in seqs):
+            raise _bad(f"tokens must be a list of token ids in [0, {loop_.vocab}), or a list of such lists")
+        skip = _flag(body, "skip_special_tokens", True)  # SGLang's default
+        texts = [prompt_tok.decode(s, skip_special_tokens=skip) for s in seqs]
+        text = texts if batch else texts[0]
+        return {"text": text, "prompt": text}  # SGLang answers `text`, vLLM `prompt`
+
+    @app.post("/tokenize")
+    @app.post("/v1/tokenize")
+    async def tokenize_route(http: HTTPRequest):
+        body = await _body(http)
+        return await asyncio.get_running_loop().run_in_executor(prompt_pool, tokenize, body)
+
+    @app.post("/detokenize")
+    @app.post("/v1/detokenize")
+    async def detokenize_route(http: HTTPRequest):
+        body = await _body(http)
+        return await asyncio.get_running_loop().run_in_executor(prompt_pool, detokenize, body)
+
+    from . import native  # here, not at the top: native imports this module
+
+    native.add_routes(
+        app,
+        loop_,
+        model_name=model_name,
+        preset=preset,
+        prompt_pool=prompt_pool,
+        prompt_tok=prompt_tok,
+        gen_defaults=gen_defaults,
+    )
+
+    # The Responses and Messages APIs, translated into the chat path (start_chat). Imported here: both import this module.
+    from . import anthropic, responses
+
+    @app.post("/v1/responses")
+    async def responses_route(http: HTTPRequest):
+        body = await _body(http)
+        return await responses.respond(http, body, start_chat, model_name)
+
+    @app.get("/v1/responses/{response_id}")
+    @app.delete("/v1/responses/{response_id}")
+    @app.post("/v1/responses/{response_id}/cancel")
+    async def stored_response(response_id: str):
+        raise responses.not_stored(response_id)
+
+    @app.post("/v1/messages")
+    async def messages_route(http: HTTPRequest):
+        try:
+            body = await _body(http)
+            return await anthropic.respond(http, body, start_chat, model_name)
+        except HTTPException as e:  # Anthropic's error shape
+            return anthropic.error_response(e)
+
+    def count_tokens(body: dict) -> dict:
+        """Anthropic's count_tokens: the prompt the same request to /v1/messages would send the engine, rendered on the
+        prompt thread as a chat prompt is (/tokenize counts the same way)."""
+        ids, _ = chat_prompt(prompt_tok, anthropic.to_chat(body))
+        return {"input_tokens": len(ids)}
+
+    @app.post("/v1/messages/count_tokens")
+    async def count_tokens_route(http: HTTPRequest):
+        try:
+            body = await _body(http)
+            return await asyncio.get_running_loop().run_in_executor(prompt_pool, count_tokens, body)
+        except HTTPException as e:
+            return anthropic.error_response(e)
 
     return app
