@@ -14,8 +14,10 @@ Shapes follow SGLang's main branch as of September 2026 (after v0.5.18): python/
 (GenerateReqInput, AbortReq), python/sglang/srt/entrypoints/http_server.py, python/sglang/srt/managers/
 tokenizer_manager.py (meta_info and its logprob tuples), python/sglang/srt/managers/schedule_batch.py (finish reasons) and
 python/sglang/srt/sampling/sampling_params.py. Every route reaches the engine through EngineLoop's inbox (AGENTS.md:
-the engine thread owns engine state). What the served graphs cannot compute (prompt logprobs, guided decoding, several
-samples per prompt, multimodal input, LoRA) is refused with a 400 that names the field, as on the OpenAI routes.
+the engine thread owns engine state). Guided decoding, min_new_tokens and penalties go to the engine, which serves them
+when started with --structured-outputs or --penalties and refuses them otherwise. What the served graphs cannot compute
+(prompt logprobs, several samples per prompt, multimodal input, LoRA) is refused with a 400 that names the field, as on
+the OpenAI routes.
 """
 
 from __future__ import annotations
