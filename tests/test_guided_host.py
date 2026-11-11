@@ -1,8 +1,9 @@
-"""The host side of guided decoding and thinking budgets (engine/guided.py HostSampling), driven token by token with a
-stand-in tokenizer and matcher: no model, no xgrammar.
+"""The host side of guided decoding and thinking budgets (engine/guided.py HostSampling) and the stop-string check under
+min_tokens (engine/engine.py), driven token by token with a stand-in tokenizer and matcher: no model, no xgrammar.
 
 - a grammar's dead end ends its request as "stop", with or without ignore_eos;
 - a thinking budget reached on a partial close tag forces only the rest of the tag;
+- a stop string that ended among the first min_tokens tokens never ends the request later.
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from trnrt.engine.engine import LLMEngine
 from trnrt.engine.guided import HostSampling
 from trnrt.engine.request import Request, SamplingParams, Status
 
@@ -106,3 +108,59 @@ def test_a_budget_reached_elsewhere_forces_the_whole_close_tag():
     assert r.think_force == [12, 13, 14]
     r = think(6, [20], [21], [22], [12, 13, 14])  # the model closes the block itself, under the budget
     assert r.think_done and not r.think_force
+
+
+class _Tok:
+    """Detokenizes each id to its own bracketed text, so a stop string names exactly one token."""
+
+    @staticmethod
+    def decode(ids):
+        return "".join(f"<{i}>" for i in ids)
+
+
+class StopEngine:
+    """The engine's stop-string check and speculative trim, over _Tok, recording what it finishes."""
+
+    _check_stop_strings = LLMEngine._check_stop_strings
+    _stop_in = LLMEngine._stop_in
+    _trim_past_stop = LLMEngine._trim_past_stop
+
+    def __init__(self):
+        self.tokenizer = _Tok()
+        self.finished: list[str] = []
+        self.scheduler = SimpleNamespace(finish_now=lambda req, why: self.finished.append(why))
+
+
+def stop_check(r: Request, draft=False) -> list[Request]:
+    eng = StopEngine()
+    done = eng._check_stop_strings([SimpleNamespace(req=r, sample=True, draft=draft)])
+    assert len(done) == len(eng.finished) and all(w == "stop" for w in eng.finished)
+    return done
+
+
+def test_a_stop_string_among_the_first_min_tokens_never_ends_the_request():
+    """vLLM checks stop strings from min_tokens on, over the newly decoded text only: a stop string that ended among the
+    protected tokens stays in the output and is not matched later."""
+    r = running([5, 6], SamplingParams(stop=("<7>",), min_tokens=3))
+    for t in (7, 8, 9, 20, 21):  # the stop token is the first output token, protected
+        emit(r, t)
+        assert stop_check(r) == [], r.output_ids
+    emit(r, 7)  # past min_tokens: it ends the request
+    assert stop_check(r) == [r]
+
+
+def test_a_stop_string_completed_by_the_token_past_min_tokens_ends_the_request():
+    r = running([5, 6], SamplingParams(stop=("<8><9>",), min_tokens=2))
+    emit(r, 30, 8)
+    assert stop_check(r) == []
+    emit(r, 9)  # the stop string straddles the boundary and ends past it
+    assert stop_check(r) == [r]
+
+
+def test_a_speculative_step_past_min_tokens_trims_to_its_own_stop_string_not_a_protected_one():
+    r = running([5, 6], SamplingParams(stop=("<7>",), min_tokens=3))
+    emit(r, 7, 8, 9)
+    assert stop_check(r) == []
+    emit(r, 20, 7, 21)  # one speculative step of three tokens: its stop token is the middle one
+    assert stop_check(r, draft=True) == [r]
+    assert r.output_ids == [7, 8, 9, 20, 7], "trimmed past the protected stop token"

@@ -770,13 +770,13 @@ class LLMEngine:
             ended_here = s.draft and id(req) in ended
             if not stops or not s.sample or (req.status is not Status.RUNNING and not ended_here):
                 continue
-            if len(req.output_ids) < req.params.min_tokens:  # vLLM checks stop strings from min_tokens on
+            out = req.output_ids
+            if len(out) <= req.params.min_tokens:  # vLLM checks stop strings from min_tokens on
                 continue
             # Only the tail can newly contain a stop string; decode enough of it to cover
             # the longest one plus multi-token characters.
             w = max(len(x) for x in stops) + 8
-            tail = self.tokenizer.decode(req.output_ids[-w:])
-            if any(x in tail for x in stops):
+            if self._stop_in(out, len(out), stops, w, req.params.min_tokens):
                 if s.draft:
                     self._trim_past_stop(req, stops, w)
                 if ended_here:
@@ -786,13 +786,22 @@ class LLMEngine:
                     done.append(req)
         return done
 
+    def _stop_in(self, out: list[int], n: int, stops, w: int, protect: int) -> bool:
+        """Whether the last w tokens of out[:n] decode to text holding a stop string that ends past the first `protect`
+        tokens (min_tokens). vLLM matches only the newly decoded text, so a stop string that ended among the protected
+        tokens stays in the output and never ends the request later."""
+        start = max(0, n - w)
+        tail = self.tokenizer.decode(out[start:n])
+        head = len(self.tokenizer.decode(out[start : min(protect, n)])) if start < protect else 0
+        return any(tail.find(x, max(0, head - len(x) + 1)) >= 0 for x in stops)
+
     def _trim_past_stop(self, req: Request, stops, w: int) -> None:
         """A speculative step appends up to 1 + spec_k tokens at once, so the stop string can end before its newest one.
         Drop the tokens past it, and their logprobs, so the output (and its usage count) is what one-token steps would
         have stopped at: the shortest prefix whose last w tokens decode to a stop string."""
         out = req.output_ids
         n = len(out)
-        while n > 1 and any(x in self.tokenizer.decode(out[max(0, n - 1 - w) : n - 1]) for x in stops):
+        while n > 1 and self._stop_in(out, n - 1, stops, w, req.params.min_tokens):
             n -= 1
         if n < len(out):
             del req.token_ids[req.num_prompt + n :]
