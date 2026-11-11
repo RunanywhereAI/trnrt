@@ -112,17 +112,20 @@ def test_the_requests_beside_a_guided_one_are_unchanged(model):
     assert json.loads(text(eng, got[1])) in ({"a": "x"}, {"a": "b"})
 
 
-def test_a_grammar_the_vocabulary_cannot_finish_ends_the_request_not_the_engine(model):
+@pytest.mark.parametrize("ignore_eos", [False, True])
+def test_a_grammar_the_vocabulary_cannot_finish_ends_the_request_not_the_engine(model, ignore_eos):
     """xgrammar allows a token whose bytes start a match without knowing whether the vocabulary can finish it: "y" for
-    the regex "yz" (no token spells "z"). The request then ends on EOS ("stop"), and the request beside it is
-    unaffected."""
+    the regex "yz" (no token spells "z"). The request then ends on EOS ("stop"), also under ignore_eos (the commit does
+    not stop on that EOS: the dead end does), and the request beside it is unaffected."""
     ps = T.prompts(36, (9, 11))
     plain = SamplingParams(max_new_tokens=10, temperature=0.0, ignore_eos=True)
-    stuck = SamplingParams(max_new_tokens=10, temperature=0.0, grammar=GrammarSpec("regex", "yz"))
+    grammar = GrammarSpec("regex", "yz")
+    stuck = SamplingParams(max_new_tokens=10, temperature=0.0, ignore_eos=ignore_eos, grammar=grammar)
     _, alone = run(model, ps, plain, structured_outputs=False)
     eng, got = run(model, ps, [plain, stuck])
     assert got[0].output_ids == alone[0].output_ids
     assert text(eng, got[1]) == "y" and got[1].finish_reason == "stop" and got[1].grammar_dead
+    assert got[1].output_ids == [WORDS["y"], 1], got[1].output_ids  # one EOS, not one a step to the length
 
 
 def test_a_malformed_grammar_is_refused_at_admission(model):
