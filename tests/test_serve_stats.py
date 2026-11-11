@@ -214,6 +214,31 @@ def test_a_torn_line_and_a_full_queue_lose_only_themselves(tmp_path):
     assert log.put("requests", {}) and not log.put("requests", {}) and log.dropped["requests"] == 1
 
 
+def test_a_segment_is_read_once_while_gzip_runs_or_after_it_was_cut_short(tmp_path, monkeypatch):
+    """gzip_file publishes the .gz only once complete; a restart between its rename and its remove leaves both copies,
+    and day_files reads one."""
+    seg = tmp_path / "requests.1.jsonl"
+    seg.write_text('{"rid": "a"}\n{"rid": "b"}\n')
+
+    def cut_short(f, g, n):
+        g.write(f.read(5))
+        assert not os.path.exists(str(seg) + ".gz"), "a partial .gz is never visible under its name"
+        raise OSError("killed")
+
+    monkeypatch.setattr(PL.shutil, "copyfileobj", cut_short)
+    PL.gzip_file(str(seg))
+    assert sorted(os.listdir(tmp_path)) == ["requests.1.jsonl"]  # the source whole, no partial copy left
+    monkeypatch.undo()
+    with gzip.open(str(seg) + ".gz", "wb") as g:  # the rename done, the remove not
+        g.write(seg.read_bytes())
+    (tmp_path / "requests.jsonl").write_text('{"rid": "c"}\n')
+    files = PL.day_files(str(tmp_path), "requests")
+    assert files == [str(seg), str(tmp_path / "requests.jsonl")]
+    assert [r["rid"] for p in files for r in PL.read_jsonl(p)] == ["a", "b", "c"]
+    PL.gzip_file(str(seg))
+    assert sorted(os.listdir(tmp_path)) == ["requests.1.jsonl.gz", "requests.jsonl"]
+
+
 def test_the_production_log_is_off_unless_set(monkeypatch, tmp_path):
     monkeypatch.delenv(PL.ENV, raising=False)
     assert PL.ProdLog.from_env("engine-8001") is None

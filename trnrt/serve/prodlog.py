@@ -72,12 +72,14 @@ def day_files(day_dir: str, kind: str) -> list[str]:
     current one."""
     stem = NAMES[kind][: -len(".jsonl")]
     try:
-        names = os.listdir(day_dir)
+        names = set(os.listdir(day_dir))
     except OSError:
         return []
     segs: list[tuple[float, str]] = []
     for n in names:
         base = n.removesuffix(".gz")
+        if n != base and base in names:  # a restart between gzip_file's rename and its remove: read one copy
+            continue
         if base == NAMES[kind]:
             segs.append((float("inf"), n))
         elif base.startswith(stem + ".") and base.endswith(".jsonl"):
@@ -88,12 +90,18 @@ def day_files(day_dir: str, kind: str) -> list[str]:
 
 
 def gzip_file(path: str) -> None:
+    """path as path.gz, which appears only once complete (written as a .tmp, then renamed), then path removed. A
+    process killed meanwhile leaves the source whole, and day_files reads it alone."""
+    tmp = path + ".gz.tmp"
     try:
-        with open(path, "rb") as f, gzip.open(path + ".gz", "wb") as g:
+        with open(path, "rb") as f, gzip.open(tmp, "wb") as g:
             shutil.copyfileobj(f, g, 1 << 20)
+        os.replace(tmp, path + ".gz")
         os.remove(path)
     except OSError as e:
         logger.warning("production log: could not gzip %s: %s", path, e)
+        with contextlib.suppress(OSError):
+            os.remove(tmp)
 
 
 class ProdLog:
