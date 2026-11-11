@@ -196,8 +196,7 @@ def test_refusals_are_400_in_anthropics_error_shape(client, body):
     assert r.status_code == 400, r.text
     err = r.json()
     assert err["type"] == "error" and err["error"]["type"] == "invalid_request_error" and err["error"]["message"]
-    assert all(q.status.name == "FINISHED" for q in eng.added)  # a refusal leaves nothing running
-    assert eng.scheduler.running == []
+    assert eng.added == [] and eng.scheduler.running == []  # a refusal never reaches the engine
 
 
 def test_a_malformed_body_and_an_engine_failure_answer_in_anthropics_shape(client):
