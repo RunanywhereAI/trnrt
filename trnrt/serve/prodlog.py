@@ -27,6 +27,7 @@ import queue
 import shutil
 import threading
 import time
+import zlib
 from typing import IO, TYPE_CHECKING
 
 from .stats import BUCKET_S
@@ -50,7 +51,8 @@ def utc_day(t: float) -> str:
 
 
 def read_jsonl(path: str) -> list[dict]:
-    """A .jsonl or .jsonl.gz file's records; a torn line (a write cut short) is skipped."""
+    """A .jsonl or .jsonl.gz file's records; a torn line (a write cut short) is skipped, and a truncated or corrupt .gz
+    (EOFError, zlib.error) keeps the records read before it."""
     out = []
     opener = gzip.open if path.endswith(".gz") else open
     try:
@@ -62,7 +64,7 @@ def read_jsonl(path: str) -> list[dict]:
                     continue
                 if isinstance(rec, dict):
                     out.append(rec)
-    except OSError:
+    except (OSError, EOFError, zlib.error):
         pass
     return out
 

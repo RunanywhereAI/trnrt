@@ -207,6 +207,13 @@ def test_a_torn_line_and_a_full_queue_lose_only_themselves(tmp_path):
     with gzip.open(p, "wt") as f:
         f.write('{"a": 1}\n{"b": 2')
     assert PL.read_jsonl(str(p)) == [{"a": 1}]
+    cut = tmp_path / "cut.jsonl.gz"  # a gzip stream cut short, or a disk that lost its tail
+    with gzip.open(cut, "wt") as f:
+        f.writelines(json.dumps({"i": i, "pad": os.urandom(64).hex()}) + "\n" for i in range(200))
+    data = cut.read_bytes()
+    cut.write_bytes(data[: len(data) // 2])
+    got = PL.read_jsonl(str(cut))
+    assert 0 < len(got) < 200 and [r["i"] for r in got] == list(range(len(got)))
     log = PL.ProdLog.__new__(PL.ProdLog)
     import queue
 
