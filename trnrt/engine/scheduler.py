@@ -324,11 +324,12 @@ class Scheduler:
 
     def rank(self, req: Request) -> float:
         """req's priority as a sort key, smaller first: higher priority values first (SGLang's default), lower ones with
-        low_priority_first; a request without one comes last (SGLang gives it the worst value, sys.maxsize)."""
+        low_priority_first; a request without one comes last (SGLang gives it the worst value, sys.maxsize). Kept an
+        int: the API takes signed 64-bit priorities, which a float would round together above 2**53."""
         p = req.priority
         if p is None:
             return math.inf
-        return float(p) if self.cfg.low_priority_first else -float(p)
+        return p if self.cfg.low_priority_first else -p
 
     def add(self, req: Request) -> Request | None:
         """Queue `req`. Returns the waiting request it displaced from a full queue (already finished, finish_reason
@@ -346,7 +347,7 @@ class Scheduler:
         """req's priority for the priority eviction, larger kept longer: SGLang's request priority, 0 when it has none
         (radix_cache.py _insert_helper), negated with low_priority_first so that eviction keeps what scheduling favours."""
         p = req.priority or 0
-        return -float(p) if self.cfg.low_priority_first else float(p)
+        return -p if self.cfg.low_priority_first else p  # an int, exact as rank's
 
     def _queue_room(self, req: Request) -> Request | None:
         """Make room for `req` under the queue limits, or raise QueueFull. Over max_queued_requests with priority

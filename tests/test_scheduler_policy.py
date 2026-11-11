@@ -197,6 +197,31 @@ def test_a_waiting_request_better_by_more_than_the_threshold_takes_a_seat(prio, 
         assert r.output_ids == reference_output_no_eos(r.prompt_ids, 30), r.rid
 
 
+BIG = 2**60  # the API takes signed 64-bit priorities; floats step by 256 here, so a float key would tie these
+
+
+def test_priorities_past_2_53_order_admission_exactly():
+    hi = policy(make(max_seqs=1, budget=64), priority_scheduling=True)
+    assert admitted(hi, [req("a", 4, priority=BIG), req("b", 4, priority=BIG + 1)]) == ["b", "a"]
+    lo = policy(make(max_seqs=1, budget=64), priority_scheduling=True, low_priority_first=True)
+    assert admitted(lo, [req("a", 4, priority=-BIG), req("b", 4, priority=-BIG - 1)]) == ["b", "a"]
+    sched = policy(make(), low_priority_first=True)
+    assert sched._importance(req("a", 4, priority=-BIG - 1)) > sched._importance(req("b", 4, priority=-BIG))
+
+
+@pytest.mark.parametrize(("prio", "preempts"), [(BIG + 11, True), (BIG + 10, False)])
+def test_the_preemption_threshold_holds_exactly_past_2_53(prio, preempts):
+    sched, low = _seats_full()
+    for r in low:
+        r.priority = BIG
+    urgent = req("urgent", 5, 30, priority=prio)
+    urgent.params = low[0].params
+    sched.add(urgent)
+    plan = step(sched)
+    assert (urgent in [s.req for s in plan.prefills]) == preempts
+    assert sched.num_priority_preemptions == int(preempts)
+
+
 def test_priority_preemption_can_be_disabled_and_needs_priority_scheduling():
     sched, _ = _seats_full(priority_preemption=False)
     urgent = req("urgent", 5, 30, priority=100)
