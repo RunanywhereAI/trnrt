@@ -20,6 +20,9 @@ and versions follow [Semantic Versioning](https://semver.org/). Rebuild the comp
   choice i `seed + i`, as in vLLM ([docs/API.md](docs/API.md#sampling-extras)).
 - SGLang's `stop_regex`, and keeping the stop text with `include_stop_str_in_output` (vLLM) or `no_stop_trim` (SGLang).
 - `skip_special_tokens: false`, and SGLang's `matched_stop` on every finished choice.
+- `stop_regex` refuses a pattern whose search can take exponential or polynomial time, and matches within the last
+  2048 characters of output.
+- SGLang's `no_logs` on `/generate`: the request's record stays out of the production log.
 - The OpenAI Responses API, `POST /v1/responses`, stateless: reasoning, message and function-call items, and the
   Responses stream events ([docs/API.md](docs/API.md#responses-api)).
 - The Anthropic Messages API, `POST /v1/messages` and `/v1/messages/count_tokens`: thinking, text and tool-use blocks,
@@ -51,6 +54,8 @@ and versions follow [Semantic Versioning](https://semver.org/). Rebuild the comp
   does not mark it special, as in vLLM and SGLang.
 - `min_new_tokens` (SGLang's name for `min_tokens`) and `spaces_between_special_tokens: false` are refused with 400;
   they were ignored.
+- `service_tier` other than `"auto"` or `"default"` is refused with 400 on `/v1/chat/completions`, `/v1/completions`
+  and `/v1/responses`.
 
 ## [0.1.0] - 2026-11-08
 
