@@ -119,7 +119,9 @@ def test_the_stream_sends_the_responses_events_and_the_same_items(client):
         "response.function_call_arguments.done",
         "response.output_item.done",
     ]
-    assert [k for k in kinds[2:-1] if not k.endswith(".delta")] == [k for k in expected if not k.endswith(".delta")]
+    # each item's deltas in their place: a run of one delta kind counts once (the script sends one or more)
+    mid = kinds[2:-1]
+    assert [k for i, k in enumerate(mid) if i == 0 or not (k.endswith(".delta") and k == mid[i - 1])] == expected
     final = ev[-1]["response"]
     assert _strip_ids(final["output"]) == _strip_ids(whole["output"])  # each parse makes its own call id
     args = "".join(e["delta"] for e in ev if e["type"] == "response.function_call_arguments.delta")
