@@ -429,7 +429,13 @@ def test_the_cache_stays_off_for_tokenizers_it_cannot_cut_exactly():
 
     strip = _tokenizer(TAGS[:4])
     strip.add_tokens([AddedToken("<|strip|>", lstrip=True, normalized=False)])
-    assert "strip or normalize" in PC.PromptCache(strip, 1 << 20).off
+    assert "strip, normalize or match single words" in PC.PromptCache(strip, 1 << 20).off
+    # a whole-word token matches by what follows it: cached "x foo bar", a cut at "foo" would keep "x " apart from
+    # it, while in "x foobar" no token matches and " f" merges. The self-check does not catch it; the guard must.
+    word = _tokenizer(TAGS[:4])
+    word.add_tokens([AddedToken("foo", single_word=True, normalized=False)])
+    assert "match single words: ['foo']" in PC.PromptCache(word, 1 << 20).off
+    assert PC.PromptCache(word, 1 << 20).encode("x foobar", "s") == full(word, "x foobar")
     trunc = _tokenizer(TAGS[:4])
     trunc._tokenizer.enable_truncation(64)
     assert "truncates or pads" in PC.PromptCache(trunc, 1 << 20).off

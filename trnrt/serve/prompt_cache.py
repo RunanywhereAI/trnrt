@@ -8,9 +8,9 @@ chat template rendered a ~100K-token conversation in about 5 ms, and its tokeniz
 last (text, ids) and encodes only what follows the text both turns share.
 
 Why a cut is exact. A Hugging Face fast tokenizer splits its added tokens out of the raw text first, then normalizes,
-pre-tokenizes and encodes each piece between them on its own. So when no added token strips its neighbours' whitespace
-or is matched after normalization (lstrip, rstrip and normalized all false, as for every added token of GLM-5.3-Flash),
-the text before an added token encodes the same whatever follows it:
+pre-tokenizes and encodes each piece between them on its own. So when no added token strips its neighbours' whitespace,
+is matched after normalization or matches only as a whole word (lstrip, rstrip, normalized and single_word all false, as
+for every added token of GLM-5.3-Flash), the text before an added token encodes the same whatever follows it:
 
     ids(new) = ids(old)[:i] + encode(new[c:])
 
@@ -26,7 +26,8 @@ time, so a stale entry or a key several chats share costs a miss, never wrong id
 off for good (logged, and the served path's ids served):
 - at construction, a self-check of the cut against the full encode on strings built from the tokenizer's own added
   tokens, and a check that the served path (apply_chat_template(tokenize=True)) equals the rendered text's encode on a
-  sample chat; and off outright for a tokenizer that truncates or pads, or whose added tokens strip or normalize;
+  sample chat; and off outright for a tokenizer that truncates or pads, or whose added tokens strip, normalize or
+  match single words (their match depends on the characters around them, which the self-check samples only);
 - an audit of the first AUDIT_FIRST hits, and of every TRNRT_PROMPT_CACHE_AUDIT-th hit after them (default 64; 0:
   none), against the served path's ids for that request.
 Used by one thread (the API server's prompt pool), so it takes no lock.
@@ -108,13 +109,15 @@ class PromptCache:
             over = any(y != x and (x in y or any(x.startswith(y[k:]) for k in range(1, len(y)))) for y in texts)
             self.need[self.fast.token_to_id(x)] = self.margin if over else max(len(y) for y in texts if y.startswith(x))
         self.added_ids = frozenset(self.need)
-        bad = [t.content for t in added if t.lstrip or t.rstrip or t.normalized]
+        # each makes a token's match depend on the characters around it. single_word: cached "x foo bar", a cut at
+        # "foo" keeps "x " apart from it, while in "x foobar" no token matches and " f" merges; the self-check passes
+        bad = [t.content for t in added if t.lstrip or t.rstrip or t.normalized or t.single_word]
         if self.fast.truncation is not None or self.fast.padding is not None:
             # transformers sets these per call and a raw encode keeps them: a truncating tokenizer.json would cut the
             # cached ids and never the served ones
             self.off = f"the tokenizer truncates or pads ({self.fast.truncation}, {self.fast.padding})"
         elif bad:
-            self.off = f"added tokens that strip or normalize: {bad[:4]}"
+            self.off = f"added tokens that strip, normalize or match single words: {bad[:4]}"
         elif not added:
             self.off = "no added tokens to cut at"
         else:
