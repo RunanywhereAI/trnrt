@@ -235,6 +235,8 @@ def test_stored_responses_are_not_found(client):
 def test_input_items_become_the_chat_messages():
     """An assistant turn's items (reasoning, its message, its calls) join into one assistant message; a call's output
     becomes a tool message; text parts join."""
+    from fastapi import HTTPException
+
     from trnrt.serve.responses import input_messages
 
     body = {
@@ -252,8 +254,9 @@ def test_input_items_become_the_chat_messages():
             {"role": "assistant", "content": "done"},
         ],
     }
-    with pytest.raises(Exception, match="not supported"):  # a part without a type is not text
+    with pytest.raises(HTTPException, match="not supported") as e:  # a part without a type is not text
         input_messages(body)
+    assert e.value.status_code == 400
     body["input"][1]["content"][1]["type"] = "input_text"
     assert input_messages(body) == [
         {"role": "system", "content": "sys"},
