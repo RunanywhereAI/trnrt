@@ -350,6 +350,36 @@ def test_health_generate_is_503_once_a_rank_died(serve):
     assert r.status_code == 503 and "rank(s) [1] exited" in r.json()["error"]
 
 
+@pytest.mark.parametrize("stream", [False, True])
+def test_a_full_queue_503_from_generate_keeps_the_queue_full_header(stream):
+    """A request the full queue refuses, and one a better request displaces from it after admission: both 503s carry
+    QUEUE_FULL_HEADER, as on the OpenAI routes, so the router does not take the engine for failed."""
+    from fastapi.testclient import TestClient
+
+    from tests.test_serve_sched import QueueEngine
+    from trnrt.engine.scheduler import DISPLACED, Scheduling
+    from trnrt.serve import api
+
+    eng = QueueEngine(PLAIN, Scheduling(priority_scheduling=True), limit=0)
+    try:
+        with TestClient(api.build_app(eng, "glm")) as c:
+            r = c.post("/generate", json={"input_ids": [1], "stream": stream})
+            assert r.status_code == 503 and r.json()["detail"] == "The request queue is full.", r.text
+            assert r.headers[api.QUEUE_FULL_HEADER] == "1"
+            if stream:
+                return
+            eng.limit = 1
+            waiting = _background(lambda: c.post("/generate", json={"input_ids": [1]}))
+            _wait_for(lambda: eng.parked)
+            better = c.post("/v1/completions", json={"prompt": [1], "priority": 9})
+            assert better.status_code == 200, better.text
+            r = waiting()
+            assert r.status_code == 503 and r.json()["detail"] == DISPLACED and r.headers[api.QUEUE_FULL_HEADER] == "1"
+    finally:
+        for lp in [lp for lp in api._LOOPS if lp.engine is eng]:
+            lp.stop()
+
+
 def test_load_and_info_endpoints(serve):
     client, eng = serve(PLAIN, preset="batch12")
     eng.scheduler.waiting.append(Request("w", [1, 2, 3], SamplingParams()))

@@ -36,7 +36,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse, Response, Streami
 from .. import __version__
 from ..engine.request import SamplingParams
 from ..metrics import kv_pages
-from .api import _NEUTRAL, _bad, _body, _Detok, _flag, _int, _params, _unless_disconnected
+from .api import _NEUTRAL, _bad, _body, _Detok, _error, _flag, _int, _params, _unless_disconnected
 
 if TYPE_CHECKING:
     from concurrent.futures import ThreadPoolExecutor
@@ -301,7 +301,7 @@ class _Run:
         while self.finish is None:
             kind, *rest = await cast("asyncio.Queue", self.sub.out).get()
             if kind == "error":
-                raise HTTPException(status_code=rest[1], detail=rest[0])
+                raise _error(*rest)  # a displaced request's 503 keeps QUEUE_FULL_HEADER
             self.push(*rest)
 
     def _finish_reason(self) -> dict | None:
@@ -555,7 +555,7 @@ def add_routes(
             for s, f in zip(subs, firsts):
                 if f[0] == "accepted":
                     loop_.abort(s.rid)
-            raise HTTPException(status_code=bad[2], detail=bad[1])
+            raise _error(*bad[1:])  # a full queue's 503 keeps QUEUE_FULL_HEADER: the router keeps the engine up
         text_in, prompt_ids = _flag(body, "return_text_in_logprobs"), _flag(body, "return_prompt_token_ids")
         runs = [_Run(it, s, tok, text_in, prompt_ids, t0) for it, s in zip(items, subs)]
         for r, f in zip(runs, firsts):
