@@ -33,6 +33,12 @@ BASE = {"max_num_seqs": 4, "max_model_len": 256, "num_pages": 256, "structured_o
 SCHEMA = {"type": "object", "properties": {"a": {"enum": ["x", "b"]}}, "required": ["a"], "additionalProperties": False}
 
 
+def prompts(seed, lengths):
+    """Random prompts drawn below the word ids (300 on), so none holds a reasoning tag: a prompt that opened a reasoning
+    block would hold its grammar back until a close tag (guided.in_reasoning)."""
+    return T.prompts(seed, lengths, vocab=min(WORDS.values()))
+
+
 @pytest.fixture(scope="module")
 def model(tmp_path_factory):
     path = str(tmp_path_factory.mktemp("glm5_next_grammar"))
@@ -56,7 +62,7 @@ def text(eng, r) -> str:
 
 @pytest.mark.parametrize("temperature", [0.0, 1.0])
 def test_a_choice_a_schema_and_a_regex_come_out_as_constrained(model, temperature):
-    ps = T.prompts(31, (9, 14, 7, 11))
+    ps = prompts(31, (9, 14, 7, 11))
     specs = [
         GrammarSpec.choice(["no", "a,b"]),
         GrammarSpec("json_schema", json.dumps(SCHEMA)),
@@ -74,7 +80,7 @@ def test_a_choice_a_schema_and_a_regex_come_out_as_constrained(model, temperatur
 
 
 def test_a_free_json_object_is_always_a_valid_prefix(model):
-    ps = T.prompts(32, (8, 12, 10))
+    ps = prompts(32, (8, 12, 10))
     params = [
         SamplingParams(
             max_new_tokens=30, temperature=1.0, seed=s, grammar=GrammarSpec("json_schema", '{"type": "object"}')
@@ -91,7 +97,7 @@ def test_a_free_json_object_is_always_a_valid_prefix(model):
 
 def test_under_reasoning_the_grammar_waits_for_the_reasoning_end(model):
     open_, close = WORDS[THINK[0]], WORDS[THINK[1]]
-    ps = [[*p, open_] for p in T.prompts(33, (9, 12))]
+    ps = [[*p, open_] for p in prompts(33, (9, 12))]
     g = GrammarSpec.choice(["no", "a,b"])
     params = [SamplingParams(max_new_tokens=24, temperature=0.0, thinking_token_budget=b, grammar=g) for b in (0, 4)]
     eng, got = run(model, ps, params)
@@ -103,7 +109,7 @@ def test_under_reasoning_the_grammar_waits_for_the_reasoning_end(model):
 
 
 def test_the_requests_beside_a_guided_one_are_unchanged(model):
-    ps = T.prompts(34, (9, 14, 7))
+    ps = prompts(34, (9, 14, 7))
     plain = SamplingParams(max_new_tokens=14, temperature=0.0, ignore_eos=True)
     guided = SamplingParams(max_new_tokens=14, temperature=0.0, grammar=GrammarSpec("json_schema", json.dumps(SCHEMA)))
     _, alone = run(model, ps, plain, structured_outputs=False)
@@ -117,7 +123,7 @@ def test_a_grammar_the_vocabulary_cannot_finish_ends_the_request_not_the_engine(
     """xgrammar allows a token whose bytes start a match without knowing whether the vocabulary can finish it: "y" for
     the regex "yz" (no token spells "z"). The request then ends on EOS ("stop"), also under ignore_eos (the commit does
     not stop on that EOS: the dead end does), and the request beside it is unaffected."""
-    ps = T.prompts(36, (9, 11))
+    ps = prompts(36, (9, 11))
     plain = SamplingParams(max_new_tokens=10, temperature=0.0, ignore_eos=True)
     grammar = GrammarSpec("regex", "yz")
     stuck = SamplingParams(max_new_tokens=10, temperature=0.0, ignore_eos=ignore_eos, grammar=grammar)
@@ -156,7 +162,7 @@ def test_under_dynamic_speculation_a_guided_request_never_speculates(mtp_model, 
 
     monkeypatch.setattr(decoder, "MTP_CHUNK_Q", decoder.MTP_CHUNK_Q)  # the engine writes its routes (test_spec_model)
     monkeypatch.setattr(decoder, "DYN_MTP_KV", decoder.DYN_MTP_KV)
-    ps = T.prompts(35, (9, 23))
+    ps = prompts(35, (9, 23))
     plain = SamplingParams(max_new_tokens=30, temperature=0.0, ignore_eos=True)
     guided = SamplingParams(max_new_tokens=20, temperature=0.0, grammar=GrammarSpec("json_schema", json.dumps(SCHEMA)))
     kw = {"max_prefill_tokens": 16, "max_model_len": 512, "num_pages": 512}
