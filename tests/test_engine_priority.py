@@ -15,6 +15,15 @@ from trnrt.engine.request import SamplingParams, Status
 from trnrt.engine.scheduler import DISPLACED, QueueFull, Scheduling
 
 
+def drain(eng, limit=8000):
+    """Step until the engine has no work, failing (not hanging) if it never drains."""
+    steps = 0
+    while eng.has_work():
+        eng.step()
+        steps += 1
+        assert steps < limit, "the engine never drained its work"
+
+
 def with_scheduling(eng, **kw):
     """make_engine's engine with these host-only settings, as LLMEngine.__init__ applies them."""
     eng.scheduling = Scheduling(**kw)
@@ -42,11 +51,7 @@ def test_priority_scheduling_through_the_engine_generates_the_reference(dyn, see
             reqs.append(eng.add_request(p, SamplingParams(max_new_tokens=rng.randrange(6, 45)), priority=prio))
         for _ in range(rng.randrange(0, 4)):
             eng.step()
-    steps = 0
-    while eng.has_work():
-        eng.step()
-        steps += 1
-        assert steps < 8000
+    drain(eng)
     check_done(eng, reqs)
     assert eng.scheduler.num_priority_preemptions > 0, "no request ever took a seat by priority"
 
@@ -62,8 +67,7 @@ def test_a_full_queue_refuses_or_displaces_through_the_engine_and_frees_what_it_
     high = eng.add_request([10, 11, 12], sp, priority=9)
     gone = low[1]  # the newer of the two worst
     assert gone.status is Status.FINISHED and gone.error == (503, DISPLACED) and gone.finish_reason == "abort"
-    while eng.has_work():
-        eng.step()
+    drain(eng)
     check_done(eng, [*running, low[0], high])
     assert gone.output_ids == []
 
@@ -74,6 +78,5 @@ def test_the_engine_refuses_a_priority_it_would_ignore():
         eng.add_request([10, 11, 12], SamplingParams(max_new_tokens=4), priority=1)
     assert not eng.scheduler.waiting
     r = eng.add_request([10, 11, 12], SamplingParams(max_new_tokens=4))  # no priority: the default engine as before
-    while eng.has_work():
-        eng.step()
+    drain(eng)
     check_done(eng, [r])
