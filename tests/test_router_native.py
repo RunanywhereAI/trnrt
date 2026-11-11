@@ -149,10 +149,17 @@ def test_info_and_load_routes_combine_the_workers():
 
 
 def test_health_generate_follows_every_worker():
+    """A worker's 503 (no step of its engine ended in time: maybe a long prefill on an engine still serving) names it
+    down in the answer, and counts toward down_after as a stalled /health does: it is marked down only after that many
+    in a row, so one slow probe moves no session pinned there."""
+
     async def check(c, router) -> None:
         r = await c.get("/health_generate")
         assert r.status_code == 200 and r.json()["status"] == "degraded", r.text
-        assert r.json()["down"] == [router.workers[1]] and router.up == [True, False]
+        assert r.json()["down"] == [router.workers[1]] and router.up == [True, True] and router.fails == [0, 1]
+        for _ in range(router.down_after - 1):
+            await c.get("/health_generate")
+        assert router.up == [True, False]
 
     _run([_native_worker(0), _native_worker(1, health_status=503)], check)
 

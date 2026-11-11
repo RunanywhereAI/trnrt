@@ -727,9 +727,12 @@ def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: floa
     async def model_info():
         return await first_live("/model_info")
 
-    async def each(method: str, path: str, timeout: float | None, **kw) -> list[httpx.Response | None]:
+    async def each(
+        method: str, path: str, timeout: float | None, hard_503: bool = True, **kw
+    ) -> list[httpx.Response | None]:
         """Every worker's answer to one request, sent to all at once; None for one that did not answer. A refused
-        connection marks it down, as in a request; a 503 too (a failed engine)."""
+        connection marks it down, as in a request; a 503 too (a failed engine), or with hard_503 False counts toward
+        down_after as a stalled /health does (Router.note_failure)."""
 
         async def one(w: int) -> httpx.Response | None:
             try:
@@ -740,7 +743,7 @@ def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: floa
             except httpx.HTTPError:
                 return None
             if r.status_code == 503:
-                router.note_failure(w, hard=True)
+                router.note_failure(w, hard=hard_503)
             return r
 
         return list(await asyncio.gather(*(one(w) for w in range(len(router.workers)))))
@@ -780,10 +783,13 @@ def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: floa
     @app.get("/health_generate")
     async def health_generate():
         """Each engine's /health_generate (a token through its engine): 200 "ok" when every engine generated,
-        "degraded" when some did, 503 "down" when none did. Each body names the engines that did not ("down")."""
+        "degraded" when some did, 503 "down" when none did. Each body names the engines that did not ("down"). An
+        engine answers 503 when no step of its ended within HEALTH_GENERATE_TIMEOUT_S, which a long prefill can do to
+        an engine still serving: that 503 counts toward down_after, as a stalled /health does, and does not move the
+        sessions pinned there at once. A failed engine's /health answers 503 too, which the poll takes as down."""
         from .native import HEALTH_GENERATE_TIMEOUT_S
 
-        rs = await each("GET", "/health_generate", HEALTH_GENERATE_TIMEOUT_S + 10)
+        rs = await each("GET", "/health_generate", HEALTH_GENERATE_TIMEOUT_S + 10, hard_503=False)
         ok = [r is not None and r.status_code == 200 for r in rs]
         for w, good in enumerate(ok):
             if good:
