@@ -125,8 +125,9 @@ def messages(body: dict) -> list[dict]:
             if kind == "text" and isinstance(b.get("text"), str):
                 text.append(b["text"])
             elif kind == "thinking" and role == "assistant":
-                if isinstance(b.get("thinking"), str):
-                    thinking.append(b["thinking"])
+                if not isinstance(b.get("thinking"), str):  # dropping it would generate from another history
+                    raise _bad(f"{at}: thinking must be a string")
+                thinking.append(b["thinking"])
             elif kind == "tool_use" and role == "assistant":
                 name, args = b.get("name"), b.get("input", {})
                 if not isinstance(name, str) or not name or not isinstance(args, dict):

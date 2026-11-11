@@ -155,6 +155,17 @@ def test_stop_sequences_and_max_tokens(client):
         {**ASK, "messages": [{"role": "system", "content": "x"}]},
         {**ASK, "messages": [{"role": "user", "content": [{"type": "image", "source": {}}]}]},
         {**ASK, "messages": [{"role": "assistant", "content": [{"type": "redacted_thinking", "data": "x"}]}]},
+        {
+            **ASK,
+            "messages": [
+                {"role": "user", "content": "x"},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "thinking", "thinking": None}, {"type": "text", "text": "a"}],
+                },
+                {"role": "user", "content": "y"},
+            ],
+        },
         {**ASK, "tools": A_TOOLS, "tool_choice": {"type": "any"}},
         {**ASK, "tools": A_TOOLS, "tool_choice": {"type": "tool", "name": "get_weather"}},
         {**ASK, "tools": [{"type": "web_search_20250305", "name": "web_search"}]},
