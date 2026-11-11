@@ -122,6 +122,16 @@ def test_the_start_and_today_windows_count_past_the_ring():
     assert (w["today"]["n"], w["today"]["ok"]) == (9, 5)
 
 
+def test_the_current_series_point_rates_over_its_elapsed_seconds():
+    """The newest point is a bucket still filling: its RPM, like its output tok/s, divides by the seconds it has run."""
+    st, _ = stats()
+    st.tick(1000.5, 20, 1, 0)
+    st.record(req("a", 1000.2, 1000.4, 1001.0), stream=False, at_arrival=None)
+    last = st.snapshot({}, now=T0 + 2.5, ttl=0)["series"][-1]
+    assert last["t"] == T0 and last["out_tok_s"] == pytest.approx(20 / 2.5)
+    assert last["rpm"] == pytest.approx(60 / 2.5)
+
+
 def test_the_snapshot_is_shared_for_its_ttl_but_the_gauges_are_live():
     st, _c = stats()
     a = st.snapshot({"g": 1}, now=T0 + 5, ttl=1.0)

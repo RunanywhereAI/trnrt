@@ -349,8 +349,8 @@ class Stats:
             t0 = k * BUCKET_S
             b, g, rs = by_bucket.get(k), past.get(k), done.get(k, [])
             pt: dict = {"t": t0}
+            width = min(BUCKET_S, now - t0) if k == last else BUCKET_S  # the current bucket has run `width` s so far
             if b is not None:
-                width = min(BUCKET_S, now - t0) if k == last else BUCKET_S
                 pt.update(
                     running=b[2] / b[1],
                     running_max=b[3],
@@ -361,7 +361,7 @@ class Stats:
             else:
                 pt.update({x: g.get(x) if g is not None else None for x in gauge_keys})
             if b is not None or rs:
-                pt["rpm"] = len(rs) * 60 / BUCKET_S
+                pt["rpm"] = len(rs) * 60 / width if width > 0 else None
             else:
                 pt["rpm"] = g.get("rpm") if g is not None else None
             ttft = [r["ttft"] for r in rs if r["ttft"] is not None]
