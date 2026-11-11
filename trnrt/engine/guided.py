@@ -112,8 +112,18 @@ class HostSampling:
                 break
             r.think_count += 1
             if r.think_count >= budget:
-                r.think_force = list(self.close_ids)
+                r.think_force = self._close_rest(out, i + 1)
         r.think_seen = len(out)
+
+    def _close_rest(self, out: list[int], end: int) -> list[int]:
+        """The close tag's ids still to force after out[:end]: the rest of it when out[:end] ends with a partial close
+        tag (a multi-token tag cut at the budget), else the whole tag. Forcing the whole tag then would write its
+        first ids twice."""
+        close = self.close_ids
+        for k in range(len(close) - 1, 0, -1):
+            if ends_at(out, end, close[:k]):
+                return close[k:]
+        return list(close)
 
     def _grammar(self, r: Request) -> bool:
         """Accept r's new output tokens into its matcher (arming it first at the reasoning's end). True once the grammar

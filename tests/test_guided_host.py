@@ -2,6 +2,7 @@
 stand-in tokenizer and matcher: no model, no xgrammar.
 
 - a grammar's dead end ends its request as "stop", with or without ignore_eos;
+- a thinking budget reached on a partial close tag forces only the rest of the tag;
 """
 
 from __future__ import annotations
@@ -79,3 +80,29 @@ def test_a_token_its_grammar_refuses_without_a_dead_end_still_fails_loudly():
     r.matcher = DeadMatcher()  # refuses, but no dead end was reached: the mask was not applied
     with pytest.raises(RuntimeError, match="rejected by its own grammar"):
         hs.advance(emit(r, EOS), lambda req, why: None)
+
+
+def think(budget: int, *outs: list[int]) -> Request:
+    """A request whose prompt opened a reasoning block, fed `outs` one commit at a time."""
+    hs = HostSampling(tokenizer, 64, (EOS,), runner=None)
+    r = running([5, *TAGS["<think>"]], SamplingParams(thinking_token_budget=budget), hs)
+    assert r.think_in
+    for ids in outs:
+        hs.advance(emit(r, *ids), lambda req, why: None)
+    return r
+
+
+def test_a_budget_reached_on_a_partial_close_tag_forces_only_the_rest_of_it():
+    r = think(3, [20], [21], [12])  # the third reasoning token is the close tag's first id
+    assert r.think_force == [13, 14] and not r.think_done
+    r = think(3, [20], [21], [12], [13], [14])  # the forced rest, one token a step: the tag is whole once
+    assert r.think_done and not r.think_force and r.output_ids == [20, 21, 12, 13, 14]
+
+
+def test_a_budget_reached_elsewhere_forces_the_whole_close_tag():
+    r = think(2, [20], [21])
+    assert r.think_force == [12, 13, 14]
+    r = think(3, [20], [12, 21])  # a close tag's first id that the next token showed was no tag
+    assert r.think_force == [12, 13, 14]
+    r = think(6, [20], [21], [22], [12, 13, 14])  # the model closes the block itself, under the budget
+    assert r.think_done and not r.think_force
