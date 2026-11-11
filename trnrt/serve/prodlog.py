@@ -29,6 +29,8 @@ import threading
 import time
 from typing import IO, TYPE_CHECKING
 
+from .stats import BUCKET_S
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
@@ -282,11 +284,12 @@ class ProdLog:
         now = self.clock()
         day = utc_day(now)
         d = os.path.join(self.root, day)
+        start = calendar.timegm(time.strptime(day, "%Y-%m-%d"))  # UTC midnight
         recs = [r for p in day_files(d, "requests") for r in read_jsonl(p) if isinstance(r.get("done"), (int, float))]
-        gauges = [
-            g
-            for p in day_files(d, "gauges")
-            for g in read_jsonl(p)
-            if isinstance(g.get("t"), (int, float)) and g["t"] >= now - GAUGES_RELOAD_S
-        ]
-        stats.merge_day(recs, gauges, calendar.timegm(time.strptime(day, "%Y-%m-%d")))  # from UTC midnight
+        gauges = [g for p in day_files(d, "gauges") for g in read_jsonl(p) if isinstance(g.get("t"), (int, float))]
+        # the "today" output tok/s counts every gauge of the day (a bucket closed just after midnight is yesterday's);
+        # the series reads back only its own 30 minutes
+        out_tok_s = (g.get("out_tok_s") for g in gauges if g["t"] >= start)
+        handed = BUCKET_S * sum(x for x in out_tok_s if isinstance(x, (int, float)))
+        recent = [g for g in gauges if g["t"] >= now - GAUGES_RELOAD_S]
+        stats.merge_day(recs, recent, start, handed=handed)

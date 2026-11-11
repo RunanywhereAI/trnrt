@@ -174,6 +174,24 @@ def test_the_production_log_writes_reloads_and_rotates(tmp_path):
     assert log2.status()["on"] and "requests.jsonl" in "".join(log2.status()["files"])
 
 
+def test_today_counts_the_output_of_earlier_processes_all_day(tmp_path):
+    """After a restart, "today"'s output tok/s counts every gauge of the day, not only the 30 minutes the series reads
+    back."""
+    day = tmp_path / "engine-8001" / PL.utc_day(T0)
+    day.mkdir(parents=True)
+    rec = {"rid": "a", "arrival": T0 - 3700, "first": T0 - 3699, "done": T0 - 3690, "prompt": 5, "cached": 0}
+    (day / "requests.jsonl").write_text(json.dumps({**rec, "output": 3, "finish": "stop"}) + "\n")
+    gauges = [{"t": T0 - 3600, "out_tok_s": 5.0}, {"t": T0 - 60, "out_tok_s": 2.0}]  # an hour ago, and a minute ago
+    (day / "gauges.jsonl").write_text("".join(json.dumps(g) + "\n" for g in gauges))
+    st, c = stats()
+    c.mono = 1100.0
+    PL.ProdLog(str(tmp_path / "engine-8001"), stats=st, clock=c.wall).close()
+    today = st.snapshot({}, now=c.wall(), ttl=0)["windows"]["today"]
+    assert today["first"] == T0 - 3700
+    assert today["out_tok_s"] == pytest.approx((50 + 20) / (T0 + 100 - (T0 - 3700)))
+    assert set(st.past) == {int((T0 - 60) // S.BUCKET_S)}  # the series still reads back 30 minutes only
+
+
 def test_a_torn_line_and_a_full_queue_lose_only_themselves(tmp_path):
     p = tmp_path / "x.jsonl.gz"
     with gzip.open(p, "wt") as f:

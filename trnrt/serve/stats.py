@@ -207,8 +207,9 @@ class Stats:
 
     # -- the production log's reload, at start ------------------------------------------------------------------------
 
-    def merge_day(self, records: list[dict], gauges: list[dict], day_start: float) -> None:
-        """Today's records and gauges from earlier processes: the "today" window, the ring's older end, the series."""
+    def merge_day(self, records: list[dict], gauges: list[dict], day_start: float, handed: float = 0.0) -> None:
+        """Today's records and gauges from earlier processes: the "today" window, the ring's older end, the series.
+        `handed`: the output tokens their gauges counted all day (gauges holds only the series' last 30 minutes)."""
         for r in records:
             derive(r)
         n_ok = sum(1 for r in records if r.get("finish") in OK_FINISH)
@@ -226,6 +227,7 @@ class Stats:
                 "aborted": n_abort,
                 "failed": len(records) - n_ok - n_abort,
                 "n": len(records),
+                "handed": handed,
                 **{k: sum(r.get(k, 0) for r in records) for k in ("prompt", "cached", "output")},
             }
             for g in gauges:
@@ -282,8 +284,7 @@ class Stats:
             dspan = now - first
             dtok = {k: day[k] + tokens[k] for k in ("prompt", "cached", "output")}
             dsel = [r for r in recs if r["done"] >= day["start"]]
-            # handed out today: earlier processes' gauges (out_tok_s x BUCKET_S each) plus this process's
-            dhanded = handed + BUCKET_S * sum(g.get("out_tok_s") or 0 for g in past.values() if g["t"] >= day["start"])
+            dhanded = handed + day["handed"]  # handed out today: this process's, plus earlier processes' all day
             windows["today"] = self._window(
                 dsel,
                 dspan,
