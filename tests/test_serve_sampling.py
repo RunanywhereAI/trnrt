@@ -205,8 +205,9 @@ def test_stop_regex_ends_the_output_after_its_match_and_aborts_the_request(app, 
     """SGLang's stop_regex: the output ends at the end of the first match, the matched text kept (SGLang's trim looks
     for the pattern itself), finish "stop", matched_stop the pattern. The engine knows nothing of it, so the request is
     aborted there. The match spans two tokens (" there", " again"), so it is only found by searching back into text
-    already pushed: a bounded pattern's search starts its longest match before the new text."""
-    client, eng = app(PLAIN * 10)
+    already pushed: a bounded pattern's search starts its longest match before the new text. The engine takes 10 ms a
+    token, so the abort reaches it before it ends the request on its own."""
+    client, eng = app(PLAIN * 10, setup=lambda e: setattr(e, "step_delay", 0.01))
     body = {"prompt": [1], "max_tokens": 40, "stop_regex": [r"x{3}", r"re\s?ag"]}
     if stream:
         events = _events(client, {**body, "stream": True})
