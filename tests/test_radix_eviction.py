@@ -90,7 +90,7 @@ def test_tlru_chain_counts_the_evicted_tail():
     assert rc.total_pages() == 3 and rc.match_prefix([1] * 12).num_pages == 3
 
 
-def test_a_sequence_that_grows_again_resets_its_evicted_tail():
+def test_a_sequence_that_grows_again_resets_its_evicted_tail_and_a_sibling_does_not():
     pool = PagePool(64)
     rc = RadixCache(pool, PS, "tlru", {"threshold": 10, "next_prompt_estimate": 2})
     rc.insert([3] * 4, pool.alloc(1))
@@ -98,8 +98,29 @@ def test_a_sequence_that_grows_again_resets_its_evicted_tail():
     rc.evict(1)
     parent = rc.match_prefix([3] * 4).node
     assert parent.tail_evicted == 4
+    # Another branch under it: the evicted sequence's next turn must still recompute its 4 tokens.
     rc.insert([3] * 4 + [6] * 4, [parent.pages[0], *pool.alloc(1)])
+    assert parent.tail_evicted == 4
+    rc.insert([3] * 4 + [4] * 4, [parent.pages[0], *pool.alloc(1)])  # the evicted sequence itself, back
     assert parent.tail_evicted == 0
+
+
+def test_a_sibling_insert_keeps_the_shared_prefix_unsafe():
+    """Budget 8 tokens. A 4-token shared prefix whose 8-token branch was evicted must not look safe (4 + 8 > 8) once a
+    short sibling branch is inserted and evicted under it: it outlives a newer safe prefix."""
+    pool = PagePool(64)
+    rc = RadixCache(pool, PS, "tlru", {"threshold": 10, "next_prompt_estimate": 2})
+    shared = [3] * 4
+    rc.insert(shared, pool.alloc(1))
+    page = rc.match_prefix(shared).pages[0]
+    rc.insert(shared + [4] * 8, [page, *pool.alloc(2)])
+    rc.evict(1)  # the 8-token branch
+    rc.insert(shared + [6] * 4, [page, *pool.alloc(1)])
+    rc.insert([2] * 8, pool.alloc(2))  # newer, 8 tokens: safe
+    rc.evict(1)  # the sibling (4 tokens below an evicted 0: safe, the oldest); a match would refresh the prefix
+    assert rc.total_pages() == 3
+    rc.evict(1)  # the shared prefix (4 + 8 evicted, unsafe) outlives the newer safe one
+    assert rc.match_prefix(shared).num_pages == 1 and rc.match_prefix([2] * 8).num_pages == 0
 
 
 def test_session_references_still_come_first_under_every_policy():

@@ -63,10 +63,12 @@ class RadixNode:
     anchor: bool = False
     # The eviction policies' bookkeeping (RadixCache.touch), read only by the policy that uses it: requests admitted on a
     # path through this node (lfu, slru; a node starts at 1, for the request that inserted it), the highest importance of
-    # those requests (priority), and the tokens already evicted below it along its deepest evicted branch (tlru).
+    # those requests (priority), and the tokens already evicted below it along its deepest evicted branch and that
+    # branch's first page (tlru).
     hit_count: int = 1
     importance: float = -math.inf
     tail_evicted: int = 0
+    tail_key: tuple[int, ...] | None = None
 
     def is_leaf(self) -> bool:
         return not self.children
@@ -269,7 +271,10 @@ class RadixCache:
                 last_access=next(self._clock),
             )
             node.children[tuple(leaf.key[:ps])] = leaf
-            node.tail_evicted = 0  # tlru: the sequence grew again, so its tail evicted earlier is no longer its tail
+            if node.tail_key == tuple(leaf.key[:ps]):
+                # tlru: the evicted branch grew again, so its tail is no longer evicted. Another branch's insert leaves
+                # it: that sequence's next turn must still recompute its tail.
+                node.tail_evicted, node.tail_key = 0, None
             self.evictable_pages += len(leaf.pages)
             tree_pages.extend(leaf.pages)
             node = leaf
@@ -404,7 +409,9 @@ class RadixCache:
                 if parent is not self.root:
                     self._register(sid, parent)
             del parent.children[tuple(leaf.key[: self.page_size])]
-            parent.tail_evicted = max(parent.tail_evicted, leaf.tail_evicted + len(leaf.key))
+            tail = leaf.tail_evicted + len(leaf.key)
+            if tail >= parent.tail_evicted:
+                parent.tail_evicted, parent.tail_key = tail, tuple(leaf.key[: self.page_size])
             leaf.parent = None
             if parent is not self.root and parent.is_leaf() and parent.lock_ref == 0:
                 heapq.heappush(heap, (self._key(parent), id(parent), parent))
