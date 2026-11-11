@@ -284,6 +284,8 @@ def test_flush_cache_flushes_only_an_idle_engine():
     refused."""
     import httpx
 
+    from trnrt.serve import api
+
     eng = ScriptedEngine(PLAIN * 40)
     eng.step_delay = 0.02
     with _uvicorn(eng) as base, httpx.Client(base_url=base, timeout=30) as c:
@@ -296,7 +298,8 @@ def test_flush_cache_flushes_only_an_idle_engine():
         r = c.post("/flush_cache")
         assert r.status_code == 400 and "1 requests are running or waiting" in r.text and eng.flushes == [0, 0]
         waiting = _background(lambda: c.post("/flush_cache?timeout=20"))
-        time.sleep(0.1)
+        (lp,) = [lp for lp in api._LOOPS if lp.engine is eng]
+        _wait_for(lambda: lp._flush is not None)  # the engine thread holds the first flush: the next one is refused
         r = c.get("/flush_cache?timeout=5")
         assert r.status_code == 400 and "Another flush_cache" in r.text
         assert busy().status_code == 200
