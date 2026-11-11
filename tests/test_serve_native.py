@@ -284,6 +284,8 @@ def test_flush_cache_flushes_only_an_idle_engine():
     refused."""
     import httpx
 
+    from trnrt.serve import api
+
     eng = ScriptedEngine(PLAIN * 40)
     eng.step_delay = 0.02
     with _uvicorn(eng) as base, httpx.Client(base_url=base, timeout=30) as c:
@@ -296,7 +298,8 @@ def test_flush_cache_flushes_only_an_idle_engine():
         r = c.post("/flush_cache")
         assert r.status_code == 400 and "1 requests are running or waiting" in r.text and eng.flushes == [0, 0]
         waiting = _background(lambda: c.post("/flush_cache?timeout=20"))
-        time.sleep(0.1)
+        (lp,) = [lp for lp in api._LOOPS if lp.engine is eng]
+        _wait_for(lambda: lp._flush is not None)  # the engine thread holds the first flush: the next one is refused
         r = c.get("/flush_cache?timeout=5")
         assert r.status_code == 400 and "Another flush_cache" in r.text
         assert busy().status_code == 200
@@ -307,10 +310,10 @@ def test_flush_cache_flushes_only_an_idle_engine():
 
 def test_health_generate_runs_a_token_through_the_engine(monkeypatch):
     """Idle: the probe (prompt [0], one greedy token) runs, and /metrics does not count it. Stuck in a step past the
-    timeout: 503, and the probe is aborted."""
+    timeout: 503, and the probe is aborted. /v1/stats counts neither probe."""
     import httpx
 
-    from trnrt.serve import native
+    from trnrt.serve import api, native
 
     eng = ScriptedEngine(PLAIN)
     with _uvicorn(eng) as base, httpx.Client(base_url=base, timeout=30) as c:
@@ -332,6 +335,15 @@ def test_health_generate_runs_a_token_through_the_engine(monkeypatch):
         assert r.status_code == 503 and "no engine step ended" in r.json()["error"], r.text
         assert started().status_code == 200
         _wait_for(lambda: len(eng.added) == 4 and eng.aborted == [eng.added[3].rid])
+        # neither probe is a request in /v1/stats or the production log, the aborted one included: the engine thread
+        # handled the abort before this later request, so once its record is in, an abort record would be too
+        eng.step_delay = 0.0
+        assert c.post("/v1/completions", json={"prompt": [1]}).status_code == 200
+        (lp,) = [lp for lp in api._LOOPS if lp.engine is eng]
+        _wait_for(lambda: lp.stats.counts["ok"] == 3)
+        assert lp.stats.counts == {"ok": 3, "aborted": 0, "failed": 0}
+        probes = {eng.added[0].rid, eng.added[3].rid}
+        assert len(lp.stats.records) == 3 and not probes & {r["rid"] for r in lp.stats.records}
 
 
 def test_health_generate_is_503_once_a_rank_died(serve):
@@ -339,6 +351,55 @@ def test_health_generate_is_503_once_a_rank_died(serve):
     eng.dead = [1]
     r = client.get("/health_generate")
     assert r.status_code == 503 and "rank(s) [1] exited" in r.json()["error"]
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_a_full_queue_503_from_generate_keeps_the_queue_full_header(stream):
+    """A request the full queue refuses, and one a better request displaces from it after admission: both 503s carry
+    QUEUE_FULL_HEADER, as on the OpenAI routes, so the router does not take the engine for failed."""
+    from fastapi.testclient import TestClient
+
+    from tests.test_serve_sched import QueueEngine
+    from trnrt.engine.scheduler import DISPLACED, Scheduling
+    from trnrt.serve import api
+
+    eng = QueueEngine(PLAIN, Scheduling(priority_scheduling=True), limit=0)
+    try:
+        with TestClient(api.build_app(eng, "glm")) as c:
+            r = c.post("/generate", json={"input_ids": [1], "stream": stream})
+            assert r.status_code == 503 and r.json()["detail"] == "The request queue is full.", r.text
+            assert r.headers[api.QUEUE_FULL_HEADER] == "1"
+            if stream:
+                return
+            eng.limit = 1
+            waiting = _background(lambda: c.post("/generate", json={"input_ids": [1]}))
+            _wait_for(lambda: eng.parked)
+            better = c.post("/v1/completions", json={"prompt": [1], "priority": 9})
+            assert better.status_code == 200, better.text
+            r = waiting()
+            assert r.status_code == 503 and r.json()["detail"] == DISPLACED and r.headers[api.QUEUE_FULL_HEADER] == "1"
+    finally:
+        for lp in [lp for lp in api._LOOPS if lp.engine is eng]:
+            lp.stop()
+
+
+def test_no_logs_keeps_a_request_out_of_the_production_log(serve, monkeypatch, tmp_path):
+    """SGLang's no_logs: true writes nothing of the request to disk (TRNRT_PROD_DIR); /v1/stats still counts it, as
+    /metrics does (log_metrics is the field for those)."""
+    from trnrt.serve import api
+    from trnrt.serve import prodlog as PL
+
+    monkeypatch.setenv(PL.ENV, str(tmp_path))
+    client, eng = serve(PLAIN)
+    for rid, no_logs in (("quiet", True), ("logged", False)):
+        r = client.post("/generate", json={"input_ids": [1], "rid": rid, "no_logs": no_logs})
+        assert r.status_code == 200, r.text
+    (lp,) = [lp for lp in api._LOOPS if lp.engine is eng]
+    _wait_for(lambda: lp.stats.counts["ok"] == 2 and lp.prodlog.written["requests"] == 1)
+    lp.stop()
+    (path,) = tmp_path.rglob("requests.jsonl")
+    assert [rec["rid"] for rec in PL.read_jsonl(str(path))] == ["logged"]
+    assert client.post("/generate", json={"input_ids": [1], "no_logs": "yes"}).status_code == 400
 
 
 def test_load_and_info_endpoints(serve):

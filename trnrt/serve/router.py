@@ -86,6 +86,7 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import math
 import os
 import threading
 import time
@@ -537,6 +538,40 @@ def _prompt(path: str, body: dict):
     return body.get("prompt", "")
 
 
+def _json_head(x, k: int):
+    """x cut to its first k items and string characters, counted in document order at every level: its JSON text
+    starts with the same k characters as x's, since each one kept writes at least one character before the first that
+    differs. A key reads that much of a prompt of any size (a 200K-token input_ids list, a batch of them) without
+    writing all of it on the event loop."""
+    left = k
+
+    def cut(v):
+        nonlocal left
+        if isinstance(v, str):
+            n = max(0, min(len(v), left))
+            left -= n
+            return v[:n]
+        if isinstance(v, list):
+            out = []
+            for item in v:
+                if left <= 0:
+                    break
+                left -= 1
+                out.append(cut(item))
+            return out
+        if isinstance(v, dict):
+            d = {}
+            for key, item in v.items():
+                if left <= 0:
+                    break
+                left -= 1
+                d[key] = cut(item)
+            return d
+        return v
+
+    return cut(x)
+
+
 def _session_key(path: str, body: dict) -> tuple[str, str]:
     """A session request's history key, (sys_hash, first_hash): hashes of its leading system messages and of the first
     SESSION_KEY_CHARS characters of the first message after them (for a completion: "" and its prompt's first
@@ -547,12 +582,14 @@ def _session_key(path: str, body: dict) -> tuple[str, str]:
     msgs = _conversation(path, body)
     if msgs is None:
         p = _prompt(path, body)
-        return h(""), h((p if isinstance(p, str) else json.dumps(p))[:SESSION_KEY_CHARS])
+        p = p if isinstance(p, str) else json.dumps(_json_head(p, SESSION_KEY_CHARS))
+        return h(""), h(p[:SESSION_KEY_CHARS])
     msgs = msgs if isinstance(msgs, list) else []
     k = _leading_system(msgs)
     first = msgs[k] if k < len(msgs) and isinstance(msgs[k], dict) else {}
     c = first.get("content")
-    c = c if isinstance(c, str) else "" if c is None else json.dumps(c, ensure_ascii=False)
+    if not isinstance(c, str):
+        c = "" if c is None else json.dumps(_json_head(c, SESSION_KEY_CHARS), ensure_ascii=False)
     return h(json.dumps(msgs[:k], ensure_ascii=False)), h(str(first.get("role", "")) + "\x00" + c[:SESSION_KEY_CHARS])
 
 
@@ -690,9 +727,12 @@ def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: floa
     async def model_info():
         return await first_live("/model_info")
 
-    async def each(method: str, path: str, timeout: float | None, **kw) -> list[httpx.Response | None]:
+    async def each(
+        method: str, path: str, timeout: float | None, hard_503: bool = True, **kw
+    ) -> list[httpx.Response | None]:
         """Every worker's answer to one request, sent to all at once; None for one that did not answer. A refused
-        connection marks it down, as in a request; a 503 too (a failed engine)."""
+        connection marks it down, as in a request; a 503 too (a failed engine), or with hard_503 False counts toward
+        down_after as a stalled /health does (Router.note_failure)."""
 
         async def one(w: int) -> httpx.Response | None:
             try:
@@ -703,7 +743,7 @@ def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: floa
             except httpx.HTTPError:
                 return None
             if r.status_code == 503:
-                router.note_failure(w, hard=True)
+                router.note_failure(w, hard=hard_503)
             return r
 
         return list(await asyncio.gather(*(one(w) for w in range(len(router.workers)))))
@@ -743,10 +783,13 @@ def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: floa
     @app.get("/health_generate")
     async def health_generate():
         """Each engine's /health_generate (a token through its engine): 200 "ok" when every engine generated,
-        "degraded" when some did, 503 "down" when none did. Each body names the engines that did not ("down")."""
+        "degraded" when some did, 503 "down" when none did. Each body names the engines that did not ("down"). An
+        engine answers 503 when no step of its ended within HEALTH_GENERATE_TIMEOUT_S, which a long prefill can do to
+        an engine still serving: that 503 counts toward down_after, as a stalled /health does, and does not move the
+        sessions pinned there at once. A failed engine's /health answers 503 too, which the poll takes as down."""
         from .native import HEALTH_GENERATE_TIMEOUT_S
 
-        rs = await each("GET", "/health_generate", HEALTH_GENERATE_TIMEOUT_S + 10)
+        rs = await each("GET", "/health_generate", HEALTH_GENERATE_TIMEOUT_S + 10, hard_503=False)
         ok = [r is not None and r.status_code == 200 for r in rs]
         for w, good in enumerate(ok):
             if good:
@@ -772,9 +815,16 @@ def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: floa
     async def flush_cache(http: Request):
         """Every engine's prefix cache flushed (each only while idle; `timeout` passed on). 200 when every engine
         flushed, else 400 naming the engines that did not and why. A flushed engine's prefix tree here is cleared:
-        the tree stands for what its cache holds."""
+        the tree stands for what its cache holds. An engine that has not answered `timeout` + health_timeout_s seconds
+        after it was asked is one that did not flush ("no answer"): an engine answers once it flushed or its timeout
+        passed, so only one that is stuck takes longer."""
         query = http.url.query
-        rs = await each(http.method, "/flush_cache" + (f"?{query}" if query else ""), None)
+        try:
+            wait = float(http.query_params.get("timeout", "0"))
+        except ValueError:
+            wait = 0.0  # each engine answers a malformed timeout with 400 at once
+        wait = wait if math.isfinite(wait) and wait >= 0 else 0.0
+        rs = await each(http.method, "/flush_cache" + (f"?{query}" if query else ""), wait + health_timeout_s)
         failed = []
         for w, r in enumerate(rs):
             if r is not None and r.status_code == 200:
@@ -804,7 +854,8 @@ def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: floa
     def engine_index(raw: str | None) -> int | None:
         if raw is None:
             return None
-        if not raw.isdigit() or int(raw) >= len(router.workers):
+        # ASCII digits only ("²" is a digit to isdigit and not to int), and few: int refuses above 4300 digits
+        if not (raw.isascii() and raw.isdigit()) or len(raw) > 9 or int(raw) >= len(router.workers):
             raise HTTPException(status_code=400, detail=f"engine must be an integer in [0, {len(router.workers)})")
         return int(raw)
 

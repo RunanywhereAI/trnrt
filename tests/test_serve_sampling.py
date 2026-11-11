@@ -112,6 +112,7 @@ def test_n_completions_with_logprobs(app):
         {"stop_regex": "("},
         {"stop_regex": ["a"] * 17},
         {"no_stop_trim": "yes"},
+        {"include_stop_str_in_output": True, "no_stop_trim": "yes"},  # checked even when the other keeps the stop
         {"skip_special_tokens": "no"},
     ],
     ids=repr,
@@ -204,8 +205,9 @@ def test_stop_regex_ends_the_output_after_its_match_and_aborts_the_request(app, 
     """SGLang's stop_regex: the output ends at the end of the first match, the matched text kept (SGLang's trim looks
     for the pattern itself), finish "stop", matched_stop the pattern. The engine knows nothing of it, so the request is
     aborted there. The match spans two tokens (" there", " again"), so it is only found by searching back into text
-    already pushed: a bounded pattern's search starts its longest match before the new text."""
-    client, eng = app(PLAIN * 10)
+    already pushed: a bounded pattern's search starts its longest match before the new text. The engine takes 10 ms a
+    token, so the abort reaches it before it ends the request on its own."""
+    client, eng = app(PLAIN * 10, setup=lambda e: setattr(e, "step_delay", 0.01))
     body = {"prompt": [1], "max_tokens": 40, "stop_regex": [r"x{3}", r"re\s?ag"]}
     if stream:
         events = _events(client, {**body, "stream": True})
@@ -223,13 +225,82 @@ def test_stop_regex_ends_the_output_after_its_match_and_aborts_the_request(app, 
 
 
 def test_stop_regex_unbounded_and_anchored(app):
-    """A pattern with an unbounded repeat is searched over the whole text; an anchor keeps its meaning (the search
-    starts at a position, never at a slice)."""
+    """A pattern with an unbounded repeat is searched back over the text (STOP_REGEX_SPAN characters before the new
+    text); an anchor keeps its meaning (the search starts at a position, never at a slice)."""
     client, _ = app(PLAIN * 4)
     r = client.post("/v1/completions", json={"prompt": [1], "max_tokens": 16, "stop_regex": r"!.*again"})
     assert r.json()["choices"][0]["text"] == "Hello there again!Hello there again"
     r = client.post("/v1/completions", json={"prompt": [1], "max_tokens": 16, "stop_regex": r"^there"})
     assert r.json()["choices"][0]["text"] == "Hello there again!" * 4  # "there" never starts the text
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        r"^(a+)+b$",  # exponential: a repeat over a part that matches more than one way
+        r"(a|a)*b",
+        r"(a{1,3}){1,10}b",
+        r"(?:\w+\s?)+$",
+        r"a*a*b",  # a power of the length: two repeats in a row that take the same characters
+        r"\d+\s*\d+",
+        r".*x.*y",
+        r"(?:)+",
+    ],
+)
+def test_stop_regex_refuses_patterns_that_backtrack(app, pattern):
+    """CPython's re holds the GIL through a search and cannot be interrupted, so a pattern whose search can take
+    exponential time, or a power of the text's length, is refused with the reason before it runs on the event loop."""
+    client, eng = app(PLAIN)
+    r = client.post("/v1/completions", json={"prompt": [1], "stop_regex": ["again", pattern]})
+    assert r.status_code == 400 and r.json()["detail"].startswith(f"stop_regex {pattern!r} is refused: it "), r.text
+    assert eng.added == []
+
+
+def test_stop_regex_admits_ordinary_patterns():
+    from trnrt.serve.api import _backtracking
+
+    ordinary = [
+        r"\n\n+",
+        r"</answer>",
+        r"Answer:\s*\d+",
+        r"\d+\.\d+",
+        r"\$\d+(?:\.\d\d)?",
+        r"\bEND\b",
+        r"(?:Human|User):",
+        r"(?:foo|bar)+",
+        r"[.!?]\s*$",
+        r"\w+@\w+\.\w+",
+        r"(?s)<think>.*</think>",
+        r"(?i)stop here",
+        r"[a-f0-9]{40}",
+        r"(\w+)\s\1",
+        r"re\s?ag",
+        r"!.*again",
+    ]
+    assert {p: _backtracking(p) for p in ordinary} == dict.fromkeys(ordinary)
+
+
+def test_stop_regex_search_reaches_back_at_most_the_span(monkeypatch):
+    """The search for an unbounded pattern starts STOP_REGEX_SPAN (+ 8) characters before the text already searched,
+    which bounds its cost: a match starting further back is not found (the limitation, pinned), a later one is."""
+    import re
+
+    from trnrt.serve import api
+
+    class Chars:  # token i is the character chr(i)
+        def decode(self, ids, skip_special_tokens=True):
+            return "".join(map(chr, ids))
+
+    def run(span):
+        monkeypatch.setattr(api, "STOP_REGEX_SPAN", span)
+        d = api._Detok(Chars(), regexes=((re.compile(r"<.*>"), None),))
+        text = "<" + "abcdefghijklmnopqrstuvwxyz" + "> then <ab> and more"
+        ids = [ord(x) for x in text]
+        out = "".join(d.push(ids[i : i + 2], i + 2 >= len(ids)) for i in range(0, len(ids), 2))
+        return out, d.matched
+
+    assert run(2048) == ("<abcdefghijklmnopqrstuvwxyz>", r"<.*>")
+    assert run(4) == ("<abcdefghijklmnopqrstuvwxyz> then <ab>", r"<.*>")
 
 
 @pytest.mark.parametrize("key", ["include_stop_str_in_output", "no_stop_trim"])

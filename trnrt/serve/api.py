@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import bisect
 import contextlib
 import copy
 import dataclasses
@@ -94,6 +95,7 @@ class _Stream:
     sent: int = 0
     metrics: bool = True  # counted in /metrics when it finishes (a /health_generate probe is not)
     stream: bool = False  # the HTTP response streams (GET /v1/stats's records)
+    logs: bool = True  # its record goes to the production log (SGLang's no_logs turns it off)
     at_arrival: tuple[int, int] | None = None  # (running, waiting) when the engine took it
 
 
@@ -116,6 +118,7 @@ class _Submit:
     out: asyncio.Queue | _Tagged = field(default_factory=asyncio.Queue)
     metrics: bool = True
     stream: bool = False
+    logs: bool = True
 
 
 # Set on a 503 that answers a full waiting queue (scheduler.QueueFull) or a request displaced from it: the engine is
@@ -260,11 +263,13 @@ class EngineLoop:
         out: _Tagged | None = None,
         priority: int | None = None,
         stream: bool = False,
+        logs: bool = True,
     ) -> _Submit:
         """Queue a request for the engine thread. `rid`: the client's request id (SGLang's), which /abort_request
         names; a new one when None. `metrics`: whether /metrics and /v1/stats count it. `out`: a choice's view of a
         shared queue (`n` > 1), instead of its own. `priority`: SGLang's per-request priority. `stream`: whether the HTTP
-        response streams (GET /v1/stats's records)."""
+        response streams (GET /v1/stats's records). `logs`: whether its record goes to the production log (SGLang's
+        no_logs: false)."""
         # Checked here, before the engine sees the request: an id outside the vocabulary fails the step, and at tp > 1
         # one failed step fails the engine for every request (_fail).
         if not prompt_ids or not all(type(t) is int and 0 <= t < self.vocab for t in prompt_ids):
@@ -284,6 +289,7 @@ class EngineLoop:
             priority=priority,
             metrics=metrics,
             stream=stream,
+            logs=logs,
         )
         if out is not None:
             sub.out = out
@@ -326,12 +332,19 @@ class EngineLoop:
         self.stats.tick(time.monotonic(), tokens, running, waiting)
 
     def _finished(self, st: _Stream, finish: str | None = None) -> None:
-        """A request's end: its record into the live statistics and the production log (O(1), never blocks)."""
-        self._hook(self._finished_hook, st, finish)
+        """A request's end: its record into the live statistics and the production log (O(1), never blocks). None for
+        a request submitted with metrics=False (a /health_generate probe), however it ends: finished or aborted."""
+        if st.metrics:
+            self._hook(self._finished_hook, st, finish)
+
+    def _failed(self, kind: str, metrics: bool) -> None:
+        """A request that never ran or that a failure ended, counted in /v1/stats unless submitted with metrics=False."""
+        if metrics:
+            self._hook(self.stats.failed, kind)
 
     def _finished_hook(self, st: _Stream, finish: str | None) -> None:
         rec = self.stats.record(st.req, st.stream, st.at_arrival, finish)
-        if self.prodlog is not None:
+        if self.prodlog is not None and st.logs:
             self.prodlog.put("requests", rec)
 
     def _drain(self, block: bool) -> None:
@@ -374,17 +387,17 @@ class EngineLoop:
             req = self.engine.add_request(sub.prompt_ids, sub.params, rid=sub.rid, session_id=sub.session_id, **extra)
         except QueueFull as e:
             post(sub.out.put_nowait, ("error", str(e), 503, True))
-            self._hook(self.stats.failed, "queue_full")
+            self._failed("queue_full", sub.metrics)
         except ValueError as e:
             post(sub.out.put_nowait, ("error", str(e), 400))
-            self._hook(self.stats.failed, "refused")
+            self._failed("refused", sub.metrics)
         except Exception as e:  # noqa: BLE001  add_request raised before the request reached the scheduler
             traceback.print_exc()  # (its last step): that request fails, the engine keeps serving
             post(sub.out.put_nowait, ("error", f"request refused: {e!r}", 500))
-            self._hook(self.stats.failed, "error")
+            self._failed("error", sub.metrics)
         else:
             self.streams[sub.rid] = _Stream(
-                req, sub.loop, sub.out, metrics=sub.metrics, stream=sub.stream, at_arrival=at_arrival
+                req, sub.loop, sub.out, metrics=sub.metrics, stream=sub.stream, at_arrival=at_arrival, logs=sub.logs
             )
             post(sub.out.put_nowait, ("accepted", req))
 
@@ -482,7 +495,7 @@ class EngineLoop:
         streams, self.streams = self.streams, {}
         for st in streams.values():
             st.loop.call_soon_threadsafe(st.out.put_nowait, ("error", f"engine failed: {reason}", 503))
-            self._hook(self.stats.failed, "engine")
+            self._failed("engine", st.metrics)
         flushes = [self._flush] if self._flush is not None else []
         self._flush = None
         while True:
@@ -523,7 +536,7 @@ class EngineLoop:
                     st.loop.call_soon_threadsafe(st.out.put_nowait, ("error", f"engine step failed: {e}", 500))
                     if st.req.status is not Status.FINISHED:
                         self.engine.abort(st.req)
-                    self._hook(self.stats.failed, "engine")
+                    self._failed("engine", st.metrics)
                 self.streams.clear()
                 continue
             self.last_step = time.monotonic()
@@ -539,7 +552,7 @@ class EngineLoop:
                 if finished and req.error is not None:  # ended unserved: displaced from a full queue
                     batch.setdefault(st.loop, []).append((st.out, ("error", req.error[1], req.error[0], True)))
                     del self.streams[rid]
-                    self._hook(self.stats.failed, "displaced")
+                    self._failed("displaced", st.metrics)
                     continue
                 if ready > st.sent or finished:
                     new = out[st.sent : ready]
@@ -553,7 +566,7 @@ class EngineLoop:
                     del self.streams[rid]
                     if st.metrics:  # a /health_generate probe is counted in neither /metrics nor /v1/stats
                         self.metrics.on_finish(req)
-                        self._finished(st)
+                    self._finished(st)
             for loop, items in batch.items():
                 loop.call_soon_threadsafe(_deliver, items)
             self._tick(handed)
@@ -582,8 +595,9 @@ class _Detok:
 
     `regexes` are SGLang's stop_regex patterns, as (compiled, the longest text a match can span or None): the output
     ends at the end of the first match, the matched text included, as SGLang's does (its trim looks for the pattern
-    itself in the text, which a pattern rarely is). A match never takes back text already streamed. `matched`: the stop
-    string or pattern that ended the output, None until one does.
+    itself in the text, which a pattern rarely is). A match starts at most STOP_REGEX_SPAN characters before the text
+    already searched. A match never takes back text already streamed. `matched`: the stop string or pattern that ended
+    the output, None until one does.
     """
 
     def __init__(
@@ -672,9 +686,11 @@ class _Detok:
             # An incomplete character's U+FFFD is not text yet: a pattern must not match it.
             body = text if final else text.rstrip("\ufffd")
             for rx, width in self.regexes:
-                # Only a match that ends in the new text is new, and a bounded one starts at most `width` before it.
+                # Only a match that ends in the new text is new, and a bounded one starts at most `width` before it;
+                # none is looked for more than STOP_REGEX_SPAN characters back (the search's cost, see there).
                 # Searching from a position (not a slice) keeps anchors and lookbehinds reading the whole text.
-                start = 0 if width is None else max(0, self._searched - width - 8)
+                span = STOP_REGEX_SPAN if width is None else min(width, STOP_REGEX_SPAN)
+                start = max(0, self._searched - span - 8)
                 m = rx.search(body, start)
                 if m is not None and (best is None or m.start() < best[0]):
                     best = (m.start(), m.end(), rx.pattern)
@@ -887,10 +903,16 @@ def _params(
 # `n` choices per request at most: each is its own engine request, holding a decode seat.
 MAX_N = 128
 # stop_regex: patterns per request, and characters per pattern, at most. Each pattern is searched on the event loop at
-# every streamed piece of text (over the new text and the longest span a match can have, or the whole text for a
-# pattern with an unbounded repeat).
+# every streamed piece of text, over the new text and the longest span a match can have, at most STOP_REGEX_SPAN
+# characters before it. CPython's re holds the GIL through a search and cannot be stopped, so its cost is bounded
+# before it runs: _backtracking refuses the shapes whose search time grows faster than the square of the text's length,
+# and the span bounds the text. The worst admitted shape, one repeat over a broad class (`\w+@\w+\.\w+` over a run of
+# letters), measured 13 ms per search at 2048 characters and 51 ms at 4096 (CPython 3.14, one Apple M3 Max core). The
+# matches are SGLang's (its tail search reads the whole output for an unbounded pattern) but for one that starts more
+# than the span before the newest text, which a stop pattern's match rarely does.
 MAX_STOP_REGEX = 16
 MAX_STOP_REGEX_CHARS = 1024
+STOP_REGEX_SPAN = 2048
 
 
 @dataclass(frozen=True)
@@ -915,6 +937,235 @@ def _match_width(pattern: str) -> int | None:
     return int(hi) if hi < 1 << 20 else None
 
 
+# The characters two character sets are compared on (_backtracking): Latin, the common spaces and line separators, and a
+# digit, letter and symbol from other scripts, plus every literal and range end of the pattern itself.
+_STOP_REGEX_PROBES = [chr(c) for c in range(0x300)] + list("\u00a0\u2028\u3000\u0663\u4e2d\u0416\U0001f642")
+_STOP_REGEX_CATEGORY = {
+    "DIGIT": re.compile(r"\d"),
+    "NOT_DIGIT": re.compile(r"\D"),
+    "SPACE": re.compile(r"\s"),
+    "NOT_SPACE": re.compile(r"\S"),
+    "WORD": re.compile(r"\w"),
+    "NOT_WORD": re.compile(r"\W"),
+    "LINEBREAK": re.compile("\n"),
+    "NOT_LINEBREAK": re.compile("[^\n]"),
+}
+
+
+class _Backtracking(Exception):
+    pass
+
+
+def _backtracking(pattern: str) -> str | None:
+    """Why Python's backtracking matcher could take more than about quadratic time on some text to search `pattern`,
+    or None. Two shapes do, and stop_regex refuses them (a linear-time engine would be a new dependency, and CPython's
+    re holds the GIL through a search, so a worker thread or a timeout cannot bound one):
+    - a repeat that can iterate more than once over a part that can match more than one way (a variable length or an
+      alternation): `(a+)+b`, `(a|a)*b`, `(a{1,3}){1,10}b`, exponential in the text's length;
+    - two repeats in a row that can take the same characters (nothing they cannot both match between them): `a*a*b`,
+      `\\d+\\s*\\d+`, `.*x.*y`, a power of the length per repeat.
+    An alternation whose branches start with characters no other branch starts with is one way only, as is a single
+    repeat over a fixed part: `\\d+\\.\\d+`, `Answer:\\s*\\d+`, `(?:foo|bar)+`, `\\n\\n+` all pass."""
+    try:
+        parser = importlib.import_module("re._parser")
+        c = importlib.import_module("re._constants")
+        tree = parser.parse(pattern)
+    except Exception as e:  # noqa: BLE001  a private module: without it no pattern can be checked
+        return f"it cannot be checked for backtracking ({type(e).__name__})"
+    probes = set(_STOP_REGEX_PROBES)
+
+    def collect(items) -> None:  # every literal and range end, so two overlapping ranges share a probe
+        for op, av in items:
+            if op in (c.LITERAL, c.NOT_LITERAL):
+                probes.update({chr(av), chr(av).lower(), chr(av).upper()})
+            elif op is c.RANGE:
+                probes.update({chr(av[0]), chr(av[1])})
+            elif op is c.IN or isinstance(av, parser.SubPattern):
+                collect(av)
+            elif isinstance(av, (tuple, list)):
+                for x in av:
+                    if isinstance(x, parser.SubPattern):
+                        collect(x)
+                    elif isinstance(x, list):
+                        for y in x:
+                            if isinstance(y, parser.SubPattern):
+                                collect(y)
+
+    collect(tree)
+
+    ordered = sorted(probes)
+    ords = [ord(p) for p in ordered]
+    categories: dict[str, frozenset] = {}
+    fold = bool(tree.state.flags & re.IGNORECASE) or "(?" in pattern  # a case-blind part may be scoped: (?i:...)
+
+    def member(op, av) -> frozenset:
+        """The character set of the one-character item (op, av), as the probes it matches (either case under
+        IGNORECASE)."""
+        if op is c.LITERAL:
+            return frozenset({chr(av), chr(av).lower(), chr(av).upper()} if fold else {chr(av)})
+        if op is c.NOT_LITERAL:
+            return frozenset(probes - {chr(av)})
+        if op is c.ANY:
+            return frozenset(probes)
+        hit: set = set()
+        neg = False
+        for o, a in av:  # IN
+            if o is c.NEGATE:
+                neg = True
+            elif o is c.LITERAL:
+                hit.add(chr(a))
+            elif o is c.RANGE:
+                hit.update(ordered[bisect.bisect_left(ords, a[0]) : bisect.bisect_right(ords, a[1])])
+            elif o is c.CATEGORY:
+                name = str(a).removeprefix("CATEGORY_").removeprefix("UNI_").removeprefix("LOC_")
+                if name not in categories:
+                    rx = _STOP_REGEX_CATEGORY.get(name)
+                    categories[name] = frozenset(probes if rx is None else (p for p in probes if rx.match(p)))
+                hit |= categories[name]
+            else:
+                hit |= probes
+        if fold:
+            hit |= {y for x in hit for y in (x.lower(), x.upper())}
+        return frozenset(probes - hit if neg else probes & hit)
+
+    everything = frozenset(probes)
+
+    def chars(items) -> frozenset:
+        """Every character `items` can consume."""
+        out: set = set()
+        for op, av in items:
+            if op in (c.LITERAL, c.NOT_LITERAL, c.ANY, c.IN):
+                out |= member(op, av)
+            elif op is c.SUBPATTERN:
+                out |= chars(av[3])
+            elif op is c.ATOMIC_GROUP:
+                out |= chars(av)
+            elif op in (c.MAX_REPEAT, c.MIN_REPEAT, c.POSSESSIVE_REPEAT):
+                out |= chars(av[2])
+            elif op is c.BRANCH:
+                for alt in av[1]:
+                    out |= chars(alt)
+            elif op is c.GROUPREF_EXISTS:
+                out |= chars(av[1]) | (chars(av[2]) if av[2] is not None else frozenset())
+            elif op is c.GROUPREF:
+                out |= everything
+        return frozenset(out)
+
+    def one_way(items) -> bool:
+        """Whether `items` can match a given text in one way only: a fixed length, no back reference, and every
+        alternation's branches starting with characters no other branch starts with."""
+        lo, hi = items.getwidth()
+        if lo != hi:
+            return False
+        for op, av in items:
+            if op is c.SUBPATTERN and not one_way(av[3]):
+                return False
+            if op in (c.GROUPREF, c.GROUPREF_EXISTS):
+                return False
+            if op in (c.MAX_REPEAT, c.MIN_REPEAT, c.POSSESSIVE_REPEAT) and not one_way(av[2]):
+                return False
+            if op is c.BRANCH:
+                firsts = [first(alt) for alt in av[1]]
+                if any(not f for f in firsts) or any(
+                    firsts[i] & firsts[j] for i in range(len(firsts)) for j in range(i)
+                ):
+                    return False
+                if not all(one_way(alt) for alt in av[1]):
+                    return False
+        return True
+
+    def first(items) -> frozenset:
+        """The characters a match of `items` can start with (empty when it matches only the empty text)."""
+        out: set = set()
+        for op, av in items:
+            if op in (c.LITERAL, c.NOT_LITERAL, c.ANY, c.IN):
+                return frozenset(out | member(op, av))
+            if op is c.SUBPATTERN:
+                out |= first(av[3])
+            elif op is c.ATOMIC_GROUP:
+                out |= first(av)
+            elif op in (c.MAX_REPEAT, c.MIN_REPEAT, c.POSSESSIVE_REPEAT):
+                out |= first(av[2])
+            elif op is c.BRANCH:
+                for alt in av[1]:
+                    out |= first(alt)
+            elif op is c.GROUPREF or op is c.GROUPREF_EXISTS:
+                return everything  # conservative
+            if parser.SubPattern(tree.state, [(op, av)]).getwidth()[0] > 0:
+                return frozenset(out)
+        return frozenset(out)
+
+    def scan(items, live: list[frozenset]) -> list[frozenset]:
+        """Walk `items` left to right with the character sets of the variable repeats still able to take more (`live`):
+        raise _Backtracking at a shape above; return what is live after them."""
+        for op, av in items:
+            if op in (c.LITERAL, c.NOT_LITERAL, c.ANY, c.IN):
+                s = member(op, av)
+                live = [x for x in live if x & s]  # a character neither repeat can take ends it
+            elif op is c.AT:
+                pass
+            elif op is c.SUBPATTERN:
+                live = scan(av[3], live)
+            elif op in (c.ASSERT, c.ASSERT_NOT):
+                scan(av[1], [])
+            elif op is c.ATOMIC_GROUP:
+                scan(av, [])
+            elif op is c.BRANCH:
+                out: list[frozenset] = []
+                for alt in av[1]:
+                    out += [x for x in scan(alt, list(live)) if x not in out]
+                live = out
+            elif op is c.GROUPREF_EXISTS:
+                out = []
+                for alt in (av[1], av[2]):
+                    if alt is not None:
+                        out += [x for x in scan(alt, list(live)) if x not in out]
+                live = out
+            elif op in (c.MAX_REPEAT, c.MIN_REPEAT, c.POSSESSIVE_REPEAT):
+                lo, hi, body = av
+                if lo == hi == 1:
+                    live = scan(body, live)
+                    continue
+                if hi > 1 and body.getwidth()[1] == 0:
+                    raise _Backtracking("it repeats a part that matches only the empty text")
+                if hi > 1 and not one_way(body):
+                    raise _Backtracking(
+                        "it repeats a part that can match more than one way (as (a+)+ or (a|a)* do), which Python's "
+                        "backtracking matcher can take exponential time over"
+                    )
+                scan(body, [])
+                s = first(body)  # a character a live repeat cannot take ends it, so only the first one can be shared
+                if lo == hi or op is c.POSSESSIVE_REPEAT:
+                    if lo > 0:
+                        live = [x for x in live if x & s]
+                    continue
+                if any(x & s for x in live):
+                    raise _Backtracking(
+                        "it has two repeats in a row that can take the same characters (as a*a* or \\d+\\s*\\d+ do), "
+                        "which Python's backtracking matcher can take time over that grows with a power of the text's "
+                        "length"
+                    )
+                live = ([] if lo > 0 else live) + [chars(body)]  # none live overlaps s: a mandatory one ends them
+            elif op is c.GROUPREF:
+                if live:
+                    raise _Backtracking(
+                        "it has a back reference after a repeat that can take the same characters, which Python's "
+                        "backtracking matcher can take time over that grows with a power of the text's length"
+                    )
+                live = [everything]
+            else:
+                raise _Backtracking(f"it uses {op}, which the backtracking check does not know")
+        return live
+
+    try:
+        scan(tree, [])
+    except _Backtracking as e:
+        return str(e)
+    except RecursionError:
+        return "it nests too deeply to be checked for backtracking"
+    return None
+
+
 def _stop_rules(body: dict) -> StopRules:
     """The request's StopRules, checked: 400 for a pattern that does not compile, and for keep or skip_special_tokens
     that is not a boolean."""
@@ -930,7 +1181,11 @@ def _stop_rules(body: dict) -> StopRules:
             compiled.append((re.compile(x), _match_width(x)))
         except (re.error, RecursionError, OverflowError) as e:
             raise _bad(f"stop_regex {x!r} is not a valid regular expression: {e}") from None
-    keep = _flag(body, "include_stop_str_in_output") or _flag(body, "no_stop_trim")
+        why = _backtracking(x)
+        if why is not None:
+            raise _bad(f"stop_regex {x!r} is refused: {why}")
+    include, no_trim = _flag(body, "include_stop_str_in_output"), _flag(body, "no_stop_trim")  # both checked, always
+    keep = include or no_trim
     return StopRules(tuple(compiled), keep, _flag(body, "skip_special_tokens", True))
 
 
