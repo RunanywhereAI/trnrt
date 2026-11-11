@@ -179,7 +179,7 @@ client that disconnects aborts its request. The router routes it like a completi
 | Request field | Meaning |
 |---|---|
 | `text` or `input_ids` | One prompt (a string, or a list of token ids), or a batch (a list of either). Exactly one of the two. |
-| `sampling_params` | SGLang's names: `max_new_tokens` (default 128), `temperature`, `top_p`, `top_k`, `min_p`, `stop`, `stop_token_ids`, `ignore_eos`, `sampling_seed`. A batch may send one object per prompt. Defaults come from the checkpoint's `generation_config.json`, as on the OpenAI routes. |
+| `sampling_params` | SGLang's names: `max_new_tokens` (default 128), `temperature`, `top_p`, `top_k`, `min_p`, `stop`, `stop_token_ids`, `ignore_eos`, `sampling_seed`; with `--structured-outputs`, `json_schema`, `regex`, `ebnf` and `min_new_tokens`; with `--penalties`, `frequency_penalty`, `presence_penalty` and `repetition_penalty`. A batch may send one object per prompt. Defaults come from the checkpoint's `generation_config.json`, as on the OpenAI routes. |
 | `stream` | Server-sent events, then `data: [DONE]`. Each event carries the output so far (SGLang's default): `text`, `output_ids` and `meta_info`. A batch's events also carry their prompt's `index`. |
 | `return_logprob`, `top_logprobs_num` (0 to 20), `return_text_in_logprobs` | Output-token logprobs in `meta_info`. |
 | `logprob_start_len` | `-1` (or absent) only, when `return_logprob` is set. |
@@ -202,11 +202,16 @@ The response is one object for one prompt and a list for a batch:
 | `meta_info.output_top_logprobs` | With `top_logprobs_num` > 0: a list of `[logprob, token_id, text or null]` per output token. |
 | `meta_info.input_token_logprobs`, `input_top_logprobs` | Always `[]`: prompt logprobs are not computed. |
 
-Answered with 400, naming the field: prompt logprobs (`logprob_start_len` >= 0 with `return_logprob`), `n` > 1,
-guided decoding (`json_schema`, `regex`, `ebnf`, `structural_tag`), `min_new_tokens`, `no_stop_trim`, `logit_bias`,
-`skip_special_tokens` false, penalties, multimodal input, LoRA, hidden states, `priority`, `session_params` and the
-other GenerateReqInput fields this server does not serve. An unknown `sampling_params` key is refused too, as SGLang
-does. Each is accepted at its neutral value.
+Guided decoding (`json_schema`, `regex`, `ebnf`), `min_new_tokens` and the penalties are served as on the OpenAI
+routes, by an engine started with `--structured-outputs` or `--penalties`
+([below](#structured-outputs-penalties-and-thinking-budgets)); otherwise they are answered with 400, naming the flag.
+
+Answered with 400, naming the field: prompt logprobs (`logprob_start_len` >= 0 with `return_logprob`); in
+`sampling_params`, `n` > 1, `structural_tag`, `stop_regex`, `no_stop_trim`, `skip_special_tokens` false,
+`spaces_between_special_tokens` false, `logit_bias`, `stream_interval` or `beam_width` other than 1, and
+`custom_params`; and multimodal input, LoRA, hidden states, `priority`, `session_params` and the other
+GenerateReqInput fields this server does not serve. An unknown `sampling_params` key is refused too, as SGLang does.
+Each is accepted at its neutral value.
 
 ```bash
 curl -s localhost:8000/generate -H 'Content-Type: application/json' \
