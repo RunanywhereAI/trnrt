@@ -10,7 +10,7 @@ response, back into Anthropic content blocks:
 | `text` blocks | message content |
 | an assistant's `thinking` blocks | its `reasoning_content` (GLM's template replays it) |
 | an assistant's `tool_use` blocks | its `tool_calls` |
-| a user's `tool_result` blocks | `tool` messages, in their place among the user's text |
+| a user's `tool_result` blocks | `tool` messages, in their place among the user's text (`is_error` true is refused) |
 | `tools` (`name`, `description`, `input_schema`) | function tools |
 | `tool_choice` `auto` / `none`; `disable_parallel_tool_use` | `tool_choice` `auto` / `none`; `parallel_tool_calls` false |
 | `max_tokens` (required), `temperature`, `top_p`, `top_k`, `stop_sequences` | the same sampling fields; `stop` |
@@ -140,6 +140,10 @@ def messages(body: dict) -> list[dict]:
                     }
                 )
             elif kind == "tool_result" and role == "user":
+                # GLM's template has no slot for a failed call, so the model would read the error as a result (SGLang's
+                # adapter drops the flag that way); the client can say so in the content instead
+                if b.get("is_error") not in (None, False):
+                    raise _bad(f"{at}: tool_result is_error is not supported; send the error in its content")
                 if text:  # the user's text before the result stays before it
                     out.append({"role": "user", "content": "".join(text)})
                     text = []

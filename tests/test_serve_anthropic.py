@@ -166,6 +166,17 @@ def test_stop_sequences_and_max_tokens(client):
                 {"role": "user", "content": "y"},
             ],
         },
+        {
+            **ASK,
+            "messages": [
+                {"role": "user", "content": "x"},
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "f", "input": {}}]},
+                {
+                    "role": "user",
+                    "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "boom", "is_error": True}],
+                },
+            ],
+        },
         {**ASK, "tools": A_TOOLS, "tool_choice": {"type": "any"}},
         {**ASK, "tools": A_TOOLS, "tool_choice": {"type": "tool", "name": "get_weather"}},
         {**ASK, "tools": [{"type": "web_search_20250305", "name": "web_search"}]},
@@ -248,7 +259,12 @@ def test_the_messages_become_the_chat_messages():
                 "role": "user",
                 "content": [
                     {"type": "text", "text": "before"},
-                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": [{"type": "text", "text": "r"}]},
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_1",
+                        "content": [{"type": "text", "text": "r"}],
+                        "is_error": False,
+                    },
                     {"type": "text", "text": "after"},
                 ],
             },
