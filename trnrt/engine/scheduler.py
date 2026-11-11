@@ -125,6 +125,10 @@ class SchedulerConfig:
             v = getattr(self, name)
             if v is not None and v < 1:
                 raise ValueError(f"{name} must be at least 1")
+        if self.priority_preemption_threshold < 0:
+            # As the CLI (--priority-scheduling-preemption-threshold): below 0, a waiting request would preempt a running
+            # one of equal priority, which would preempt it back, recomputing both prefills without end.
+            raise ValueError("priority_preemption_threshold must be at least 0")
 
 
 @dataclass(frozen=True)
@@ -324,17 +328,27 @@ class Scheduler:
 
     def rank(self, req: Request) -> float:
         """req's priority as a sort key, smaller first: higher priority values first (SGLang's default), lower ones with
-        low_priority_first; a request without one comes last (SGLang gives it the worst value, sys.maxsize)."""
+        low_priority_first; a request without one comes last (SGLang gives it the worst value, sys.maxsize). Kept an
+        int: the API takes signed 64-bit priorities, which a float would round together above 2**53."""
         p = req.priority
         if p is None:
             return math.inf
-        return float(p) if self.cfg.low_priority_first else -float(p)
+        return p if self.cfg.low_priority_first else -p
+
+    def check_add(self, req: Request) -> None:
+        """Raise what add(req) would (ValueError, QueueFull), changing nothing: the engine calls it before it builds a
+        request's grammar matcher, so a refused request costs none."""
+        self._check_len(req)
+        self._queue_room(req, apply=False)
+
+    def _check_len(self, req: Request) -> None:
+        if req.num_tokens >= self.cfg.max_model_len:
+            raise ValueError(f"prompt of {req.num_tokens} tokens does not fit max_model_len={self.cfg.max_model_len}")
 
     def add(self, req: Request) -> Request | None:
         """Queue `req`. Returns the waiting request it displaced from a full queue (already finished, finish_reason
         "abort", Request.error set), or None; raises QueueFull when the queue is at its limit and nothing is displaced."""
-        if req.num_tokens >= self.cfg.max_model_len:
-            raise ValueError(f"prompt of {req.num_tokens} tokens does not fit max_model_len={self.cfg.max_model_len}")
+        self._check_len(req)
         displaced = self._queue_room(req)
         if req.session_id is not None:
             req.session_gen = self.radix.session_open(req.session_id)
@@ -346,12 +360,13 @@ class Scheduler:
         """req's priority for the priority eviction, larger kept longer: SGLang's request priority, 0 when it has none
         (radix_cache.py _insert_helper), negated with low_priority_first so that eviction keeps what scheduling favours."""
         p = req.priority or 0
-        return -float(p) if self.cfg.low_priority_first else float(p)
+        return -p if self.cfg.low_priority_first else p  # an int, exact as rank's
 
-    def _queue_room(self, req: Request) -> Request | None:
+    def _queue_room(self, req: Request, apply: bool = True) -> Request | None:
         """Make room for `req` under the queue limits, or raise QueueFull. Over max_queued_requests with priority
         scheduling, the worst waiting request (the newest among equals) is displaced if `req` ranks strictly better;
-        one that has already generated tokens (a preempted request, partly streamed) is never displaced."""
+        one that has already generated tokens (a preempted request, partly streamed) is never displaced. With apply
+        False nothing is displaced: the request that would be is returned."""
         c = self.cfg
         if c.max_queued_tokens is not None:
             queued = sum(r.num_tokens for r in self.waiting)
@@ -364,6 +379,8 @@ class Scheduler:
             if fresh:
                 worst = max(fresh, key=lambda r: (self.rank(r), r.arrival_time))
                 if self.rank(req) < self.rank(worst):
+                    if not apply:
+                        return worst
                     self.abort(worst)
                     worst.error = (503, DISPLACED)
                     return worst
@@ -531,6 +548,8 @@ class Scheduler:
             return
         if c.policy == "lpm":
             if len(self.waiting) > LPM_MAX_QUEUE:
+                # Arrival order, as documented: the queue may still be in an earlier round's cache-hit order.
+                self.waiting = deque(sorted(self.waiting, key=lambda r: r.arrival_time))
                 return
             ps = c.page_size
             hit = {

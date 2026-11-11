@@ -24,7 +24,7 @@ from tests.test_scheduler import (
 )
 from tests.test_scheduler_spec import K, emitted, speculating
 from trnrt.engine.request import Request, SamplingParams, Status
-from trnrt.engine.scheduler import DISPLACED, NeedSync, QueueFull, SchedulerConfig, Scheduling
+from trnrt.engine.scheduler import DISPLACED, LPM_MAX_QUEUE, NeedSync, QueueFull, SchedulerConfig, Scheduling
 
 
 def policy(sched, **kw):
@@ -130,6 +130,9 @@ def test_config_validation():
         SchedulerConfig(1, 1, 1, 2, policy="lpm", priority_scheduling=True)
     with pytest.raises(ValueError, match="at least 1"):
         SchedulerConfig(1, 1, 1, 2, max_queued_requests=0)
+    with pytest.raises(ValueError, match="priority_preemption_threshold must be at least 0"):
+        SchedulerConfig(1, 1, 1, 2, **Scheduling(priority_preemption_threshold=-1).scheduler_fields())
+    assert SchedulerConfig(1, 1, 1, 2, priority_preemption_threshold=0).priority_preemption_threshold == 0
 
 
 def test_fcfs_spf_and_lof_admission_orders():
@@ -152,6 +155,20 @@ def test_lpm_admits_the_longest_cached_prefix_first():
     got, hot = order(policy(make(max_seqs=1, budget=64), policy="lpm"))
     assert got == ["hot", "blk", "cold"] and hot.num_cached_tokens == len(system)
     assert order(make(max_seqs=1, budget=64))[0] == ["blk", "cold", "hot"]  # the control: arrival order
+
+
+def test_lpm_past_its_queue_limit_returns_to_arrival_order():
+    """Above LPM_MAX_QUEUE waiting requests lpm stops matching prefixes and orders by arrival (SGLang's fcfs then); a
+    queue an earlier round sorted by cache hits does not stay in that order."""
+    sched = policy(make(), policy="lpm")
+    reqs = [req(f"r{i}", 4) for i in range(LPM_MAX_QUEUE + 1)]
+    for i, r in enumerate(reqs):
+        r.arrival_time = float(i)
+    shuffled = reqs[:]
+    random.Random(0).shuffle(shuffled)
+    sched.waiting = deque(shuffled)  # as a cache-hit order an earlier round left
+    sched._order_waiting()
+    assert list(sched.waiting) == reqs
 
 
 def test_priority_scheduling_orders_by_priority_both_ways_and_none_last():
@@ -195,6 +212,31 @@ def test_a_waiting_request_better_by_more_than_the_threshold_takes_a_seat(prio, 
     run(sched, [])
     for r in [*low, urgent]:
         assert r.output_ids == reference_output_no_eos(r.prompt_ids, 30), r.rid
+
+
+BIG = 2**60  # the API takes signed 64-bit priorities; floats step by 256 here, so a float key would tie these
+
+
+def test_priorities_past_2_53_order_admission_exactly():
+    hi = policy(make(max_seqs=1, budget=64), priority_scheduling=True)
+    assert admitted(hi, [req("a", 4, priority=BIG), req("b", 4, priority=BIG + 1)]) == ["b", "a"]
+    lo = policy(make(max_seqs=1, budget=64), priority_scheduling=True, low_priority_first=True)
+    assert admitted(lo, [req("a", 4, priority=-BIG), req("b", 4, priority=-BIG - 1)]) == ["b", "a"]
+    sched = policy(make(), low_priority_first=True)
+    assert sched._importance(req("a", 4, priority=-BIG - 1)) > sched._importance(req("b", 4, priority=-BIG))
+
+
+@pytest.mark.parametrize(("prio", "preempts"), [(BIG + 11, True), (BIG + 10, False)])
+def test_the_preemption_threshold_holds_exactly_past_2_53(prio, preempts):
+    sched, low = _seats_full()
+    for r in low:
+        r.priority = BIG
+    urgent = req("urgent", 5, 30, priority=prio)
+    urgent.params = low[0].params
+    sched.add(urgent)
+    plan = step(sched)
+    assert (urgent in [s.req for s in plan.prefills]) == preempts
+    assert sched.num_priority_preemptions == int(preempts)
 
 
 def test_priority_preemption_can_be_disabled_and_needs_priority_scheduling():

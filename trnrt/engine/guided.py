@@ -74,8 +74,8 @@ class HostSampling:
 
     def advance(self, seqs, finish_now) -> list[Request]:
         """After a commit: each sampling entry's new output tokens counted against its thinking budget and accepted by its
-        grammar. A grammar that terminated finishes its request ("stop", through finish_now(req, reason)); returns
-        those requests."""
+        grammar. A grammar that terminated, or ended at a dead end, finishes its request ("stop", through
+        finish_now(req, reason)); returns those requests."""
         done = []
         for s in seqs:
             r = s.req
@@ -112,12 +112,22 @@ class HostSampling:
                 break
             r.think_count += 1
             if r.think_count >= budget:
-                r.think_force = list(self.close_ids)
+                r.think_force = self._close_rest(out, i + 1)
         r.think_seen = len(out)
+
+    def _close_rest(self, out: list[int], end: int) -> list[int]:
+        """The close tag's ids still to force after out[:end]: the rest of it when out[:end] ends with a partial close
+        tag (a multi-token tag cut at the budget), else the whole tag. Forcing the whole tag then would write its
+        first ids twice."""
+        close = self.close_ids
+        for k in range(len(close) - 1, 0, -1):
+            if ends_at(out, end, close[:k]):
+                return close[k:]
+        return list(close)
 
     def _grammar(self, r: Request) -> bool:
         """Accept r's new output tokens into its matcher (arming it first at the reasoning's end). True once the grammar
-        has terminated."""
+        has terminated, or a dead end's EOS ended it (host_inputs._mask_row)."""
         m, out = r.matcher, r.output_ids
         for i in range(r.grammar_seen, len(out)):
             if not r.grammar_armed:  # the close tag arms the grammar for the token after it
@@ -129,7 +139,10 @@ class HostSampling:
             # exception is the end-of-sequence id a dead end allows (host_inputs._mask_row), which ends the request.
             if not m.accept_token(out[i]):
                 if r.grammar_dead and out[i] in self.eos_ids:
-                    break
+                    # The dead end's EOS ends the request here, as "stop": under ignore_eos the commit does not stop on
+                    # it, and the next step would meet the same dead end again, until the length limit.
+                    r.grammar_seen = len(out)
+                    return True
                 raise RuntimeError(f"{r.rid}: token {out[i]} rejected by its own grammar")
         r.grammar_seen = len(out)
         return bool(m.is_terminated())
