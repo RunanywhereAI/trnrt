@@ -112,6 +112,7 @@ def test_n_completions_with_logprobs(app):
         {"stop_regex": "("},
         {"stop_regex": ["a"] * 17},
         {"no_stop_trim": "yes"},
+        {"include_stop_str_in_output": True, "no_stop_trim": "yes"},  # checked even when the other keeps the stop
         {"skip_special_tokens": "no"},
     ],
     ids=repr,

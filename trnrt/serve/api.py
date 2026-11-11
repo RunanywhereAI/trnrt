@@ -937,7 +937,8 @@ def _stop_rules(body: dict) -> StopRules:
             compiled.append((re.compile(x), _match_width(x)))
         except (re.error, RecursionError, OverflowError) as e:
             raise _bad(f"stop_regex {x!r} is not a valid regular expression: {e}") from None
-    keep = _flag(body, "include_stop_str_in_output") or _flag(body, "no_stop_trim")
+    include, no_trim = _flag(body, "include_stop_str_in_output"), _flag(body, "no_stop_trim")  # both checked, always
+    keep = include or no_trim
     return StopRules(tuple(compiled), keep, _flag(body, "skip_special_tokens", True))
 
 
