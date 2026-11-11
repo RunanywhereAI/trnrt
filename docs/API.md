@@ -147,7 +147,8 @@ Errors use Anthropic's shape, `{"type": "error", "error": {"type": "invalid_requ
 with 400: `thinking` `{"type": "disabled"}` (the template cannot turn reasoning off), `{"type": "enabled"}` with
 `budget_tokens` on an engine started without `--structured-outputs` (with it, the budget is enforced as
 `thinking_token_budget`), `tool_choice` `any` and `tool` (a tool-call grammar for GLM's format is not built),
-image and document blocks, `redacted_thinking`, server tools, `mcp_servers`, `container` and `context_management`.
+image and document blocks, `redacted_thinking`, a `tool_result` with `is_error` true (GLM's chat template cannot mark a
+failed call; put the error in the result's content), server tools, `mcp_servers`, `container` and `context_management`.
 
 ## Tokenize and detokenize
 
