@@ -114,6 +114,8 @@ def test_n_completions_with_logprobs(app):
         {"no_stop_trim": "yes"},
         {"include_stop_str_in_output": True, "no_stop_trim": "yes"},  # checked even when the other keeps the stop
         {"skip_special_tokens": "no"},
+        {"service_tier": "flex"},
+        {"service_tier": "priority"},
     ],
     ids=repr,
 )
@@ -123,7 +125,14 @@ def test_what_cannot_be_served_is_refused_before_the_engine(app, extra):
         r = client.post(path, json={**body, **extra})
         assert r.status_code == 400, (path, r.text)
     assert eng.added == []
-    ok = {"n": 2, "best_of": 2, "seed": 2**63 - 2, "min_tokens": 0, "spaces_between_special_tokens": True}
+    ok = {
+        "n": 2,
+        "best_of": 2,
+        "seed": 2**63 - 2,
+        "min_tokens": 0,
+        "spaces_between_special_tokens": True,
+        "service_tier": "auto",
+    }
     assert client.post("/v1/completions", json={"prompt": [1], **ok}).status_code == 200
 
 

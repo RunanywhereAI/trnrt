@@ -745,6 +745,8 @@ _NEUTRAL: dict[str, tuple[object, ...]] = {
     "spaces_between_special_tokens": (None, True),
     "functions": (None, []),
     "function_call": (None, "none", "auto"),
+    # One tier of service: "flex" and "priority" would promise a latency or price class this server does not have.
+    "service_tier": (None, "auto", "default"),
 }
 
 
