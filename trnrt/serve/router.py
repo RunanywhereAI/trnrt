@@ -840,7 +840,8 @@ def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: floa
     def engine_index(raw: str | None) -> int | None:
         if raw is None:
             return None
-        if not raw.isdigit() or int(raw) >= len(router.workers):
+        # ASCII digits only ("²" is a digit to isdigit and not to int), and few: int refuses above 4300 digits
+        if not (raw.isascii() and raw.isdigit()) or len(raw) > 9 or int(raw) >= len(router.workers):
             raise HTTPException(status_code=400, detail=f"engine must be an integer in [0, {len(router.workers)})")
         return int(raw)
 

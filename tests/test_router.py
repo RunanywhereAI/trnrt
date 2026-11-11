@@ -616,6 +616,20 @@ def test_a_session_key_reads_only_the_start_of_a_long_prompt(monkeypatch):
     assert max(sizes) < 16 * K  # a cut prompt's text (up to 12 characters an item): never the 1.3 MB of the list
 
 
+@pytest.mark.parametrize("raw", ["\u00b2", "\u0663", "1" * 5000, "2", "-1", "x", ""])
+def test_an_engine_index_that_is_not_one_is_a_400(raw):
+    """?engine= takes an ASCII integer below the engine count: a superscript or Arabic-Indic digit (str.isdigit's, not
+    int's), or more digits than int reads, is a 400 like any other bad index, never a 500."""
+    from fastapi.testclient import TestClient
+
+    from trnrt.serve.router import build_router_app
+
+    with TestClient(build_router_app(Router(["http://127.0.0.1:9", "http://127.0.0.1:9"]), poll_s=0)) as c:
+        for path in ("/v1/stats", "/dashboard"):
+            r = c.get(path, params={"engine": raw}, follow_redirects=False)
+            assert r.status_code == 400 and "engine must be an integer in [0, 2)" in r.text, (path, r.text)
+
+
 def test_the_router_proxies_responses_and_messages_with_their_sessions():
     """/v1/responses and /v1/messages go through the proxy: a session_id pins them as it pins a chat."""
     import asyncio
