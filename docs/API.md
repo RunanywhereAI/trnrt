@@ -119,8 +119,11 @@ item's `response.output_item.added`, deltas and `.done` events, then `response.c
 `response.failed` on an engine error).
 
 Nothing is stored. Refused with 400: `store: true`, `previous_response_id`, `background`, `truncation: "auto"`,
-`max_tool_calls`, `top_logprobs`, `text.format` other than text, other `include` values, item references, non-text
-input parts and tools other than functions. `GET`, `DELETE` and `cancel` of a response answer 404.
+`max_tool_calls`, `top_logprobs`, `text.format` other than text, other `include` values, `reasoning` fields other than
+`effort` and `summary`, `service_tier` other than `"auto"` or `"default"`, item references, non-text input parts and
+tools other than functions. `metadata`, `user`, `safety_identifier` and `prompt_cache_key` are accepted and change
+nothing: the prefix cache matches every prompt by its tokens, with no key. `GET`, `DELETE` and `cancel` of a response
+answer 404.
 
 ## Anthropic Messages API
 
