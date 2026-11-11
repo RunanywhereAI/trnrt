@@ -39,9 +39,11 @@ and versions follow [Semantic Versioning](https://semver.org/). Rebuild the comp
 - Structured outputs through xgrammar, an optional dependency: `response_format` `json_object` and `json_schema`, vLLM's
   `guided_*` and `structured_outputs`, and SGLang's `json_schema`, `regex` and `ebnf`. Also `min_tokens` and
   `thinking_token_budget`. They need `--structured-outputs`, which adds graphs that take a token mask
-  ([docs/API.md](docs/API.md#structured-outputs-penalties-and-thinking-budgets)).
+  ([docs/API.md](docs/API.md#structured-outputs-penalties-and-thinking-budgets)). Tested on CPU; not yet run on
+  Trainium2, and the check that the default graphs are unchanged is pending.
 - Repetition, frequency and presence penalties, with `--penalties` and `--penalty-buckets`, which add graphs that take
   penalty inputs ([docs/CONFIGURATION.md](docs/CONFIGURATION.md#structured-outputs-penalties-and-thinking-budgets)).
+  Tested on CPU; not yet run on Trainium2.
 
 ### Changed
 
