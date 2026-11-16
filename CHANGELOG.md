@@ -5,6 +5,16 @@ and versions follow [Semantic Versioning](https://semver.org/). Rebuild the comp
 
 ## [Unreleased]
 
+### Fixed
+
+- The streaming tool-call parser no longer re-scans and re-renders the whole argument text on every push. A call
+  whose value grows (a `write_file` content) cost O(n²) over the stream. Host CPU only (Apple M2, CPython 3.13.5;
+  no Neuron SDK, model or precision involved): a GLM `write_file` call with tools enabled and 64 KB of content,
+  pushed in 12-character chunks (about 3–4 tokens per engine step), 5,349 pushes, took 5–6 s of parser CPU time
+  against `development` @ `ef581f5`, now 0.1 s. Streamed deltas and the non-streaming result are byte-identical to
+  that baseline at every split of the parser test corpus and in 133,000 randomized differential runs; a layout the
+  cursor scan does not recognise falls back to it.
+
 ## [0.1.0] - 2026-11-08
 
 The first public release.
