@@ -770,7 +770,11 @@ async def _unless_disconnected(http: HTTPRequest, aw):
     return task.result()
 
 
-def build_app(engine: LLMEngine, model_name: str) -> FastAPI:
+def build_app(engine: LLMEngine, model_name: str, generation_config: str = "auto") -> FastAPI:
+    """`generation_config` is --generation-config: "auto" takes the sampling defaults from the checkpoint's
+    generation_config.json, "none" keeps the server's own (vLLM's `--generation-config vllm`)."""
+    if generation_config not in ("auto", "none"):
+        raise ValueError(f"generation_config must be 'auto' or 'none', not {generation_config!r}")
     app = FastAPI(title="TrnRT")
     loop_ = EngineLoop(engine)
     tok = engine.tokenizer
@@ -779,7 +783,7 @@ def build_app(engine: LLMEngine, model_name: str) -> FastAPI:
     # stream, and two threads in one Hugging Face fast tokenizer can raise "Already borrowed".
     prompt_pool = ThreadPoolExecutor(1, thread_name_prefix="trnrt-prompt")
     prompt_tok = copy.deepcopy(tok)
-    gen_defaults = generation_defaults(getattr(engine, "model_path", None))
+    gen_defaults = generation_defaults(getattr(engine, "model_path", None)) if generation_config == "auto" else {}
     if gen_defaults:
         logger.info("trnrt: sampling defaults from the checkpoint's generation_config.json: %s", gen_defaults)
 

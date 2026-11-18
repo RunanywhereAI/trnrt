@@ -628,3 +628,33 @@ def test_the_checkpoints_generation_config_sets_the_sampling_defaults(serve, tmp
     assert params_with({"temperature": 0.6, "top_k": 20, "min_p": 0.05}, msgs) == (0.6, 1.0, 20, 0.05)
     assert params_with({"top_p": 0, "temperature": -1, "top_k": "x"}, msgs) == (1.0, 1.0, 0, 0.0)
     assert params_with(None, msgs) == (1.0, 1.0, 0, 0.0)
+
+
+def test_generation_config_none_keeps_the_servers_sampling_defaults(tmp_path):
+    """--generation-config none: a checkpoint's generation_config.json sets no default (temperature and top_p stay
+    1.0), for an operator or benchmark that relied on them; auto, the default, takes the file's. A request's own
+    values win either way, and another setting is refused."""
+    from fastapi.testclient import TestClient
+
+    from trnrt.serve import api
+
+    (tmp_path / "generation_config.json").write_text(json.dumps({"temperature": 0.6, "top_p": 0.95, "top_k": 20}))
+    msgs = {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 2}
+
+    def params_with(body: dict, **kw):
+        eng = ScriptedEngine(PLAIN)
+        eng.model_path = str(tmp_path)
+        with TestClient(api.build_app(eng, "glm", **kw)) as c:
+            r = c.post("/v1/chat/completions", json=body)
+            assert r.status_code == 200, r.text
+        for lp in [lp for lp in api._LOOPS if lp.engine is eng]:
+            lp.stop()
+        p = eng.added[-1].params
+        return p.temperature, p.top_p, p.top_k, p.min_p
+
+    assert params_with(msgs, generation_config="none") == (1.0, 1.0, 0, 0.0)
+    assert params_with({**msgs, "top_p": 0.5}, generation_config="none") == (1.0, 0.5, 0, 0.0)
+    assert params_with(msgs, generation_config="auto") == (0.6, 0.95, 20, 0.0)
+    assert params_with(msgs) == (0.6, 0.95, 20, 0.0)  # auto is the default
+    with pytest.raises(ValueError, match="generation_config"):
+        api.build_app(ScriptedEngine(PLAIN), "glm", generation_config="vllm")

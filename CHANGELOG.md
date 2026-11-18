@@ -5,6 +5,12 @@ and versions follow [Semantic Versioning](https://semver.org/). Rebuild the comp
 
 ## [Unreleased]
 
+### Added
+
+- `--generation-config auto|none` for `serve` and `engine`: `none` serves the built-in sampling defaults (temperature
+  and top_p 1.0) even when the checkpoint has a `generation_config.json`. `auto`, the default, takes the
+  checkpoint's values as before.
+
 ## [0.1.0] - 2026-11-08
 
 The first public release.

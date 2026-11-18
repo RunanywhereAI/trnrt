@@ -277,6 +277,24 @@ def test_engine_passes_other_failures_through_and_allow_compile_turns_the_assert
     assert engine.seen_env == ["1", "1", "0"]
 
 
+def test_generation_config_reaches_each_engine_and_its_app(host, engine, monkeypatch, capsys):
+    """--generation-config is the engine's to apply: serve hands it on, the engine gives it to build_app (auto without
+    the flag), and a value other than auto or none is refused by both."""
+    import trnrt.serve.api as api
+
+    assert cli.cmd_serve(["--model", "m", "--generation-config", "none"]) == 0
+    assert [_last(e.cmd, "--generation-config") for e in host.engines] == ["none", "none"]
+    got = []
+    monkeypatch.setattr(api, "build_app", lambda eng, name, **kw: got.append(kw))
+    assert cli.cmd_engine(ENGINE_ARGV) == 0
+    assert cli.cmd_engine([*ENGINE_ARGV, "--generation-config", "none"]) == 0
+    assert got == [{"generation_config": "auto"}, {"generation_config": "none"}]
+    for cmd in (cli.cmd_serve, cli.cmd_engine):
+        with pytest.raises(SystemExit):
+            cmd([*ENGINE_ARGV, "--generation-config", "vllm"])
+        assert "--generation-config" in capsys.readouterr().err
+
+
 def test_an_engine_its_host_refuses_builds_nothing(engine, monkeypatch, capsys):
     """cmd_engine asks the host checks about its own cores before anything starts: a refusal is printed and ends it
     with START_REFUSED_STATUS, no engine built and no environment set for one."""

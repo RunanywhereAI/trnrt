@@ -25,8 +25,9 @@ curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -
   (`--max-model-len` minus the prompt), as vLLM does; a completion stops at 16 tokens, the OpenAI API's default.
 - Sampling defaults come from the checkpoint's `generation_config.json`, as in vLLM: a request that sets no
   `temperature`, `top_p`, `top_k` or `min_p` gets the checkpoint's value (GLM-5.3-Flash: temperature 1.0, top_p 0.95).
-  Without one, temperature and top_p are 1.0. Sampling draws from the 64 most likely tokens at most
-  (`trnrt/engine/sampler.py`), so top_p 1.0 is top-64.
+  Without one, temperature and top_p are 1.0. `--generation-config none` turns the checkpoint's values off and
+  serves those built-in defaults (vLLM's `--generation-config vllm`); `auto` is the default. Sampling draws from the
+  64 most likely tokens at most (`trnrt/engine/sampler.py`), so top_p 1.0 is top-64.
 - A response cut off by `max_tokens` has `finish_reason` `"length"`, even when it ends in a tool call: that call may
   be incomplete.
 - A client that disconnects aborts its request, streamed or not.
