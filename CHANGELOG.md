@@ -5,6 +5,12 @@ and versions follow [Semantic Versioning](https://semver.org/). Rebuild the comp
 
 ## [Unreleased]
 
+### Changed
+
+- A request without `max_tokens` or `max_completion_tokens` generates at most the `max_new_tokens` in the checkpoint's
+  `generation_config.json`, when it sets one, as vLLM does. Such a chat request could run to the end of the context.
+  A request's own limit is unchanged.
+
 ## [0.1.0] - 2026-11-08
 
 The first public release.
