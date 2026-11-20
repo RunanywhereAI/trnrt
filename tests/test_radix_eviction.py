@@ -220,3 +220,11 @@ def test_lru_keeps_its_order_key_and_records_nothing():
     rc, (a, _b, _c) = tree()
     assert not rc.tracks_use
     assert rc._key(a) == (a.session_refs > 0, a.session_refs, a.last_access)
+    # Nor the evicted tails, which only tlru reads: an eviction below a prefix leaves it nothing to hold.
+    pool = PagePool(64)
+    rc = RadixCache(pool, PS)
+    rc.insert([3] * 4, pool.alloc(1))
+    rc.insert([3] * 4 + [4] * 8, [rc.match_prefix([3] * 4).pages[0], *pool.alloc(2)])
+    rc.evict(2)
+    parent = rc.match_prefix([3] * 4).node
+    assert (parent.tail_evicted, parent.tail_pages) == (0, ())

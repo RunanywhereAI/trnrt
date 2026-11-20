@@ -422,7 +422,7 @@ class RadixCache:
                     self._register(sid, parent)
             del parent.children[tuple(leaf.key[: self.page_size])]
             tail = leaf.tail_evicted + len(leaf.key)
-            if tail >= parent.tail_evicted:
+            if self.eviction_policy == "tlru" and tail >= parent.tail_evicted:  # only tlru reads the evicted tails
                 parent.tail_evicted, parent.tail_pages = tail, self._page_hashes(leaf.key) + leaf.tail_pages
             leaf.parent = None
             if parent is not self.root and parent.is_leaf() and parent.lock_ref == 0:
