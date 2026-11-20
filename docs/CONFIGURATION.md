@@ -68,6 +68,26 @@ arrival order. It changes no graph, so it runs on the compile cache of the confi
 docker run ... trnrt serve --model /model --port 8000 --preset batch8 --max-running 4   # the mounts and variables of DEPLOY.md, step 4
 ```
 
+## Scheduling
+
+Each engine schedules its own requests. These flags are host only: they change no graph, so they run on the compile
+cache of the configuration they are added to, and `serve` hands them to every engine. The names are SGLang's, except
+`--max-queued-tokens` and the policies SGLang does not have (`spf`, `tlru`). The defaults schedule and evict as an
+engine without these flags.
+
+| Argument | Default | |
+|---|---|---|
+| `--schedule-policy` | fcfs | the order waiting requests start in: `fcfs` arrival, `lpm` the longest cached prefix first (arrival order above 128 waiting, as SGLang), `lof` the longest `max_tokens` first, `spf` the shortest prompt first; `priority` is `fcfs` with `--enable-priority-scheduling` |
+| `--enable-priority-scheduling` | off | each request's `priority` first ([API.md](API.md#scheduling-and-priority)), higher values first; KV pressure preempts the worst priority first. Takes `fcfs`, `lof` or `spf`, not `lpm` (SGLang's rule) |
+| `--schedule-low-priority-values-first` | off | lower priority values first |
+| `--priority-scheduling-preemption-threshold` | 10 | with every seat taken, a waiting request better than a running one by more than this takes its seat |
+| `--disable-priority-preemption` | off | never preempt a running request for a waiting one |
+| `--max-queued-requests`, `--max-queued-tokens` | no limit | requests, and prompt tokens, waiting per engine at most; past either a request is answered 503 |
+| `--radix-eviction-policy` | lru | which cached prefix the prefix cache drops first: `lru` the least recently used; `lfu` the fewest hits; `slru` those with fewer than `protected_threshold` hits (2) before the rest; `priority` the lowest request priority; `tlru` (Tail-Optimized LRU, [arXiv 2510.15152](https://arxiv.org/abs/2510.15152)) first the tail a session's next turn could recompute within `threshold - next_prompt_estimate` tokens. Prefixes a session still references go last under every policy |
+| `--radix-eviction-policy-config` | none | the policy's settings as JSON: `{"protected_threshold": N}` for `slru`; `{"threshold": N, "next_prompt_estimate": M}` for `tlru`, which needs both |
+
+Behind the router, a session stays on one engine, so its requests are ordered by that engine's policy.
+
 ## Speculative decoding: the `mtp-*` presets
 
 The model's own multi-token-prediction (MTP) layer drafts 2 tokens a step and the target model verifies them in the next
@@ -114,6 +134,33 @@ other than a preset's changes the graphs and needs its own capture. The `mtp-*` 
 which changes the kernels' DMA form. A speculative engine serves temperature and top-p sampling as the plain engine does (verification
 is the rejection sampler's, so the output distribution is unchanged), and refuses the requests the plain engine refuses.
 
+## Structured outputs, penalties and thinking budgets
+
+These need graphs that take inputs from the host, so an engine serves them only when started with the flag. Each flag adds
+graphs to warmup and to the capture: capture with the flags you serve with. With both off, the graphs are meant to be
+the ones an engine without the flags compiles; the graph-equivalence check of that, and a Trainium2 run of the variants,
+are pending (they are tested on CPU). They are refused with speculation at every batch size (`mtp-always`): its verify graph
+takes no mask or penalties. Under the other `mtp-*` presets the engine steps every request plain while one that uses
+them runs.
+
+| Argument | Default | |
+|---|---|---|
+| `--structured-outputs` | off | guided decoding (needs the `xgrammar` package: `pip install 'trnrt[grammar]'`), `thinking_token_budget` and `min_tokens`: decode and prefill graphs that take a token mask |
+| `--penalties` | off | repetition, frequency and presence penalties: decode and prefill graphs that take penalty inputs |
+| `--penalty-buckets` | 1024,16384 | with `--penalties`: the distinct-token counts per request the penalty graphs are compiled at; the vocabulary size is always added as the last |
+
+Graphs each flag adds (decode graphs at the plain decode buckets times the page buckets; prefill graphs are the sampling
+step only, one per prefill bucket):
+
+| Configuration | `--structured-outputs` | `--penalties` (3 rungs) | both |
+|---|---|---|---|
+| default (batch 12) | 18 decode, 4 prefill | 54 decode, 12 prefill | 72 decode, 16 prefill |
+| `--preset batch8` | 15 decode, 4 prefill | 45 decode, 12 prefill | 60 decode, 16 prefill |
+| `mtp-batch8`, `mtp-batch12` | 9 decode, 4 prefill | 27 decode, 12 prefill | 36 decode, 16 prefill |
+| `mtp-batch24` | 6 decode, 4 prefill | 18 decode, 12 prefill | 24 decode, 16 prefill |
+
+These counts follow from the bucket ladders; the variants' device cost (compile time, HBM, step time) is not measured yet.
+
 ## Supported scope
 
 The supported configurations are the default (batch 12), `--preset batch8`, the four `mtp-*` presets, and any of them
@@ -135,5 +182,8 @@ Set them on the server's container (`docker run -e NAME=value ...`); its engines
 | `TRNRT_SKIP_DEVICE_CHECK` | unset | `1`: start without checking that the engine's Neuron devices are free |
 | `TRNRT_SKIP_HOST_MEM_CHECK` | unset | `1`: start without checking the host's free contiguous memory |
 | `TRNRT_LOG_LEVEL` | `INFO` | the level of the server's, engines' and router's log messages, on stderr (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
+| `TRNRT_PROD_DIR` | unset | a directory: each engine writes every finished request's record (token counts, times, the finish reason; never a prompt or an output) and a 10-s gauges record there, under `engine-<port>/<UTC date>/`, rotated daily and at 1 GiB and gzipped; `/v1/stats`'s `today` window reads them back after a restart. Unset, nothing is written |
+| `TRNRT_PROMPT_CACHE_MB` | unset | MiB of host memory per engine for the prompt token cache: a chat turn's prompt ids built from the session's previous turn and an encode of the new tail, instead of an encode of the whole prompt (195-239 ms for 97K-114K-token prompts, GLM-5.3-Flash's tokenizer on one host CPU core of a trn2.48xlarge). It returns exactly the ids of a full encode, or turns itself off: it checks itself at start, and audits its first 8 hits and every 64th after against a full render and encode |
+| `TRNRT_PROMPT_CACHE_AUDIT` | 64 | with the prompt token cache, audit every this many hits after the first 8 (0: only the checks at start) |
 | `TRNRT_ROUTER_LOG_SESSIONS` | unset | `1`, for debugging: the router's log names session ids: a line per new pin and per side request, and the id in its failover and return-home lines; unset, it logs no session id |
 | `NEURON_LIBTORCH_CACHE_ROOT` | `~/.cache/neuron_libtorch` | the compile cache's root ([DEPLOY.md](DEPLOY.md), step 4) |

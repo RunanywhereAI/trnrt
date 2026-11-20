@@ -50,12 +50,31 @@ The tree is text-level, like SGLang's router, so it needs no tokenizer; it is pr
 evicting least-recently-used leaves (128M characters: above 32 sessions of a 1M-token context's ~4 MB of text, so long
 sessions' prefixes are not evicted under load).
 
+The Responses API's and the Messages API's requests (/v1/responses, /v1/messages) carry a conversation as a chat's do:
+its instructions or system part leads it as its system messages, so they are routed by session and prefix the same way
+(_conversation). /v1/messages/count_tokens, like /tokenize, goes to any live worker and touches no routing state.
+
 The router's own endpoints:
 - GET /health: 200 {"status": "ok"} while every worker is up; 200 {"status": "degraded"} while some are (requests and
   sessions go to the live ones, so a load balancer in front keeps sending); 503 {"status": "down"} once none is. Each
   body names the workers down ("down": their URLs) and carries the routing counters. Up and down are the router's view
   (above): the /health polls and the requests' refused connections and 503s;
-- GET /v1/models: the answer of the first live worker that gives one (least loaded first), 503 if none does.
+- GET /v1/models: the answer of the first live worker that gives one (least loaded first), 503 if none does;
+- SGLang's native API (serve/native.py). POST /generate is a request like /v1/completions: routed by its prompt (`text`
+  or `input_ids`, a batch as one request) or its session. The rest go to every worker or to one:
+
+  | Route | Workers | Answer |
+  |---|---|---|
+  | /model_info, /get_model_info | the first live one | its answer (every worker serves the same model) |
+  | /server_info, /get_server_info | all | the first answer, with dp_size the number of workers and internal_states every worker's load |
+  | /get_load | all | every worker's entry, dp_rank its index |
+  | /health_generate | all | 200 "ok" when each generated, "degraded" when some did, 503 "down" when none did |
+  | /abort_request | all | 200 once any took it: only the worker holding the rid has it, so no rid map is kept |
+  | /flush_cache | all | 200 when every one flushed (its prefix tree here is cleared too), else 400 naming the others |
+- GET /v1/stats: every worker's /v1/stats ({"engines": [{"url", "up", "stats"}], "router": the /health counters}), or
+  with ?engine=i worker i's alone, with a "router" block naming the engines;
+- GET /dashboard: the engines' page (serve/dashboard.py), one engine at a time (?engine=i): the engines listen on
+  127.0.0.1 only, so the router is where a browser can reach it.
 
     python -m trnrt.serve.router --worker-urls http://127.0.0.1:8111,http://127.0.0.1:8112 --port 8000
 """
@@ -67,15 +86,24 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import math
 import os
 import threading
 import time
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import (
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    RedirectResponse,
+    Response,
+    StreamingResponse,
+)
 
 from .. import log
+from .dashboard import PAGE as DASHBOARD_PAGE
 
 logger = log.get("router")
 
@@ -86,7 +114,16 @@ SESSION_FIELD = "session_id"  # the request body field naming the session (serve
 # without it.
 LOG_SESSIONS_ENV = "TRNRT_ROUTER_LOG_SESSIONS"
 SESSION_KEY_CHARS = 4096
-ROUTES = ("/v1/completions", "/v1/chat/completions")
+# The generation routes: each carries a conversation (a chat's messages, a Responses request's instructions and input, a
+# Messages request's system and messages; _conversation) or a prompt (_prompt), routed by its session or its prefix.
+ROUTES = ("/v1/completions", "/v1/chat/completions", "/generate", "/v1/responses", "/v1/messages")
+# Every worker answers these the same (one model, one tokenizer), so they go to the least loaded live worker and touch
+# no prefix tree and no session: a /tokenize of an agent's context must not steer where its next turn is routed.
+STATELESS_ROUTES = ("/tokenize", "/v1/tokenize", "/detokenize", "/v1/detokenize", "/v1/messages/count_tokens")
+# An engine's 503 for a full waiting queue carries this header (serve/api.py QUEUE_FULL_HEADER): the engine is serving,
+# so the answer goes to the client as it is (SGLang's 503 "The request queue is full.") and the engine stays up. Another
+# engine is not tried: a session belongs on its own, and one without a session was routed where its prefix is cached.
+QUEUE_FULL_HEADER = "x-trnrt-queue-full"
 
 
 class _Node:
@@ -344,6 +381,11 @@ class Router:
         self.keys.pop(sid, None)
         self.tentative.discard(sid)
 
+    def clear_tree(self, w: int) -> None:
+        """Forget what was sent to worker w (its prefix cache was flushed): no request is routed there for it."""
+        with self._trees_lock:
+            self.trees[w] = PrefixTree(self.trees[w].max_chars)
+
     def note_ok(self, w: int) -> None:
         if not self.up[w]:
             logger.info("trnrt.router: worker %s (%s) is up", w, self.workers[w])
@@ -460,14 +502,74 @@ def _leading_system(msgs: list) -> int:
     return k
 
 
+def _conversation(path: str, body: dict) -> list | None:
+    """A request's conversation as a list of chat-like messages (the system part first), None for a prompt. The
+    Responses API's instructions and Anthropic's system lead as a system message, so each API's conversation grows at
+    its end like a chat's and its system part is the shared head."""
+    if path.endswith("chat/completions"):
+        return body.get("messages", [])
+    if path.endswith("/responses"):
+        ins, inp = body.get("instructions"), body.get("input")
+        head = [{"role": "system", "content": ins}] if ins else []
+        return head + (inp if isinstance(inp, list) else [{"role": "user", "content": inp}] if inp else [])
+    if path.endswith("/messages"):
+        system, msgs = body.get("system"), body.get("messages")
+        head = [{"role": "system", "content": system}] if system else []
+        return head + (msgs if isinstance(msgs, list) else [])
+    return None
+
+
 def _request_head(path: str, body: dict) -> int:
-    """The length of _request_text's prefix through a chat request's leading system messages (0 for a prompt): the part
+    """The length of _request_text's prefix through a conversation's leading system messages (0 for a prompt): the part
     every session of one client shares (its instructions, environment and file tree)."""
-    if not path.endswith("chat/completions"):
+    msgs = _conversation(path, body)
+    if not msgs or not isinstance(msgs, list):
         return 0
-    msgs = body.get("messages") or []
     k = _leading_system(msgs)
     return len(json.dumps(msgs[:k], ensure_ascii=False)) - 1 if k else 0  # "[A, B" is a prefix of "[A, B, C]"
+
+
+def _prompt(path: str, body: dict):
+    """A prompt request's prompt: /v1/completions' `prompt`, SGLang /generate's `text` or else `input_ids` (a string, a
+    list of ids, or a batch's list of either)."""
+    if path == "/generate":
+        text = body.get("text")
+        return body.get("input_ids", "") if text is None else text
+    return body.get("prompt", "")
+
+
+def _json_head(x, k: int):
+    """x cut to its first k items and string characters, counted in document order at every level: its JSON text
+    starts with the same k characters as x's, since each one kept writes at least one character before the first that
+    differs. A key reads that much of a prompt of any size (a 200K-token input_ids list, a batch of them) without
+    writing all of it on the event loop."""
+    left = k
+
+    def cut(v):
+        nonlocal left
+        if isinstance(v, str):
+            n = max(0, min(len(v), left))
+            left -= n
+            return v[:n]
+        if isinstance(v, list):
+            out = []
+            for item in v:
+                if left <= 0:
+                    break
+                left -= 1
+                out.append(cut(item))
+            return out
+        if isinstance(v, dict):
+            d = {}
+            for key, item in v.items():
+                if left <= 0:
+                    break
+                left -= 1
+                d[key] = cut(item)
+            return d
+        return v
+
+    return cut(x)
 
 
 def _session_key(path: str, body: dict) -> tuple[str, str]:
@@ -477,21 +579,25 @@ def _session_key(path: str, body: dict) -> tuple[str, str]:
     under another system prompt (a title or summary request), first_hash under another conversation start (a
     compaction). No dump of the whole request (~1 MB at 200K tokens)."""
     h = lambda b: hashlib.sha1(b.encode("utf-8", "replace"), usedforsecurity=False).hexdigest()  # noqa: E731
-    if not path.endswith("chat/completions"):
-        p = body.get("prompt", "")
-        return h(""), h((p if isinstance(p, str) else json.dumps(p))[:SESSION_KEY_CHARS])
-    msgs = body.get("messages") or []
+    msgs = _conversation(path, body)
+    if msgs is None:
+        p = _prompt(path, body)
+        p = p if isinstance(p, str) else json.dumps(_json_head(p, SESSION_KEY_CHARS))
+        return h(""), h(p[:SESSION_KEY_CHARS])
+    msgs = msgs if isinstance(msgs, list) else []
     k = _leading_system(msgs)
     first = msgs[k] if k < len(msgs) and isinstance(msgs[k], dict) else {}
     c = first.get("content")
-    c = c if isinstance(c, str) else "" if c is None else json.dumps(c, ensure_ascii=False)
+    if not isinstance(c, str):
+        c = "" if c is None else json.dumps(_json_head(c, SESSION_KEY_CHARS), ensure_ascii=False)
     return h(json.dumps(msgs[:k], ensure_ascii=False)), h(str(first.get("role", "")) + "\x00" + c[:SESSION_KEY_CHARS])
 
 
 def _request_text(path: str, body: dict) -> str:
-    if path.endswith("chat/completions"):
-        return json.dumps(body.get("messages", []), ensure_ascii=False)
-    p = body.get("prompt", "")
+    msgs = _conversation(path, body)
+    if msgs is not None:
+        return json.dumps(msgs, ensure_ascii=False)
+    p = _prompt(path, body)
     return p if isinstance(p, str) else json.dumps(p)
 
 
@@ -596,13 +702,12 @@ def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: floa
             {"status": status, "down": down, **router.health()}, status_code=503 if status == "down" else 200
         )
 
-    @app.get("/v1/models")
-    async def models():
-        """Every worker serves the same model: the first live one that answers, least loaded first. A refused
-        connection marks a worker down, as in a request."""
+    async def first_live(path: str) -> JSONResponse:
+        """What every worker answers the same (one model): the first live one that answers, least loaded first. A
+        refused connection marks a worker down, as in a request."""
         for w in sorted(router._live(), key=lambda i: (router.load[i], i)):
             try:
-                r = await client.get(router.workers[w] + "/v1/models", timeout=health_timeout_s)
+                r = await client.get(router.workers[w] + path, timeout=health_timeout_s)
             except httpx.ConnectError:
                 router.note_failure(w, hard=True)
                 continue
@@ -611,7 +716,172 @@ def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: floa
             if r.status_code == 200:
                 with contextlib.suppress(ValueError):
                     return JSONResponse(r.json())
-        raise HTTPException(status_code=503, detail="no engine answered /v1/models")
+        raise HTTPException(status_code=503, detail=f"no engine answered {path}")
+
+    @app.get("/v1/models")
+    async def models():
+        return await first_live("/v1/models")
+
+    @app.get("/model_info")
+    @app.get("/get_model_info")
+    async def model_info():
+        return await first_live("/model_info")
+
+    async def each(
+        method: str, path: str, timeout: float | None, hard_503: bool = True, **kw
+    ) -> list[httpx.Response | None]:
+        """Every worker's answer to one request, sent to all at once; None for one that did not answer. A refused
+        connection marks it down, as in a request; a 503 too (a failed engine), or with hard_503 False counts toward
+        down_after as a stalled /health does (Router.note_failure)."""
+
+        async def one(w: int) -> httpx.Response | None:
+            try:
+                r = await client.request(method, router.workers[w] + path, timeout=timeout, **kw)
+            except httpx.ConnectError:
+                router.note_failure(w, hard=True)
+                return None
+            except httpx.HTTPError:
+                return None
+            if r.status_code == 503:
+                router.note_failure(w, hard=hard_503)
+            return r
+
+        return list(await asyncio.gather(*(one(w) for w in range(len(router.workers)))))
+
+    def json_of(r: httpx.Response | None):
+        if r is None or r.status_code != 200:
+            return None
+        try:
+            return r.json()
+        except ValueError:
+            return None
+
+    @app.get("/get_load")
+    async def get_load():
+        """Every engine's SGLang load entry, dp_rank its worker index (an engine is the data-parallel rank here)."""
+        out = []
+        for w, r in enumerate(await each("GET", "/get_load", health_timeout_s)):
+            got = json_of(r)
+            if isinstance(got, list):
+                out += [dict(e, dp_rank=w) for e in got if isinstance(e, dict)]
+        if not out:
+            raise HTTPException(status_code=503, detail="no engine answered /get_load")
+        return out
+
+    @app.get("/server_info")
+    @app.get("/get_server_info")
+    async def server_info():
+        """The first engine's configuration (the engines share it), as SGLang's data-parallel /server_info: dp_size
+        the number of engines, internal_states each answering engine's load."""
+        answers = [(w, json_of(r)) for w, r in enumerate(await each("GET", "/server_info", health_timeout_s))]
+        answers = [(w, a) for w, a in answers if isinstance(a, dict)]
+        if not answers:
+            raise HTTPException(status_code=503, detail="no engine answered /server_info")
+        states = [dict(e, dp_rank=w) for w, a in answers for e in a.get("internal_states") or () if isinstance(e, dict)]
+        return {**answers[0][1], "dp_size": len(router.workers), "internal_states": states}
+
+    @app.get("/health_generate")
+    async def health_generate():
+        """Each engine's /health_generate (a token through its engine): 200 "ok" when every engine generated,
+        "degraded" when some did, 503 "down" when none did. Each body names the engines that did not ("down"). An
+        engine answers 503 when no step of its ended within HEALTH_GENERATE_TIMEOUT_S, which a long prefill can do to
+        an engine still serving: that 503 counts toward down_after, as a stalled /health does, and does not move the
+        sessions pinned there at once. A failed engine's /health answers 503 too, which the poll takes as down."""
+        from .native import HEALTH_GENERATE_TIMEOUT_S
+
+        rs = await each("GET", "/health_generate", HEALTH_GENERATE_TIMEOUT_S + 10, hard_503=False)
+        ok = [r is not None and r.status_code == 200 for r in rs]
+        for w, good in enumerate(ok):
+            if good:
+                router.note_ok(w)
+        status = "ok" if all(ok) else "degraded" if any(ok) else "down"
+        down = [u for u, good in zip(router.workers, ok) if not good]
+        return JSONResponse({"status": status, "down": down}, status_code=503 if status == "down" else 200)
+
+    @app.post("/abort_request")
+    async def abort_request(http: Request):
+        """Sent to every engine: only the one holding the rid has it (abort_all: every engine aborts all). 200 once
+        any engine took it; else the first engine's refusal (a malformed body), or 503 if none answered."""
+        body = await _json_object(http)
+        rs = await each("POST", "/abort_request", health_timeout_s, json=body)
+        if any(r is not None and r.status_code == 200 for r in rs):
+            return Response(status_code=200)
+        r = next((r for r in rs if r is not None), None)
+        if r is None:
+            raise HTTPException(status_code=503, detail="no engine answered /abort_request")
+        return Response(r.content, status_code=r.status_code, media_type=r.headers.get("content-type"))
+
+    @app.api_route("/flush_cache", methods=["GET", "POST"])
+    async def flush_cache(http: Request):
+        """Every engine's prefix cache flushed (each only while idle; `timeout` passed on). 200 when every engine
+        flushed, else 400 naming the engines that did not and why. A flushed engine's prefix tree here is cleared:
+        the tree stands for what its cache holds. An engine that has not answered `timeout` + health_timeout_s seconds
+        after it was asked is one that did not flush ("no answer"): an engine answers once it flushed or its timeout
+        passed, so only one that is stuck takes longer."""
+        query = http.url.query
+        try:
+            wait = float(http.query_params.get("timeout", "0"))
+        except ValueError:
+            wait = 0.0  # each engine answers a malformed timeout with 400 at once
+        wait = wait if math.isfinite(wait) and wait >= 0 else 0.0
+        rs = await each(http.method, "/flush_cache" + (f"?{query}" if query else ""), wait + health_timeout_s)
+        failed = []
+        for w, r in enumerate(rs):
+            if r is not None and r.status_code == 200:
+                router.clear_tree(w)
+            else:
+                why = "no answer" if r is None else r.text.strip() or f"status {r.status_code}"
+                failed.append(f"engine {w}: {why}")
+        if failed:
+            return PlainTextResponse("Cache not flushed on every engine.\n" + "\n".join(failed) + "\n", status_code=400)
+        return PlainTextResponse(rs[0].text if rs[0] is not None else "")
+
+    def engines() -> list[dict]:
+        return [{"url": u, "up": ok} for u, ok in zip(router.workers, router.up)]
+
+    async def worker_stats(w: int) -> dict:
+        """Worker w's GET /v1/stats; HTTPException 503 when it does not answer with one."""
+        try:
+            r = await client.get(router.workers[w] + "/v1/stats", timeout=health_timeout_s)
+            if r.status_code == 200:
+                body = r.json()
+                if isinstance(body, dict):
+                    return body
+        except (httpx.HTTPError, ValueError):
+            pass
+        raise HTTPException(status_code=503, detail=f"engine {w} did not answer /v1/stats")
+
+    def engine_index(raw: str | None) -> int | None:
+        if raw is None:
+            return None
+        # ASCII digits only ("²" is a digit to isdigit and not to int), and few: int refuses above 4300 digits
+        if not (raw.isascii() and raw.isdigit()) or len(raw) > 9 or int(raw) >= len(router.workers):
+            raise HTTPException(status_code=400, detail=f"engine must be an integer in [0, {len(router.workers)})")
+        return int(raw)
+
+    @app.get("/v1/stats")
+    async def stats(engine: str | None = None):
+        """Every engine's statistics (serve/stats.py), or engine i's with ?engine=i. Read only: no routing state."""
+        w = engine_index(engine)
+        if w is not None:
+            body = await worker_stats(w)
+            body["router"] = {"engine": w, "engines": engines()}
+            return JSONResponse(body)
+        out = []
+        for i, e in enumerate(engines()):
+            try:
+                out.append({**e, "stats": await worker_stats(i)})
+            except HTTPException as x:
+                out.append({**e, "stats": None, "error": x.detail})
+        return JSONResponse({"engines": out, "router": router.health()})
+
+    @app.get("/dashboard")
+    async def dashboard(engine: str | None = None):
+        """The engines' page, for one engine: without ?engine, the first live one's."""
+        if engine_index(engine) is None:
+            live = router._live()
+            return RedirectResponse(f"dashboard?engine={live[0] if live else 0}", status_code=307)
+        return HTMLResponse(DASHBOARD_PAGE)
 
     async def proxy(path: str, http: Request):
         body = await _json_object(http)
@@ -654,7 +924,16 @@ def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: floa
             except BaseException:
                 router.load[w] -= 1
                 raise
-            if (resp if body.get("stream") else r).status_code == 503:
+            got = resp if body.get("stream") else r  # a streamed 503 was read whole above
+            if got.status_code == 503 and got.headers.get(QUEUE_FULL_HEADER):
+                router.load[w] -= 1
+                return Response(
+                    got.content,
+                    status_code=503,
+                    media_type=got.headers.get("content-type"),
+                    headers={QUEUE_FULL_HEADER: "1"},
+                )
+            if got.status_code == 503:
                 router.load[w] -= 1
                 router.note_failure(w, hard=True)
                 if attempt == 1 or all(not ok for ok in router.up):
@@ -691,8 +970,34 @@ def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: floa
 
         return handler
 
+    async def stateless(path: str, http: Request):
+        """STATELESS_ROUTES: the first live worker that answers, least loaded first. A refused connection or a 503 (a
+        failed engine) marks the worker down, as in a request, and the next one is asked."""
+        body = await _json_object(http)
+        for w in sorted(router._live(), key=lambda i: (router.load[i], i)):
+            try:
+                r = await client.post(router.workers[w] + path, json=body)
+            except httpx.ConnectError:
+                router.note_failure(w, hard=True)
+                continue
+            except httpx.HTTPError:
+                continue
+            if r.status_code == 503:
+                router.note_failure(w, hard=True)
+                continue
+            return Response(r.content, status_code=r.status_code, media_type=r.headers.get("content-type"))
+        raise HTTPException(status_code=503, detail=f"no engine answered {path}")
+
+    def stateless_route(path: str):
+        async def handler(http: Request):
+            return await stateless(path, http)
+
+        return handler
+
     for path in ROUTES:
-        app.add_api_route(path, route(path), methods=["POST"])
+        app.add_api_route(path, route(path), methods=["POST", "PUT"] if path == "/generate" else ["POST"])
+    for path in STATELESS_ROUTES:
+        app.add_api_route(path, stateless_route(path), methods=["POST"])
     return app
 
 

@@ -216,13 +216,15 @@ def test_an_engine_that_dies_while_the_next_starts_ends_serve(host, monkeypatch)
 class _FakeLLMEngine:
     seen_env: ClassVar[list] = []
     cfgs: ClassVar[list] = []
+    schedulings: ClassVar[list] = []
     fail = None
 
-    def __init__(self, cfg):
+    def __init__(self, cfg, scheduling=None):
         import os
 
         type(self).seen_env.append(os.environ.get(cli.CACHE_HIT_ENV))
         type(self).cfgs.append(cfg)
+        type(self).schedulings.append(scheduling)
 
     def warmup(self):
         if type(self).fail is not None:
@@ -247,6 +249,7 @@ def engine(monkeypatch):
     import trnrt.serve.api as api
 
     _FakeLLMEngine.seen_env, _FakeLLMEngine.cfgs, _FakeLLMEngine.fail = [], [], None
+    _FakeLLMEngine.schedulings = []
     monkeypatch.setattr(eng, "LLMEngine", _FakeLLMEngine)
     monkeypatch.setattr(api, "serve", lambda *a, **k: None)
     monkeypatch.setattr(api, "build_app", lambda *a, **k: None)
