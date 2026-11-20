@@ -123,6 +123,42 @@ def test_a_partial_regrowth_keeps_the_rest_of_the_evicted_tail():
     assert parent.tail_evicted == 8 and rc._key(parent)[-2] is True  # not safe
 
 
+def test_successive_partial_regrowths_carry_the_rest_of_the_tail():
+    """Budget 8 tokens. A 16-token tail under a 4-token prefix is evicted; its first page comes back, then its second, each
+    in its own insert. The second page still has 8 evicted tokens below it (4 + 8 > 8: unsafe), so a newer, independent
+    safe 8-token prefix goes first."""
+    pool = PagePool(64)
+    rc = RadixCache(pool, PS, "tlru", {"threshold": 10, "next_prompt_estimate": 2})
+    shared, tail = [3] * 4, [4] * 4 + [5] * 4 + [6] * 4 + [7] * 4
+    rc.insert(shared, pool.alloc(1))
+    page = rc.match_prefix(shared).pages[0]
+    rc.insert(shared + tail, [page, *pool.alloc(4)])
+    rc.evict(4)
+    parent = rc.match_prefix(shared).node
+    assert parent.tail_evicted == 16
+    a = rc.insert(shared + tail[:4], [page, *pool.alloc(1)]).node
+    b = rc.insert(shared + tail[:8], [page, a.pages[0], *pool.alloc(1)]).node
+    assert (parent.tail_evicted, a.tail_evicted, b.tail_evicted) == (0, 0, 8)
+    rc.insert([2] * 8, pool.alloc(2))  # newer, 8 tokens: safe
+    rc.evict(1)
+    assert rc.match_prefix(shared + tail[:8]).num_pages == 3 and rc.match_prefix([2] * 8).num_pages == 0
+
+
+def test_a_returning_turn_longer_than_the_evicted_tail_clears_it():
+    """The next turn re-inserts the evicted tail and its new tokens in one leaf: nothing below the prefix is evicted any
+    more, and nothing is left owed on the leaf."""
+    pool = PagePool(64)
+    rc = RadixCache(pool, PS, "tlru", {"threshold": 10, "next_prompt_estimate": 2})
+    shared = [3] * 4
+    rc.insert(shared, pool.alloc(1))
+    page = rc.match_prefix(shared).pages[0]
+    rc.insert(shared + [4] * 8, [page, *pool.alloc(2)])
+    rc.evict(2)
+    parent = rc.match_prefix(shared).node
+    leaf = rc.insert(shared + [4] * 8 + [9] * 4, [page, *pool.alloc(3)]).node
+    assert (parent.tail_evicted, leaf.tail_evicted, leaf.tail_pages) == (0, 0, ())
+
+
 def test_a_sibling_insert_keeps_the_shared_prefix_unsafe():
     """Budget 8 tokens. A 4-token shared prefix whose 8-token branch was evicted must not look safe (4 + 8 > 8) once a
     short sibling branch is inserted and evicted under it: it outlives a newer safe prefix."""

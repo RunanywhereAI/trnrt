@@ -63,12 +63,12 @@ class RadixNode:
     anchor: bool = False
     # The eviction policies' bookkeeping (RadixCache.touch), read only by the policy that uses it: requests admitted on a
     # path through this node (lfu, slru; a node starts at 1, for the request that inserted it), the highest importance of
-    # those requests (priority), and the tokens already evicted below it along its deepest evicted branch and that
-    # branch's first page (tlru).
+    # those requests (priority), and the tokens already evicted below it along its deepest evicted branch and the hashes
+    # of that branch's pages in order (tlru), so a branch that grows back page by page takes its tail back as it goes.
     hit_count: int = 1
     importance: float = -math.inf
     tail_evicted: int = 0
-    tail_key: tuple[int, ...] | None = None
+    tail_pages: tuple[int, ...] = ()
 
     def is_leaf(self) -> bool:
         return not self.children
@@ -165,6 +165,12 @@ class RadixCache:
 
     def _page_key(self, ids: list[int], i: int) -> tuple[int, ...]:
         return tuple(ids[i : i + self.page_size])
+
+    def _page_hashes(self, key: list[int]) -> tuple[int, ...]:
+        """A page-aligned key's pages as hashes, one int a page: tlru's record of an evicted branch (RadixNode.tail_pages)
+        costs one int per page rather than its tokens."""
+        ps = self.page_size
+        return tuple(hash(tuple(key[i : i + ps])) for i in range(0, len(key), ps))
 
     def _key(self, n: RadixNode):
         """Eviction order, smallest first: unreferenced before session-referenced, fewer references
@@ -271,12 +277,16 @@ class RadixCache:
                 last_access=next(self._clock),
             )
             node.children[tuple(leaf.key[:ps])] = leaf
-            if node.tail_key == tuple(leaf.key[:ps]):
-                # tlru: the evicted branch grew again, so what it restored is no longer evicted. A regrowth shorter than
-                # the evicted tail leaves the rest on the new leaf, so evicting it again records the whole tail. Another
-                # branch's insert leaves the tail: that sequence's next turn must still recompute it.
-                leaf.tail_evicted = max(0, node.tail_evicted - len(leaf.key))
-                node.tail_evicted, node.tail_key = 0, None
+            tail = node.tail_pages
+            # tlru: the evicted branch grew again (the leaf's first pages are its pages), so what it restored is no
+            # longer evicted. A regrowth shorter than the evicted tail leaves the rest on the new leaf, so evicting it
+            # again records the whole tail and a later insert below it takes back the next part. Another branch's
+            # insert (one that leaves the evicted pages anywhere) leaves the tail: that sequence's next turn must still
+            # recompute it.
+            if tail and (head := self._page_hashes(leaf.key[: len(tail) * ps])) == tail[: len(head)]:
+                rest = tail[len(head) :]  # empty when the leaf covers the whole tail
+                leaf.tail_evicted, leaf.tail_pages = max(0, node.tail_evicted - len(leaf.key)), rest
+                node.tail_evicted, node.tail_pages = 0, ()
             self.evictable_pages += len(leaf.pages)
             tree_pages.extend(leaf.pages)
             node = leaf
@@ -413,7 +423,7 @@ class RadixCache:
             del parent.children[tuple(leaf.key[: self.page_size])]
             tail = leaf.tail_evicted + len(leaf.key)
             if tail >= parent.tail_evicted:
-                parent.tail_evicted, parent.tail_key = tail, tuple(leaf.key[: self.page_size])
+                parent.tail_evicted, parent.tail_pages = tail, self._page_hashes(leaf.key) + leaf.tail_pages
             leaf.parent = None
             if parent is not self.root and parent.is_leaf() and parent.lock_ref == 0:
                 heapq.heappush(heap, (self._key(parent), id(parent), parent))
