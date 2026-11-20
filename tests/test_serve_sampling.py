@@ -272,6 +272,33 @@ def test_a_stop_among_the_min_tokens_does_not_end_the_output(app, monkeypatch, s
     assert last["finish_reason"] == "stop" and last["matched_stop"] == matched
 
 
+class _Bytes:
+    """A tokenizer stand-in: token i decodes to vocab[i]."""
+
+    def __init__(self, vocab):
+        self.vocab = vocab
+
+    def decode(self, ids, skip_special_tokens=True):
+        return "".join(self.vocab[i] for i in ids)
+
+
+def test_zero_width_stop_regexes_match_and_terminate():
+    """A zero-width pattern matches where it should, with or without min_tokens, and a search past the protected text
+    ends: a search position past the end is clamped to the end, where `$` would match again forever."""
+    import re
+
+    from trnrt.serve.api import _Detok
+
+    tok = _Bytes(["abc", ""])
+    end, start = ((re.compile("$"), 0),), ((re.compile("^"), 0),)
+    d = _Detok(tok, regexes=end)  # an empty output: `$` matches at its start
+    assert d.push([], final=True) == "" and d.matched == "$"
+    d = _Detok(tok, regexes=start)
+    assert d.push([0], final=False) == "" and d.matched == "^"
+    d = _Detok(tok, regexes=end, protect=1)  # the text ends inside the protected token: no stop, and the search ends
+    assert d.push([0, 1], final=True) == "abc" and d.matched is None
+
+
 @pytest.mark.parametrize(
     "pattern",
     [
