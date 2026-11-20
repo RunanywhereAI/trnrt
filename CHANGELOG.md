@@ -20,8 +20,8 @@ and versions follow [Semantic Versioning](https://semver.org/). Rebuild the comp
   choice i `seed + i`, as in vLLM ([docs/API.md](docs/API.md#sampling-extras)).
 - SGLang's `stop_regex`, and keeping the stop text with `include_stop_str_in_output` (vLLM) or `no_stop_trim` (SGLang).
 - `skip_special_tokens: false`, and SGLang's `matched_stop` on every finished choice.
-- `stop_regex` refuses a pattern whose search can take exponential or polynomial time. Each search reaches back about
-  2048 characters before the text already searched, so a match must start there or later.
+- `stop_regex` refuses a pattern whose search can take more than about quadratic time in the text's length. Each search
+  reaches back about 2048 characters before the text already searched, so a match must start there or later.
 - SGLang's `no_logs` on `/generate`: the request's record stays out of the production log.
 - The OpenAI Responses API, `POST /v1/responses`, stateless: reasoning, message and function-call items, and the
   Responses stream events ([docs/API.md](docs/API.md#responses-api)).
