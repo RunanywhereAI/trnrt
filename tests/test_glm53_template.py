@@ -119,6 +119,13 @@ def test_values_the_template_would_ignore_are_refused(client):
         assert r.status_code == 400, (extra, r.text)
     r = client.post("/v1/chat/completions", json={**MSG, "chat_template_kwargs": {"enable_thinking": False}})
     assert "no enable_thinking" in r.json()["detail"] and "reasoning_effort" in r.json()["detail"]
+
+
+def test_a_malformed_tools_value_is_400_not_a_template_error(client):
+    """A non-array tools value made the real template raise ValueError, which the server answered 500."""
+    for tools in ("notalist", [1], [{"type": "function"}]):
+        r = client.post("/v1/chat/completions", json={**MSG, "tools": tools})
+        assert r.status_code == 400, (tools, r.status_code, r.text)
     assert client.engine.added == []
 
 

@@ -5,6 +5,12 @@ and versions follow [Semantic Versioning](https://semver.org/). Rebuild the comp
 
 ## [Unreleased]
 
+### Fixed
+
+- A malformed `tools` array, or a `parallel_tool_calls` that is not a boolean, is refused with a 400 that names the
+  field. Before, a non-array `tools` reached the chat template and raised there (a 500), and a malformed entry or
+  `"false"` was accepted silently: a different prompt, and parallel calls kept.
+
 ## [0.1.0] - 2026-11-08
 
 The first public release.

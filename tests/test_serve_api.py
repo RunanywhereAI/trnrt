@@ -206,6 +206,46 @@ def test_chat_returns_reasoning_content_and_a_tool_call(serve):
     }
 
 
+def test_malformed_tools_and_parallel_tool_calls_are_400(serve):
+    """A tools entry the template or parser cannot read, and a non-boolean parallel_tool_calls, are refused before
+    the engine. The first was a template 500 (or, where the template ignores tools, a silently different prompt);
+    the second silently kept parallel calls (AGENTS.md invariant 7)."""
+    client, eng = serve(PLAIN)
+    body = {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 8}
+    for tools in (
+        "notalist",
+        [1],
+        [{"type": "function"}],
+        [{"type": "function", "function": {}}],
+        [{"type": "function", "function": {"name": ""}}],
+        [{"type": "function", "function": {"name": "bad name"}}],
+        [{"type": "function", "function": {"name": "f", "parameters": "x"}}],
+        [{"type": "function", "function": {"name": "f", "parameters": {"properties": ["x"]}}}],
+        [{"type": "function", "function": {"name": "f", "description": 1}}],
+        [{"type": "function", "function": {"name": "f", "strict": True}}],
+        [{"type": "function", "function": {"name": "f", "strict": "true"}}],
+        [{"type": "function", "function": {"name": "f", "strict": 1}}],
+        [{"type": "function", "function": {"name": "f", "strict": {}}}],
+        [{"type": "nope", "function": {"name": "f"}}],
+    ):
+        r = client.post("/v1/chat/completions", json={**body, "tools": tools})
+        assert r.status_code == 400, (tools, r.status_code, r.text)
+        assert "tools" in r.json()["detail"], (tools, r.json())
+    for value in ("false", 0, 1, {}, None):
+        r = client.post("/v1/chat/completions", json={**body, "parallel_tool_calls": value})
+        assert r.status_code == 400, (value, r.status_code, r.text)
+        assert "parallel_tool_calls" in r.json()["detail"], (value, r.json())
+    assert eng.added == []  # none reached the engine
+    r = client.post("/v1/chat/completions", json={**body, "tools": "notalist", "tool_choice": "none"})
+    assert r.status_code == 200, r.text  # tools are discarded with tool_choice "none"
+    r = client.post("/v1/chat/completions", json={**body, "tools": TOOLS, "parallel_tool_calls": False})
+    assert r.status_code == 200, r.text
+    for neutral_strict in (False, None):
+        neutral = [{"type": "function", "function": {"name": "f", "strict": neutral_strict}}]
+        r = client.post("/v1/chat/completions", json={**body, "tools": neutral})
+        assert r.status_code == 200, (neutral_strict, r.text)  # false and null are neutral, not unsupported
+
+
 def test_streamed_chat_gives_the_same_message_and_a_usage_chunk_when_asked(serve):
     client, _ = serve(TOOL_TURN)
     body = {
