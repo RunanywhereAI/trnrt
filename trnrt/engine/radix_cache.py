@@ -272,8 +272,10 @@ class RadixCache:
             )
             node.children[tuple(leaf.key[:ps])] = leaf
             if node.tail_key == tuple(leaf.key[:ps]):
-                # tlru: the evicted branch grew again, so its tail is no longer evicted. Another branch's insert leaves
-                # it: that sequence's next turn must still recompute its tail.
+                # tlru: the evicted branch grew again, so what it restored is no longer evicted. A regrowth shorter than
+                # the evicted tail leaves the rest on the new leaf, so evicting it again records the whole tail. Another
+                # branch's insert leaves the tail: that sequence's next turn must still recompute it.
+                leaf.tail_evicted = max(0, node.tail_evicted - len(leaf.key))
                 node.tail_evicted, node.tail_key = 0, None
             self.evictable_pages += len(leaf.pages)
             tree_pages.extend(leaf.pages)

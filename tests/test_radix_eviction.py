@@ -105,6 +105,24 @@ def test_a_sequence_that_grows_again_resets_its_evicted_tail_and_a_sibling_does_
     assert parent.tail_evicted == 0
 
 
+def test_a_partial_regrowth_keeps_the_rest_of_the_evicted_tail():
+    """Budget 8 tokens. An 8-token tail under a 4-token prefix is evicted, then only its first page comes back: the other
+    4 tokens are still evicted, so evicting that page again records all 8 and the prefix stays unsafe (4 + 8 > 8)."""
+    pool = PagePool(64)
+    rc = RadixCache(pool, PS, "tlru", {"threshold": 10, "next_prompt_estimate": 2})
+    shared = [3] * 4
+    rc.insert(shared, pool.alloc(1))
+    page = rc.match_prefix(shared).pages[0]
+    rc.insert(shared + [4] * 8, [page, *pool.alloc(2)])
+    rc.evict(2)
+    parent = rc.match_prefix(shared).node
+    assert parent.tail_evicted == 8
+    leaf = rc.insert(shared + [4] * 4, [page, *pool.alloc(1)]).node
+    assert (parent.tail_evicted, leaf.tail_evicted) == (0, 4)
+    rc.evict(1)
+    assert parent.tail_evicted == 8 and rc._key(parent)[-2] is True  # not safe
+
+
 def test_a_sibling_insert_keeps_the_shared_prefix_unsafe():
     """Budget 8 tokens. A 4-token shared prefix whose 8-token branch was evicted must not look safe (4 + 8 > 8) once a
     short sibling branch is inserted and evicted under it: it outlives a newer safe prefix."""
