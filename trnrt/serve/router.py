@@ -29,7 +29,7 @@ tools:
   least-loaded live worker; the pin and key stay.
 A client that sends no tools keeps its pin through compactions. One case stays open for such a client: if its first
 request is a side request (another system block), its main turns are taken as side requests and go by load.
-Session-routed requests skip the prefix tree: no match, no insert (both walk the request text in Python, ~1 MB of it for
+Session-routed requests skip the prefix tree: no match, no insert (both walk the request text, ~1 MB of it for
 a 200K-token context). The session map forgets sessions idle past `session_ttl_s` (4 x session_idle_s), and the least
 recently used past `max_sessions` (100,000), on each poll and each new pin.
 
@@ -87,6 +87,8 @@ SESSION_FIELD = "session_id"  # the request body field naming the session (serve
 LOG_SESSIONS_ENV = "TRNRT_ROUTER_LOG_SESSIONS"
 SESSION_KEY_CHARS = 4096
 ROUTES = ("/v1/completions", "/v1/chat/completions")
+# The header httpx set for `json=body`, which it no longer sets for the pre-encoded `content=` body (#30).
+_JSON_HEADERS = {"content-type": "application/json"}
 
 
 class _Node:
@@ -97,6 +99,24 @@ class _Node:
         self.text = text
         self.last = 0.0
         self.parent = parent
+
+
+def _common_prefix(a: str, s: str, i: int) -> int:
+    """The length of the common prefix of `a` and `s[i:]`, comparing slices (C speed) instead of one character at a
+    time: the walk cost ~300 ms of held GIL per 1 MB of request text in PrefixTree.match and insert, and it runs in a
+    worker thread whose lock the event loop then waits on in switch-interval slices (#30). Binary search: prefix
+    equality is monotone, so ~log2(n) slice comparisons find the exact same length as the character loop."""
+    n = min(len(a), len(s) - i)
+    if a[:n] == s[i : i + n]:
+        return n
+    lo, hi = 0, n  # a[:lo] == s[i:i+lo], and a[:hi] != s[i:i+hi] while hi <= n
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if a[:mid] == s[i : i + mid]:
+            lo = mid
+        else:
+            hi = mid
+    return lo
 
 
 class PrefixTree:
@@ -114,9 +134,7 @@ class PrefixTree:
             child = node.children.get(s[i])
             if child is None:
                 break
-            n = 0
-            while n < len(child.text) and i + n < len(s) and child.text[n] == s[i + n]:
-                n += 1
+            n = _common_prefix(child.text, s, i)
             child.last = now
             i += n
             if n < len(child.text):
@@ -135,9 +153,7 @@ class PrefixTree:
                 node.children[s[i]] = leaf
                 self.size += len(leaf.text)
                 break
-            n = 0
-            while n < len(child.text) and i + n < len(s) and child.text[n] == s[i + n]:
-                n += 1
+            n = _common_prefix(child.text, s, i)
             if n < len(child.text):  # split
                 upper = _Node(child.text[:n], node)
                 upper.last = now
@@ -379,11 +395,12 @@ class Router:
     async def pick_off_loop(
         self, text: str, session: str | None = None, head: int = 0, key: tuple | None = None, tools: bool = False
     ) -> int:
-        """pick, with the prefix trees' match and insert in a worker thread: both walk the request text character by
-        character in Python, 35 ms at 0.14 MB of text and ~300 ms at 1.1 MB (~250K tokens), which on the event loop
-        stalled every stream the router relays. The decision itself stays on the event loop, with the rest of the
-        router's state. One request at a time, in arrival order (_pick_lock), from its match to its insert: the routing
-        is pick's, request for request. A session request touches no tree and is picked at once."""
+        """pick, with the prefix trees' match and insert in a worker thread: both walk the request text and hold the GIL
+        while they do (a slice-compared walk is ~0.3 ms at 1 MB since #30; the character-by-character one it replaced
+        was ~300 ms at 1.1 MB, ~250K tokens, which on the event loop stalled every stream the router relays). The
+        decision itself stays on the event loop, with the rest of the router's state. One request at a time, in arrival
+        order (_pick_lock), from its match to its insert: the routing is pick's, request for request. A session request
+        touches no tree and is picked at once."""
         if session is not None:
             return self.pick_keyed(session, key, tools)
         loop = asyncio.get_running_loop()
@@ -499,11 +516,23 @@ def _request_text_head(path: str, body: dict) -> tuple[str, int]:
     return _request_text(path, body), _request_head(path, body)
 
 
+def _payload(body: dict) -> bytes:
+    """The body as httpx sends it for `json=body` (httpx>=0.28.1's encode_json, the minimum pyproject requires),
+    serialised here so the event loop does not: another ~6 ms at 1 MB per request. The same flags as httpx's, so the
+    bytes the worker receives do not change."""
+    return json.dumps(body, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
+
+
+def _payload_and_text(path: str, body: dict) -> tuple[bytes, str, int]:
+    return _payload(body), *_request_text_head(path, body)
+
+
 async def _json_object(http: Request) -> dict:
     """The request's JSON object; 400 for anything else, as each engine answers (serve/api.py, _body). Without this, a
-    malformed body or a JSON array raised inside the proxy and the router answered 500."""
+    malformed body or a JSON array raised inside the proxy and the router answered 500. Parsed in a worker thread: a
+    1 MB body is ~6 ms of json.loads, and the loop would spend it stalled for every relayed stream."""
     try:
-        body = await http.json()
+        body = await asyncio.to_thread(json.loads, await http.body())
     except ValueError:  # json.JSONDecodeError and UnicodeDecodeError
         raise HTTPException(status_code=400, detail="the request body must be a JSON object") from None
     if not isinstance(body, dict):
@@ -618,8 +647,13 @@ def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: floa
         sid = router.session_of(body)
         key = _session_key(path, body) if sid is not None else None
         tools = bool(body.get("tools"))
-        # The request's text (json.dumps of its messages, ~6 ms at 1 MB) is computed off the event loop too.
-        text, head = await asyncio.to_thread(_request_text_head, path, body) if sid is None else ("", 0)
+        # The request's text (json.dumps of its messages, ~6 ms at 1 MB) and the bytes httpx sends (its own dump of the
+        # body, another ~6 ms) are computed off the event loop, in one thread hop for a sessionless request.
+        if sid is None:
+            payload, text, head = await asyncio.to_thread(_payload_and_text, path, body)
+        else:
+            payload = await asyncio.to_thread(_payload, body)
+            text, head = "", 0
 
         async def pick() -> int:
             return await router.pick_off_loop(text, session=sid, head=head, key=key, tools=tools)
@@ -632,7 +666,9 @@ def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: floa
             router.load[w] += 1
             try:
                 if body.get("stream"):
-                    resp = await client.send(client.build_request("POST", url, json=body), stream=True)
+                    resp = await client.send(
+                        client.build_request("POST", url, content=payload, headers=_JSON_HEADERS), stream=True
+                    )
                     if resp.status_code == 503:
                         try:
                             await resp.aread()
@@ -640,7 +676,7 @@ def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: floa
                             await resp.aclose()
                         r = resp
                 else:
-                    r = await _unless_disconnected(http, client.post(url, json=body))
+                    r = await _unless_disconnected(http, client.post(url, content=payload, headers=_JSON_HEADERS))
                     if r is None:  # the client went away: the upstream request is cancelled and its connection closed
                         router.load[w] -= 1
                         return Response(status_code=499)  # nginx's "client closed request"; nobody reads it

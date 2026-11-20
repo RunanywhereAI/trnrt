@@ -25,6 +25,57 @@ def test_prefix_tree_match_insert_and_prune():
     assert small.size <= 50
 
 
+def test_common_prefix_is_the_character_walk():
+    """`_common_prefix` (slice comparisons, #30) returns the length the character loop returned, on every shape a radix
+    tree edge can have: equal, a prefix of the other, a mismatch at any position, and an empty side."""
+    import random
+
+    from trnrt.serve.router import _common_prefix
+
+    rng = random.Random(0)
+    for _ in range(1000):
+        a = "".join(rng.choice("abc") for _ in range(rng.randrange(0, 64)))
+        s = "".join(rng.choice("abc") for _ in range(rng.randrange(0, 64)))
+        i = rng.randrange(0, len(s) + 1)
+        n = 0
+        while n < len(a) and i + n < len(s) and a[n] == s[i + n]:
+            n += 1
+        assert _common_prefix(a, s, i) == n, (a, s, i)
+
+
+def test_the_slice_walk_keeps_the_radix_tree_matching_the_character_reference():
+    """Random inserts and probes through the prefix tree and through a copy of the pre-#30 character walk: same match
+    every time, same size. The faster walk changed no routing decision."""
+    import random
+
+    class Ref:  # PrefixTree's match before #30: the per-character loop
+        def __init__(self):
+            self.words = []
+
+        def insert(self, s):
+            self.words.append(s)
+
+        def match(self, s):
+            best = 0
+            for w in self.words:
+                n = 0
+                while n < len(w) and n < len(s) and w[n] == s[n]:
+                    n += 1
+                best = max(best, n)
+            return best
+
+    rng = random.Random(1)
+    tree, ref = PrefixTree(max_chars=10**9), Ref()
+    for _ in range(60):
+        w = "".join(rng.choice("ab") for _ in range(rng.randrange(1, 20)))
+        tree.insert(w)
+        ref.insert(w)
+        assert tree.size == len({x[:k] for x in ref.words for k in range(1, len(x) + 1)})  # distinct prefixes
+        for _ in range(10):
+            probe = "".join(rng.choice("abcd") for _ in range(rng.randrange(0, 24)))
+            assert tree.match(probe) == ref.match(probe), (w, probe)
+
+
 def test_router_keeps_a_shared_prefix_on_one_worker():
     r = Router(["a", "b", "c"], cache_threshold=0.5)
     system = "SYSTEM: you are an expert SQL assistant. " * 10
@@ -168,12 +219,15 @@ async def _stop(servers, tasks, i=None):
 
 def _stub_worker(i: int, chat_status: int = 200):
     """A worker that answers /health, /v1/models and /v1/chat/completions (with chat_status: 503 is a failed engine,
-    whose serve/api.py refuses every request before it queues it), streaming or not."""
+    whose serve/api.py refuses every request before it queues it), streaming or not. Records every body it receives,
+    with its Content-Type, in state.bodies."""
+    import json
+
     from fastapi import FastAPI, HTTPException, Request
     from fastapi.responses import StreamingResponse
 
     app = FastAPI()
-    app.state.chats, app.state.status = 0, chat_status
+    app.state.chats, app.state.status, app.state.bodies = 0, chat_status, []
 
     @app.get("/health")
     async def health():
@@ -185,7 +239,9 @@ def _stub_worker(i: int, chat_status: int = 200):
 
     @app.post("/v1/chat/completions")
     async def chat(req: Request):
-        body = await req.json()
+        raw = await req.body()
+        app.state.bodies.append((raw, req.headers.get("content-type")))
+        body = json.loads(raw)
         app.state.chats += 1
         if body.get("bad"):
             raise HTTPException(status_code=400, detail="bad request")
@@ -280,6 +336,53 @@ def test_a_body_that_is_not_a_json_object_is_answered_400_and_reaches_no_worker(
                 assert router.load == [0] and worker.state.chats == 0
         finally:
             await _stop(servers, tasks)
+
+    asyncio.run(main())
+
+
+def test_the_payload_is_httpx_s_json_encoding():
+    """`_payload` takes httpx's place for `json=body` (#30): same flags as httpx 0.28's encode_json (compact separators,
+    ensure_ascii=False, allow_nan=False), so the bytes a worker receives do not change."""
+    import httpx
+
+    from trnrt.serve.router import _payload
+
+    bodies = [
+        {"model": "glm", "messages": [{"role": "user", "content": "héllo ✓"}]},
+        {"a": [1, 2.5, None, True, {"b": "x" * 1000}], "stream": False},
+        {"text": '\x00\x1f"\\\n'},
+        {"n": 1e-7},
+    ]
+    for body in bodies:
+        assert _payload(body) == httpx.Request("POST", "http://x/", json=body).read()
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_the_worker_gets_the_client_body_bytes_and_a_json_content_type(stream):
+    """The proxy serialises the body once, off the event loop, and sends those bytes with Content-Type: application/json
+    (httpx re-dumped `json=body` on the loop for every relayed stream). The bytes are httpx's own encoding of the body
+    the client sent."""
+    import asyncio
+
+    import httpx
+
+    from trnrt.serve.router import build_router_app
+
+    async def main() -> None:
+        ports = [_free_port() for _ in range(2)]
+        router, worker = Router([f"http://127.0.0.1:{ports[0]}"]), _stub_worker(0)
+        servers, tasks = await _start([(worker, ports[0]), (build_router_app(router, poll_s=0), ports[1])])
+        body = {"model": "glm", "stream": stream, "messages": [{"role": "user", "content": "héllo " * 100_000}]}
+        sent = httpx.Request("POST", "http://x/", json=body).read()
+        try:
+            async with httpx.AsyncClient(timeout=30) as c:
+                r = await c.post(f"http://127.0.0.1:{ports[1]}/v1/chat/completions", json=body)
+                assert r.status_code == 200, r.text
+        finally:
+            await _stop(servers, tasks)
+        raw, ctype = worker.state.bodies[-1]
+        assert worker.state.chats == 1 and raw == sent
+        assert ctype.split(";")[0] == "application/json", ctype
 
     asyncio.run(main())
 
