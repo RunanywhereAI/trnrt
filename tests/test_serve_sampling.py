@@ -243,6 +243,35 @@ def test_stop_regex_unbounded_and_anchored(app):
     assert r.json()["choices"][0]["text"] == "Hello there again!" * 4  # "there" never starts the text
 
 
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    ("stops", "text", "matched"),
+    [
+        ({"stop": ["Hello", "again"]}, "Hello there ", "again"),
+        ({"stop_regex": [r"Hel+o", r"ag\w+"]}, "Hello there again", r"ag\w+"),
+    ],
+    ids=["stop", "stop_regex"],
+)
+def test_a_stop_among_the_min_tokens_does_not_end_the_output(app, monkeypatch, stream, stops, text, matched):
+    """min_tokens 2: "Hello" ends in the first output token, so it stays in the text and the output runs on to the next
+    stop, as the engine checks stop strings (engine._stop_in, after vLLM). The scripted engine stands in for one started
+    with --structured-outputs, which serves min_tokens."""
+    import tests.test_serve_api as scripted
+
+    monkeypatch.setattr(scripted, "unsupported", lambda params: None)
+    client, _ = app(PLAIN * 2)
+    body = {"prompt": [1], "max_tokens": 8, "min_tokens": 2, **stops}
+    if stream:
+        events = _events(client, {**body, "stream": True})
+        got = "".join(e["choices"][0]["text"] for e in events)
+        last = events[-1]["choices"][0]
+    else:
+        last = client.post("/v1/completions", json=body).json()["choices"][0]
+        got = last["text"]
+    assert got == text
+    assert last["finish_reason"] == "stop" and last["matched_stop"] == matched
+
+
 @pytest.mark.parametrize(
     "pattern",
     [

@@ -272,7 +272,7 @@ class _Run:
 
     def __init__(self, item: _Item, sub: _Submit, tok, text_in_logprobs: bool, prompt_ids: bool, t0: float):
         self.item, self.sub, self.tok = item, sub, tok
-        self.detok = _Detok(tok, item.params.stop, incremental=True, rid=sub.rid)
+        self.detok = _Detok(tok, item.params.stop, incremental=True, rid=sub.rid, protect=item.params.min_tokens)
         self.text_in, self.prompt_ids, self.t0 = text_in_logprobs, prompt_ids, t0
         self.ids: list[int] = []
         # SGLang's logprob entries of the output so far, built once per token (a stream's events repeat them all)

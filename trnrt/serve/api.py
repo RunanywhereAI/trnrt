@@ -598,6 +598,10 @@ class _Detok:
     itself in the text, which a pattern rarely is). A match starts at most STOP_REGEX_SPAN characters before the text
     already searched. A match never takes back text already streamed. `matched`: the stop string or pattern that ended
     the output, None until one does.
+
+    `protect` is the request's min_tokens: a stop string or pattern counts only once the output has more tokens than that,
+    and only if it ends past the text of the first `protect` tokens, as the engine checks it (engine._stop_in, after
+    vLLM; SGLang's min_new_tokens holds back every stop check). One that ends among them stays in the text.
     """
 
     def __init__(
@@ -609,8 +613,11 @@ class _Detok:
         regexes: tuple[tuple[re.Pattern, int | None], ...] = (),
         keep: bool = False,
         skip_special: bool = True,
+        protect: int = 0,
     ):
         self.tok = tokenizer
+        self.protect = protect
+        self._head: int | None = None  # the length of the protected tokens' text, once the output is past them
         self.rid = rid
         self.stops = stops
         self.keep = keep
@@ -677,9 +684,16 @@ class _Detok:
     def _stop_at(self, text: str, final: bool) -> int | None:
         """Where the output ends, if a stop string or a stop regex is in `text`: the earliest to start wins (a stop
         string on a tie). Sets `matched`."""
+        if self.protect and self._head is None:
+            if len(self.ids) <= self.protect:  # every token so far is protected (min_tokens)
+                if self.regexes:
+                    self._searched = len(text if final else text.rstrip("\ufffd"))
+                return None
+            self._head = len(self.tok.decode(self.ids[: self.protect], skip_special_tokens=self.skip_special))
+        head = self._head or 0  # a match must end past this
         best: tuple[int, int, str] | None = None  # (start, end of the output, what matched)
         for x in self.stops:
-            i = text.find(x)
+            i = text.find(x, max(0, head - len(x) + 1))
             if i >= 0 and (best is None or i < best[0]):
                 best = (i, i + len(x) if self.keep else i, x)
         if self.regexes:
@@ -692,6 +706,8 @@ class _Detok:
                 span = STOP_REGEX_SPAN if width is None else min(width, STOP_REGEX_SPAN)
                 start = max(0, self._searched - span - 8)
                 m = rx.search(body, start)
+                while m is not None and m.end() <= head:  # ends among the protected tokens: look past it
+                    m = rx.search(body, m.start() + 1)
                 if m is not None and (best is None or m.start() < best[0]):
                     best = (m.start(), m.end(), rx.pattern)
             self._searched = len(body)
@@ -1518,6 +1534,7 @@ class Run:
                     regexes=self.rules.regexes,
                     keep=self.rules.keep,
                     skip_special=self.rules.skip_special,
+                    protect=sub.params.min_tokens,
                 )
             )
 
