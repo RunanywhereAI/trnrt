@@ -706,8 +706,10 @@ class _Detok:
                 span = STOP_REGEX_SPAN if width is None else min(width, STOP_REGEX_SPAN)
                 start = max(0, self._searched - span - 8)
                 m = rx.search(body, start)
-                while m is not None and m.end() <= head:  # ends among the protected tokens: look past it
-                    m = rx.search(body, m.start() + 1)
+                while self.protect and m is not None and m.end() <= head:  # ends among the protected tokens
+                    # Look past it. A search position past the end is clamped to the end, where a zero-width match
+                    # would repeat forever: nothing is left to search.
+                    m = rx.search(body, m.start() + 1) if m.start() < len(body) else None
                 if m is not None and (best is None or m.start() < best[0]):
                     best = (m.start(), m.end(), rx.pattern)
             self._searched = len(body)
