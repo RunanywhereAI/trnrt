@@ -244,7 +244,7 @@ class EngineConfig:
         dsa_satwfcga.check_layouts(w, lay)
         if self.spec_method is not None:
             raise ValueError("dsa_row_classes: speculative decoding's verify and MTP calls would skip the runner's slot "
-                             "order")
+                             "order; the latency build (--preset latency) is the speculative one")
         buckets, pages = self.resolved_decode_batch_buckets(), self.resolved_page_buckets()
         for B, ngs in sorted(lay.items()):
             P = 128 * max(ngs)

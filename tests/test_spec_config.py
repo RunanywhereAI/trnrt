@@ -17,6 +17,8 @@ import pytest
 from trnrt import __main__ as cli
 from trnrt.engine import model_runner as mr
 
+pytestmark = pytest.mark.usefixtures("decode_routes")  # set_decode_routes's writes are undone
+
 if TYPE_CHECKING:
     from trnrt.config import EngineConfig
 
@@ -189,16 +191,25 @@ def test_an_inconsistent_combination_is_refused(argv, why, monkeypatch):
 
 
 def test_the_valid_neighbours_of_the_refused_combinations_build():
+    """Speculation's neighbours on the latency build (the speculative one), with plain decode back for the rows above a
+    smaller speculation limit; a plain build's own."""
+    spec = ("--preset", "latency", "--plain-decode")
     ok = (
-        ("--spec-method", "mtp", "--spec-max-batch", "4", "--state-spec-seats", "4"),
-        ("--spec-method", "mtp", "--spec-max-batch", "4", "--spec-bucket-max", "4", "--plain-bucket-min", "4"),
-        ("--spec-method", "mtp", "--spec-synth-al", "3.0"),
-        ("--spec-method", "mtp", "--mtp-chunk-q", "64", "--mtp-kv-only"),
+        (*spec, "--spec-max-batch", "4", "--state-spec-seats", "4"),
+        (*spec, "--spec-max-batch", "4", "--spec-bucket-max", "4", "--plain-bucket-min", "4"),
+        (*spec, "--spec-synth-al", "3.0"),
+        (*spec, "--mtp-chunk-q", "64", "--mtp-kv-only"),
         ("--state-seats", "28"),
         ("--preset", "latency", "--plain-decode"),
     )
     for argv in ok:
         _cfg(*argv)
+
+
+@pytest.mark.parametrize("build", ["balanced", "throughput"])
+def test_speculation_on_a_row_class_build_is_refused_and_names_the_latency_build(build):
+    with pytest.raises(ValueError, match="--preset latency"):
+        _cfg("--preset", build, "--spec-method", "mtp")
 
 
 def test_the_sequence_parallel_gather_is_xla_or_nki():
