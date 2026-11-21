@@ -16,9 +16,9 @@ def _routes(monkeypatch):
     """Whatever set_decode_routes writes is undone after each test: every module constant (an upper-case name) of the
     modules it writes."""
     from trnrt.kernels import dense_half, dsa_satwf, shell, sp_gather
-    from trnrt.models import decoder, mla
+    from trnrt.models import decoder, linear_attn, mla
 
-    for mod in (hybrid, mla, sp_gather, dsa_satwf, dense_half, decoder, shell):
+    for mod in (hybrid, mla, sp_gather, dsa_satwf, dense_half, decoder, shell, linear_attn):
         for name, v in list(vars(mod).items()):
             if name.isupper():
                 monkeypatch.setattr(mod, name, v)
@@ -49,3 +49,13 @@ def test_the_mix_row_split_switch():
     assert shell.MIX_ROW_SPLIT is True and shell.mix_rev_term() == mix_wide.RSPLIT_REV != 0
     E.set_decode_routes(EngineConfig(model_path="m"))
     assert shell.MIX_ROW_SPLIT is False and shell.mix_rev_term() == 0
+
+
+def test_the_mid_export_switch():
+    from trnrt.models import linear_attn
+
+    assert EngineConfig(model_path="m").state_ckpt_mid_export is False
+    E.set_decode_routes(EngineConfig(model_path="m", state_ckpt_mid_export=True))
+    assert linear_attn.MID_EXPORT is True
+    E.set_decode_routes(EngineConfig(model_path="m"))
+    assert linear_attn.MID_EXPORT is False

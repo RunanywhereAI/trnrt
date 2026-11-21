@@ -126,6 +126,9 @@ def set_decode_routes(cfg: EngineConfig) -> None:
     from ..kernels import shell
 
     shell.MIX_ROW_SPLIT = bool(cfg.shell_mix_row_split)
+    from ..models import linear_attn
+
+    linear_attn.MID_EXPORT = bool(cfg.state_ckpt_mid_export)
 
 
 def local_k_counts(model) -> list[float] | None:

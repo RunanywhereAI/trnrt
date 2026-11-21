@@ -167,6 +167,10 @@ class EngineConfig:
     #   the dense half's and the KDA shell's mix_in) with its rows split over the LNC pair, each program mixing its half
     #   and reading the other's back from the kernel's output; exact.
     shell_mix_row_split: bool = False
+    # - state_ckpt_mid_export (models/linear_attn.py MID_EXPORT): a prefill chunk with an in-chunk state checkpoint takes
+    #   the checkpoint's state from the main delta-rule scan (its chunk-end states, and one 128-row call when the
+    #   checkpoint is not on a 128-row boundary) instead of a second, masked scan over the whole chunk; bitwise on trn2.
+    state_ckpt_mid_export: bool = False
 
     def __post_init__(self):
         if self.max_running is not None and self.max_running < 1:
