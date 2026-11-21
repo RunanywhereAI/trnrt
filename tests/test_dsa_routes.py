@@ -48,7 +48,8 @@ def test_defaults_are_the_modules_own(routes):
 def test_each_field_reaches_its_module_and_resets(routes, field):
     mod, name, value, want = FIELDS[field]
     default = getattr(mod, name)
-    E.set_decode_routes(_cfg(**{field: value}))
+    extra = {"sp_gather": "nki"} if field == "sp_gather_direct" else {}
+    E.set_decode_routes(_cfg(**{field: value}, **extra))
     assert getattr(mod, name) == want
     E.set_decode_routes(_cfg())  # a later engine inherits nothing
     assert getattr(mod, name) == default

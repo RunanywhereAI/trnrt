@@ -167,12 +167,17 @@ class EngineConfig:
     # - dsa_slots_pipe_rows (kernels/dsa_slots_n_p.py PIPE_ROWS): a prefill chunk's main rows' slot attention with its
     #   rows software-pipelined, this many rows a device-loop iteration (0: the split kernel's call).
     dsa_slots_pipe_rows: int = 0
+    # - sp_gather_direct (kernels/sp_gather.py DIRECT, with sp_gather "nki"): the sequence-parallel gather written straight
+    #   into the kernel's output, no copy-out.
+    sp_gather_direct: bool = False
 
     def _check_dsa_routes(self) -> None:
         """The DSA block's checks (__post_init__ runs them last)."""
         if self.dsa_slots_pipe_rows < 0 or self.dsa_slots_pipe_rows % 2:
             raise ValueError(f"dsa_slots_pipe_rows={self.dsa_slots_pipe_rows}: 0 (off) or an even row count (each "
                              f"LNC program a half)")
+        if self.sp_gather_direct and self.sp_gather != "nki":
+            raise ValueError("sp_gather_direct needs sp_gather 'nki' (the kernel's gather)")
     # -- end of the DSA block
 
     def __post_init__(self):

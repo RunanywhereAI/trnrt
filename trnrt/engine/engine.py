@@ -127,6 +127,7 @@ def set_decode_routes(cfg: EngineConfig) -> None:
     mla.CP_FAIL_TRIP = bool(cfg.dsa_cp_fail_trip)
     mla.CP_FAIL_ATTN_TRIP = bool(cfg.dsa_cp_fail_attn_trip)
     dsa_slots_n_p.PIPE_ROWS = int(cfg.dsa_slots_pipe_rows)
+    sp_gather.DIRECT = bool(cfg.sp_gather_direct)
 
 
 def local_k_counts(model) -> list[float] | None:
