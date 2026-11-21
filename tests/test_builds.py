@@ -145,6 +145,19 @@ def test_every_build_names_the_same_fields_and_each_is_engine_configs():
         assert all(getattr(c, k) == v for k, v in got.items()), name
 
 
+@pytest.mark.parametrize("build", ["balanced", "throughput"])
+def test_a_cpu_engine_runs_without_the_device_row_classes(build):
+    """The row classes are the device kernel's layout (the runner classes rows on a NeuronCore only): a CPU engine of any
+    build leaves them off, so its own shapes build; the device engine keeps them."""
+    dev = _cfg("--preset", build)
+    assert dev.dsa_row_classes and dev.dsa_rowsplit_layout
+    cpu = _cfg(
+        "--preset", build, "--device", "cpu", "--decode-buckets", "1,2", "--max-running", "2", "--state-seats", "2"
+    )
+    assert (cpu.dsa_row_classes, cpu.dsa_row_classes_cw, cpu.dsa_rowsplit_layout) == ("", False, "")
+    assert cpu.dsa_slots_pipe_rows == dev.dsa_slots_pipe_rows  # every other route is the build's
+
+
 def test_a_build_field_engine_config_lacks_is_refused(monkeypatch):
     monkeypatch.setitem(cli.BUILD_FIELDS, "latency", {**cli.BUILD_FIELDS["latency"], "kda_shel": False})
     with pytest.raises(ValueError, match="kda_shel"):

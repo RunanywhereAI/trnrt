@@ -218,8 +218,14 @@ BUILD_FIELDS: dict[str, dict] = {
 }
 
 
-def build_fields(build: str) -> dict:
-    """BUILD_FIELDS[build], every name an EngineConfig field (a misspelt one would silently keep its default)."""
+# The DSA row classes and form W are the device selection kernel's layout: the runner orders a batch into the classes'
+# slots on a NeuronCore only (model_runner.rowclass_init), so a CPU engine runs the unclassed selection whatever its shapes.
+CPU_OFF_FIELDS = {"dsa_row_classes": "", "dsa_row_classes_cw": False, "dsa_rowsplit_layout": ""}
+
+
+def build_fields(build: str, device: str = "neuron") -> dict:
+    """BUILD_FIELDS[build], every name an EngineConfig field (a misspelt one would silently keep its default); on a CPU
+    engine without the device-only row-class layouts (CPU_OFF_FIELDS)."""
     import dataclasses
 
     from .config import EngineConfig
@@ -228,7 +234,10 @@ def build_fields(build: str) -> dict:
     unknown = sorted(set(BUILD_FIELDS[build]) - known)
     if unknown:
         raise ValueError(f"build {build!r} sets fields EngineConfig does not have: {unknown}")
-    return dict(BUILD_FIELDS[build])
+    fields = dict(BUILD_FIELDS[build])
+    if device == "cpu":
+        fields.update(CPU_OFF_FIELDS)
+    return fields
 
 
 # The environment a build needs before anything imports trnrt.kernels. TRNRT_DMA_HW (the static DMA helpers of
@@ -599,7 +608,7 @@ def engine_config(argv: list[str], core_base: int = 0):
         host_cache_batch=a.host_cache_batch,
         host_cache_save_once=a.host_cache_save_once,
         pool_ascending=a.pool_ascending,
-        **build_fields(a.preset),
+        **build_fields(a.preset, a.device),
     )
 
 
