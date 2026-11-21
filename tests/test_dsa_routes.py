@@ -16,11 +16,13 @@ from trnrt.models import mla
 ROUTES = [
     (dsa_topk, "ROWSPLIT_BIG"),
     (mla, "CP_FAIL_TRIP"),
+    (mla, "CP_FAIL_ATTN_TRIP"),
 ]
 # field: (module, constant, a non-default value, the constant it sets)
 FIELDS = {
     "dsa_topk_rowsplit_big": (dsa_topk, "ROWSPLIT_BIG", True, True),
     "dsa_cp_fail_trip": (mla, "CP_FAIL_TRIP", True, True),
+    "dsa_cp_fail_attn_trip": (mla, "CP_FAIL_ATTN_TRIP", True, True),
 }
 
 

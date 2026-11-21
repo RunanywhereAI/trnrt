@@ -161,6 +161,9 @@ class EngineConfig:
     # - dsa_cp_fail_trip (models/mla.py CP_FAIL_TRIP): a prefill chunk's failed-row merge (the rows whose local top-K
     #   certificate failed) runs its selections only when some row failed (kernels/dsa_topk_t.py).
     dsa_cp_fail_trip: bool = False
+    # - dsa_cp_fail_attn_trip (models/mla.py CP_FAIL_ATTN_TRIP): its failed rows' attention runs the live (failed)
+    #   entries only, so it runs no row when none failed.
+    dsa_cp_fail_attn_trip: bool = False
 
     def __post_init__(self):
         if self.max_running is not None and self.max_running < 1:

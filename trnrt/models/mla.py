@@ -82,6 +82,13 @@ CP_LOCAL_F = 128
 # of real text so far) neither selection runs. Off: the merge with its tie search, at full size every call. The engine's
 # EngineConfig.dsa_cp_fail_trip, set on every rank before the shard is built; read when a prefill graph is traced.
 CP_FAIL_TRIP = False
+# The failed rows' attention (attention_cp_rows' _cp_attend_classes over the CP_LOCAL_F compacted entries) with both slot
+# classes counting the live entries only, so kernels/dsa_slots_n.py's run-time row loop runs no row when no row failed:
+# the 128-row masked call every DSA layer of a prefill chunk paid is gone. Exact: the live entries are compact()'s first
+# nf, so each class keeps them first and in order; each row's attention reads only its own q / rows / bias; and the
+# combine takes o_f / lse_f only at failed rows whose slot < CP_LOCAL_F, i.e. live entries (the others' are unwritten
+# on the device and never selected). EngineConfig.dsa_cp_fail_attn_trip, set as CP_FAIL_TRIP is.
+CP_FAIL_ATTN_TRIP = False
 VISIBLE_SCORE = -5e29  # kernels/dsa_topk.VISIBLE: scores at or below it are not candidates
 # A context-parallel layer's FP8 w_a (q_a + kv_a), q_b and o_proj are also kept as model-dtype copies
 # (w_a_dec, q_b_dec, o_dec: dequant of the stored FP8 and scales at load, so the same values), which
@@ -1036,7 +1043,7 @@ def attention_cp_rows(model, layer, x, positions, slot_mapping, table):
         rows_f = tb_f.gather(1, pg_f.clamp(max=tb_f.shape[1] - 1)) * ppl + (lp_f - pg_f * ppl)
         o_f, lse_f = _cp_attend_classes(q_lat[fi], layer.k_cache, rows_f, rows_tail[fi], chosen_f,
                                         tail_own[fi] & live, npool[fi], pos_b[fi], m.softmax_scale, kp,
-                                        CP_SLOTS_SMALL, n_slots)
+                                        CP_SLOTS_SMALL, n_slots, rows_live=live if CP_FAIL_ATTN_TRIP else None)
         slot = (torch.cumsum(fail.to(torch.float32), 0) - 1.0).clamp(min=0.0).to(torch.int64)  # its place in fi
         use = fail & (slot < nF)
         slot = slot.clamp(max=nF - 1)
@@ -1170,7 +1177,7 @@ def _cp_combine(model, layer, o_r, lse_r, T: int, A: int, nh: int, r: int, dv: i
 
 
 def _cp_attend_classes(q_all, kc, rows_sel, rows_tail, mine, tail_own, npool, positions, scale: float, kp: int,
-                       small: int, full: int, single: bool = False):
+                       small: int, full: int, single: bool = False, rows_live=None):
     """(o [T, H, R] fp32, lse [T, H] fp32): this rank's partial attention of every row over its selected local pools
     and its tail, as attention_cp's fixed slots give it, with each row in a buffer sized by where its selected entries
     end. The local lists come in the selection kernel's value order (score descending, pool ascending:
@@ -1180,7 +1187,8 @@ def _cp_attend_classes(q_all, kc, rows_sel, rows_tail, mine, tail_own, npool, po
     `mine` as in the fixed slots; every other row the full one (attention_cp's fixed layout, `full` >= keep + 1
     slots). Masking by `mine` keeps it exact whatever the order. Each buffer holds its rows first (compact over the
     rows) and kernels/dsa_slots_n.py runs only those: n_small c(small) + n_full c(full). No gather of the local list
-    (a per-element gather of [1024, 512] cost ~60 ms on trn1)."""
+    (a per-element gather of [1024, 512] cost ~60 ms on trn1). rows_live (CP_FAIL_ATTN_TRIP): the entries each class
+    counts, the others run no row."""
     from ..kernels import dsa_slots_n
 
     T, keep = mine.shape
@@ -1217,7 +1225,10 @@ def _cp_attend_classes(q_all, kc, rows_sel, rows_tail, mine, tail_own, npool, po
         return dsa_slots_n.attend(q_all, kc, rows, bias, scale, torch.full((1,), T, dtype=torch.int64, device=dev),
                                   lse=True)
     out_o, out_l = [], []
-    for want, (C, L) in ((fits, (small, S1)), (~fits, (full, keep))):
+    w_small, w_full = fits, ~fits
+    if rows_live is not None:  # CP_FAIL_ATTN_TRIP: only the live entries count, so a class with none runs no row
+        w_small, w_full = fits & rows_live, ~fits & rows_live
+    for want, (C, L) in ((w_small, (small, S1)), (w_full, (full, keep))):
         idx, n = _dsa_long.compact(want.to(torch.float32).view(1, T), T)  # this buffer's rows first
         idx = idx.view(T)
         rows, bias = build(C, L)
