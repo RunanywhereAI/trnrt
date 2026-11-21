@@ -772,7 +772,8 @@ def attention_cp(model, layer, x, positions, slot_mapping, table, ffn=None):
                 from ..kernels import ffn_half as FH
 
                 S_, post_a, comb_a = ffn
-                blobs, fkw = FH.decode_args(model, layer, S_.shape[1])
+                # the graph's page-table width and rows: the FFN half's ring depth follows them (ffn_half.ring_for)
+                blobs, fkw = FH.decode_args(model, layer, S_.shape[1], pages=table.shape[-1], T=S_.shape[0])
                 r_ = dsa_satwf.satwf(q_p, w2.float() * scale, layer.pool_key.view(-1, dsa_shell.PPP * Di), table,
                                      nloc, positions, q_pre, layer.k_cache, layer.w_uv_t, layer.o_t, ident, keep, A,
                                      rank, model.tp_size, m.softmax_scale, S=S_, post_a=post_a, comb_a=comb_a,
