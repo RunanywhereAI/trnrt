@@ -173,6 +173,18 @@ class EngineConfig:
     # - dsa_drop_unread_o_dec (models/mla.py ODEC_DROP): the main DSA layers keep no model-dtype o_proj copy beside the
     #   fused layer calls' pre-tiled one (no graph reads it when every decode step runs the fused call): HBM only.
     dsa_drop_unread_o_dec: bool = False
+    # - dsa_row_classes (kernels/dsa_sel2gc.py LAYOUTS): static row classes, "B:NxG+NxG..,B:.." (e.g.
+    #   "24:6x24+6x8+12x4"): a plain decode batch of B rows at the page bucket of its widest class (128 G pages) scores
+    #   each slot over its own class's first 128 G pages only. The runner orders the batch into the slots, longest rows
+    #   first, and sends a batch that does not fit to the next page bucket. "": no classes.
+    # - dsa_row_classes_cw (kernels/dsa_sel2gc.py CW): the classed selection builds each row's candidate bias from nloc
+    #   in the kernel instead of reading an XLA-built [B, P] mask.
+    # - dsa_rowsplit_layout (kernels/dsa_satwfcga.py W_LAYOUTS): form W, "B:naxqa+nbxqb[,B:..]" a row group's two runs
+    #   of slots: a classed call's selection over this rank's row group's rows only, its lists gathered over the world.
+    #   Every classed batch size needs one.
+    dsa_row_classes: str = ""
+    dsa_row_classes_cw: bool = False
+    dsa_rowsplit_layout: str = ""
 
     def _check_dsa_routes(self) -> None:
         """The DSA block's checks (__post_init__ runs them last)."""
@@ -181,6 +193,30 @@ class EngineConfig:
                              f"LNC program a half)")
         if self.sp_gather_direct and self.sp_gather != "nki":
             raise ValueError("sp_gather_direct needs sp_gather 'nki' (the kernel's gather)")
+        if not self.dsa_row_classes:
+            if self.dsa_row_classes_cw or self.dsa_rowsplit_layout:
+                raise ValueError("dsa_row_classes_cw and dsa_rowsplit_layout need dsa_row_classes")
+            return
+        from .kernels import dsa_satwfcga, dsa_sel2gc  # (at construction: no import cycle with this module)
+
+        lay = dsa_sel2gc.parse(self.dsa_row_classes)
+        dsa_sel2gc._rc_ints(lay)  # the kernel's form: at most 2 batch sizes of at most 4 runs
+        w = dsa_satwfcga.parse_w(self.dsa_rowsplit_layout)
+        if set(w) != set(lay):
+            raise ValueError(f"dsa_rowsplit_layout {self.dsa_rowsplit_layout!r} must cover every classed batch size "
+                             f"{sorted(lay)} (the classed selection is served in form W only)")
+        dsa_satwfcga.check_layouts(w, lay)
+        if self.spec_method is not None:
+            raise ValueError("dsa_row_classes: speculative decoding's verify and MTP calls would skip the runner's slot "
+                             "order")
+        buckets, pages = self.resolved_decode_batch_buckets(), self.resolved_page_buckets()
+        for B, ngs in sorted(lay.items()):
+            P = 128 * max(ngs)
+            if B not in buckets:
+                raise ValueError(f"dsa_row_classes: B {B} is not a decode bucket {buckets}")
+            if P not in pages or P == max(pages):
+                raise ValueError(f"dsa_row_classes: B {B}'s page bucket {P} must be a page bucket below the largest "
+                                 f"{pages} (the runner's fallback for a batch that does not fit)")
     # -- end of the DSA block
 
     def __post_init__(self):

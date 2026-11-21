@@ -779,7 +779,8 @@ def attention_cp(model, layer, x, positions, slot_mapping, table, ffn=None):
                                      rank, model.tp_size, m.softmax_scale, S=S_, post_a=post_a, comb_a=comb_a,
                                      blobs=blobs, w_blob=layer.w_blob, ffn=fkw, kp=kp, ns=dsa_decode.NCH * 128,
                                      nr=SEL2_NR, pf=SEL2_PF, il=1, fz=1, ob=1, pw=1, rp=0, yb=1,
-                                     **({"pq": _mk_pq(T, A)} if _mk_pq(T, A) else {}), cs=SEL2_CS)
+                                     **({"pq": _mk_pq(T, A)} if _mk_pq(T, A) else {}), cs=SEL2_CS,
+                                     rowgroup=model.attn_rank // A)  # (form W: the rank's row group)
                 # fz 1 + ob 1 + pw 1 + rp 0 + yb 1: the measured-exact form of the join, every cross-program hand-off
                 # through outputs or program 0, none through internal shared scratch
                 Sn, post, comb, rp, sp = r_[10:15]

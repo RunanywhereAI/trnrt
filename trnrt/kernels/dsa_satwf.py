@@ -283,3 +283,30 @@ def satwf(*args, **kw):  # noqa: F811
         if dsa_sel2g.takes(args[3] if len(args) > 3 else kw["table"]):
             return dsa_satwfg.satwf(*args, **kw)
     return _satwf_pre_sel2g(*args, **kw)
+
+
+# Form W, the DSA decode selection split across the context-parallel row groups (EngineConfig.dsa_row_classes and
+# dsa_rowsplit_layout; the engine sets dsa_sel2gc's and dsa_satwfcga's layouts on every rank before the shard is built):
+# a decode call the classed selection takes (dsa_sel2gc.takes: a batch size with a class layout at its layout's page
+# bucket, the runner's slot order guarded) takes dsa_satwfcga's kernel, whose P1 scores this rank's row group's rows only
+# and whose S2 gathers every group's lists over the world. models/mla.py passes every fused call its rank's row group
+# (rowgroup); this wrapper takes it off every call it does not route. Every classed batch size has a form-W layout
+# (dsa_satwfcga.set_layouts), so a classed call form W does not take (a comb that is not mhc_front's PendingComb, a world
+# of other than RG row groups) is not a served form: refused. Without row classes, satwf is the function above.
+_satwf_pre_rowsplit = satwf
+
+
+def satwf(*args, rowgroup=None, **kw):  # noqa: F811
+    from . import dsa_sel2gc
+
+    if dsa_sel2gc.LAYOUTS:  # (positional, as models/mla.py calls it: q, w, pkc, table, ..., A at 12, world at 14)
+        q, table = args[0], args[3]
+        if dsa_sel2gc.takes(q.shape[0], table):
+            from . import dsa_satwfcga
+
+            A, world = int(args[12]), int(args[14])
+            if rowgroup is None or not dsa_satwfcga.takes(q.shape[0], table, kw.get("comb_a"), world, A):
+                raise NotImplementedError(f"a classed decode call of {q.shape[0]} rows that form W does not take "
+                                          f"(row group {rowgroup}, world {world}, A {A})")
+            return dsa_satwfcga.satwf(*args, rowgroup=int(rowgroup), **kw)
+    return _satwf_pre_rowsplit(*args, **kw)
