@@ -72,7 +72,12 @@ class Names:
         return self.name_map.get(out, out)
 
     def blob(self, b):
-        return self.rxb.sub(b"", b) if self.rxb else b
+        """A kernel binary's JSON frame with the package prefixes dropped and the name map applied: a renamed kernel's
+        module JSON names its functions too (functions[].name), so the map must reach them as well as func_name."""
+        out = self.rxb.sub(b"", b) if self.rxb else b
+        for old, new in self.name_map.items():
+            out = re.sub(rb"(?<![\w.])" + re.escape(old.encode()) + rb"(?![\w.])", new.encode(), out)
+        return out
 
 
 # ---- captures ----

@@ -37,13 +37,13 @@ def _zstd(b):
     return subprocess.run(["zstd", "-q", "-c"], input=b, capture_output=True, check=True).stdout
 
 
-def write_colz(path, pkg, eps=1e-6, src="/src/a.py"):
+def write_colz(path, pkg, eps=1e-6, src="/src/a.py", kname="k1"):
     """A kernel binary shaped like the real ones: module JSON, a binary table, instruction records with debug info."""
     module = {
         "arch": "gen3",
         "functions": [
             {
-                "name": f"{pkg}.kernels.k1.{pkg}_k1_kernel",
+                "name": f"{pkg}.kernels.{kname}.{pkg}_{kname}_kernel",
                 "origin": "NKI",
                 "allocations": [{"name": "x_set", "debug": {"tensor_name": "x"}}],
             }
@@ -62,7 +62,7 @@ def write_colz(path, pkg, eps=1e-6, src="/src/a.py"):
         f.write(b"COLZ" + struct.pack("<3I", 1, 0, 0) + b"".join(_zstd(fr) for fr in frames))
 
 
-def write_hlo(path, pkg, kernel_path, dim=8, id_base=100, src="/src/model.py"):
+def write_hlo(path, pkg, kernel_path, dim=8, id_base=100, src="/src/model.py", kname="k1"):
     m = PB2.HloModuleProto(name=f"{pkg}_module.{id_base}", id=id_base, entry_computation_name="main")
     c = m.computations.add(name=f"main.{id_base}", id=id_base + 1)
 
@@ -78,7 +78,7 @@ def write_hlo(path, pkg, kernel_path, dim=8, id_base=100, src="/src/model.py"):
 
     p = ins("p0", "parameter", [dim, 4], parameter_number=0)
     cfg = {
-        "func_name": f"{pkg}.kernels.k1.{pkg}_k1_kernel",
+        "func_name": f"{pkg}.kernels.{kname}.{pkg}_{kname}_kernel",
         "platform_target": 3,
         "kernel_format": "colz",
         "klir_binary": str({"binary": kernel_path, "input_names": ["x"], "output_names": ["o"]}),
@@ -99,18 +99,26 @@ def write_hlo(path, pkg, kernel_path, dim=8, id_base=100, src="/src/model.py"):
         f.write(m.SerializeToString())
 
 
-def make_capture(root, pkg, keys, eps=1e-6, dim=8, id_base=100, src="/src"):
+def make_capture(root, pkg, keys, eps=1e-6, dim=8, id_base=100, src="/src", kname="k1"):
     """Two graphs per capture: g0 calls the kernel, g1 is plain HLO (it references no kernel binary)."""
     cache = os.path.join(root, "cache", "neuron", "compile_cache")
     kdir = os.path.join(root, "nki")
     os.makedirs(kdir, exist_ok=True)
-    kpath = os.path.join(kdir, f"{pkg}.kernels.k1.{pkg}_k1_kernel_lnc0_c{id_base:x}.colz")
-    write_colz(kpath, pkg, eps=eps, src=f"{src}/{pkg}/kernels/k1.py")
+    kpath = os.path.join(kdir, f"{pkg}.kernels.{kname}.{pkg}_{kname}_kernel_lnc0_c{id_base:x}.colz")
+    write_colz(kpath, pkg, eps=eps, src=f"{src}/{pkg}/kernels/{kname}.py", kname=kname)
     for j, key in enumerate(keys):
         d = os.path.join(cache, key)
         os.makedirs(d, exist_ok=True)
         if j == 0:
-            write_hlo(os.path.join(d, "graph.hlo"), pkg, kpath, dim=dim, id_base=id_base, src=f"{src}/{pkg}/model.py")
+            write_hlo(
+                os.path.join(d, "graph.hlo"),
+                pkg,
+                kpath,
+                dim=dim,
+                id_base=id_base,
+                src=f"{src}/{pkg}/model.py",
+                kname=kname,
+            )
         else:
             m = PB2.HloModuleProto(name=f"plain.{id_base}", id=id_base)
             c = m.computations.add(name="main", id=id_base + 1)
@@ -130,13 +138,13 @@ def make_capture(root, pkg, keys, eps=1e-6, dim=8, id_base=100, src="/src"):
         json.dump({"rank": 0, "keys": dict.fromkeys(keys, "captured")}, f)
 
 
-def run(tmp_path, new_kw):
+def run(tmp_path, new_kw, args=()):
     ref, new = str(tmp_path / "ref"), str(tmp_path / "new")
     make_capture(ref, REF, ["a" * 32, "b" * 32])
     make_capture(new, "trnrt", ["c" * 32, "d" * 32], id_base=500, src="/other/checkout", **new_kw)
     out = str(tmp_path / "eq.json")
     rc = G.main(
-        [ref, new, "--ref-package", REF, "--json", out]
+        [ref, new, "--ref-package", REF, "--json", out, *args]
         + (["--hlo-proto-path", os.environ["HLO_PB2_PATH"]] if os.environ.get("HLO_PB2_PATH") else [])
     )
     return rc, json.load(open(out))
@@ -146,6 +154,17 @@ def test_renamed_tree_is_equal(tmp_path):
     rc, rep = run(tmp_path, {})
     assert rc == 0 and rep["verdict"] == "EQUAL", rep
     assert rep["pairs"][0]["kernels"] == ["kernels.k1.k1_kernel"]
+
+
+def test_a_renamed_kernel_is_equal_under_the_name_map_and_differs_without_it(tmp_path):
+    """The new tree renamed kernels.k1.k1_kernel to kernels.k2.k2_kernel: its name is in the HLO's func_name and in the
+    kernel binary's module JSON (functions[].name); --name-map must reach both."""
+    rc, rep = run(tmp_path, {"kname": "k2"})
+    assert rc == 1 and rep["pairs"][0]["diffs"] == ["hlo", "kernels"], rep["pairs"][0]
+    nmap = tmp_path / "map.json"
+    nmap.write_text(json.dumps({"kernels.k1.k1_kernel": "kernels.k2.k2_kernel"}))
+    rc, rep = run(tmp_path / "mapped", {"kname": "k2"}, ["--name-map", str(nmap)])
+    assert rc == 0 and rep["verdict"] == "EQUAL", rep
 
 
 def test_one_kernel_constant_differs_exactly_its_graph(tmp_path):
