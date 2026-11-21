@@ -501,6 +501,15 @@ def _parent_gone() -> bool:
     return p is not None and not p.is_alive()
 
 
+def unacked_ranks():
+    """For a stuck stop (engine._bounded_stop's log): over the shared-memory channel, the ranks whose acknowledged seq
+    lags the last call rank 0 wrote; over gloo (no channel open), a note that its broadcast gives no per-rank answer."""
+    ch = _CH["ch"]
+    if ch is None or ch.acks is None:
+        return "unknown (gloo broadcast: no per-rank acknowledgement)"
+    return [r for r in range(1, ch.world) if int(ch.acks[r]) < ch.seen]
+
+
 def send(msg) -> None:
     ch = _CH["ch"]
     if ch is None and SHM and not _CH["failed"] and msg is not None and dist.get_world_size() > 1:

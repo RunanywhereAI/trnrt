@@ -42,6 +42,47 @@ def _close_open() -> None:
         eng.close()
 
 
+# How long close() waits for the workers to take rank 0's stop (seconds; 0: no bound). Over gloo the stop is a broadcast
+# bounded only by the process group's timeout (hours); over the shared-memory channel, an acknowledgement wait bounded by
+# nothing. A rank that never answers (one still inside a collective, or a graph rank 0 never joined) held the process
+# until an outer timeout killed it, 3,600 s twice in a row on trn2. Past the bound, close() logs the ranks that never
+# acknowledged and terminates the workers. A healthy stop is unchanged: the same call, joined well inside the bound.
+TP_STOP_WAIT_S = 120.0
+
+
+def _bounded_stop(send, timeout: float | None = None) -> bool:
+    """send(None), rank 0's stop, on a daemon thread joined for at most `timeout` (TP_STOP_WAIT_S) seconds. True when the
+    stop went out and every worker took it; False, after logging who did not, when it raised or did not return in time."""
+    t = TP_STOP_WAIT_S if timeout is None else timeout
+    if t <= 0:
+        send(None)
+        return True
+    import threading
+
+    err: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            send(None)
+        except BaseException as e:  # noqa: BLE001  reported below, on the closing thread
+            err.append(e)
+
+    th = threading.Thread(target=run, name="tp-stop", daemon=True)
+    th.start()
+    th.join(t)
+    if th.is_alive() or err:
+        from . import tp
+
+        why = f"raised {err[0]!r}" if err else f"no answer in {t:g} s"
+        logger.warning(
+            "engine close: the tensor-parallel stop %s; ranks not acknowledged: %s; terminating the workers",
+            why,
+            tp.unacked_ranks(),
+        )
+        return False
+    return True
+
+
 def host_tier_split(budget: float, row_bytes: int, page_bytes: int, frac: float = 0.5) -> tuple[int, int]:
     """Per-rank host cache capacities (checkpoint slots, KV pages) from a byte budget: `frac` of it for state checkpoints
     (at least one slot), the remainder for pages. frac 0.5 is the even split."""
@@ -419,8 +460,8 @@ class LLMEngine:
         if self._workers and runner is not None and runner.tp_send is not None:
             if self.dead_ranks():  # a broadcast to a dead peer raises or never returns: stop the rest instead
                 wait = 0.0
-            else:
-                runner.tp_send(None)
+            elif not _bounded_stop(runner.tp_send):
+                wait = 0.0  # a rank never took the stop: terminate them all now (_stop_workers)
             runner.tp_send = None
         self._stop_tp(wait)
         arena_close = getattr(runner, "kv_arena_close", None)
