@@ -28,13 +28,24 @@ if nki is not None:
     def _snd_write_hbm(o, lse, SND, T: int, H: int, R: int, rows):
         """_snd_write's rows copied HBM -> HBM, o / lse straight into SND with no SBUF staging: row h T + t gets
         o[0, t, h, :] in columns 0 .. R - 1 and lse[0, t, h, 0] in column R (sh 1 / pw 1: on the device, program 1's
-        SBUF-sourced rows were invisible to program 0 after a core barrier; HBM -> HBM writes are not)."""
+        SBUF-sourced rows were invisible to program 0 after a core barrier; HBM -> HBM writes are not). rows is one
+        ascending contiguous run r0 .. r1 (every caller's: range(T) under pw 1, the program's half under the split),
+        written in two DMAs with 3-D access patterns, o over (t, h, r) and lse over (t, h). Two DMAs a row instead cost
+        program 0 48 hardware-DGE DMAs at ~0.85 us each at 24 rows on trn2, 42.7 us of a DSA layer while program 1 waits
+        at the send buffer's barrier."""
         Cn = R + 16
+        r0 = -1
+        r1 = -1
         for t in rows:
-            _dma(dst=SND.ap(pattern=[[T * Cn, H], [1, R]], offset=t * Cn),
-                 src=o.ap(pattern=[[R, H], [1, R]], offset=t * H * R))
-            _dma(dst=SND.ap(pattern=[[T * Cn, H], [1, 1]], offset=t * Cn + R),
-                 src=lse.ap(pattern=[[1, H], [1, 1]], offset=t * H))
+            if r0 < 0:
+                r0 = t
+            r1 = t
+        if r0 >= 0:
+            n = r1 - r0 + 1
+            _dma(dst=SND.ap(pattern=[[Cn, n], [T * Cn, H], [1, R]], offset=r0 * Cn),
+                 src=o.ap(pattern=[[H * R, n], [R, H], [1, R]], offset=r0 * H * R))
+            _dma(dst=SND.ap(pattern=[[Cn, n], [T * Cn, H], [1, 1]], offset=r0 * Cn + R),
+                 src=lse.ap(pattern=[[H, n], [1, H], [1, 1]], offset=r0 * H))
 # -- the kernel source end
 
 
