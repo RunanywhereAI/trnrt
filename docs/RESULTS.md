@@ -224,8 +224,9 @@ mix is synthetic: real agent traffic differs in content and pacing.
 
 ## Reproducing
 
-1. Serve the configuration under test ([DEPLOY.md](DEPLOY.md); `--preset batch8` and `--max-running 4` for batch 8 and
-   4, [CONFIGURATION.md](CONFIGURATION.md)).
+1. Serve the configuration under test ([DEPLOY.md](DEPLOY.md), [CONFIGURATION.md](CONFIGURATION.md)). The tables here
+   were measured with release 0.1.0's presets (`batch8`, batch 12, the `mtp-*` presets), which later releases map to
+   the builds of CONFIGURATION.md; reproduce them on release 0.1.0.
 2. Run [AgentX](https://github.com/SemiAnalysisAI/agentx-harness) with its standard scenario and public trace set
    against the router's `/v1` endpoint. Use a 1M-token context, one hour per concurrency point, and a load client on
    a separate machine.
