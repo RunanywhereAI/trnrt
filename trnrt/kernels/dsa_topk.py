@@ -75,6 +75,11 @@ RBITS = 2
 # group's rows).
 ROWSPLIT = True
 ROWSPLIT_ROWS = 8
+# The same two-tile form for a one-tile call of at least 64 rows: a prefill chunk's [128, 4096] local selection, which
+# otherwise runs on program 0 alone (626-650 us a DSA layer on trn2, 11 layers a 4,096-row chunk), then takes ceil(R / 2)
+# rows per program at twice the pieces. Decode and verify calls (fewer than 64 rows) keep their form. The engine sets it
+# on every rank (EngineConfig.dsa_topk_rowsplit_big) before the shard is built; read when a selection is traced.
+ROWSPLIT_BIG = False
 
 
 def pieces(rows: int, n: int, group: bool = True) -> int:
@@ -477,7 +482,7 @@ def kernel_inputs(sc: torch.Tensor, keep: int, vis_only: bool = True, group: boo
         from .. import platform
 
         rowsplit = ROWSPLIT and spl and platform.nki_grid() > 1
-    if rowsplit and group and 2 <= R <= ROWSPLIT_ROWS and R * g <= 128:  # one tile: ceil(R / 2) rows per program
+    if rowsplit and group and (2 <= R <= ROWSPLIT_ROWS or (ROWSPLIT_BIG and R >= 64)) and R * g <= 128:  # one tile: ceil(R / 2) rows per program
         g, tiles = pieces(-(-R // 2), P, group), 1
     if P // g > MAX_W:
         raise NotImplementedError(f"DSA top-k kernel: {P // g} scores per partition (more than {MAX_W})")

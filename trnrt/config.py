@@ -153,6 +153,11 @@ class EngineConfig:
     # state_spec_seats hold 1 + spec_k rows each (the ones that speculate) and the rest one row (None: all of them).
     state_seats: int | None = None
     state_spec_seats: int | None = None
+    # -- the DSA layers' routes (the dsa area's block; engine.set_decode_routes copies each into the module that reads it
+    # when a graph is traced, so each is graph structure: a change needs a new capture) --
+    # - dsa_topk_rowsplit_big (kernels/dsa_topk.py ROWSPLIT_BIG): a prefill chunk's one-tile selections of at least 64
+    #   rows split over the two LNC programs, as the decode calls' are.
+    dsa_topk_rowsplit_big: bool = False
 
     def __post_init__(self):
         if self.max_running is not None and self.max_running < 1:

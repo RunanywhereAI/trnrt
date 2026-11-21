@@ -120,6 +120,10 @@ def set_decode_routes(cfg: EngineConfig) -> None:
     dense_half.SKIP_T = frozenset(cfg.dense_half_skip_rows)
     decoder.MTP_CHUNK_Q = int(cfg.mtp_chunk_q)
     decoder.DYN_MTP_KV = "1" if cfg.dyn_mtp_kv else "0"
+    # -- the DSA layers' routes (the dsa area's block: one line a field) --
+    from ..kernels import dsa_topk
+
+    dsa_topk.ROWSPLIT_BIG = bool(cfg.dsa_topk_rowsplit_big)
 
 
 def local_k_counts(model) -> list[float] | None:
