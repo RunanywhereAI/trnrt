@@ -96,6 +96,24 @@ VISIBLE_SCORE = -5e29  # kernels/dsa_topk.VISIBLE: scores at or below it are not
 # ms of a 4.1 ms DSA layer, measured on trn1). Prefill keeps the FP8 weights. +22.5 MB per DSA layer
 # per rank at tp 32, +0.23 GiB over the 11 layers.
 DECODE_BF16_NAMES = ("w_a", "q_b", "o")
+# o_dec is not kept on a layer that has the fused layer calls' o_t (DecoderForCausalLM drops it once the layers are
+# built, before any load): the fused call reads o_t, which load_layer fills from the same dequant(o, o_scale) with or
+# without o_dec, and attention_cp's XLA decode branch falls back to model._w (_wd) when the copy is absent. When every
+# decode step runs the fused call (decode buckets up to dsa_layer_max_rows) no graph reads it: 43 MB a rank of HBM. The
+# MTP layer is not passed, so it keeps its own (its graphs read it). EngineConfig.dsa_drop_unread_o_dec, set on every
+# rank before the shard is built.
+ODEC_DROP = False
+
+
+def drop_unread_o_dec(layers) -> int:
+    """Remove o_dec from each layer that also has o_t (ODEC_DROP). Returns how many."""
+    n = 0
+    for layer in layers:
+        if getattr(layer, "o_t", None) is not None and "o_dec" in layer._parameters:
+            del layer._parameters["o_dec"]
+            layer._decode_only = tuple(x for x in getattr(layer, "_decode_only", ()) if x != "o_dec")
+            n += 1
+    return n
 # The decode shell's selection (kernels/dsa_shell.py select2): its page groups gathered ahead, its
 # page tiles in flight, and its compaction with each program's rows stacked up to 4 a tile.
 SEL2_PF = 5

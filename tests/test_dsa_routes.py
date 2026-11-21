@@ -9,21 +9,21 @@ import torch
 
 from trnrt.config import EngineConfig
 from trnrt.engine import engine as E
-from trnrt.kernels import dsa_topk
+from trnrt.kernels import dsa_slots_n_p, dsa_topk, sp_gather
 from trnrt.models import mla
 
-# (module, constant) pairs set_decode_routes writes for the DSA fields, restored after each test
-ROUTES = [
-    (dsa_topk, "ROWSPLIT_BIG"),
-    (mla, "CP_FAIL_TRIP"),
-    (mla, "CP_FAIL_ATTN_TRIP"),
-]
-# field: (module, constant, a non-default value, the constant it sets)
+# field: (module, constant, a non-default value, the constant it then holds); set_decode_routes writes each
 FIELDS = {
     "dsa_topk_rowsplit_big": (dsa_topk, "ROWSPLIT_BIG", True, True),
     "dsa_cp_fail_trip": (mla, "CP_FAIL_TRIP", True, True),
     "dsa_cp_fail_attn_trip": (mla, "CP_FAIL_ATTN_TRIP", True, True),
+    "dsa_slots_pipe_rows": (dsa_slots_n_p, "PIPE_ROWS", 64, 64),
+    "sp_gather_direct": (sp_gather, "DIRECT", True, True),
+    "dsa_drop_unread_o_dec": (mla, "ODEC_DROP", True, True),
 }
+# what a field needs beside it
+NEEDS = {"sp_gather_direct": {"sp_gather": "nki"}}
+ROUTES = sorted({(m, n) for m, n, _, _ in FIELDS.values()}, key=lambda r: (r[0].__name__, r[1]))
 
 
 @pytest.fixture
@@ -48,15 +48,19 @@ def test_defaults_are_the_modules_own(routes):
 def test_each_field_reaches_its_module_and_resets(routes, field):
     mod, name, value, want = FIELDS[field]
     default = getattr(mod, name)
-    extra = {"sp_gather": "nki"} if field == "sp_gather_direct" else {}
-    E.set_decode_routes(_cfg(**{field: value}, **extra))
+    E.set_decode_routes(_cfg(**{field: value}, **NEEDS.get(field, {})))
     assert getattr(mod, name) == want
     E.set_decode_routes(_cfg())  # a later engine inherits nothing
     assert getattr(mod, name) == default
 
 
-def test_every_route_has_a_field():
-    assert sorted((m.__name__, n) for m, n, _, _ in FIELDS.values()) == sorted((m.__name__, n) for m, n in ROUTES)
+def test_set_decode_routes_writes_every_field():
+    """Every DSA field's constant is one set_decode_routes assigns (its source names it)."""
+    import inspect
+
+    src = inspect.getsource(E.set_decode_routes)
+    for field, (mod, name, _, _) in FIELDS.items():
+        assert f"{mod.__name__.rsplit('.', 1)[1]}.{name} = " in src and f"cfg.{field}" in src, field
 
 
 @pytest.mark.parametrize(

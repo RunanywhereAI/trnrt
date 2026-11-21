@@ -170,6 +170,9 @@ class EngineConfig:
     # - sp_gather_direct (kernels/sp_gather.py DIRECT, with sp_gather "nki"): the sequence-parallel gather written straight
     #   into the kernel's output, no copy-out.
     sp_gather_direct: bool = False
+    # - dsa_drop_unread_o_dec (models/mla.py ODEC_DROP): the main DSA layers keep no model-dtype o_proj copy beside the
+    #   fused layer calls' pre-tiled one (no graph reads it when every decode step runs the fused call): HBM only.
+    dsa_drop_unread_o_dec: bool = False
 
     def _check_dsa_routes(self) -> None:
         """The DSA block's checks (__post_init__ runs them last)."""
