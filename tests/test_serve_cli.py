@@ -22,6 +22,14 @@ MISS = (
 )
 
 
+@pytest.fixture(autouse=True)
+def _kernel_env_already_set(monkeypatch):
+    """Every build puts TRNRT_DMA_HW into the environment before the kernels are imported, and refuses in a process that
+    imported them without it (tests/test_preset_env.py), as this test session may have: the value is set here, as the
+    environment that starts a real engine has it. A value the caller set is kept."""
+    monkeypatch.setenv("TRNRT_DMA_HW", os.environ.get("TRNRT_DMA_HW", "0"))
+
+
 def _last(cmd: list[str], flag: str) -> str:
     """The value argparse takes for `flag` in `cmd`: the last (an engine's command repeats serve's --port, --host)."""
     return cmd[len(cmd) - cmd[::-1].index(flag)]
@@ -333,7 +341,7 @@ def test_serve_hands_each_engine_an_argv_it_parses(stand_in):
     """The argv serve builds for each engine through cmd_engine's parser and engine_config: the `--host 127.0.0.1` serve
     appends is the engine's listen address, not an abbreviation of --host-cache-gb."""
     assert cli.cmd_serve(["--model", "m", "--device", "cpu", "--port", "9000"]) == 0
-    assert [(c.host_cache_gb, c.tp_core_base) for c in stand_in.cfgs] == [(4.0, 0), (4.0, 32)]
+    assert [(c.host_cache_gb, c.tp_core_base) for c in stand_in.cfgs] == [(16.0, 0), (16.0, 32)]
     stand_in.cfgs.clear()
     assert cli.cmd_serve(["--model", "m", "--device", "cpu", "--host-cache-gb", "2", "--host", "0.0.0.0"]) == 0  # noqa: S104  an argv; the stand-in binds nothing
     assert [c.host_cache_gb for c in stand_in.cfgs] == [2.0, 2.0]  # a full name still reaches the engines
@@ -352,7 +360,7 @@ def test_with_abbreviations_allowed_the_engines_fail_to_start(stand_in, monkeypa
     with pytest.raises(SystemExit) as e:
         cli.cmd_serve(["--model", "m", "--device", "cpu"])
     assert "engine 0 exited during start-up (status 2)" in str(e.value.code), e.value.code
-    assert "--host-cache-gb: invalid float value: '127.0.0.1'" in capsys.readouterr().err
+    assert "--host could match --host-cache-gb" in capsys.readouterr().err  # serve's --host read as an engine argument
 
 
 def test_serve_refuses_an_abbreviated_argument(host):

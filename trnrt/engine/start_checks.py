@@ -14,6 +14,10 @@ a failure deep in start-up. Only on Linux with --device neuron: anywhere else th
   with a node's Normal zone at 0 free blocks while hundreds of GiB were available: clean page cache (a checkpoint just
   read, other large files) breaks the blocks up, and dropping it gives them back. The floors are margins above that
   failure, not measured thresholds. TRNRT_SKIP_HOST_MEM_CHECK=1 skips it.
+- Every rank can be pinned to its NeuronCore's NUMA node (engine/tp.py numa_pin): the device listing works, and the
+  CPUs this engine was launched on hold some CPU of every one of its devices' nodes. A rank that cannot pin runs as
+  launched, and its host work crosses the socket on every step; a launch CPU set that held CPUs of one node only once
+  left half of an engine's 32 ranks unpinned with no error. TRNRT_NUMA_PIN_OPTIONAL=1 starts anyway, with a warning.
 
 A start that passes logs one line (stderr, through trnrt's logging) naming what each check found, or why it did not
 run, so an operator can see the checks ran.
@@ -169,6 +173,37 @@ def device_check(
     ), ""
 
 
+def numa_check(
+    core_base: int, world: int, lnc: int | None = None, devices: list[dict] | None = None, launched=None
+) -> tuple[str | None, str]:
+    """(why the engine's ranks cannot all be pinned to their NUMA nodes, or None; what the check found). devices:
+    neuron-ls's records (read here when None); launched: this process's CPU set (read here when None)."""
+    from . import tp as _tp
+
+    if launched is None:
+        launched = os.sched_getaffinity(0)  # type: ignore[attr-defined, unused-ignore]  # Linux-only: mypy elsewhere has no os.sched_*affinity
+    try:
+        devs = _tp.neuron_devices() if devices is None else devices
+        n = _tp.pin_count(core_base, world, devs, launched, lnc)
+    except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as e:
+        why = f"the device listing failed ({type(e).__name__}: {e})"
+    else:
+        if n == world:
+            return None, f"NUMA pin on, {n}/{world} ranks"
+        why = (
+            f"only {n} of {world} ranks can be pinned to their NeuronCore's NUMA node: the launch CPU set "
+            f"{_tp.fmt_cpus(launched)} holds no CPU of the others' node"
+        )
+    if os.environ.get(_tp.PIN_OPTIONAL) == "1":
+        logger.warning("trnrt: %s; starting anyway (%s=1)", why, _tp.PIN_OPTIONAL)
+        return None, f"NUMA pin not complete ({_tp.PIN_OPTIONAL}=1)"
+    return (
+        f"{why}. A rank that cannot pin runs as launched and its host work crosses the socket on every step. Launch "
+        f"the engine on CPUs of every node its devices sit on (or on all CPUs), or set {_tp.PIN_OPTIONAL}=1 to start "
+        "anyway."
+    ), ""
+
+
 def refusal(device: str, core_base: int, tp: int) -> str | None:
     """Why an engine of `tp` ranks on logical cores from `core_base` must not start on this host, or None. Nothing is
     checked off Linux or off the Neuron device. A pass logs one line: what each check found, or why it did not run."""
@@ -186,5 +221,10 @@ def refusal(device: str, core_base: int, tp: int) -> str | None:
         why, mem = host_memory_check()
         if why is not None:
             return why
-    logger.info("trnrt: start checks passed: %s; %s", found, mem)
+    from .. import platform
+
+    why, pin = numa_check(core_base, tp, platform.LNC)
+    if why is not None:
+        return why
+    logger.info("trnrt: start checks passed: %s; %s; %s", found, mem, pin)
     return None

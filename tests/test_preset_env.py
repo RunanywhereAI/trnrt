@@ -1,4 +1,4 @@
-"""The environment a preset needs before trnrt.kernels is imported (trnrt/__main__.py PRESET_ENV, apply_preset_env).
+"""The environment a build needs before trnrt.kernels is imported (trnrt/__main__.py PRESET_ENV, apply_preset_env).
 
 TRNRT_DMA_HW is read at kernel import (tests/test_dma_hw.py). So the CLI puts it into the process environment of
 `trnrt engine`, and through it of every engine `trnrt serve` starts, and of `trnrt compile capture`, before anything
@@ -18,7 +18,7 @@ import pytest
 from trnrt import __main__ as cli
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-MTP = sorted(p for p in cli.PRESETS if p.startswith("mtp-"))
+BUILDS = sorted(cli.PRESETS)
 SEEN = (
     "def seen():\n"
     "    return {'env': os.environ.get('TRNRT_DMA_HW'),\n"
@@ -62,53 +62,47 @@ def _run(code: str, args: list[str], env_value: str | None = None) -> dict:
 
 @pytest.fixture(scope="module")
 def plain_rev() -> int:
-    """shell.REV in a process that never had the knob: what an unset run imports."""
-    return _run(ENGINE, [])["rev"]
+    """shell.REV with the knob off (the caller's 0, which every build keeps): what a run without hardware DGE imports."""
+    return _run(ENGINE, [], env_value="0")["rev"]
 
 
-def test_every_mtp_preset_and_only_they_need_the_hardware_dge_knob():
-    assert MTP == ["mtp-always", "mtp-batch12", "mtp-batch24", "mtp-batch8"]
-    assert set(cli.PRESET_ENV) == set(MTP)
-    assert all(cli.PRESET_ENV[p] == {"TRNRT_DMA_HW": "1"} for p in MTP)
+def test_every_build_needs_the_hardware_dge_knob():
+    assert BUILDS == ["balanced", "latency", "throughput"]
+    assert set(cli.PRESET_ENV) == set(BUILDS)
+    assert all(cli.PRESET_ENV[p] == {"TRNRT_DMA_HW": "1"} for p in BUILDS)
 
 
-@pytest.mark.parametrize("preset", MTP)
-def test_engine_sets_it_for_an_mtp_preset_before_any_kernel_import(preset, plain_rev):
-    r = _run(ENGINE, ["--preset", preset])
+@pytest.mark.parametrize(
+    "argv", [[], ["--preset", "latency"], ["--preset", "throughput"], ["--users", "12"], ["--preset", "batch8"]]
+)
+def test_engine_sets_it_for_every_build_before_any_kernel_import(argv, plain_rev):
+    """No preset is the balanced build, --users picks one, an earlier release's name runs one: every build sets it."""
+    r = _run(ENGINE, argv)
     assert r["rc"] == cli.START_REFUSED_STATUS  # the test's start check stopped it, after the environment was set
     assert r["env"] == "1"
     assert r["kernels"] == []
     assert r["rev"] == plain_rev ^ r["span"]  # the kernels imported afterwards are the hardware-DGE form
 
 
-@pytest.mark.parametrize("preset", [None, "batch8"])
-def test_engine_leaves_it_unset_for_the_other_configurations(preset, plain_rev):
-    r = _run(ENGINE, [] if preset is None else ["--preset", preset])
-    assert r["env"] is None
-    assert r["kernels"] == []
-    assert r["rev"] == plain_rev
-
-
 def test_engine_keeps_a_value_the_caller_set(plain_rev):
-    r = _run(ENGINE, ["--preset", "mtp-batch8"], env_value="0")
+    r = _run(ENGINE, ["--preset", "latency"], env_value="0")
     assert r["env"] == "0"
     assert r["rev"] == plain_rev
 
 
-@pytest.mark.parametrize("preset", MTP)
-def test_compile_capture_sets_it_from_the_engine_arguments_before_the_farm_runs(preset, plain_rev):
-    r = _run(COMPILE, ["capture", "--out", "o", "--", "--model", "m", "--preset", preset])
+@pytest.mark.parametrize("argv", [["--preset", "latency"], []])
+def test_compile_capture_sets_it_from_the_engine_arguments_before_the_farm_runs(argv, plain_rev):
+    r = _run(COMPILE, ["capture", "--out", "o", "--", "--model", "m", *argv])
     assert r["rc"] == 0
     assert r["env"] == "1"
     assert r["kernels"] == []
     assert r["rev"] == plain_rev ^ r["span"]
 
 
-def test_compile_capture_without_a_preset_and_the_other_subcommands_leave_it_unset(plain_rev):
-    for args in (["capture", "--out", "o", "--", "--model", "m"], ["strip", "--out", "o"]):
-        r = _run(COMPILE, args)
-        assert r["env"] is None
-        assert r["rev"] == plain_rev
+def test_the_other_compile_subcommands_leave_it_unset(plain_rev):
+    r = _run(COMPILE, ["strip", "--out", "o"])
+    assert r["env"] is None
+    assert r["rev"] == plain_rev
 
 
 def test_a_process_that_imported_the_kernels_without_it_is_refused(monkeypatch):
@@ -117,7 +111,7 @@ def test_a_process_that_imported_the_kernels_without_it_is_refused(monkeypatch):
     monkeypatch.setenv("TRNRT_DMA_HW", "x")  # so that teardown restores the variable's absence
     monkeypatch.delenv("TRNRT_DMA_HW")
     with pytest.raises(RuntimeError, match=r"before trnrt\.kernels is imported"):
-        cli.apply_preset_env(["--model", "m", "--preset", "mtp-batch8"])
+        cli.apply_preset_env(["--model", "m", "--preset", "latency"])
     assert "TRNRT_DMA_HW" not in os.environ
 
 
@@ -125,6 +119,6 @@ def test_a_value_already_set_is_kept_and_not_refused_after_a_kernel_import(monke
     import trnrt.kernels.shell  # noqa: F401
 
     monkeypatch.setenv("TRNRT_DMA_HW", "1")
-    assert cli.apply_preset_env(["--model", "m", "--preset", "mtp-batch8"]) == {}
+    assert cli.apply_preset_env(["--model", "m", "--preset", "latency"]) == {}
     assert cli.apply_preset_env(["--model", "m"]) == {}
     assert os.environ["TRNRT_DMA_HW"] == "1"

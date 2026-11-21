@@ -5,6 +5,32 @@ and versions follow [Semantic Versioning](https://semver.org/). Rebuild the comp
 
 ## [Unreleased]
 
+### Changed
+
+- Three builds replace the presets, one per band of expected users per engine: `--preset latency` (1-8 users, MTP
+  speculative decoding at every step, no plain decode graph), `--preset balanced` (9-16, decode batches of 8, 16 and 24;
+  the default) and `--preset throughput` (17 and up, decode batches of 16 and 24). `--preset auto --users N` (or
+  `--users N` alone) picks the build for N users per engine ([docs/CONFIGURATION.md](docs/CONFIGURATION.md)). The
+  earlier names still work and run the nearest build, with a deprecation warning: `batch8`, `mtp-batch8` and
+  `mtp-always` run `latency`, `batch12` and `mtp-batch12` run `balanced`, `mtp-batch24` runs `throughput`. Every build
+  has its own graphs: rebuild the compile cache.
+- `TRNRT_DMA_HW=1` under every build.
+- An engine whose device listing fails, or whose launch CPU set cannot pin every rank to its NeuronCore's NUMA node,
+  refuses to start; `TRNRT_NUMA_PIN_OPTIONAL=1` starts it anyway, with a warning. Rank 0 logs how many ranks pinned.
+- Every engine warms every slot of its IO pool, so no slot's buffers are built on a serving call.
+
+### Added
+
+- Host cache: batched moves (`--host-cache-batch`: a restore's and an eviction's pages in one call, every cache copied
+  once per run of consecutive pages), save-once (`--host-cache-save-once`: the ranks of one context-parallel index keep
+  one shared copy of a page in /dev/shm instead of one each), ascending page allocation (`--pool-ascending`) and the
+  checkpoints' share of the host cache (`--host-cache-ckpt-frac`). Host only; on in the balanced and throughput builds.
+- `--no-plain-decode`: no plain decode graph, for a build whose speculation never turns off.
+- The runner's side of the DSA selection's row classes: a plain decode batch in class-slot order, and a batch whose rows
+  do not fit their classes sent to the next page bucket.
+- Closing an engine bounds the tensor-parallel stop (120 s): a rank that never answers is named in the log and the
+  workers are terminated, instead of holding the process.
+
 ## [0.1.0] - 2026-11-08
 
 The first public release.
