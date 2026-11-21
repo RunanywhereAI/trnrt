@@ -36,9 +36,9 @@ from . import shell as SH
 from .moe_half import KTOP
 
 P = 128
-# The routed experts' ring loads: by the compiler's choice for wb.select (GpSimd's software DGE). GATHER_HW (off): by
-# hardware DGE, each expert's rows at a run-time offset (kda_half's state-load form).
-GATHER_HW = False
+# The routed experts' ring loads: GATHER_HW (served) by hardware DGE, each expert's rows at a run-time offset
+# (kda_half's state-load form); off, by the compiler's choice for wb.select (GpSimd's software DGE).
+GATHER_HW = True
 # The router's chosen-expert scores tv: KTOP x (compare, multiply, reduce) on [T, ER]. TV_WIDE (off): one broadcast
 # compare [T, KTOP, ER], one multiply and one reduce, the same per-element arithmetic.
 TV_WIDE = False
@@ -53,6 +53,18 @@ NORM_1R = True
 NORM_NN = True
 SS_XLA = True
 RSQ_POOL = True
+# IDS1 (served): the pairs' expert ids on partition 0 (e_sb) built right after the id clamp, and the ring's prologue
+# loads (groups 0 .. PD - 1, the loop's it < 0 steps, which hold loads only) issued right after them, ahead of the
+# chosen scores' gather (tv), the weights (wv) and the shared expert, which only stage C needs: a 24-row step had
+# ~10-12 us of that vector work between the ids and the first expert load. The same instructions in another order:
+# exact.
+IDS1 = True
+# XC1 (served; needs SS_XLA): the norm (x r), the weight product and the row isolation run on the k-major xk the sum of
+# squares' expansion already made (all elementwise, so layout-free; r is per row), with post_norm loaded k-major, and xc
+# is a strided copy of the result: one masked expansion a call instead of two, and no second PSUM evacuation. Every
+# element's arithmetic is unchanged: exact. xn comes back k-major (the dbg write follows). With IDS1 and ring 5 (the
+# FFN half's ring), 0.60 ms a 24-row step on trn2.
+XC1 = True
 
 try:  # the Neuron venv
     import nki
@@ -142,8 +154,12 @@ if nki is not None:
         C = H // P
         R = P // W
         # the sum of squares of each row, on every partition: per partition over w, then a ones-matmul (fp32 both)
-        xf = nl.ndarray((P, T, W), dtype=f32, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=xf, src=xb, engine=VE)
+        if XC1:  # post_norm k-major, wk[i, c] = pnorm[c P + i], issued first (no dependency on x)
+            wk = nl.ndarray((P, C), dtype=bf16, buffer=nl.sbuf)
+            SH.dma_static(dst=wk, src=pnorm.ap(pattern=[[1, P], [P, C]], offset=0))
+        else:
+            xf = nl.ndarray((P, T, W), dtype=f32, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=xf, src=xb, engine=VE)
         sel = _sel_kmajor(P, R, C) if SS_XLA else None
         if SS_XLA:  # XLA's order: x[t, c P + i] on partition i (the xc expansion on x, exact), chained over c in order
             xk = nl.ndarray((P, T, C), dtype=f32, buffer=nl.sbuf)
@@ -187,6 +203,29 @@ if nki is not None:
             nisa.tensor_scalar(dst=nt, data=nt, op0=nl.multiply, operand0=-0.5, op1=nl.add, operand1=1.5, engine=VE)
             r = nl.ndarray((P, T), dtype=f32, buffer=nl.sbuf)
             nisa.tensor_tensor(dst=r, data1=r0, data2=nt, op=nl.multiply, engine=VE)
+        if XC1:  # the same per-element ops on xk [P, T, C] (xk[i, t, c] = x[t, c P + i], exact), then xc a strided copy
+            nisa.tensor_tensor(dst=xk, data1=xk, data2=r.ap(pattern=[[T, P], [1, T], [0, C]], offset=0), op=nl.multiply,
+                               engine=VE)
+            if NORM_1R:
+                xqk = xk
+            else:
+                xqk = nl.ndarray((P, T, C), dtype=bf16, buffer=nl.sbuf)
+                nisa.tensor_copy(dst=xqk, src=xk, engine=VE)
+            xnk = nl.ndarray((P, T, C), dtype=bf16, buffer=nl.sbuf)
+            nisa.tensor_tensor(dst=xnk, data1=wk.ap(pattern=[[C, P], [0, T], [1, C]], offset=0), data2=xqk,
+                               op=nl.multiply, engine=VE)
+            xsk = xnk
+            if fin:
+                fzk = nl.ndarray((P, T, C), dtype=f32, buffer=nl.sbuf)
+                x16k = nl.ndarray((P, T, C), dtype=u16, buffer=nl.sbuf)
+                if fin == 2:
+                    RI.finite_or_zero3(xnk.view(u16), x16k, fzk)
+                else:
+                    SH.finite_or_zero(xnk.view(u16), x16k, fzk)
+                xsk = x16k.view(bf16)
+            xc = nl.ndarray((P, C, T), dtype=bf16, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=xc.ap(pattern=[[C * T, P], [1, T], [T, C]], offset=0), src=xsk, engine=VE)
+            return xnk, xc
         nisa.tensor_tensor(dst=xf, data1=xf, data2=r.ap(pattern=[[T, P], [1, T], [0, W]], offset=0), op=nl.multiply,
                            engine=VE)
         if NORM_1R:  # one rounding, the product below from fp32 x r
@@ -339,6 +378,31 @@ if nki is not None:
         nisa.tensor_copy(dst=i8f, src=i8)
         nisa.tensor_scalar(dst=i8f, data=i8f, op0=nl.maximum, operand0=0.0, op1=nl.minimum, operand1=float(ER - 1),
                            engine=nisa.vector_engine)
+        if IDS1:  # e_sb (the ids only) and the ring's prologue loads before tv / wv / the shared expert
+            mi = nl.ndarray((T, T, KTOP), dtype=f32, buffer=nl.sbuf)
+            nisa.tensor_tensor(dst=mi, data1=i8f.expand_dim(1).broadcast(1, T),
+                               data2=eye[0:T].expand_dim(2).broadcast(2, KTOP), op=nl.multiply)
+            ones_c = nl.ndarray((P, 1), dtype=f32, buffer=nl.sbuf)
+            nisa.memset(dst=ones_c, value=1.0)
+            pe = nl.ndarray((1, N), dtype=f32, buffer=nl.psum)
+            nisa.nc_matmul(dst=pe, stationary=ones_c[0:T, :], moving=mi.flatten_dims(1, 2), accumulate=False)
+            e_sb = nl.ndarray((1, NP), dtype=i32, buffer=nl.sbuf)
+            nisa.memset(dst=e_sb, value=0)
+            nisa.tensor_copy(dst=e_sb[:, 0:N], src=pe)
+            bufs = (nl.ndarray((P, Q, F), dtype=nl.uint8, buffer=nl.sbuf),
+                    nl.ndarray((P, Q, F), dtype=nl.uint8, buffer=nl.sbuf),
+                    nl.ndarray((P, Q, F), dtype=nl.uint8, buffer=nl.sbuf),
+                    nl.ndarray((P, Q, F), dtype=nl.uint8, buffer=nl.sbuf),
+                    nl.ndarray((P, Q, F), dtype=nl.uint8, buffer=nl.sbuf))[:NR]
+            for gl in range(min(PD, NL)):  # the loop's it < 0 steps: loads only
+                bq = bufs[gl % NR]
+                for s in range(Q):
+                    e = e_sb.ap(pattern=[[NP, 1], [1, 1]], offset=(q_lo + gl) * Q + s)
+                    if not GATHER_HW:
+                        nisa.dma_copy(dst=bq[:, s, :], src=wb.select(0, e))
+                    else:
+                        nisa.dma_copy(dst=bq[:, s, :], src=wb.ap(pattern=[[F, P], [1, F]], offset=0, scalar_offset=e,
+                                                                indirect_dim=0), dge_mode=nisa.dge_mode.hwdge)
         tv = nl.ndarray((T, KTOP), dtype=f32, buffer=nl.sbuf)  # the chosen experts' scores: sum_e [e == id] sc[e]
         if not TV_WIDE:
             mk = nl.ndarray((T, ER), dtype=f32, buffer=nl.sbuf)
@@ -403,19 +467,21 @@ if nki is not None:
         nisa.tensor_copy(dst=pvb, src=pv)
         # the pairs u = t K + k: ids on partition 0 (e_sb), weights on every partition (wb_), by matmuls that sum
         # M[t', t, k] = value[t', k] [t' == t] over t'
-        mi = nl.ndarray((T, T, KTOP), dtype=f32, buffer=nl.sbuf)
-        nisa.tensor_tensor(dst=mi, data1=i8f.expand_dim(1).broadcast(1, T),
-                           data2=eye[0:T].expand_dim(2).broadcast(2, KTOP), op=nl.multiply)
+        if not IDS1:
+            mi = nl.ndarray((T, T, KTOP), dtype=f32, buffer=nl.sbuf)
+            nisa.tensor_tensor(dst=mi, data1=i8f.expand_dim(1).broadcast(1, T),
+                               data2=eye[0:T].expand_dim(2).broadcast(2, KTOP), op=nl.multiply)
         mv = nl.ndarray((T, T, KTOP), dtype=bf16, buffer=nl.sbuf)
         nisa.tensor_tensor(dst=mv, data1=pvb.expand_dim(1).broadcast(1, T),
                            data2=eyeb[0:T].expand_dim(2).broadcast(2, KTOP), op=nl.multiply)
-        ones_c = nl.ndarray((P, 1), dtype=f32, buffer=nl.sbuf)
-        nisa.memset(dst=ones_c, value=1.0)
-        pe = nl.ndarray((1, N), dtype=f32, buffer=nl.psum)
-        nisa.nc_matmul(dst=pe, stationary=ones_c[0:T, :], moving=mi.flatten_dims(1, 2), accumulate=False)
-        e_sb = nl.ndarray((1, NP), dtype=i32, buffer=nl.sbuf)
-        nisa.memset(dst=e_sb, value=0)
-        nisa.tensor_copy(dst=e_sb[:, 0:N], src=pe)
+        if not IDS1:
+            ones_c = nl.ndarray((P, 1), dtype=f32, buffer=nl.sbuf)
+            nisa.memset(dst=ones_c, value=1.0)
+            pe = nl.ndarray((1, N), dtype=f32, buffer=nl.psum)
+            nisa.nc_matmul(dst=pe, stationary=ones_c[0:T, :], moving=mi.flatten_dims(1, 2), accumulate=False)
+            e_sb = nl.ndarray((1, NP), dtype=i32, buffer=nl.sbuf)
+            nisa.memset(dst=e_sb, value=0)
+            nisa.tensor_copy(dst=e_sb[:, 0:N], src=pe)
         ones_b = nl.ndarray((P, P), dtype=bf16, buffer=nl.sbuf)
         nisa.memset(dst=ones_b, value=1.0)
         pwb = nl.ndarray((P, N), dtype=f32, buffer=nl.psum)
@@ -473,9 +539,10 @@ if nki is not None:
         nisa.tensor_scalar(dst=mh[:, 1:2], data=ip, op0=nl.greater_equal, operand0=64.0)
         acc = nl.ndarray((P, T, C), dtype=f32, buffer=nl.sbuf)  # [p, t, g]: g = 2 c' + half
         nisa.memset(dst=acc, value=0.0)
-        bufs = (nl.ndarray((P, Q, F), dtype=nl.uint8, buffer=nl.sbuf), nl.ndarray((P, Q, F), dtype=nl.uint8, buffer=nl.sbuf),
-                nl.ndarray((P, Q, F), dtype=nl.uint8, buffer=nl.sbuf), nl.ndarray((P, Q, F), dtype=nl.uint8, buffer=nl.sbuf),
-                nl.ndarray((P, Q, F), dtype=nl.uint8, buffer=nl.sbuf))[:NR]
+        if not IDS1:
+            bufs = (nl.ndarray((P, Q, F), dtype=nl.uint8, buffer=nl.sbuf), nl.ndarray((P, Q, F), dtype=nl.uint8, buffer=nl.sbuf),
+                    nl.ndarray((P, Q, F), dtype=nl.uint8, buffer=nl.sbuf), nl.ndarray((P, Q, F), dtype=nl.uint8, buffer=nl.sbuf),
+                    nl.ndarray((P, Q, F), dtype=nl.uint8, buffer=nl.sbuf))[:NR]
         sg_r = (nl.ndarray((P, Q, C), dtype=f32, buffer=nl.sbuf), nl.ndarray((P, Q, C), dtype=f32, buffer=nl.sbuf),
                 nl.ndarray((P, Q, C), dtype=f32, buffer=nl.sbuf))
         sd_r = (nl.ndarray((P, Q, C), dtype=f32, buffer=nl.sbuf), nl.ndarray((P, Q, C), dtype=f32, buffer=nl.sbuf),
@@ -503,13 +570,23 @@ if nki is not None:
         # step i: the loads of group i + PD, stage A of group i, stages B and C of group i - 1 (the pairs kernel's)
         for it in range(-PD, NL + 1):
             gl = it + PD
-            if 0 <= gl < NL:
+            if not IDS1:
+                if 0 <= gl < NL:
+                    bq = bufs[gl % NR]
+                    for s in range(Q):
+                        e = e_sb.ap(pattern=[[NP, 1], [1, 1]], offset=(q_lo + gl) * Q + s)
+                        if not GATHER_HW:
+                            nisa.dma_copy(dst=bq[:, s, :], src=wb.select(0, e))
+                        else:  # GATHER_HW: expert e's [128, F] rows, e a run-time offset on wb's axis 0
+                            nisa.dma_copy(dst=bq[:, s, :], src=wb.ap(pattern=[[F, P], [1, F]], offset=0, scalar_offset=e,
+                                                                    indirect_dim=0), dge_mode=nisa.dge_mode.hwdge)
+            elif PD <= gl < NL:  # IDS1: groups 0 .. PD - 1 were loaded ahead of tv
                 bq = bufs[gl % NR]
                 for s in range(Q):
                     e = e_sb.ap(pattern=[[NP, 1], [1, 1]], offset=(q_lo + gl) * Q + s)
                     if not GATHER_HW:
                         nisa.dma_copy(dst=bq[:, s, :], src=wb.select(0, e))
-                    else:  # GATHER_HW: expert e's [128, F] rows, e a run-time offset on wb's axis 0
+                    else:
                         nisa.dma_copy(dst=bq[:, s, :], src=wb.ap(pattern=[[F, P], [1, F]], offset=0, scalar_offset=e,
                                                                 indirect_dim=0), dge_mode=nisa.dge_mode.hwdge)
             if 0 <= it < NL:  # stage A: gate_up, scales
@@ -614,7 +691,10 @@ if nki is not None:
         rp, sp, i8f, pvb, ch = half_body_pb(None, bb, bf, wb, Is, K, rsc, group, ring, limit, rsp, o_rt, o_gu, o_dn,
                                             o_rb, cp, comb_out, hc, iters, eps, skf, xc_in=xc)
         if dbg:  # both programs write the same values
-            SH.dma_static(dst=xn_out.ap(pattern=[[W, P], [H, T], [1, W]], offset=0), src=xn)  # xn: h-layout
+            if XC1:  # xn k-major: xn[i, t, c] = xn_row[t, c P + i]
+                SH.dma_static(dst=xn_out.ap(pattern=[[1, P], [H, T], [P, W]], offset=0), src=xn)
+            else:
+                SH.dma_static(dst=xn_out.ap(pattern=[[W, P], [H, T], [1, W]], offset=0), src=xn)  # xn: h-layout  # xn: h-layout
             ti = nl.ndarray((T, K), dtype=i32, buffer=nl.sbuf)
             nisa.tensor_copy(dst=ti, src=i8f, engine=VE)
             SH.dma_static(dst=ti_out, src=ti)

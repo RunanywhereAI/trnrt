@@ -153,6 +153,24 @@ class EngineConfig:
     # state_spec_seats hold 1 + spec_k rows each (the ones that speculate) and the rest one row (None: all of them).
     state_seats: int | None = None
     state_spec_seats: int | None = None
+    # -- KDA, mHC and FFN-half routes (engine.set_decode_routes copies each into the module that reads it at trace) --
+    # - kda_shell (models/hybrid.py KDA_SHELL): a KDA layer's decode attention block may run as the KDA shell's kernel
+    #   (kernels/kda_shell.py; its packed blobs exist only then), up to kda_shell_max_rows rows and for verifies. Off,
+    #   every KDA decode step runs linear_attn's decode form (kernels/kda_decode.py): the shell's per-row recurrence
+    #   (~8.5-10.5 us a row per layer) costs more than the decode kernel at 8 rows a step and up.
+    kda_shell: bool = True
+    # - mhc_seam (models/hybrid.py MHC_SEAM): a decode layer that takes the FFN half without the KDA shell and without
+    #   the fused DSA layer runs the previous layer's FFN mix and its own attention pre as one kernel call
+    #   (kernels/mhc_seam.py, rows split over the LNC pair), its fn re-laid at load as a decode-only copy.
+    mhc_seam: bool = False
+    # - shell_mix_row_split (kernels/shell.py MIX_ROW_SPLIT): the stream mix inside the decode kernels (the FFN half's,
+    #   the dense half's and the KDA shell's mix_in) with its rows split over the LNC pair, each program mixing its half
+    #   and reading the other's back from the kernel's output; exact.
+    shell_mix_row_split: bool = False
+    # - state_ckpt_mid_export (models/linear_attn.py MID_EXPORT): a prefill chunk with an in-chunk state checkpoint takes
+    #   the checkpoint's state from the main delta-rule scan (its chunk-end states, and one 128-row call when the
+    #   checkpoint is not on a 128-row boundary) instead of a second, masked scan over the whole chunk; bitwise on trn2.
+    state_ckpt_mid_export: bool = False
 
     def __post_init__(self):
         if self.max_running is not None and self.max_running < 1:

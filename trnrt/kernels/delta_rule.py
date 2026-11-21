@@ -270,16 +270,25 @@ if nki is not None:
         return Y
 
     @nki.jit
-    def delta_rule_kernel(q, k, v, g, beta, S0, cst, kind: int, ug: int, rev: int):
+    def delta_rule_kernel(q, k, v, g, beta, S0, cst, kind: int, ug: int, rev: int, states: int = 0, moff=None):
         """See the module docstring. kind 1: KDA (g [T, Hv, 128]), 0: GDN (g [T, Hv]); ug: units
         (chunk, v head) processed together (their instructions interleaved); rev: this module's source revision
-        (REV, see _kernel_rev). Returns o fp32 [T, Hv, Dv] and the final state fp32 [Hv, Dk, Dv]."""
+        (REV, see _kernel_rev). Returns o fp32 [T, Hv, Dv] and the final state fp32 [Hv, Dk, Dv]; states 1 (a static
+        flag, chunk(states=True)): also every chunk's end state, fp32 [T // 128, Hv, Dk, Dv] (S_all[c]: the state after
+        rows 0 .. 128 c + 127), one DMA of the state tile the chain already holds, per unit; and 128 rows of the
+        operands, R fp32 [128, 2 Hk Dk + Hv Dv + Wg + Hv] = [q | k | v | g | beta] rows r0 .. r0 + 127 (Wg = Hv Dk for
+        KDA, Hv for GDN), where moff int32 [1, 4] holds r0's element offsets (r0 Hk Dk, r0 Hv Dv, r0 Wg, r0 Hv):
+        runtime-offset DMAs by program 0, so a consumer of those rows (linear_attn's checkpoint call) reads the
+        kernel's output, not the operands."""
         T, Hk, D = q.shape
         Hv, Dv = v.shape[1], v.shape[2]
         rep = Hv // Hk
         NCH = T // 128
         o = nl.ndarray((T, Hv, Dv), dtype=F32, buffer=nl.shared_hbm)
         S_out = nl.ndarray((Hv, D, Dv), dtype=F32, buffer=nl.shared_hbm)
+        S_all = nl.ndarray((NCH, Hv, D, Dv), dtype=F32, buffer=nl.shared_hbm) if states else None
+        WQ, WV, WG = Hk * D, Hv * Dv, (Hv * D if kind == 1 else Hv)
+        R_out = nl.ndarray((128, 2 * WQ + WV + WG + Hv), dtype=F32, buffer=nl.shared_hbm) if states else None
         C = _sb((128, NCST, 128))
         nisa.dma_copy(dst=C, src=cst)
         I = C[:, C_I, :]
@@ -291,6 +300,21 @@ if nki is not None:
         HP = Hv // npg if Hv % npg == 0 else Hv
         h0 = pid * HP if Hv % npg == 0 else 0
         mine = Hv % npg == 0 or pid == 0  # heads that do not split evenly all run on program 0
+        if states and pid == 0:  # the checkpoint call's 128 rows (see the docstring), written out unrolled
+            mo = nl.ndarray((1, 4), dtype=nl.int32, buffer=nl.sbuf)
+            nisa.dma_copy(dst=mo, src=moff)
+            rt = _sb((128, 2 * WQ + WV + WG + Hv))
+            nisa.dma_copy(dst=rt[:, 0:WQ], src=q.reshape((T * WQ, 1)).ap(pattern=[[WQ, 128], [1, WQ]], offset=0,
+                                                                          scalar_offset=mo[:, 0:1], indirect_dim=0))
+            nisa.dma_copy(dst=rt[:, WQ:2 * WQ], src=k.reshape((T * WQ, 1)).ap(pattern=[[WQ, 128], [1, WQ]], offset=0,
+                                                                               scalar_offset=mo[:, 0:1], indirect_dim=0))
+            nisa.dma_copy(dst=rt[:, 2 * WQ:2 * WQ + WV], src=v.reshape((T * WV, 1)).ap(pattern=[[WV, 128], [1, WV]], offset=0,
+                                                                                        scalar_offset=mo[:, 1:2], indirect_dim=0))
+            nisa.dma_copy(dst=rt[:, 2 * WQ + WV:2 * WQ + WV + WG], src=g.reshape((T * WG, 1)).ap(pattern=[[WG, 128], [1, WG]],
+                          offset=0, scalar_offset=mo[:, 2:3], indirect_dim=0))
+            nisa.dma_copy(dst=rt[:, 2 * WQ + WV + WG:2 * WQ + WV + WG + Hv], src=beta.reshape((T * Hv, 1)).ap(
+                          pattern=[[Hv, 128], [1, Hv]], offset=0, scalar_offset=mo[:, 3:4], indirect_dim=0))
+            nisa.dma_copy(dst=R_out, src=rt)
         St = [None] * Hv  # a list (the NKI tracer takes only str keys in a dict)
         for h in range(h0, h0 + HP):
             if mine:
@@ -489,12 +513,20 @@ if nki is not None:
                 sn = _sb((128, Dv))
                 nisa.tensor_copy(dst=sn, src=ps_, engine=nisa.vector_engine)
                 St[h] = sn
+                if states:  # this unit's chunk-end state (a kernel output, so one buffer for both programs)
+                    nisa.dma_copy(dst=S_all.ap(pattern=[[Dv, 128], [1, Dv]], offset=((t0s[j] // 128) * Hv + h) * D * Dv),
+                                  src=sn)
         for h in range(h0, h0 + HP):
             if mine:
                 nisa.dma_copy(dst=S_out.ap(pattern=[[Dv, 128], [1, Dv]], offset=h * D * Dv), src=St[h])
         if npg > 1:  # LNC: both programs' heads written before either ends (whatever runs next reads all of them)
             nisa.core_barrier(data=o, cores=(0, 1))
             nisa.core_barrier(data=S_out, cores=(0, 1))
+            if states:
+                nisa.core_barrier(data=S_all, cores=(0, 1))
+                nisa.core_barrier(data=R_out, cores=(0, 1))
+        if states:
+            return o, S_out, S_all, R_out
         return o, S_out
 
 else:
@@ -531,8 +563,10 @@ def kernel():
 UNIT_GROUP = 2
 
 
-def kernel_inputs(q, k, v, g, beta, S0, device=None, ug: int | None = None):
-    """The kernel's arguments; T must be a multiple of 128 (chunk() pads); ug: the unit group (default UNIT_GROUP)."""
+def kernel_inputs(q, k, v, g, beta, S0, device=None, ug: int | None = None, states: bool = False, mrow=None):
+    """The kernel's arguments; T must be a multiple of 128 (chunk() pads); ug: the unit group (default UNIT_GROUP);
+    states: also return every chunk's end state and the 128 operand rows from mrow (an int64 [1] tensor, a multiple of
+    128 below T: the static flag and moff are passed only when set)."""
     T, Hk, Dk = k.shape
     Hv, Dv = v.shape[1:]
     if Dk != 128 or Dv != 128 or Hv % Hk:
@@ -540,17 +574,49 @@ def kernel_inputs(q, k, v, g, beta, S0, device=None, ug: int | None = None):
     if T % L:
         raise ValueError(f"T = {T} is not a multiple of {L}")
     kind = KINDS["kda"] if g.dim() == 3 else KINDS["gdn"]
-    return dict(q=q.float().contiguous(), k=k.float().contiguous(), v=v.float().contiguous(),
-                g=g.float().contiguous(), beta=beta.float().contiguous(), S0=S0.float().contiguous(),
-                cst=consts(device if device is not None else q.device), kind=kind,
-                ug=(ug or UNIT_GROUP), rev=REV)
+    a = dict(q=q.float().contiguous(), k=k.float().contiguous(), v=v.float().contiguous(),
+             g=g.float().contiguous(), beta=beta.float().contiguous(), S0=S0.float().contiguous(),
+             cst=consts(device if device is not None else q.device), kind=kind,
+             ug=(ug or UNIT_GROUP), rev=REV)
+    if states:
+        Wg = Hv * Dk if kind == KINDS["kda"] else Hv
+        r0 = mrow.to(torch.long).view(1)
+        a["states"] = 1
+        a["moff"] = torch.stack([r0 * (Hk * Dk), r0 * (Hv * Dv), r0 * Wg, r0 * Hv], dim=1).to(torch.int32).contiguous()
+    return a
 
 
-def chunk(q, k, v, g, beta, S0, keep_pad: bool = False, ug: int | None = None):
+def split_rows(R, Hk: int, Hv: int, kda: bool):
+    """The kernel's row output R [128, 2 Hk 128 + Hv 128 + Wg + Hv] as (q, k, v, g, beta) rows."""
+    D = 128
+    WQ, WV, WG = Hk * D, Hv * D, (Hv * D if kda else Hv)
+    c = [0, WQ, 2 * WQ, 2 * WQ + WV, 2 * WQ + WV + WG, 2 * WQ + WV + WG + Hv]
+    shp = [(Hk, D), (Hk, D), (Hv, D), ((Hv, D) if kda else (Hv,)), (Hv,)]
+    return tuple(R[:, c[i]:c[i + 1]].reshape(R.shape[0], *shp[i]) for i in range(5))
+
+
+def chunk(q, k, v, g, beta, S0, keep_pad: bool = False, ug: int | None = None, states: bool = False, mrow=None):
     """linear_attn.chunk_scan's contract on the device inside the caller's graph: o [T, Hv, Dv] and
     the final state, fp32. T is padded to whole chunks with beta = g = 0 (the state is unchanged
     by padding); keep_pad returns o with its padding rows (a consumer that reads only the first T rows then takes the
-    kernel's output as is instead of a sliced copy)."""
+    kernel's output as is instead of a sliced copy). states: a third result, every chunk's end state
+    [ceil(T / 128), Hv, Dk, Dv] (linear_attn's in-chunk checkpoint reads its row there), and a fourth, (q, k, v, g, beta)
+    rows mrow .. mrow + 127 of the padded operands, fp32, copied by the kernel (mrow: int64 [1], a multiple of 128, at
+    most the padded T - 128)."""
+    if states:
+        if mrow is None:
+            raise ValueError("chunk(states=True) needs mrow")
+        from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
+
+        from .. import platform
+
+        T = q.shape[0]
+        pad = -T % L
+        if pad:
+            q, k, v, g, beta = (torch.cat([x, x.new_zeros((pad, *x.shape[1:]))]) for x in (q, k, v, g, beta))
+        grid = platform.nki_grid() if platform.lnc_split("delta_rule") else 1
+        o, S, S_all, R = wrap_nki(kernel())[grid](**kernel_inputs(q, k, v, g, beta, S0, ug=ug, states=True, mrow=mrow))
+        return (o[:T] if pad and not keep_pad else o), S, S_all, split_rows(R, k.shape[1], v.shape[1], g.dim() == 3)
     from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
     T = q.shape[0]

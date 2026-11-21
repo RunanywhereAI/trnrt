@@ -232,6 +232,54 @@ def test_run_launches_the_pb_kernel(monkeypatch):
     assert seen == [(kpb, FB.REV, RI.FIN, npg)], seen
 
 
+def test_the_ring_by_rows_then_page_bucket():
+    """ring_for: 3 for a graph of at most 3 rows (a one-sequence verify), else 3 at the 4096-page bucket, else 5; with
+    the graph's width or rows unknown, the page rule or RING alone."""
+    assert FH.RING == 5 and FH.RING_BY_P == {4096: 3} and FH.RING_BY_T == {3: 3}
+    assert [FH.ring_for(p, 24) for p in (1024, 2048, 3072, 4096)] == [5, 5, 5, 3]
+    assert [FH.ring_for(1024, t) for t in (1, 2, 3, 4, 6, 8, 16)] == [3, 3, 3, 5, 5, 5, 5]
+    assert FH.ring_for(4096, 3) == 3 and FH.ring_for(None) == 5 and FH.ring_for(4096) == 3 and FH.ring_for(None, 2) == 3
+
+
+def test_decode_runs_the_ring_of_its_graph(monkeypatch):
+    """decode() hands run() ring_for(pages, T) of its call (decode_args' ring), the dense dispatch passing pages on."""
+    seen = []
+
+    def fake_run(S, pend, blobs, w_blob, **kw):
+        seen.append(kw["ring"])
+        T, hc, H = S.shape
+        return S, torch.zeros(T, hc), torch.zeros(T, hc, hc), torch.zeros(2, T, H), torch.zeros(2, T, H)
+
+    monkeypatch.setattr(FH, "run", fake_run)
+    monkeypatch.setattr(FH, "decode_out", lambda model, rp, sp, dt: rp.sum(0))
+    import trnrt.platform as platform
+
+    monkeypatch.setattr(platform, "nki_grid", lambda: 2)
+    hy = types.SimpleNamespace(swiglu_limit=7.0, sinkhorn_iters=20, hc_eps=1e-6)
+    model = types.SimpleNamespace(
+        cfg=types.SimpleNamespace(hybrid=hy, num_experts_per_tok=8, routed_scaling_factor=2.5, rms_norm_eps=1e-5)
+    )
+    z = torch.zeros(1)
+    layer = types.SimpleNamespace(
+        moe=True,
+        mh_blob_bf16=z,
+        mh_blob_f32=z,
+        post_norm=z,
+        hc_ffn_base=z,
+        hc_ffn_scale=z,
+        hc_ffn_fnj=z,
+        hc_ffn_fn=z,
+        w_blob=z,
+        shared_gate_up=torch.zeros(256, 1),
+    )
+    monkeypatch.setattr(MS, "fn_arg", lambda layer: z)
+    for T, pages in ((24, 4096), (24, 3072), (3, 1024), (8, None)):
+        S = torch.zeros(T, 4, 256, dtype=torch.bfloat16)
+        pend = (torch.zeros(T, 4), torch.zeros(T, 4, 4), torch.zeros(2, T, 256, dtype=torch.bfloat16))
+        FH.decode(model, layer, S, pend, pages=pages)
+    assert seen == [3, 5, 3, 5]
+
+
 # -- ffn_half_shared: the served kernel's body for the fused DSA layer ----------------------------------------------
 
 
@@ -610,6 +658,7 @@ def test_decode_dispatches_by_layer_kind(monkeypatch):
     monkeypatch.setattr(DH, "decode", lambda *a: "dense")
     L = types.SimpleNamespace
     assert FH.decode(None, L(moe=False), None, None) == "dense" and FH.decode(None, L(moe=True), None, None) == "moe"
+    assert FH.decode(None, L(moe=True), None, None, pages=4096) == "moe"
 
 
 def _takes_layer(**kw):
