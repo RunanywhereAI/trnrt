@@ -164,6 +164,16 @@ class EngineConfig:
     # - dsa_cp_fail_attn_trip (models/mla.py CP_FAIL_ATTN_TRIP): its failed rows' attention runs the live (failed)
     #   entries only, so it runs no row when none failed.
     dsa_cp_fail_attn_trip: bool = False
+    # - dsa_slots_pipe_rows (kernels/dsa_slots_n_p.py PIPE_ROWS): a prefill chunk's main rows' slot attention with its
+    #   rows software-pipelined, this many rows a device-loop iteration (0: the split kernel's call).
+    dsa_slots_pipe_rows: int = 0
+
+    def _check_dsa_routes(self) -> None:
+        """The DSA block's checks (__post_init__ runs them last)."""
+        if self.dsa_slots_pipe_rows < 0 or self.dsa_slots_pipe_rows % 2:
+            raise ValueError(f"dsa_slots_pipe_rows={self.dsa_slots_pipe_rows}: 0 (off) or an even row count (each "
+                             f"LNC program a half)")
+    # -- end of the DSA block
 
     def __post_init__(self):
         if self.max_running is not None and self.max_running < 1:
@@ -219,6 +229,7 @@ class EngineConfig:
             raise ValueError(
                 f"state_spec_seats={self.state_spec_seats} must cover spec_max_batch {self.spec_max_batch} and fit the "
                 f"{self.state_seats or self.max_num_seqs} seats")
+        self._check_dsa_routes()  # the DSA block's checks
 
     def resolved_moe_kernel(self) -> str:
         return self.moe_kernel or ("nki" if self.device in ("neuron", "meta") else "xla")

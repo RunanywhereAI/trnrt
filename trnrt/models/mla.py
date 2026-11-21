@@ -1031,10 +1031,8 @@ def attention_cp_rows(model, layer, x, positions, slot_mapping, table):
                                         m.softmax_scale, kp, CP_SLOTS_SMALL, n_slots)
     else:  # every row in one buffer of CP_SLOTS_SMALL slots (its K entries and the tail), the failed rows replaced
         if glue:  # the buffer the glue kernel built (_cp_attend_classes single's, bit for bit)
-            from ..kernels import dsa_slots_n
-
-            o_r, lse_r = dsa_slots_n.attend(q_lat, layer.k_cache, g_rows, g_bias, m.softmax_scale,
-                                            torch.full((1,), n, dtype=torch.int64, device=q_lat.device), lse=True)
+            o_r, lse_r = _cp_slots_attend(q_lat, layer.k_cache, g_rows, g_bias, m.softmax_scale,
+                                          torch.full((1,), n, dtype=torch.int64, device=q_lat.device))
         else:
             o_r, lse_r = _cp_attend_classes(q_lat, layer.k_cache, rows_sel, rows_tail, chosen, tail_own, npool, pos_b,
                                             m.softmax_scale, kp, CP_SLOTS_SMALL, n_slots, single=True)
@@ -1176,6 +1174,17 @@ def _cp_combine(model, layer, o_r, lse_r, T: int, A: int, nh: int, r: int, dv: i
     return F.linear(out, model._w(layer, "o"))
 
 
+def _cp_slots_attend(q, kc, rows, bias, scale: float, n):
+    """The local-K single buffer's slot attention (o, lse), attention_cp_rows' main rows: kernels/dsa_slots_n_p.py, the
+    split kernel's rows software-pipelined (its o / lse bit for bit), under its route (dsa_slots_n_p.PIPE_ROWS); else
+    dsa_slots_n.attend."""
+    from ..kernels import dsa_slots_n, dsa_slots_n_p
+
+    if dsa_slots_n_p.takes():
+        return dsa_slots_n_p.attend(q, kc, rows, bias, scale, n, lse=True)
+    return dsa_slots_n.attend(q, kc, rows, bias, scale, n, lse=True)
+
+
 def _cp_attend_classes(q_all, kc, rows_sel, rows_tail, mine, tail_own, npool, positions, scale: float, kp: int,
                        small: int, full: int, single: bool = False, rows_live=None):
     """(o [T, H, R] fp32, lse [T, H] fp32): this rank's partial attention of every row over its selected local pools
@@ -1222,8 +1231,7 @@ def _cp_attend_classes(q_all, kc, rows_sel, rows_tail, mine, tail_own, npool, po
         rows = torch.where(sl < keep, rs, torch.where(sl == keep, rows_tail, torch.zeros_like(rows_tail)))
         ok = ((sl < keep) & ms).unsqueeze(-1) | ((sl == keep).unsqueeze(-1) & tail_tok)
         bias = torch.where(ok, 0.0, NEG_INF).to(torch.float32)
-        return dsa_slots_n.attend(q_all, kc, rows, bias, scale, torch.full((1,), T, dtype=torch.int64, device=dev),
-                                  lse=True)
+        return _cp_slots_attend(q_all, kc, rows, bias, scale, torch.full((1,), T, dtype=torch.int64, device=dev))
     out_o, out_l = [], []
     w_small, w_full = fits, ~fits
     if rows_live is not None:  # CP_FAIL_ATTN_TRIP: only the live entries count, so a class with none runs no row
