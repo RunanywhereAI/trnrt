@@ -40,8 +40,9 @@ elements see the per-head form's ops in its order; the lanes between quadrants a
 outer product k delta^T reads k and delta at partition 32 h. On trn2 every output and the state were bitwise the
 per-head form's. Pipeline: state rows loaded PD rows ahead into a ring of RING; stage A of chunk g (8 matvecs, 2
 vector ops, the o rows out) beside stage B of chunk g - 1 (4 outer products, 4 state updates, the rows' states back
-to the pool). Every DMA is on hardware DGE (the runtime-row state loads and stores skip out-of-range rows): left to
-the compiler they went to GpSimd's software DGE, the kernel's busiest engine (1.67 ms of a 24-row step).
+to the pool). The state rows' loads and stores (at runtime rows, out-of-range rows skipped), the o rows and the
+quadrant placements are DMAs on hardware DGE: left to the compiler they went to GpSimd's software DGE, the kernel's
+busiest engine (1.67 ms of a 24-row step).
 
 The pool is returned as the kernel's output (NKI detect_must_alias: an input returned as an output).
 """
