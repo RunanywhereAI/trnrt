@@ -493,6 +493,7 @@ class ModelRunner:
         self.spec_page_set = self.spec_page_buckets != tuple(sorted(self.page_buckets))
         self.prefill_page_buckets = ecfg.resolved_prefill_page_buckets()
         self.prefill_page_min_rows = ecfg.prefill_page_min_rows
+        self.rc = rowclass_init(self, ecfg)  # the DSA selection's static row classes: the runner's side (file end)
         # A prefill chunk's MTP pass fills the draft layer's KV over the chunk: in one call of the chunk's bucket, or, with
         # mtp_fill_rows, in calls of at most that many rows over the same hidden states (spec_after_prefill). The pass's
         # scratchpad reservation grows with its rows (the compiler's figure at 4096 pages: 1.0 GiB at 512 rows, 1.5 at
@@ -992,7 +993,7 @@ class ModelRunner:
         """B sequences x one token."""
         n = len(seqs)
         B = pick_family(n, self.plain_buckets, "plain decode")
-        P = pick_bucket(-(-max(s.end for s in seqs) // self.ps), self.page_buckets)
+        P = rowclass_page(self, seqs, B, pick_bucket(-(-max(s.end for s in seqs) // self.ps), self.page_buckets))
         ids = np.zeros(B, np.int64)
         pos = np.zeros(B, np.int64)
         table = np.full((B, P), NULL_PAGE, np.int64)
@@ -1584,3 +1585,88 @@ def spec_page_buckets(ecfg: EngineConfig, page_buckets: tuple[int, ...]) -> tupl
         raise ValueError(f"spec_page_buckets {sp} must be page buckets {pb} including the largest (every context has a rung)")
     return sp
 
+
+# -- static row classes of the DSA selection, the runner's side -------------------------------------------------------------------
+# The row-class selection kernel (kernels/dsa_sel2gc.py) scores, for each batch slot s of a plain decode at its layout's page bucket,
+# only the slot's first 128 NG_s pages. The kernel needs the batch in class-slot order and a guard, both here, host only:
+# - rowclass_order (LLMEngine._launch): a plain decode chunk whose batch size has a layout is sorted by pages, longest first
+#   (stable), so the longest rows take the widest slots (slot s runs on LNC program s % 2; a layout's classes are contiguous,
+#   even and widest first);
+# - rowclass_page (decode()): at the layout's bucket, a batch whose rows don't fit their slots (pages > 128 NG_s) goes to the next
+#   page bucket (the unclassed graph); one that would fit sorted but arrived unsorted is refused (a caller skipped rowclass_order).
+# Every input, output, state save and hidden row follows the chunk's order (all keyed by request, not row), so nothing permutes on
+# the device. The engine has no data-parallel attention and no mixed batches, the paths that would reorder a chunk.
+
+
+def _row_class_layouts() -> dict:
+    """The selection kernel's layouts, {B: (NG per slot)} (kernels/dsa_sel2gc.py LAYOUTS, which set_decode_routes fills from
+    the configuration), or {} when the kernel is not in this tree or has none."""
+    import importlib.util
+
+    if importlib.util.find_spec("trnrt.kernels.dsa_sel2gc") is None:
+        return {}
+    from ..kernels import dsa_sel2gc
+
+    return {int(b): tuple(int(g) for g in ngs) for b, ngs in (getattr(dsa_sel2gc, "LAYOUTS", None) or {}).items()}
+
+
+def rowclass_init(runner, ecfg) -> dict:
+    """{B: NG per slot} when the selection kernel has layouts (else {}), after the checks that make an unguarded classed call
+    impossible to construct; installs the kernel's runner guard (dsa_sel2gc.RUNNER) only then. Off on a CPU engine: the
+    selection kernel runs on a NeuronCore (and in its capture, on the meta device) only."""
+    runner.rc_steps = runner.rc_fallbacks = 0  # classed calls / batches sent to the next page bucket (rowclass_page)
+    lay = _row_class_layouts() if getattr(runner, "device", None) is None or runner.device.type != "cpu" else {}
+    if not lay:
+        return {}
+    from ..kernels import dsa_sel2gc
+
+    why = []
+    pb = tuple(sorted(runner.page_buckets))
+    spec, Q = bool(getattr(ecfg, "spec_method", None)), 1 + int(getattr(ecfg, "spec_k", 0) or 0)
+    for B, ngs in sorted(lay.items()):
+        P = 128 * max(ngs)
+        if list(ngs) != sorted(ngs, reverse=True):
+            why.append(f"B {B}'s classes aren't widest first {ngs}")
+        if B not in runner.plain_buckets:
+            why.append(f"B {B} is not a plain decode bucket {tuple(runner.plain_buckets)}")
+        if P not in pb or P == pb[-1]:
+            why.append(f"B {B}'s bucket P {P} needs a larger page bucket for the guard's fallback (page buckets {pb})")
+        if spec and P in runner.spec_page_buckets and any(b == B or b * Q == B for b in runner.spec_buckets):
+            why.append(f"a verify or MTP call of {B} rows at P {P} (spec ladder {runner.spec_page_buckets}) would skip the guard")
+    if why:
+        raise ValueError("the DSA selection's row classes: " + "; ".join(why))
+    dsa_sel2gc.RUNNER = "trnrt.engine.model_runner.rowclass_page"
+    return lay
+
+
+def rowclass_order(runner, seqs: list) -> list:
+    """A plain decode chunk in class-slot order: sorted by pages, longest first, stable (ties keep the scheduler's order), when its
+    batch size has a layout; else the chunk unchanged. The caller keeps the returned list as the chunk (outputs and state saves
+    follow it)."""
+    lay = getattr(runner, "rc", None)
+    if not lay or len(seqs) < 2:
+        return seqs
+    B = next((b for b in runner.plain_buckets if b >= len(seqs)), None)
+    if B not in lay:
+        return seqs
+    ps = runner.ps
+    return sorted(seqs, key=lambda s: -s.end // ps)  # -pages (pages = ceil(end / ps), as decode() buckets them)
+
+
+def rowclass_page(runner, seqs, B: int, P: int) -> int:
+    """The page bucket of a plain decode of `seqs` at batch bucket B, given today's pick P: P itself unless P is B's classed bucket
+    and the rows, in their order, don't fit their slots (row b's pages <= 128 NG_b); then the next page bucket. Refuses an order
+    that would fit sorted (the caller skipped rowclass_order: the kernel would read a long row's first 128 NG_s pages only)."""
+    lay = runner.rc.get(B) if getattr(runner, "rc", None) else None
+    if lay is None or P != 128 * max(lay):
+        return P
+    caps = [128 * g for g in lay]
+    pages = [-(-s.end // runner.ps) for s in seqs]
+    if len(pages) <= len(caps) and all(p <= c for p, c in zip(pages, caps)):
+        runner.rc_steps += 1
+        return P
+    if len(pages) <= len(caps) and all(p <= c for p, c in zip(sorted(pages, reverse=True), caps)):
+        raise RuntimeError(f"plain decode of {len(pages)} rows at B {B} / P {P}: rows not in class-slot order (pages {pages}); "
+                           "the caller must order the chunk with rowclass_order")
+    runner.rc_fallbacks += 1
+    return pick_bucket(P + 1, tuple(sorted(runner.page_buckets)))

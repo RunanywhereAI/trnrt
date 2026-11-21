@@ -15,7 +15,7 @@ from ..config import EngineConfig, ModelConfig
 from ..models.loader import load_model, resolve_model_path
 from . import watchdog
 from .kv_pool import PagePool
-from .model_runner import ModelRunner
+from .model_runner import ModelRunner, rowclass_order
 from .radix_cache import RadixCache
 from .request import Request, SamplingParams, Status, unsupported
 from .sampler import NUM_TOP_LOGPROBS, unpack
@@ -587,7 +587,8 @@ class LLMEngine:
             self.dyn_spec_steps += bool(spec)
         self._restore_states(plan)
         for i in range(0, len(plain), max_b):
-            chunk = plain[i : i + max_b]
+            # in the DSA selection's class-slot order when its row classes are on (model_runner.rowclass_order)
+            chunk = rowclass_order(self.runner, plain[i : i + max_b])
             launches.append((chunk, self.runner.decode(chunk), "decode"))
             self._save_states(chunk)
         Q = 1 + self.cfg.spec_k
