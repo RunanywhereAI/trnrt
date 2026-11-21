@@ -492,7 +492,8 @@ def layer(model, layer, h, positions, slot_mapping, table, bias, state_slot=None
             mk = MK.layer_takes(model, layer, T) and layer.moe
         if mk:  # both halves, with XLA's sums between them, as ffn_half.decode
             S, post, comb, y = MK.decode_layer_split(model, layer, streams.view(T, hy.hc, H), positions, state_slot,
-                                                     pend=pend)  # (post, comb, y) as is: the kernel builds y's slots
+                                                     pend=pend, pages=None if table is None else table.shape[-1])
+            # (pend's (post, comb, y) as is: the kernel builds y's slots; pages: the FFN half's ring)
         else:
             call = kda_shell.verify if state_slot.dim() == 2 else kda_shell.decode  # a verify's B Q rows: one call
             S, (post, comb, Y) = call(model, layer, streams.view(T, hy.hc, H), positions, state_slot,
@@ -531,7 +532,7 @@ def layer(model, layer, h, positions, slot_mapping, table, bias, state_slot=None
         from ..kernels import ffn_half
 
         if not mk:  # (the fused KDA or DSA layer has run the FFN half already)
-            S, post, comb, y = ffn_half.decode(model, layer, S, pend_a)
+            S, post, comb, y = ffn_half.decode(model, layer, S, pend_a, pages=None if table is None else table.shape[-1])
         if defer:  # the FFN output's mix left to the next layer's KDA shell call
             return S.reshape(S.shape[0], W), (post, comb, y)
         return mix_out(post, comb, y, S, True)

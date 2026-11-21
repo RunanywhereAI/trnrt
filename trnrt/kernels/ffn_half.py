@@ -71,9 +71,26 @@ def to_rows(rp: torch.Tensor) -> torch.Tensor:
 
 # the kernel's revision (ffn_half_pb's: its source and its bodies')
 REV = FB.REV
-# the routed experts' load ring the FFN half's MoE body runs with (its argument `ring`: NR buffers, prefetch distance
-# NR - 2): moe_dedupe's RING
-RING = mdd.RING
+# The routed experts' load ring the FFN half's MoE body runs with (its argument `ring`: NR buffers, prefetch distance
+# NR - 2), a static kernel argument chosen per decode graph by ring_for: RING_BY_T's ring for a graph of at most maxT
+# rows (the smallest matching maxT), else RING_BY_P's for its page bucket (the page table's width), else RING. The
+# MoE body's stage A waited on the ring's loads (~0.36 ms a step idle at ring 3). On trn2, ring 5 against ring 3: a
+# 24-row step 0.60 ms faster at 3072 pages and 1.33 ms slower at 4096 pages; a 3-row verify (one sequence, two drafts)
+# 0.886 ms slower; the fused KDA layer's FFN half at 8 rows and 4096 pages 0.161 ms slower; at 4 rows and 2048 pages
+# 0.131 ms faster.
+RING = 5
+RING_BY_P = {4096: 3}
+RING_BY_T = {3: 3}
+
+
+def ring_for(pages, T=None) -> int:
+    """The FFN half's ring for a decode graph of T rows whose page table has `pages` columns: RING_BY_T's (T at most
+    its smallest matching maxT), else RING_BY_P's, else RING (pages None: not known; T None: not known)."""
+    if T is not None and RING_BY_T:
+        for mt in sorted(RING_BY_T):
+            if int(T) <= mt:
+                return RING_BY_T[mt]
+    return RING_BY_P.get(int(pages), RING) if pages is not None else RING
 
 
 def run(S, pend_a, blobs: dict, w_blob, *, Is: int, K: int, scale: float, group: int, ring: int, limit: float,
@@ -138,14 +155,14 @@ def run(S, pend_a, blobs: dict, w_blob, *, Is: int, K: int, scale: float, group:
 
 # -- in the model's decode graph (models/hybrid.py layer) ------------------------------------------------------------
 
-def decode(model, layer, S, pend_a):
+def decode(model, layer, S, pend_a, pages=None):
     """A MoE layer's decode FFN block, the attention output's mix included, as one call: (S_n [T, hc, H], post fp32
     [T, hc], comb fp32 [T, hc, hc], y [T, H]), y the FFN output all-reduced (AR2) as _mlp returns it (the
     routed partials permuted and added, the shared ones added, routed + shared in bf16).
     S [T, hc, H]: the streams before the attention output's mix; pend_a = (post_a, comb_a, Y_a [n, T, H]): that mix,
     Y_a the attention output's n all-reduced partial slots (a KDA shell call's npg; 1 otherwise), padded here with
     zero slots to the kernel's programs (mix_in sums them once in fp32: the same y). On host tensors under
-    hybrid.SHELL_HOST (tests): the served CPU forms of the same steps."""
+    hybrid.SHELL_HOST (tests): the served CPU forms of the same steps. pages: the graph's page-table width (ring_for)."""
     from ..models import hybrid
 
     if hybrid.SHELL_HOST and S.device.type == "cpu":
@@ -157,18 +174,19 @@ def decode(model, layer, S, pend_a):
     post_a, comb_a, Y_a = pend_a
     if Y_a.shape[0] < npg:
         Y_a = torch.cat([Y_a, Y_a.new_zeros(npg - Y_a.shape[0], T, H)])
-    blobs, kw = decode_args(model, layer, hc)
+    blobs, kw = decode_args(model, layer, hc, pages, T=T)
     Sn, post, comb, rp, sp = run(S, (post_a, comb_a, Y_a), blobs, layer.w_blob, grid=npg, **kw)
     return Sn, post, comb, decode_out(model, rp, sp, S.dtype)
 
 
-def decode_args(model, layer, hc: int) -> tuple[dict, dict]:
-    """decode()'s blobs and run keywords for a layer (also the fused DSA layer's: the same FFN half inside its kernel)."""
+def decode_args(model, layer, hc: int, pages=None, T=None) -> tuple[dict, dict]:
+    """decode()'s blobs and run keywords for a layer (also the fused DSA layer's: the same FFN half inside its kernel).
+    pages / T: the graph's page-table width and rows, for ring_for."""
     hy, cfg = model.cfg.hybrid, model.cfg
     blobs = {BF16: layer.mh_blob_bf16, F32: layer.mh_blob_f32, "fn": MS.fn_arg(layer), "post_norm": layer.post_norm,
              "base": layer.hc_ffn_base, "scale": layer.hc_ffn_scale}
     kw = dict(Is=int(layer.shared_gate_up.shape[0] // 2), K=int(cfg.num_experts_per_tok),
-              scale=float(cfg.routed_scaling_factor), group=mdd.group_size(1), ring=RING, limit=float(hy.swiglu_limit),
+              scale=float(cfg.routed_scaling_factor), group=mdd.group_size(1), ring=ring_for(pages, T), limit=float(hy.swiglu_limit),
               rsp=MH.RSPLIT, hc=hc, iters=hy.sinkhorn_iters, hc_eps=hy.hc_eps, rms_eps=cfg.rms_norm_eps)
     return blobs, kw
 
@@ -202,8 +220,8 @@ from . import dense_half as _DH  # noqa: E402
 _decode_moe = decode
 
 
-def decode(model, layer, S, pend_a):
-    """A dense layer's to dense_half.decode; an MoE layer's to the MoE form above."""
+def decode(model, layer, S, pend_a, pages=None):
+    """A dense layer's to dense_half.decode (no ring: pages unused); an MoE layer's to the MoE form above."""
     if not getattr(layer, "moe", True):
         return _DH.decode(model, layer, S, pend_a)
-    return _decode_moe(model, layer, S, pend_a)
+    return _decode_moe(model, layer, S, pend_a, pages)

@@ -39,12 +39,13 @@ def layer_takes(model, layer, T: int) -> bool:
     return T % npg == 0 and model.cfg.hidden_size // 128 <= 128
 
 
-def decode_layer_split(model, layer, S, positions, state_slot, pend=None):
+def decode_layer_split(model, layer, S, positions, state_slot, pend=None, pages=None):
     """One KDA + MoE layer's decode call (a verify's with kda_shell.verify in place of decode): kda_shell.decode (its
     kernel, then model._attn_all_reduce), then mk_ffn_b5_kernel (ffn_half_pb's body and _b5, the arguments
     ffn_half.decode's run builds; past 8 rows at grid 2 mk_ffn_b5c_kernel with the chunked _b5c), then
     model._out_reduce.
-    pend: the previous layer's (post, comb, y [T, H]) as it returned them. Returns (S_n [T, hc, H], post fp32 [T, hc],
+    pend: the previous layer's (post, comb, y [T, H]) as it returned them; pages: the graph's page-table width (the FFN
+    half's ring, ffn_half.ring_for). Returns (S_n [T, hc, H], post fp32 [T, hc],
     comb fp32 [T, hc, hc], y [T, H] all-reduced), as kda_shell.decode then ffn_half.decode return them."""
     import torch
 
@@ -63,7 +64,7 @@ def decode_layer_split(model, layer, S, positions, state_slot, pend=None):
           "post_norm": layer.post_norm, "base": layer.hc_ffn_base, "scale": layer.hc_ffn_scale}
     fa = FH.run(S1, (post_a, comb_a, Y_a), fb, layer.w_blob, Is=int(layer.shared_gate_up.shape[0] // 2),
                 K=int(cfg.num_experts_per_tok), scale=float(cfg.routed_scaling_factor), group=mdd.group_size(1),
-                ring=FH.RING, limit=float(hy.swiglu_limit), rsp=MH.RSPLIT, hc=hc, iters=hy.sinkhorn_iters,
+                ring=FH.ring_for(pages, T), limit=float(hy.swiglu_limit), rsp=MH.RSPLIT, hc=hc, iters=hy.sinkhorn_iters,
                 hc_eps=hy.hc_eps, rms_eps=cfg.rms_norm_eps, grid=npg, build_only=True)
     # past one chunk of this program's rows (T > 8 at grid 2) the chunked glue's kernel; at T <= 8 the served one
     chunked = (T // npg) * (H // 128) > 128
