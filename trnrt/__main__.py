@@ -165,17 +165,56 @@ DEPRECATED: dict[str, str] = {
 #   rows a step the KDA decode kernel costs less than the shell's per-row recurrence;
 # - mhc_seam, shell_mix_row_split, state_ckpt_mid_export: the mHC seam kernel, the decode kernels' stream mix split over
 #   the LNC pair, and the in-chunk state checkpoint from the main delta-rule scan, in throughput only.
-# PLACEHOLDER (merge): the DSA area's fields join these. What each build runs there: the DSA selection's row classes
-#   (kernels/dsa_sel2gc.py LAYOUTS; the runner's side is model_runner.rowclass_init) balanced
-#   "24:6x24+6x8+12x4,16:4x24+12x8", throughput "24:2x24+2x16+4x12+16x6", each with the one-store compaction (pe),
-#   throughput with the CW form (lt); the form-W row split balanced "16:2x24+2x8,24:2x24+4x8", throughput "24:2x24+4x6";
-#   the stage-2 gather, the output-decode drop, the pipelined prefill slots (64) and the big top-k row split in balanced
-#   and throughput; the context-parallel failure trips (selection and attention) and the direct sequence-parallel
-#   gather in throughput only.
+# - the DSA layers: the selection's row classes (kernels/dsa_sel2gc.py; the runner's side is model_runner.rowclass_init)
+#   and the form-W row split that serves them, with the in-kernel candidate bias in throughput; the pipelined prefill
+#   slots and the big top-k row split, and dropping the unread o_proj copy, in balanced and throughput; the
+#   context-parallel failure trips (selection and attention) and the direct sequence-parallel gather in throughput.
 BUILD_FIELDS: dict[str, dict] = {
-    "latency": {"kda_shell": True, "mhc_seam": False, "shell_mix_row_split": False, "state_ckpt_mid_export": False},
-    "balanced": {"kda_shell": False, "mhc_seam": False, "shell_mix_row_split": False, "state_ckpt_mid_export": False},
-    "throughput": {"kda_shell": False, "mhc_seam": True, "shell_mix_row_split": True, "state_ckpt_mid_export": True},
+    "latency": {
+        "kda_shell": True,
+        "mhc_seam": False,
+        "shell_mix_row_split": False,
+        "state_ckpt_mid_export": False,
+        "dsa_topk_rowsplit_big": False,
+        "dsa_cp_fail_trip": False,
+        "dsa_cp_fail_attn_trip": False,
+        "dsa_slots_pipe_rows": 0,
+        "sp_gather_direct": False,
+        "dsa_drop_unread_o_dec": False,
+        "dsa_row_classes": "",
+        "dsa_row_classes_cw": False,
+        "dsa_rowsplit_layout": "",
+    },
+    "balanced": {
+        "kda_shell": False,
+        "mhc_seam": False,
+        "shell_mix_row_split": False,
+        "state_ckpt_mid_export": False,
+        "dsa_topk_rowsplit_big": True,
+        "dsa_cp_fail_trip": False,
+        "dsa_cp_fail_attn_trip": False,
+        "dsa_slots_pipe_rows": 64,
+        "sp_gather_direct": False,
+        "dsa_drop_unread_o_dec": True,
+        "dsa_row_classes": "24:6x24+6x8+12x4,16:4x24+12x8",
+        "dsa_row_classes_cw": False,
+        "dsa_rowsplit_layout": "16:2x24+2x8,24:2x24+4x8",
+    },
+    "throughput": {
+        "kda_shell": False,
+        "mhc_seam": True,
+        "shell_mix_row_split": True,
+        "state_ckpt_mid_export": True,
+        "dsa_topk_rowsplit_big": True,
+        "dsa_cp_fail_trip": True,
+        "dsa_cp_fail_attn_trip": True,
+        "dsa_slots_pipe_rows": 64,
+        "sp_gather_direct": True,
+        "dsa_drop_unread_o_dec": True,
+        "dsa_row_classes": "24:2x24+2x16+4x12+16x6",
+        "dsa_row_classes_cw": True,
+        "dsa_rowsplit_layout": "24:2x24+4x6",
+    },
 }
 
 

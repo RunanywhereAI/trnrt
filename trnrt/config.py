@@ -189,6 +189,71 @@ class EngineConfig:
     # Every page pool hands out the lowest free page ids in ascending order, so a request's pages, and the pages an
     # eviction frees, form few runs for the batched host-cache copies. Host only (page ids are values, not shapes).
     pool_ascending: bool = False
+    # -- the DSA layers' routes (the dsa area's block; engine.set_decode_routes copies each into the module that reads it
+    # when a graph is traced, so each is graph structure: a change needs a new capture) --
+    # - dsa_topk_rowsplit_big (kernels/dsa_topk.py ROWSPLIT_BIG): a prefill chunk's one-tile selections of at least 64
+    #   rows split over the two LNC programs, as the decode calls' are.
+    dsa_topk_rowsplit_big: bool = False
+    # - dsa_cp_fail_trip (models/mla.py CP_FAIL_TRIP): a prefill chunk's failed-row merge (the rows whose local top-K
+    #   certificate failed) runs its selections only when some row failed (kernels/dsa_topk_t.py).
+    dsa_cp_fail_trip: bool = False
+    # - dsa_cp_fail_attn_trip (models/mla.py CP_FAIL_ATTN_TRIP): its failed rows' attention runs the live (failed)
+    #   entries only, so it runs no row when none failed.
+    dsa_cp_fail_attn_trip: bool = False
+    # - dsa_slots_pipe_rows (kernels/dsa_slots_n_p.py PIPE_ROWS): a prefill chunk's main rows' slot attention with its
+    #   rows software-pipelined, this many rows a device-loop iteration (0: the split kernel's call).
+    dsa_slots_pipe_rows: int = 0
+    # - sp_gather_direct (kernels/sp_gather.py DIRECT, with sp_gather "nki"): the sequence-parallel gather written straight
+    #   into the kernel's output, no copy-out.
+    sp_gather_direct: bool = False
+    # - dsa_drop_unread_o_dec (models/mla.py ODEC_DROP): the main DSA layers keep no model-dtype o_proj copy beside the
+    #   fused layer calls' pre-tiled one (no graph reads it when every decode step runs the fused call): HBM only.
+    dsa_drop_unread_o_dec: bool = False
+    # - dsa_row_classes (kernels/dsa_sel2gc.py LAYOUTS): static row classes, "B:NxG+NxG..,B:.." (e.g.
+    #   "24:6x24+6x8+12x4"): a plain decode batch of B rows at the page bucket of its widest class (128 G pages) scores
+    #   each slot over its own class's first 128 G pages only. The runner orders the batch into the slots, longest rows
+    #   first, and sends a batch that does not fit to the next page bucket. "": no classes.
+    # - dsa_row_classes_cw (kernels/dsa_sel2gc.py CW): the classed selection builds each row's candidate bias from nloc
+    #   in the kernel instead of reading an XLA-built [B, P] mask.
+    # - dsa_rowsplit_layout (kernels/dsa_satwfcga.py W_LAYOUTS): form W, "B:naxqa+nbxqb[,B:..]" a row group's two runs
+    #   of slots: a classed call's selection over this rank's row group's rows only, its lists gathered over the world.
+    #   Every classed batch size needs one.
+    dsa_row_classes: str = ""
+    dsa_row_classes_cw: bool = False
+    dsa_rowsplit_layout: str = ""
+
+    def _check_dsa_routes(self) -> None:
+        """The DSA block's checks (__post_init__ runs them last)."""
+        if self.dsa_slots_pipe_rows < 0 or self.dsa_slots_pipe_rows % 2:
+            raise ValueError(f"dsa_slots_pipe_rows={self.dsa_slots_pipe_rows}: 0 (off) or an even row count (each "
+                             f"LNC program a half)")
+        if self.sp_gather_direct and self.sp_gather != "nki":
+            raise ValueError("sp_gather_direct needs sp_gather 'nki' (the kernel's gather)")
+        if not self.dsa_row_classes:
+            if self.dsa_row_classes_cw or self.dsa_rowsplit_layout:
+                raise ValueError("dsa_row_classes_cw and dsa_rowsplit_layout need dsa_row_classes")
+            return
+        from .kernels import dsa_satwfcga, dsa_sel2gc  # (at construction: no import cycle with this module)
+
+        lay = dsa_sel2gc.parse(self.dsa_row_classes)
+        dsa_sel2gc._rc_ints(lay)  # the kernel's form: at most 2 batch sizes of at most 4 runs
+        w = dsa_satwfcga.parse_w(self.dsa_rowsplit_layout)
+        if set(w) != set(lay):
+            raise ValueError(f"dsa_rowsplit_layout {self.dsa_rowsplit_layout!r} must cover every classed batch size "
+                             f"{sorted(lay)} (the classed selection is served in form W only)")
+        dsa_satwfcga.check_layouts(w, lay)
+        if self.spec_method is not None:
+            raise ValueError("dsa_row_classes: speculative decoding's verify and MTP calls would skip the runner's slot "
+                             "order")
+        buckets, pages = self.resolved_decode_batch_buckets(), self.resolved_page_buckets()
+        for B, ngs in sorted(lay.items()):
+            P = 128 * max(ngs)
+            if B not in buckets:
+                raise ValueError(f"dsa_row_classes: B {B} is not a decode bucket {buckets}")
+            if P not in pages or P == max(pages):
+                raise ValueError(f"dsa_row_classes: B {B}'s page bucket {P} must be a page bucket below the largest "
+                                 f"{pages} (the runner's fallback for a batch that does not fit)")
+    # -- end of the DSA block
 
     def __post_init__(self):
         if self.max_running is not None and self.max_running < 1:
@@ -250,6 +315,7 @@ class EngineConfig:
             raise ValueError(
                 f"state_spec_seats={self.state_spec_seats} must cover spec_max_batch {self.spec_max_batch} and fit the "
                 f"{self.state_seats or self.max_num_seqs} seats")
+        self._check_dsa_routes()  # the DSA block's checks
 
     def resolved_moe_kernel(self) -> str:
         return self.moe_kernel or ("nki" if self.device in ("neuron", "meta") else "xla")

@@ -28,13 +28,24 @@ if nki is not None:
     def _snd_write_hbm(o, lse, SND, T: int, H: int, R: int, rows):
         """_snd_write's rows copied HBM -> HBM, o / lse straight into SND with no SBUF staging: row h T + t gets
         o[0, t, h, :] in columns 0 .. R - 1 and lse[0, t, h, 0] in column R (sh 1 / pw 1: on the device, program 1's
-        SBUF-sourced rows were invisible to program 0 after a core barrier; HBM -> HBM writes are not)."""
+        SBUF-sourced rows were invisible to program 0 after a core barrier; HBM -> HBM writes are not). rows is one
+        ascending contiguous run r0 .. r1 (every caller's: range(T) under pw 1, the program's half under the split),
+        written in two DMAs with 3-D access patterns, o over (t, h, r) and lse over (t, h). Two DMAs a row instead cost
+        program 0 48 hardware-DGE DMAs at ~0.85 us each at 24 rows on trn2, 42.7 us of a DSA layer while program 1 waits
+        at the send buffer's barrier."""
         Cn = R + 16
+        r0 = -1
+        r1 = -1
         for t in rows:
-            _dma(dst=SND.ap(pattern=[[T * Cn, H], [1, R]], offset=t * Cn),
-                 src=o.ap(pattern=[[R, H], [1, R]], offset=t * H * R))
-            _dma(dst=SND.ap(pattern=[[T * Cn, H], [1, 1]], offset=t * Cn + R),
-                 src=lse.ap(pattern=[[1, H], [1, 1]], offset=t * H))
+            if r0 < 0:
+                r0 = t
+            r1 = t
+        if r0 >= 0:
+            n = r1 - r0 + 1
+            _dma(dst=SND.ap(pattern=[[Cn, n], [T * Cn, H], [1, R]], offset=r0 * Cn),
+                 src=o.ap(pattern=[[H * R, n], [R, H], [1, R]], offset=r0 * H * R))
+            _dma(dst=SND.ap(pattern=[[Cn, n], [T * Cn, H], [1, 1]], offset=r0 * Cn + R),
+                 src=lse.ap(pattern=[[H, n], [1, H], [1, 1]], offset=r0 * H))
 # -- the kernel source end
 
 
@@ -42,14 +53,16 @@ REV = (SH.kernel_rev(__file__, "# -- the kernel source", "# -- the kernel source
 
 
 def sat_args(q, w, pkc, table, nloc, positions, q_all, kc, w_uv_p, o_p, ident, keep: int, A: int, rank, world: int,
-        scale: float, *, kp: int = 4, ns: int = 640, rbits2: int = 2, rbits: int = 4, nr: int | None = None, pf: int = 2,
+        scale: float, *, kp: int = 4, ns: int = 640, rbits2: int = 2, rbits: int = 2, nr: int | None = None, pf: int = 2,
         il: int = 1, st: int = 1, ss: int = 1, tl: int = 1, fo: int = 1, so: int = 1, wu: int = 1, nf: int = 1,
         ev: int = 1, pn: int = 0, fz: int = 0, wl: int = 0, po: int = 1, dw: int = 0, ob: int = 0,
         sh: int = 0, rp: int = 1, pw: int = 0, yb: int = 0, pq: int = 0, cs: int = 0, grid: int | None = None,
         _kernel=None,
         _rev: int | None = None):
     """The fused layer kernel _kernel's arguments for the section and the tail (dsa_satwf / dsa_satwfc add the FFN
-    half's): (args, kern, grid, T, H, R). _rev: the calling kernel's REV."""
+    half's): (args, kern, grid, T, H, R). _rev: the calling kernel's REV. rbits: the bits a round of the merge's
+    selection decides (dsa_shell._select_st); at 2 the per-round compare and reduce over [128, nt, Jw, W] shrinks 5x
+    (Jw 15 -> 3) against 4's for twice the rounds, cheaper at 24 decode rows, and the selection is the same set."""
     from . import dsa_index, dsa_slots
 
     kern = _kernel
@@ -286,7 +299,7 @@ REV_K = (SH.kernel_rev(__file__, "# -- the layer kernel without", "# -- the laye
 
 
 def sat(q, w, pkc, table, nloc, positions, q_all, kc, w_uv_p, o_p, ident, keep: int, A: int, rank, world: int,
-        scale: float, *, kp: int = 4, ns: int = 640, rbits2: int = 2, rbits: int = 4, nr: int | None = None, pf: int = 2,
+        scale: float, *, kp: int = 4, ns: int = 640, rbits2: int = 2, rbits: int = 2, nr: int | None = None, pf: int = 2,
         il: int = 1, st: int = 1, ss: int = 1, tl: int = 1, fo: int = 1, so: int = 1, wu: int = 1, nf: int = 1,
         ev: int = 1, pn: int = 0, fz: int = 0, wl: int = 0, po: int = 1, dw: int = 0, ob: int = 0,
         sh: int = 0, rp: int = 1, pw: int = 0, yb: int = 0, cs: int = 0, grid: int | None = None):

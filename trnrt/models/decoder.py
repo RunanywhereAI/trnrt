@@ -325,6 +325,8 @@ class DecoderForCausalLM(nn.Module):
                                                  index=i, keep_fp8=keep_fp8, moe_kernel=moe_kernel,
                                                  attn_tp=self.attn_tp, attn_rank=self.attn_rank)
                                     for i in range(cfg.num_layers))
+        if _mla.ODEC_DROP:  # the main layers' unread o_dec (models/mla.py); the MTP layer keeps its own
+            _mla.drop_unread_o_dec(self.layers)
         self.norm = nn.Parameter(torch.empty(cfg.hidden_size, dtype=dtype), requires_grad=False)
         self.lm_head = (
             None if cfg.tie_word_embeddings

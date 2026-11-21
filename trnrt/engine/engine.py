@@ -180,6 +180,18 @@ def set_decode_routes(cfg: EngineConfig) -> None:
     from ..models import linear_attn
 
     linear_attn.MID_EXPORT = bool(cfg.state_ckpt_mid_export)
+    # -- the DSA layers' routes (the dsa area's block: one line a field) --
+    from ..kernels import dsa_satwfcga, dsa_sel2gc, dsa_slots_n_p, dsa_topk
+
+    dsa_topk.ROWSPLIT_BIG = bool(cfg.dsa_topk_rowsplit_big)
+    mla.CP_FAIL_TRIP = bool(cfg.dsa_cp_fail_trip)
+    mla.CP_FAIL_ATTN_TRIP = bool(cfg.dsa_cp_fail_attn_trip)
+    dsa_slots_n_p.PIPE_ROWS = int(cfg.dsa_slots_pipe_rows)
+    sp_gather.DIRECT = bool(cfg.sp_gather_direct)
+    mla.ODEC_DROP = bool(cfg.dsa_drop_unread_o_dec)
+    dsa_sel2gc.set_layouts(cfg.dsa_row_classes)
+    dsa_sel2gc.CW = bool(cfg.dsa_row_classes_cw)
+    dsa_satwfcga.set_layouts(cfg.dsa_rowsplit_layout)  # (after dsa_sel2gc's: checked against them)
 
 
 def local_k_counts(model) -> list[float] | None:
