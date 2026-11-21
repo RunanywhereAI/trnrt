@@ -232,6 +232,9 @@ SITES = {
     ("trnrt/kernels/dsa_shell.py", "attend"): ["flip"],
     ("trnrt/kernels/dsa_shell.py", "select2"): ["flip"],  # sel2 is the served decode selection
     ("trnrt/kernels/dsa_sel2g.py", "select2g"): ["flip"],  # sel2's generated copy: the P3072 decode selection
+    ("trnrt/kernels/dsa_sel2gc.py", "select2gc"): ["flip"],  # the classed decode selection (row classes)
+    ("trnrt/kernels/dsa_topk_t.py", "select"): ["flip"],  # dsa_topk's selection under a run-time trip count
+    ("trnrt/models/mla.py", "_cp_slots_attend"): ["flip"],  # a prefill chunk's slot attention, pipelined or split
     ("trnrt/kernels/dsa_slots_c.py", "attend"): ["off"],
     ("trnrt/kernels/dsa_slots_n.py", "attend"): ["flip"],
     ("trnrt/kernels/dsa_topk.py", "select"): ["flip"],
