@@ -411,6 +411,25 @@ def alloc_kv(shapes, slots: int, dtype, device):
     return ks, vs
 
 
+def page_runs(pages: list[int]) -> list[tuple[int, int, list[int]]]:
+    """A host-cache batch's device pages as runs of consecutive pages: (first page, count, the batch indices of its pages
+    in page order). A batch names each page once (fresh allocations; held pages are saved once)."""
+    if len(set(pages)) != len(pages):
+        raise ValueError(f"a host-cache batch names a page twice: {sorted(pages)}")
+    order = sorted(range(len(pages)), key=lambda j: pages[j])
+    runs, start = [], 0
+    for k in range(1, len(order) + 1):
+        if k == len(order) or pages[order[k]] != pages[order[k - 1]] + 1:
+            runs.append((pages[order[start]], k - start, order[start:k]))
+            start = k
+    return runs
+
+
+def _new_so_stats() -> dict:
+    """Save-once counters of one rank (ModelRunner.so_stats)."""
+    return dict(save_pages=0, load_calls=0, load_pages=0, load_peer_pages=0, wait_s=0.0, tag_checked=0)
+
+
 def state_checkpoint_rows(ecfg: EngineConfig) -> int:
     """Rows of a recurrent model's state pool kept for prefix-cache checkpoints: the configured
     count, else twice max_num_seqs (SGLang v0.5.21 int8_mamba_ckpt_size's default: 2x the active
@@ -1237,19 +1256,198 @@ class ModelRunner:
     # Every rank holds its own share of each page and state row, so each call is broadcast and every rank copies its own.
 
     def kv_save(self, slot: int, page: int) -> None:
+        if getattr(self, "_so", None) is not None:
+            raise RuntimeError("the save-once host cache moves pages in batches only (host_cache_batch)")
         if self.tp_send is not None:
             self.tp_send(("kv_save", None, [slot, page]))
         self._kv_save(slot, page)
 
     def kv_load(self, slot: int, page: int) -> None:
+        if getattr(self, "_so", None) is not None:
+            raise RuntimeError("the save-once host cache moves pages in batches only (host_cache_batch)")
         if self.tp_send is not None:
             self.tp_send(("kv_load", None, [slot, page]))
         self._kv_load(slot, page)
 
     def kv_drop(self, slot: int) -> None:
+        if getattr(self, "_so", None) is not None:
+            return  # an arena slot is overwritten by its next save (its generation moves on): nothing is held per rank
         if self.tp_send is not None:
             self.tp_send(("kv_drop", None, [slot]))
         self._kv_drop(slot)
+
+    def kv_save_many(self, slots: list[int], pages: list[int], tags: list[int] | None = None) -> None:
+        """kv_save of every (slot, page) pair in ONE broadcast, each cache copied once per run of consecutive pages
+        (EngineConfig.host_cache_batch): the per-page broadcasts and the per-page, per-cache copies were the host cache's
+        cost at the KV wall, not its bytes. tags: under save-once, the pages' tag cells (host_arena.tag_of of each chain
+        hash), stamped beside the generation."""
+        if getattr(self, "_so", None) is not None:
+            if not slots:
+                return
+            self._so_seq += 1
+            gens = []
+            for s in slots:
+                self._so_gen[s] = self._so_gen.get(s, 0) + 1
+                gens.append(self._so_gen[s])
+            args = [list(slots), list(pages), gens, self._so_seq, None if tags is None else list(tags)]
+            if self.tp_send is not None:
+                self.tp_send(("kv_save_many_so", None, args))
+            self._kv_save_many_so(*args)
+            return
+        if self.tp_send is not None:
+            self.tp_send(("kv_save_many", None, [list(slots), list(pages)]))
+        self._kv_save_many(slots, pages)
+
+    def kv_load_many(self, slots: list[int], pages: list[int], tags: list[int] | None = None) -> None:
+        """kv_load of every (slot, page) pair in ONE broadcast, each cache written once per run of consecutive pages.
+        tags: under save-once, the tag each slot must carry (every rank checks it before copying)."""
+        if getattr(self, "_so", None) is not None:
+            if not slots:
+                return
+            self._so_seq += 1
+            gens = [self._so_gen[s] for s in slots]
+            for s in slots:
+                self._so_load_seq[s] = self._so_seq
+            args = [list(slots), list(pages), gens, self._so_seq, None if tags is None else list(tags)]
+            if self.tp_send is not None:
+                self.tp_send(("kv_load_many_so", None, args))
+            self._kv_load_many_so(*args)
+            return
+        if self.tp_send is not None:
+            self.tp_send(("kv_load_many", None, [list(slots), list(pages)]))
+        self._kv_load_many(slots, pages)
+
+    def _kv_save_many(self, slots: list[int], pages: list[int]) -> None:
+        if not slots:
+            return
+        caches, lps = self._paged_caches(), self.lps
+        for lo, n, idx in page_runs(pages):
+            sl = slice(lo * lps, (lo + n) * lps)
+            hosts = [c[sl].to("cpu", copy=True) for c in caches]  # one device-to-host copy per cache per run
+            for k, j in enumerate(idx):  # each slot its own copy, so it frees on its own (clone: not a view of the run)
+                self._host_kv[slots[j]] = [h[k * lps:(k + 1) * lps].clone() for h in hosts]
+
+    def _kv_load_many(self, slots: list[int], pages: list[int]) -> None:
+        if not slots:
+            return
+        self._settle()  # as _kv_load: once for the whole batch
+        caches, lps = self._paged_caches(), self.lps
+        for lo, n, idx in page_runs(pages):
+            sl = slice(lo * lps, (lo + n) * lps)
+            for i, c in enumerate(caches):  # one host-to-device copy per cache per run
+                hs = [self._host_kv[slots[j]][i] for j in idx]
+                c[sl].copy_(hs[0] if len(hs) == 1 else torch.cat(hs))
+
+    # -- save-once (engine/host_arena.py, EngineConfig.host_cache_save_once): a page is copied ONCE per CP index, into
+    # the arena of the row group that owns its host slot, and restored from there on every rank of that CP index ------
+
+    def so_possible(self) -> bool:
+        """Save-once needs at least two context-parallel row groups (the ranks of one CP index hold identical bytes)."""
+        return getattr(self.model, "cp_rows", 1) > 1 and getattr(self.model, "tp_size", 1) > 1
+
+    def kv_arena_init(self, tag: str, capacity_slots: int) -> list[str]:
+        """Create every rank's arena (and the completion board) for `capacity_slots` host slots in all. Rank 0 first
+        removes the stale segments of an engine with this tag (their names are returned), and refuses when the arenas'
+        worst case does not fit /dev/shm (host_arena.check_capacity)."""
+        from . import host_arena as HA
+
+        lay = HA.Layout(self._paged_caches(), self.lps)
+        R = self.model.attn_tp // self.model.cp
+        HA.check_capacity(self.model.tp_size * -(-capacity_slots // R) * lay.slot_bytes)
+        gone = HA.cleanup_stale(tag)
+        if self.tp_send is not None:
+            self.tp_send(("kv_arena_init", None, [tag, capacity_slots]))
+        self._kv_arena_init(tag, capacity_slots)
+        return gone
+
+    def _kv_arena_init(self, tag: str, capacity_slots: int) -> None:
+        from . import host_arena as HA
+
+        rank = getattr(self.model, "tp_rank", 0)
+        self._so = HA.HostStore(tag, rank, self.model.tp_size, self.model.attn_tp, self.model.cp,
+                                HA.Layout(self._paged_caches(), self.lps), capacity_slots)
+        self._so.attach_board(create=rank == 0)
+        self._so.board.mark(rank, 0)
+        self._so_stats = _new_so_stats()
+        if rank == 0:
+            self._so_seq, self._so_gen, self._so_load_seq = 0, {}, {}
+
+    def kv_arena_close(self) -> None:
+        """Unlink this process's arena and (rank 0) the completion board; peers' arenas are only unmapped. The workers'
+        own go when they exit (LLMEngine.close stops them first)."""
+        st = getattr(self, "_so", None)
+        if st is not None:
+            self._so = None
+            st.close()
+
+    def so_active(self) -> bool:
+        """Whether the save-once arenas are up (the host cache then tags its saves and checks its restores)."""
+        return getattr(self, "_so", None) is not None
+
+    def so_stats(self) -> dict:
+        """This rank's save-once counters: pages it wrote into its arena, restores and the pages they brought
+        (load_peer_pages: those another row group's arena held), seconds spent waiting for an owner's save, tags
+        checked."""
+        st = getattr(self, "_so_stats", None)
+        return dict(st) if st is not None else {}
+
+    def so_busy(self, slot: int) -> bool:
+        """Rank 0: whether a restore that read this slot may still be running on some rank (its sequence number is past
+        the board's minimum). The host cache does not evict a busy slot: it stays pinned through the copy, not only
+        through the broadcast."""
+        if getattr(self, "_so", None) is None:
+            return False  # save-once off: the host cache asks on every eviction, and nothing is ever busy
+        seq = self._so_load_seq.get(slot)
+        if seq is None:
+            return False
+        if self._so.board.min_done() >= seq:
+            del self._so_load_seq[slot]
+            return False
+        return True
+
+    def _kv_save_many_so(self, slots: list[int], pages: list[int], gens: list[int], seq: int,
+                         tags: list[int] | None = None) -> None:
+        from .host_arena import NOTAG
+
+        st, caches, lps = self._so, self._paged_caches(), self.lps
+        tags = tags if tags is not None else [NOTAG] * len(slots)  # a caller without chain hashes: nothing to check
+        mine = [(s, p, g, t) for s, p, g, t in zip(slots, pages, gens, tags) if st.owner(s) == st.mine]
+        for lo, n, idx in page_runs([p for _, p, _, _ in mine]):  # one copy per cache per run of THIS row group's pages
+            sl = slice(lo * lps, (lo + n) * lps)
+            hosts = [c[sl].to("cpu", copy=True) for c in caches]
+            for k, j in enumerate(idx):
+                s, _, g, t = mine[j]
+                st.begin(s, g)  # before the payload: a reader copying right now fails its check_gen, it keeps no torn bytes
+                for v, h in zip(st.views(s), hosts):
+                    v.copy_(h[k * lps:(k + 1) * lps])
+                st.commit(s, g, t)  # after the payload: a reader that sees the generation sees the bytes and the tag
+        self._so_stats["save_pages"] += len(mine)
+        st.board.mark(st.rank, seq)
+
+    def _kv_load_many_so(self, slots: list[int], pages: list[int], gens: list[int], seq: int,
+                         tags: list[int] | None = None) -> None:
+        st, caches, lps, stats = self._so, self._paged_caches(), self.lps, self._so_stats
+        t0 = time.perf_counter()
+        for s, g in zip(slots, gens):
+            st.wait_gen(s, g)  # the owner's save of this generation finished (a timeout raises: never stale bytes)
+        stats["wait_s"] += time.perf_counter() - t0
+        if tags is not None:
+            for s, t in zip(slots, tags):
+                st.check_tag(s, t)  # the slot holds the page the host cache looked it up as, before a byte is copied
+            stats["tag_checked"] += len(slots)
+        self._settle()
+        views = {s: st.views(s) for s in slots}
+        for lo, n, idx in page_runs(pages):
+            sl = slice(lo * lps, (lo + n) * lps)
+            for i, c in enumerate(caches):
+                hs = [views[slots[j]][i] for j in idx]
+                c[sl].copy_(hs[0] if len(hs) == 1 else torch.cat(hs))
+        for s, g in zip(slots, gens):
+            st.check_gen(s, g)  # none was rewritten while it was copied (the busy rule prevents it; this makes a breach loud)
+        stats["load_calls"] += 1
+        stats["load_pages"] += len(slots)
+        stats["load_peer_pages"] += sum(st.owner(s) != st.mine for s in slots)
+        st.board.mark(st.rank, seq)
 
     def _paged_caches(self) -> list[torch.Tensor]:
         return self.k_caches + self.v_caches + self.aux_caches + self.s_caches
@@ -1317,7 +1515,9 @@ class ModelRunner:
         """Ranks > 0: execute every call rank 0 broadcasts, until it sends None."""
         local = {"state_copy": self._copy_state, "kv_save": self._kv_save, "kv_load": self._kv_load,
                  "kv_drop": self._kv_drop, "state_save": self._state_save, "state_load": self._state_load,
-                 "state_drop": self._state_drop}
+                 "state_drop": self._state_drop, "kv_save_many": self._kv_save_many,
+                 "kv_load_many": self._kv_load_many, "kv_arena_init": self._kv_arena_init,
+                 "kv_save_many_so": self._kv_save_many_so, "kv_load_many_so": self._kv_load_many_so}
         while True:
             msg = recv()
             if msg is None:
@@ -1383,3 +1583,4 @@ def spec_page_buckets(ecfg: EngineConfig, page_buckets: tuple[int, ...]) -> tupl
     if not set(sp) <= set(pb) or sp[-1] != pb[-1]:
         raise ValueError(f"spec_page_buckets {sp} must be page buckets {pb} including the largest (every context has a rung)")
     return sp
+

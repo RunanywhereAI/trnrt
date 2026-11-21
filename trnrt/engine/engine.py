@@ -42,6 +42,16 @@ def _close_open() -> None:
         eng.close()
 
 
+def host_tier_split(budget: float, row_bytes: int, page_bytes: int, frac: float = 0.5) -> tuple[int, int]:
+    """Per-rank host cache capacities (checkpoint slots, KV pages) from a byte budget: `frac` of it for state checkpoints
+    (at least one slot), the remainder for pages. frac 0.5 is the even split."""
+    if not 0.0 < frac < 1.0:
+        raise ValueError(f"the checkpoints' share of the host cache must be in (0, 1), not {frac}")
+    ckpts = max(1, int(budget * frac // row_bytes)) if row_bytes else 0
+    rest = budget - ckpts * row_bytes
+    return ckpts, (int(rest // page_bytes) if page_bytes else 0)
+
+
 @dataclass
 class StepStats:
     """The work the last step() launched (decodes, prefill tokens, and its graph calls by kind) and that step() call's
@@ -277,7 +287,7 @@ class LLMEngine:
 
             self.runner.tp_send = tp.send
             _OPEN.add(self)
-        self.pool = PagePool(num_pages)
+        self.pool = PagePool(num_pages, ascending=cfg.pool_ascending)
         self.radix = RadixCache(self.pool, cfg.page_size)
         scfg = SchedulerConfig(
             page_size=cfg.page_size,
@@ -296,19 +306,32 @@ class LLMEngine:
         self.scheduler = Scheduler(scfg, self.pool, self.radix, draft_fn=self._propose if cfg.spec_method else None)
         self.scheduler.states = self.runner.state  # checkpoint rows of the state pool back the radix nodes
         self.radix.free_ckpt = self.runner.state.free_ckpt
-        # Host memory under the radix cache (engine/host_cache.py), per rank: half for state checkpoints, the rest for
-        # KV pages. Evicted pages and checkpoints go there (a checkpoint on a running request's path too, when no row is
-        # free), and a later hit copies them back.
+        # Host memory under the radix cache (engine/host_cache.py), per rank: host_cache_ckpt_frac of it for state
+        # checkpoints, the rest for KV pages. Evicted pages and checkpoints go there (a checkpoint on a running request's
+        # path too, when no row is free), and a later hit copies them back.
         self.host_tier: HostTier | None = None
         if cfg.host_cache_gb > 0:
             from .host_cache import HostTier
 
-            budget = cfg.host_cache_gb * 2**30
-            ckpts = max(1, int(budget / 2 // self.runner.state.bytes_per_row()))
-            budget -= ckpts * self.runner.state.bytes_per_row()
             page_bytes = self.runner.kv_page_bytes()
-            pages = int(budget // page_bytes) if page_bytes else cfg.max_num_seqs * cfg.max_pages_per_seq
-            self.host_tier = HostTier(self.runner, cfg.page_size, max(1, pages), ckpts)
+            ckpts, pages = host_tier_split(
+                cfg.host_cache_gb * 2**30, self.runner.state.bytes_per_row(), page_bytes, cfg.host_cache_ckpt_frac
+            )
+            if not page_bytes:
+                pages = cfg.max_num_seqs * cfg.max_pages_per_seq
+            if cfg.host_cache_save_once and page_bytes and pages:
+                if self.runner.so_possible():
+                    # The ranks of one CP index pool their budgets: each page is kept once, not once per row group.
+                    R = self.model.cp_rows
+                    tag = f"c{cfg.tp_core_base}" if cfg.device == "neuron" else f"p{os.getpid() % 100000}"
+                    pages *= R
+                    gone = self.runner.kv_arena_init(tag, pages)
+                    if gone:
+                        logger.info("removed %d stale host-arena segments of tag %s", len(gone), tag)
+                    logger.info("save-once host cache: %d pages over %d row groups (tag %s)", pages, R, tag)
+                else:
+                    logger.info("save-once host cache off: no context-parallel row groups; every rank keeps its copy")
+            self.host_tier = HostTier(self.runner, cfg.page_size, max(1, pages), ckpts, batch=cfg.host_cache_batch)
             self.radix.offload, self.radix.offload_ckpt = self.host_tier.offload, self.host_tier.offload_ckpt
             self.radix.offload_ckpt_hash = self.host_tier.offload_ckpt_hash
             self.scheduler.host = self.host_tier
@@ -400,6 +423,9 @@ class LLMEngine:
                 runner.tp_send(None)
             runner.tp_send = None
         self._stop_tp(wait)
+        arena_close = getattr(runner, "kv_arena_close", None)
+        if arena_close is not None:
+            arena_close()  # the save-once arenas: rank 0's own and the board, after the workers have gone
 
     def _stop_tp(self, wait: float = 30.0) -> None:
         """Workers that did not exit within `wait` seconds (and every worker of an engine whose

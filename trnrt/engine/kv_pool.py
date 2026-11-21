@@ -13,7 +13,8 @@ NULL_PAGE = 0
 
 
 class PagePool:
-    def __init__(self, num_pages: int):
+    def __init__(self, num_pages: int, ascending: bool = False):
+        """ascending (EngineConfig.pool_ascending): a request's pages are the lowest free ids in ascending order."""
         if num_pages < 2:
             raise ValueError("need at least one usable page besides the null page")
         self.num_pages = num_pages
@@ -22,6 +23,12 @@ class PagePool:
         self._is_free = bytearray(num_pages)
         for p in self._free:
             self._is_free[p] = 1
+        # ascending: the pages of an allocation, and the pages an eviction frees, then form few runs of consecutive ids,
+        # so the host cache's batched copies (ModelRunner.kv_save_many / kv_load_many: one copy per cache per run) stay
+        # few. The plain LIFO order hands a freed prompt's pages back out in descending runs (measured on trn2: a long
+        # prompt's pages came out as about 257 one-page runs, 33 caches each, 240 ms of copies). It changes which pages
+        # a request gets, never a graph.
+        self.ascending = ascending
 
     @property
     def num_free(self) -> int:
@@ -35,6 +42,8 @@ class PagePool:
         """Return `n` pages, or None (and allocate nothing) if fewer are free."""
         if n > len(self._free):
             return None
+        if self.ascending and n > 1:
+            self._free.sort(reverse=True)
         pages = [self._free.pop() for _ in range(n)]
         for p in pages:
             self._is_free[p] = 0

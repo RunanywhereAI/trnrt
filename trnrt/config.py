@@ -153,6 +153,20 @@ class EngineConfig:
     # state_spec_seats hold 1 + spec_k rows each (the ones that speculate) and the rest one row (None: all of them).
     state_seats: int | None = None
     state_spec_seats: int | None = None
+    # -- host area: the decode families, the host cache's moves and the page pool's order -------------------------------
+    # The share of host_cache_gb given to recurrent-state checkpoints; the rest holds KV pages. Host only.
+    host_cache_ckpt_frac: float = 0.5
+    # A restore's pages and an eviction's pages in one broadcast each, every cache copied once per run of consecutive
+    # device pages (engine/host_cache.py), instead of one broadcast and one copy per cache per page. Host only.
+    host_cache_batch: bool = False
+    # The ranks that hold identical bytes under context-parallel DSA (one CP index in each row group) keep one shared copy
+    # of a page in host memory instead of one each (engine/host_arena.py): the same host_cache_gb holds as many times
+    # the pages as there are row groups. Needs host_cache_batch; without row groups the host cache stays write-through.
+    # Host only.
+    host_cache_save_once: bool = False
+    # Every page pool hands out the lowest free page ids in ascending order, so a request's pages, and the pages an
+    # eviction frees, form few runs for the batched host-cache copies. Host only (page ids are values, not shapes).
+    pool_ascending: bool = False
 
     def __post_init__(self):
         if self.max_running is not None and self.max_running < 1:
@@ -203,6 +217,10 @@ class EngineConfig:
                     f"a running request must hold its state rows")
             if self.state_seats > self.max_num_seqs:
                 raise ValueError(f"state_seats={self.state_seats} above max_num_seqs={self.max_num_seqs}")
+        if not 0.0 < self.host_cache_ckpt_frac < 1.0:
+            raise ValueError(f"host_cache_ckpt_frac={self.host_cache_ckpt_frac}: in (0, 1)")
+        if self.host_cache_save_once and not self.host_cache_batch:
+            raise ValueError("host_cache_save_once needs host_cache_batch (the shared arenas move pages in batches)")
         if self.state_spec_seats is not None and not self.spec_max_batch <= self.state_spec_seats <= (
                 self.state_seats or self.max_num_seqs):
             raise ValueError(
