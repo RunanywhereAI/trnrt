@@ -30,3 +30,11 @@ def test_the_kda_shell_switch():
     assert hybrid.KDA_SHELL is False
     E.set_decode_routes(EngineConfig(model_path="m"))
     assert hybrid.KDA_SHELL is True
+
+
+def test_the_mhc_seam_switch():
+    assert EngineConfig(model_path="m").mhc_seam is False
+    E.set_decode_routes(EngineConfig(model_path="m", mhc_seam=True))
+    assert hybrid.MHC_SEAM is True
+    E.set_decode_routes(EngineConfig(model_path="m"))
+    assert hybrid.MHC_SEAM is False

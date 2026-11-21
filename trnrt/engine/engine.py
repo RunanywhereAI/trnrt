@@ -122,6 +122,7 @@ def set_decode_routes(cfg: EngineConfig) -> None:
     decoder.DYN_MTP_KV = "1" if cfg.dyn_mtp_kv else "0"
     # -- KDA, mHC and FFN-half routes
     hybrid.KDA_SHELL = bool(cfg.kda_shell)
+    hybrid.MHC_SEAM = bool(cfg.mhc_seam)
 
 
 def local_k_counts(model) -> list[float] | None:

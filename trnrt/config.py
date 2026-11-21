@@ -159,6 +159,10 @@ class EngineConfig:
     #   every KDA decode step runs linear_attn's decode form (kernels/kda_decode.py): the shell's per-row recurrence
     #   (~8.5-10.5 us a row per layer) costs more than the decode kernel at 8 rows a step and up.
     kda_shell: bool = True
+    # - mhc_seam (models/hybrid.py MHC_SEAM): a decode layer that takes the FFN half without the KDA shell and without
+    #   the fused DSA layer runs the previous layer's FFN mix and its own attention pre as one kernel call
+    #   (kernels/mhc_seam.py, rows split over the LNC pair), its fn re-laid at load as a decode-only copy.
+    mhc_seam: bool = False
 
     def __post_init__(self):
         if self.max_running is not None and self.max_running < 1:

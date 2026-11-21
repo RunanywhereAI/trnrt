@@ -32,7 +32,10 @@ calls (docs/MEGAKERNELS.md):
   layer as two kernels with the model's own sums between them;
 - the fused DSA layer (models/mla.py): a DSA layer's attention block and its FFN half as one call,
   with the attention-block Sinkhorn left to that call (kernels/mhc_front.py), which runs it under
-  its own collective waits.
+  its own collective waits;
+- the mHC seam (kernels/mhc_seam.py, EngineConfig.mhc_seam): in a build without the KDA shell, the
+  previous layer's deferred FFN mix and this layer's attention pre as one call, rows split over the
+  LNC pair, for a layer that takes the FFN half outside the fused DSA layer.
 Every one of them is decode-only: their weights are listed in layer._decode_only, so no prefill
 graph sees them.
 """
@@ -84,6 +87,10 @@ def init_layer(layer, cfg, spec, index: int, tp: int, p) -> None:
     # list (decoder._layer_split) shifts.
     layer.hc_ffn_fnj = p(128, hc * H // 128, n)
     layer._decode_only = tuple(getattr(layer, "_decode_only", ())) + ("hc_ffn_fnj",)
+    if MHC_SEAM:  # the seam kernel's copy of the attention block's fn (kernels/mhc_seam.py fn_w), filled at load;
+        # decode-only, as hc_ffn_fnj
+        layer.hc_attn_fnw = p(128, hc * H // 128, n)
+        layer._decode_only = tuple(getattr(layer, "_decode_only", ())) + ("hc_attn_fnw",)
     if KDA_SHELL and isinstance(spec, LinearSpec):  # the KDA shell's packed blobs
         from ..kernels import kda_half, kda_shell
 
@@ -100,6 +107,10 @@ def load_layer(layer, ck, pre: str, cfg, r: int, n: int, dtype) -> None:
     from ..kernels import mhc_fnj
 
     layer.hc_ffn_fnj.data.copy_(mhc_fnj.fn_j(layer.hc_ffn_fn.data))  # the FFN half's copy of the FFN block's fn
+    if getattr(layer, "hc_attn_fnw", None) is not None:  # the seam kernel's copy of the attention block's fn
+        from ..kernels import mhc_seam
+
+        layer.hc_attn_fnw.data.copy_(mhc_seam.fn_w(layer.hc_attn_fn.data, cfg.hybrid.hc))
     if getattr(layer, "ks_blob_bf16", None) is not None:  # the KDA shell's packed blobs
         from ..kernels import kda_shell
 
@@ -189,9 +200,11 @@ def call_kind(model, h, positions, table) -> tuple:
 
 def defers(model, layer, nxt, h, positions, table, bias, state_slot) -> bool:
     """Whether `layer` leaves its FFN mix to `nxt`, the next layer, in this call (h the call's hidden state, table /
-    bias nxt's; bias is not read): a decode call whose next attention block is a KDA shell call (the mix-in)."""
+    bias nxt's; bias is not read): a decode call whose next attention block is a KDA shell call (the mix-in), or (MHC_SEAM)
+    whose next layer takes the seam kernel (its pend mix and attention pre as one call: _seam_takes)."""
     sp, dec = call_kind(model, h, positions, table)
-    return kda_shell_takes(model, nxt, h, state_slot, dec, sp)
+    return (kda_shell_takes(model, nxt, h, state_slot, dec, sp)
+            or (MHC_SEAM and _seam_takes(model, nxt, h, dec, sp, ffn_half_takes(model, nxt, h, dec, sp))))
 
 
 # Decode calls of fewer rows than this take the FFN half (kernels/ffn_half.py): moe_dedupe's pairs kernel's bound. The
@@ -223,12 +236,44 @@ def ffn_half_takes(model, layer, streams, dec: bool, sp: bool) -> bool:
     return getattr(layer, blob, None) is not None
 
 
-def _attn_unmixed(model, layer, streams, fn, dec: bool):
+# The mHC seam (kernels/mhc_seam.py): a decode call's FFN-half layer that takes _attn_unmixed runs the previous layer's
+# deferred FFN mix and its own attention pre as one kernel call (EngineConfig.mhc_seam, set by engine.build_shard).
+MHC_SEAM = False
+
+
+def _seam_takes(model, layer, streams, dec: bool, sp: bool, fh: bool) -> bool:
+    """Whether this layer's pend mix and attention pre run as kernels/mhc_seam.py's one call: MHC_SEAM, a decode call's
+    FFN-half layer (fh) that takes _attn_unmixed (the fused DSA layer's path keeps mhc_front, its Sinkhorn inside that
+    call), with its fn_w copy loaded and the kernel's shapes (T even)."""
+    from ..kernels import mhc_seam
+
+    T = streams.shape[0]
+    return (MHC_SEAM and fh and dec and not sp and getattr(layer, "hc_attn_fnw", None) is not None
+            and not (getattr(layer.spec, "mla", None) is not None and _mk4_rows_on(T))
+            and mhc_seam.takes(streams.device, T, model.cfg.hidden_size, model.cfg.hybrid.hc))
+
+
+def _seam(model, layer, pend, streams):
+    """(S' [T, hc H], (x [T, H], post [T, hc], comb [T, hc, hc])): pend = (post, comb, y) the previous FFN block's, mixed
+    into the streams, and this layer's attention pre on the result, in one kernel call."""
+    from ..kernels import mhc_seam
+
+    hy, H = model.cfg.hybrid, model.cfg.hidden_size
+    T = streams.shape[0]
+    post, comb, y = pend
+    S2, x, p2, c2 = mhc_seam.seam(post, comb, y, streams.view(T, hy.hc, H), layer.hc_attn_fnw, layer.hc_attn_fn,
+                                  layer.hc_attn_base, layer.hc_attn_scale, hy.sinkhorn_iters, hy.hc_eps,
+                                  model.cfg.rms_norm_eps)
+    return S2, (x, p2, c2)
+
+
+def _attn_unmixed(model, layer, streams, fn, dec: bool, pre=None):
     """_block's attention block without its final mix_out: (S [T, hc, H], (post, comb, y [1, T, H])), the mix left to
-    the FFN half's call (its mix_in, from one partial slot)."""
+    the FFN half's call (its mix_in, from one partial slot). pre: (x, post, comb) already computed by the seam kernel,
+    in place of _mhc's."""
     hy, H = model.cfg.hybrid, model.cfg.hidden_size
     S = streams.view(streams.shape[0], hy.hc, H)
-    x, post, comb = _mhc(model, layer, "attn", S, dec)
+    x, post, comb = pre if pre is not None else _mhc(model, layer, "attn", S, dec)
     y = fn(rms_norm(x, layer.in_norm, model.cfg.rms_norm_eps))
     return S, (post, comb, y.unsqueeze(0))
 
@@ -504,8 +549,12 @@ def layer(model, layer, h, positions, slot_mapping, table, bias, state_slot=None
                 # the next block is not a shell: its mix in here, y the two programs' all-reduced partials summed
                 streams = mix_out(post, comb, Y.float().sum(0).to(S.dtype), S, True)
     else:
+        seam = None
         if pend is not None:  # the previous layer's deferred FFN mix
-            streams = mix_out(*pend, streams.view(streams.shape[0], hy.hc, H), True)
+            if MHC_SEAM and _seam_takes(model, layer, streams, dec, sp, fh):  # with the attention pre, one call
+                streams, seam = _seam(model, layer, pend, streams)
+            else:
+                streams = mix_out(*pend, streams.view(streams.shape[0], hy.hc, H), True)
         if (fh and dec and not sp and getattr(layer.spec, "mla", None) is not None
                 and _mk4_rows_on(streams.shape[0])):
             # The fused DSA layer: _attn_unmixed's steps, the attention block's (S, post, comb) passed down, its
@@ -523,7 +572,7 @@ def layer(model, layer, h, positions, slot_mapping, table, bias, state_slot=None
         elif fh:  # the attention block without its mix, which moves into the FFN half's call
             S, pend_a = _attn_unmixed(model, layer, streams,
                                       rows(lambda x: _mix(model, layer, x, positions, slot_mapping, table, bias,
-                                                          state_slot, seq)), dec)
+                                                          state_slot, seq)), dec, pre=seam)
         else:
             streams = _block(model, layer, "attn", streams, layer.in_norm,
                              rows(lambda x: _mix(model, layer, x, positions, slot_mapping, table, bias, state_slot,
