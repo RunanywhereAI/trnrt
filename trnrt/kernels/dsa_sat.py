@@ -53,14 +53,16 @@ REV = (SH.kernel_rev(__file__, "# -- the kernel source", "# -- the kernel source
 
 
 def sat_args(q, w, pkc, table, nloc, positions, q_all, kc, w_uv_p, o_p, ident, keep: int, A: int, rank, world: int,
-        scale: float, *, kp: int = 4, ns: int = 640, rbits2: int = 2, rbits: int = 4, nr: int | None = None, pf: int = 2,
+        scale: float, *, kp: int = 4, ns: int = 640, rbits2: int = 2, rbits: int = 2, nr: int | None = None, pf: int = 2,
         il: int = 1, st: int = 1, ss: int = 1, tl: int = 1, fo: int = 1, so: int = 1, wu: int = 1, nf: int = 1,
         ev: int = 1, pn: int = 0, fz: int = 0, wl: int = 0, po: int = 1, dw: int = 0, ob: int = 0,
         sh: int = 0, rp: int = 1, pw: int = 0, yb: int = 0, pq: int = 0, cs: int = 0, grid: int | None = None,
         _kernel=None,
         _rev: int | None = None):
     """The fused layer kernel _kernel's arguments for the section and the tail (dsa_satwf / dsa_satwfc add the FFN
-    half's): (args, kern, grid, T, H, R). _rev: the calling kernel's REV."""
+    half's): (args, kern, grid, T, H, R). _rev: the calling kernel's REV. rbits: the bits a round of the merge's
+    selection decides (dsa_shell._select_st); at 2 the per-round compare and reduce over [128, nt, Jw, W] shrinks 5x
+    (Jw 15 -> 3) against 4's for twice the rounds, cheaper at 24 decode rows, and the selection is the same set."""
     from . import dsa_index, dsa_slots
 
     kern = _kernel
@@ -297,7 +299,7 @@ REV_K = (SH.kernel_rev(__file__, "# -- the layer kernel without", "# -- the laye
 
 
 def sat(q, w, pkc, table, nloc, positions, q_all, kc, w_uv_p, o_p, ident, keep: int, A: int, rank, world: int,
-        scale: float, *, kp: int = 4, ns: int = 640, rbits2: int = 2, rbits: int = 4, nr: int | None = None, pf: int = 2,
+        scale: float, *, kp: int = 4, ns: int = 640, rbits2: int = 2, rbits: int = 2, nr: int | None = None, pf: int = 2,
         il: int = 1, st: int = 1, ss: int = 1, tl: int = 1, fo: int = 1, so: int = 1, wu: int = 1, nf: int = 1,
         ev: int = 1, pn: int = 0, fz: int = 0, wl: int = 0, po: int = 1, dw: int = 0, ob: int = 0,
         sh: int = 0, rp: int = 1, pw: int = 0, yb: int = 0, cs: int = 0, grid: int | None = None):
