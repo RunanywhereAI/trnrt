@@ -33,6 +33,7 @@ except ImportError:
 
 if nki is not None:
     _norm_xc, half_body_pb = FB._norm_xc, FB.half_body_pb  # the served helpers, by the names the body calls
+    XC1 = FB.XC1  # the served form (xn comes back k-major), by the name the body's dbg write reads
 
     def ffn_half_body(S, post_p, comb_p, Yp, fnb, base, scale, pnorm, bb, bf, wb, hc: int, iters: int, eps: float,
                       rms_eps: float, sig: int, skf: int, Is: int, K: int, rsc: float, group: int, ring: int,
@@ -71,7 +72,10 @@ if nki is not None:
         rp, sp, i8f, pvb, ch = half_body_pb(None, bb, bf, wb, Is, K, rsc, group, ring, limit, rsp, o_rt, o_gu, o_dn,
                                             o_rb, cp, comb_out, hc, iters, eps, skf, xc_in=xc)
         if dbg:  # both programs write the same values
-            SH.dma_static(dst=xn_out.ap(pattern=[[W, P], [H, T], [1, W]], offset=0), src=xn)  # xn: h-layout
+            if XC1:  # xn k-major: xn[i, t, c] = xn_row[t, c P + i]
+                SH.dma_static(dst=xn_out.ap(pattern=[[1, P], [H, T], [P, W]], offset=0), src=xn)
+            else:
+                SH.dma_static(dst=xn_out.ap(pattern=[[W, P], [H, T], [1, W]], offset=0), src=xn)  # xn: h-layout
             ti = nl.ndarray((T, K), dtype=i32, buffer=nl.sbuf)
             nisa.tensor_copy(dst=ti, src=i8f, engine=VE)
             SH.dma_static(dst=ti_out, src=ti)
