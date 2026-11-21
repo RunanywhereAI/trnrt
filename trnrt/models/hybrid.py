@@ -84,7 +84,7 @@ def init_layer(layer, cfg, spec, index: int, tp: int, p) -> None:
     # list (decoder._layer_split) shifts.
     layer.hc_ffn_fnj = p(128, hc * H // 128, n)
     layer._decode_only = tuple(getattr(layer, "_decode_only", ())) + ("hc_ffn_fnj",)
-    if isinstance(spec, LinearSpec):  # the KDA shell's packed blobs
+    if KDA_SHELL and isinstance(spec, LinearSpec):  # the KDA shell's packed blobs
         from ..kernels import kda_half, kda_shell
 
         kda_shell.register(layer, cfg, spec, kda_half.half_programs())
@@ -139,11 +139,19 @@ def final(model, h: torch.Tensor) -> torch.Tensor:
 # a matmul of comb with the streams in the model dtype) made neuronx-cc spill the prefill layer graphs on trn1 (layer 0
 # at C=512, 8 heads per rank: 10.7 ms, about 80 ms once any NKI call sits in the mixer, against 3.8 ms).
 
+# Whether a KDA layer's decode attention block can run as the KDA shell (kernels/kda_shell.py) at all: only then are
+# its packed decode-only blobs registered (init_layer). EngineConfig.kda_shell, set on every rank by engine.build_shard
+# before it builds the shard. Off, every KDA decode step runs linear_attn's decode form (kernels/kda_decode.py on the
+# device), with the attention block's mix in the FFN half's call or the next layer's seam (mhc_seam).
+KDA_SHELL = True
 # The KDA shell takes decode steps of at most this many rows; the XLA half runs above. Its per-row recurrence costs
 # ~8.5-10.5 us per row x 34 layers, which a batched recurrence could lift. The engine's --kda-shell-max-rows
-# (EngineConfig.kda_shell_max_rows, set on every rank by engine.build_shard before it builds the shard; 8 here and
-# under --preset batch8, 12 served, so every decode step up to 12 rows takes the shell and the split layer).
+# (EngineConfig.kda_shell_max_rows, set on every rank by engine.build_shard before it builds the shard).
 KDA_SHELL_MAXB = 8
+# A speculative verify of at most this many positions a sequence (state_slot [B, 1 + Q], Q <= 3) takes the shell too,
+# as kda_shell.verify's one call of its B Q rows, KDA_SHELL_MAXB capping B Q; a longer verify keeps linear_attn's verify
+# form. Q 3 (two drafts a step) is the verify the one call was checked bitwise against Q decode calls at.
+KDA_SHELL_VERIFY = 3
 
 
 def kda_shell_rows(rows: int) -> bool:
@@ -157,14 +165,17 @@ SHELL_HOST = False
 
 
 def kda_shell_takes(model, layer, streams, state_slot, dec: bool, sp: bool) -> bool:
-    """Whether a layer's attention block runs as the KDA shell's call: a decode call (dec) of a KDA layer with its packed
-    blobs, replicated streams (not sp), a state row per row, at most KDA_SHELL_MAXB rows, on the device (or the host,
+    """Whether a layer's attention block runs as the KDA shell's call: KDA_SHELL, a decode call (dec) of a KDA layer
+    with its packed blobs, replicated streams (not sp), a state row per row or a verify of at most KDA_SHELL_VERIFY
+    positions a sequence (state_slot [B, 1 + Q], B Q rows), at most KDA_SHELL_MAXB rows, on the device (or the host,
     SHELL_HOST / shell.HOST_SIM). streams: any tensor with the call's rows and device. layer() and _run_layers (through
     defers) both ask this."""
-    return (dec and not sp and getattr(layer, "ks_blob_bf16", None) is not None
+    return (KDA_SHELL and dec and not sp and getattr(layer, "ks_blob_bf16", None) is not None
             and (streams.device.type != "cpu" or SHELL_HOST or SH.HOST_SIM) and state_slot is not None
-            and state_slot.dim() == 1
-            and state_slot.shape[0] == streams.shape[0] and kda_shell_rows(streams.shape[0]))
+            and ((state_slot.dim() == 1 and state_slot.shape[0] == streams.shape[0])
+                 or (state_slot.dim() == 2 and 1 <= state_slot.shape[1] - 1 <= KDA_SHELL_VERIFY
+                     and state_slot.shape[0] * (state_slot.shape[1] - 1) == streams.shape[0]))
+            and kda_shell_rows(streams.shape[0]))
 
 
 def call_kind(model, h, positions, table) -> tuple:
@@ -483,8 +494,9 @@ def layer(model, layer, h, positions, slot_mapping, table, bias, state_slot=None
             S, post, comb, y = MK.decode_layer_split(model, layer, streams.view(T, hy.hc, H), positions, state_slot,
                                                      pend=pend)  # (post, comb, y) as is: the kernel builds y's slots
         else:
-            S, (post, comb, Y) = kda_shell.decode(model, layer, streams.view(T, hy.hc, H), positions, state_slot,
-                                                  pend=_shell_pend(layer, pend))
+            call = kda_shell.verify if state_slot.dim() == 2 else kda_shell.decode  # a verify's B Q rows: one call
+            S, (post, comb, Y) = call(model, layer, streams.view(T, hy.hc, H), positions, state_slot,
+                                      pend=_shell_pend(layer, pend))
             if fh:  # this mix moves into the FFN half's call
                 pend_a = (post, comb, Y)
             else:

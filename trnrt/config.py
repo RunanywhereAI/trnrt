@@ -153,6 +153,12 @@ class EngineConfig:
     # state_spec_seats hold 1 + spec_k rows each (the ones that speculate) and the rest one row (None: all of them).
     state_seats: int | None = None
     state_spec_seats: int | None = None
+    # -- KDA, mHC and FFN-half routes (engine.set_decode_routes copies each into the module that reads it at trace) --
+    # - kda_shell (models/hybrid.py KDA_SHELL): a KDA layer's decode attention block may run as the KDA shell's kernel
+    #   (kernels/kda_shell.py; its packed blobs exist only then), up to kda_shell_max_rows rows and for verifies. Off,
+    #   every KDA decode step runs linear_attn's decode form (kernels/kda_decode.py): the shell's per-row recurrence
+    #   (~8.5-10.5 us a row per layer) costs more than the decode kernel at 8 rows a step and up.
+    kda_shell: bool = True
 
     def __post_init__(self):
         if self.max_running is not None and self.max_running < 1:

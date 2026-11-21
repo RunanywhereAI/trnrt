@@ -17,9 +17,9 @@ KimiLinearForgetGate, chunk_kimi_delta_attention) and models/glm5_next/modeling_
 lower_bound * sigmoid(exp(A_log) * g)).
 
 Static-shape formulation (the same code runs on CPU and on a NeuronCore):
-- decode (B sequences x 1 token): the recurrent step above as batched einsums. On the device a
-  decode step's KDA layers run as the KDA shell instead (models/hybrid.py, kernels/kda_shell.py), and a step above
-  the shell's row cap runs the recurrence here as kernels/kda_decode.py.
+- decode (B sequences x 1 token): the recurrent step above as batched einsums; on the device the
+  recurrence runs as kernels/kda_decode.py. A build with the KDA shell (models/hybrid.py KDA_SHELL,
+  kernels/kda_shell.py) runs the decode steps up to the shell's row cap, and its verifies, as the shell instead.
 - prefill chunk (one sequence x C tokens): the chunked form (fla / the transformers chunk
   kernels) over fixed sub-chunks of CHUNK tokens, unrolled at trace time; on the device the NKI
   chunked delta rule (kernels/delta_rule.py). The per-chunk triangular solve (I + A)^-1, which
@@ -479,8 +479,8 @@ def _mix_rows(model, layer, x: torch.Tensor, positions: torch.Tensor, slot_mappi
         _write_rows(layer.rec_state, write, states.reshape(B * Q, nv, dk, dv))
         o = o.reshape(T, nv, dv)
     elif form == "decode":
-        # Above the KDA shell's row cap (hybrid.kda_shell_rows), on the device: the recurrence as one kernel, which
-        # reads, updates and writes the pool rows in place (kernels/kda_decode.py); the einsums below elsewhere.
+        # A step the KDA shell does not take (hybrid.kda_shell_takes), on the device: the recurrence as one kernel,
+        # which reads, updates and writes the pool rows in place (kernels/kda_decode.py); the einsums below elsewhere.
         from ..kernels import kda_decode
 
         if kda_decode.takes(x, dk, dv, sp.kind == "kda" and g.dim() == 3):
