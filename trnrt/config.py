@@ -154,6 +154,10 @@ class EngineConfig:
     state_seats: int | None = None
     state_spec_seats: int | None = None
     # -- host area: the decode families, the host cache's moves and the page pool's order -------------------------------
+    # plain_decode False: no plain decode bucket at all, so no plain decode graph is warmed or compiled. Only where no plain
+    # decode can launch (model_runner.plain_none_refusal): MTP speculation always on, spec_max_batch covering the largest
+    # decode bucket and the running cap, and no state_spec_seats. Graph set: a change needs a new capture.
+    plain_decode: bool = True
     # The share of host_cache_gb given to recurrent-state checkpoints; the rest holds KV pages. Host only.
     host_cache_ckpt_frac: float = 0.5
     # A restore's pages and an eviction's pages in one broadcast each, every cache copied once per run of consecutive
@@ -190,6 +194,8 @@ class EngineConfig:
                          "dyn_mtp_kv"):
                 if getattr(self, name):
                     raise ValueError(f"{name} needs spec_method 'mtp'")
+            if not self.plain_decode:
+                raise ValueError("plain_decode False (no plain decode graphs) needs spec_method 'mtp'")
         else:
             if self.spec_k < 1:
                 raise ValueError(f"spec_k={self.spec_k}: at least 1")

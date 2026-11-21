@@ -1544,14 +1544,47 @@ def state_pool_rows(ecfg: EngineConfig) -> int:
     return 1 + spec * per_req + (seats - spec) + state_checkpoint_rows(ecfg) + 1
 
 
+def plain_none_refusal(ecfg: EngineConfig) -> str | None:
+    """Why no plain decode buckets at all (EngineConfig.plain_decode False) are unsafe for this configuration, or None when
+    they are safe. With none, no plain decode graph is warmed or compiled, so a plain decode launch must be impossible by
+    construction:
+    - the engine's only plain launch is LLMEngine._launch's ModelRunner.decode, which picks its bucket with pick_family;
+    - a step decodes plain only in dynamic plain mode (LLMEngine._dyn_plain), entered only when more than spec_max_batch
+      requests decode, or when a request sits in a plain state seat (state_spec_seats);
+    - warmup's plain decode calls are gated on the plain buckets.
+    So all of: MTP speculation; dynamic speculation (spec_max_batch) covering the largest decode bucket and the running cap
+    (max_running, else max_num_seqs); no state_spec_seats."""
+    m = ecfg.spec_max_batch or 0
+    cap = ecfg.max_num_seqs if ecfg.max_running is None else min(ecfg.max_num_seqs, ecfg.max_running)
+    buckets = ecfg.resolved_decode_batch_buckets()
+    checks = (
+        (ecfg.spec_method == "mtp", f"spec_method is {ecfg.spec_method!r}, not mtp"),
+        (bool(m), "no dynamic speculation (spec_max_batch 0)"),
+        (m >= buckets[-1], f"spec_max_batch {m} < the largest decode bucket {buckets[-1]}"),
+        (cap <= m, f"the running cap {cap} > spec_max_batch {m} (dynamic speculation steps plain above it)"),
+        (ecfg.state_spec_seats is None, "state_spec_seats is set (a request in a plain seat steps plain)"),
+    )
+    bad = [why for ok, why in checks if not ok]
+    return "; ".join(bad) if bad else None
+
+
 def family_buckets(ecfg: EngineConfig, buckets: tuple[int, ...]) -> tuple[tuple[int, ...], tuple[int, ...]]:
     """(plain decode buckets, verify-family buckets): the decode buckets each step family is warmed and picked at; both the
     decode buckets when EngineConfig.spec_bucket_max and plain_bucket_min are 0. With dynamic speculation the two families
     use disjoint row counts: the verify family (verify, the speculative board graphs, the decode-side MTP pass) only runs
     while at most spec_max_batch requests decode, plain decode only above it (down to spec_max_batch - spec_hysteresis + 1).
     spec_bucket_max keeps the verify family to buckets <= B; plain_bucket_min keeps plain decode to buckets >= B, a smaller
-    batch padded up. Every kept graph's key is the same as without the knobs, and the dropped ones are never loaded."""
+    batch padded up. Every kept graph's key is the same as without the knobs, and the dropped ones are never loaded.
+    plain_decode False: no plain decode bucket at all, allowed only where plain_none_refusal finds no plain launch path."""
     lo, hi, m = ecfg.plain_bucket_min, ecfg.spec_bucket_max, ecfg.spec_max_batch
+    if not ecfg.plain_decode:
+        why = plain_none_refusal(ecfg)
+        if why:
+            raise ValueError(f"plain_decode False (no plain decode buckets) refused: {why}")
+        spec = tuple(b for b in buckets if not hi or b <= hi)
+        if not spec or spec[-1] < m:
+            raise ValueError(f"spec_bucket_max={hi}: the verify family's buckets {spec} do not cover spec_max_batch {m}")
+        return (), spec
     if not lo and not hi:
         return tuple(buckets), tuple(buckets)
     plain = tuple(b for b in buckets if not lo or b >= lo)
@@ -1565,7 +1598,11 @@ def family_buckets(ecfg: EngineConfig, buckets: tuple[int, ...]) -> tuple[tuple[
 
 def pick_family(n: int, buckets: tuple[int, ...], family: str) -> int:
     """pick_bucket over one step family's warmed buckets (family_buckets), raising a clear error past them: a launch outside
-    the warmed set must never compile or look up a missing graph at run time."""
+    the warmed set must never compile or look up a missing graph at run time; a family with no buckets (plain_decode False)
+    has no graph at all."""
+    if not buckets:
+        raise RuntimeError(f"a {family} launch of {n} rows on an engine with no {family} buckets (no {family} graph is "
+                           "warmed or compiled): refused")
     if n > buckets[-1]:
         raise RuntimeError(f"a {family} launch of {n} rows exceeds its warmed buckets {buckets}: not compiled, refused")
     return pick_bucket(n, buckets)
