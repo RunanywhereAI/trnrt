@@ -124,6 +124,7 @@ def set_decode_routes(cfg: EngineConfig) -> None:
     from ..kernels import dsa_topk
 
     dsa_topk.ROWSPLIT_BIG = bool(cfg.dsa_topk_rowsplit_big)
+    mla.CP_FAIL_TRIP = bool(cfg.dsa_cp_fail_trip)
 
 
 def local_k_counts(model) -> list[float] | None:

@@ -77,6 +77,11 @@ CP_SLOTS_SMALL = 128
 # turns it off (_local_k).
 CP_LOCAL_K = 120
 CP_LOCAL_F = 128
+# The failed rows' merge (attention_cp_rows) as dsa_long.cp_merge_rows_2k with both selections under a run-time trip of
+# (failed rows > 0) (kernels/dsa_topk_t.py): the same mask, masked by `live` as before, and when no row fails (every row
+# of real text so far) neither selection runs. Off: the merge with its tie search, at full size every call. The engine's
+# EngineConfig.dsa_cp_fail_trip, set on every rank before the shard is built; read when a prefill graph is traced.
+CP_FAIL_TRIP = False
 VISIBLE_SCORE = -5e29  # kernels/dsa_topk.VISIBLE: scores at or below it are not candidates
 # A context-parallel layer's FP8 w_a (q_a + kv_a), q_b and o_proj are also kept as model-dtype copies
 # (w_a_dec, q_b_dec, o_dec: dequant of the stored FP8 and scales at load, so the same values), which
@@ -985,7 +990,11 @@ def attention_cp_rows(model, layer, x, positions, slot_mapping, table):
         cpool_f = lp_f * A + rank.view(())
         ev_f = _cp_gather(model, lval_f).permute(1, 0, 2)  # [nF, A, keep]
         ec_f = _cp_gather(model, cpool_f.to(torch.float32)).permute(1, 0, 2)
-        chosen_f = _cp_chosen(_dsa_long.cp_merge(ev_f, ec_f, keep, None, Pl * A), rank, A, nF, keep) & live.view(nF, 1)
+        if CP_FAIL_TRIP:  # the selections run only when a row failed
+            chosen_f = _cp_chosen(_dsa_long.cp_merge(ev_f, ec_f, keep, None, Pl * A, two_k=True,
+                                                     trip=(nf > 0).to(torch.int32)), rank, A, nF, keep) & live.view(nF, 1)
+        else:
+            chosen_f = _cp_chosen(_dsa_long.cp_merge(ev_f, ec_f, keep, None, Pl * A), rank, A, nF, keep) & live.view(nF, 1)
         if getattr(layer, "cp_localk", None) is not None:
             nff = fail.to(torch.float32).sum().view(1)  # every failed row: compact's count stops at nF
             layer.cp_localk.add_(torch.cat([torch.full_like(nff, float(n)), nff, (nff - float(nF)).clamp(min=0.0)]))

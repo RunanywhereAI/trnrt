@@ -10,11 +10,18 @@ import torch
 from trnrt.config import EngineConfig
 from trnrt.engine import engine as E
 from trnrt.kernels import dsa_topk
+from trnrt.models import mla
 
 # (module, constant) pairs set_decode_routes writes for the DSA fields, restored after each test
 ROUTES = [
     (dsa_topk, "ROWSPLIT_BIG"),
+    (mla, "CP_FAIL_TRIP"),
 ]
+# field: (module, constant, a non-default value, the constant it sets)
+FIELDS = {
+    "dsa_topk_rowsplit_big": (dsa_topk, "ROWSPLIT_BIG", True, True),
+    "dsa_cp_fail_trip": (mla, "CP_FAIL_TRIP", True, True),
+}
 
 
 @pytest.fixture
@@ -35,11 +42,18 @@ def test_defaults_are_the_modules_own(routes):
     assert {name: getattr(mod, name) for mod, name in ROUTES} == before
 
 
-def test_rowsplit_big_reaches_dsa_topk_and_resets(routes):
-    E.set_decode_routes(_cfg(dsa_topk_rowsplit_big=True))
-    assert dsa_topk.ROWSPLIT_BIG is True
-    E.set_decode_routes(_cfg())
-    assert dsa_topk.ROWSPLIT_BIG is False
+@pytest.mark.parametrize("field", sorted(FIELDS))
+def test_each_field_reaches_its_module_and_resets(routes, field):
+    mod, name, value, want = FIELDS[field]
+    default = getattr(mod, name)
+    E.set_decode_routes(_cfg(**{field: value}))
+    assert getattr(mod, name) == want
+    E.set_decode_routes(_cfg())  # a later engine inherits nothing
+    assert getattr(mod, name) == default
+
+
+def test_every_route_has_a_field():
+    assert sorted((m.__name__, n) for m, n, _, _ in FIELDS.values()) == sorted((m.__name__, n) for m, n in ROUTES)
 
 
 @pytest.mark.parametrize(

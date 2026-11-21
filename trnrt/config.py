@@ -158,6 +158,9 @@ class EngineConfig:
     # - dsa_topk_rowsplit_big (kernels/dsa_topk.py ROWSPLIT_BIG): a prefill chunk's one-tile selections of at least 64
     #   rows split over the two LNC programs, as the decode calls' are.
     dsa_topk_rowsplit_big: bool = False
+    # - dsa_cp_fail_trip (models/mla.py CP_FAIL_TRIP): a prefill chunk's failed-row merge (the rows whose local top-K
+    #   certificate failed) runs its selections only when some row failed (kernels/dsa_topk_t.py).
+    dsa_cp_fail_trip: bool = False
 
     def __post_init__(self):
         if self.max_running is not None and self.max_running < 1:
