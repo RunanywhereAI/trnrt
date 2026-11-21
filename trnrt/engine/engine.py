@@ -258,7 +258,7 @@ class LLMEngine:
                 for w in self._workers:
                     w.start()
                 if cfg.device == "neuron":
-                    tp.neuron_env(0, port, cfg.tp_core_base)
+                    tp.neuron_env(0, port, cfg.tp_core_base, world=cfg.tp)
                 tp.init_rank(0, cfg.tp, port)
             except BaseException:
                 self._stop_tp()
