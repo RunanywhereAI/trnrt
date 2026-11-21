@@ -141,8 +141,10 @@ def test_route_sends_only_the_cp_single_buffer_call(monkeypatch):
     from trnrt import platform
     from trnrt.kernels import dsa_slots_n as dsn
     from trnrt.kernels import dsa_slots_n_p as dp
+    from trnrt.kernels import shell as SH
     from trnrt.models import mla
 
+    monkeypatch.setattr(SH, "HOST_SIM", True)  # the kernels for host tensors (the device's routes)
     seen = []
     monkeypatch.setattr(dp, "attend", lambda *a, **k: seen.append(("p", k)) or "p")
     monkeypatch.setattr(dsn, "attend", lambda *a, **k: seen.append(("n", k)) or "n")
@@ -150,16 +152,22 @@ def test_route_sends_only_the_cp_single_buffer_call(monkeypatch):
     split = {"dsa_slots_n"}
     monkeypatch.setattr(platform, "lnc_split", lambda kernel: kernel in split)
     assert dp.PIPE_ROWS == 0
-    assert mla._cp_slots_attend(1, 2, 3, 4, 0.1, 5) == "n"  # the default: off
+    q = torch.zeros(1)
+    assert mla._cp_slots_attend(q, 2, 3, 4, 0.1, 5) == "n"  # the default: off
     monkeypatch.setattr(dp, "PIPE_ROWS", 64)
-    assert mla._cp_slots_attend(1, 2, 3, 4, 0.1, 5) == "p"
+    assert mla._cp_slots_attend(q, 2, 3, 4, 0.1, 5) == "p"
     split.clear()  # the split off
-    assert mla._cp_slots_attend(1, 2, 3, 4, 0.1, 5) == "n"
+    assert mla._cp_slots_attend(q, 2, 3, 4, 0.1, 5) == "n"
     split.add("dsa_slots_n")
     monkeypatch.setattr(platform, "nki_grid", lambda: 1)  # grid 1
-    assert mla._cp_slots_attend(1, 2, 3, 4, 0.1, 5) == "n"
+    assert mla._cp_slots_attend(q, 2, 3, 4, 0.1, 5) == "n"
     assert [s for s, _ in seen] == ["n", "p", "n", "n"]
     assert seen[1][1] == {"lse": True}
+    monkeypatch.setattr(platform, "nki_grid", lambda: 2)
+    monkeypatch.setattr(
+        SH, "HOST_SIM", False
+    )  # a host tensor without the simulator: the emulation's route, no grid read
+    assert mla._cp_slots_attend(torch.zeros(1), 2, 3, 4, 0.1, 5) == "n"
 
 
 def test_engine_config_refuses_an_odd_pipe():

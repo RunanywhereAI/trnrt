@@ -1200,7 +1200,7 @@ def _cp_slots_attend(q, kc, rows, bias, scale: float, n):
     dsa_slots_n.attend."""
     from ..kernels import dsa_slots_n, dsa_slots_n_p
 
-    if dsa_slots_n_p.takes():
+    if (q.device.type != "cpu" or SH.HOST_SIM) and dsa_slots_n_p.takes():  # (the host runs dsa_slots_n's emulation)
         return dsa_slots_n_p.attend(q, kc, rows, bias, scale, n, lse=True)
     return dsa_slots_n.attend(q, kc, rows, bias, scale, n, lse=True)
 
