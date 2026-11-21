@@ -555,9 +555,10 @@ class ModelRunner:
         bound = self.launch_bound = LaunchBound()
         # engine/iopool.py: a decode call's host arguments and outputs at fixed device addresses, so the runtime's IO
         # ring cache holds a few sets per NEFF instead of filling. Host-side only; on a NeuronCore only.
-        # A speculative engine pools the blind step's calls too, and warms every slot of the pool (iopool.pool_names).
+        # A speculative engine pools the blind step's calls too (iopool.pool_names). Every engine warms every slot of the
+        # pool, so no slot's buffers and DMA rings are built on a serving call after the engine said it was ready.
         self.iopool = (iopool.Pool(names=iopool.pool_names(bool(ecfg.spec_method), ecfg.mtp_kv_only),
-                                   rank=getattr(model, "tp_rank", 0), warm=bool(ecfg.spec_method))
+                                   rank=getattr(model, "tp_rank", 0), warm=True)
                        if device.type == "neuron" else None)
 
         def counted(c):
