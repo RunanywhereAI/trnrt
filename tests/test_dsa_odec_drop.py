@@ -4,10 +4,13 @@ keeps it. load_layer then fills o_t from dequant(o, o_scale), the value o_dec he
 
 from __future__ import annotations
 
+import pytest
 import torch
 from torch import nn
 
 from trnrt.models import mla
+
+pytestmark = pytest.mark.usefixtures("decode_routes")  # set_decode_routes's writes are undone
 
 
 def _layer(with_ot: bool) -> nn.Module:

@@ -26,6 +26,8 @@ from trnrt.kernels import dsa_satwfcga as W
 from trnrt.kernels import dsa_sel2gc as C
 from trnrt.kernels import dsa_shell as dsh
 
+pytestmark = pytest.mark.usefixtures("decode_routes")  # set_decode_routes's writes are undone
+
 needs_nki = pytest.mark.skipif(importlib.util.find_spec("nki") is None, reason="needs the NKI package (Neuron venv)")
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 PPP = dsh.PPP

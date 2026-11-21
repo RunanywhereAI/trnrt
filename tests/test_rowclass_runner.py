@@ -25,6 +25,8 @@ import trnrt.kernels
 from trnrt.engine import engine as E
 from trnrt.engine import model_runner as MR
 
+pytestmark = pytest.mark.usefixtures("decode_routes")  # set_decode_routes's writes are undone
+
 LAY = {24: (24,) * 6 + (8,) * 6 + (4,) * 12, 16: (24,) * 4 + (8,) * 12}  # the 9-16 build's layouts
 PS = 256
 MTP2 = types.SimpleNamespace(spec_method="mtp", spec_k=2)

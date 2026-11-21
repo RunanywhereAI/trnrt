@@ -32,6 +32,8 @@ from trnrt.engine import engine as E
 from trnrt.engine import model_runner as mr
 from trnrt.models import hybrid, mla
 
+pytestmark = pytest.mark.usefixtures("decode_routes")  # set_decode_routes's writes are undone
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # Every build, in EngineConfig's names.

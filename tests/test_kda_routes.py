@@ -10,6 +10,8 @@ from trnrt.config import EngineConfig
 from trnrt.engine import engine as E
 from trnrt.models import hybrid
 
+pytestmark = pytest.mark.usefixtures("decode_routes")  # set_decode_routes's writes are undone
+
 
 @pytest.fixture(autouse=True)
 def _routes(monkeypatch):

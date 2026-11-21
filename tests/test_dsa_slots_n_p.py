@@ -15,6 +15,8 @@ import torch
 from tests.test_dsa_slots import _inputs, kernel_args
 from trnrt.kernels import dsa_slots as ds
 
+pytestmark = pytest.mark.usefixtures("decode_routes")  # set_decode_routes's writes are undone
+
 needs_nki = pytest.mark.skipif(importlib.util.find_spec("nki") is None, reason="needs the NKI package (Neuron venv)")
 
 

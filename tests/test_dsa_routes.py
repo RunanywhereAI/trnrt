@@ -12,6 +12,8 @@ from trnrt.engine import engine as E
 from trnrt.kernels import dsa_slots_n_p, dsa_topk, sp_gather
 from trnrt.models import mla
 
+pytestmark = pytest.mark.usefixtures("decode_routes")  # set_decode_routes's writes are undone
+
 # field: (module, constant, a non-default value, the constant it then holds); set_decode_routes writes each
 FIELDS = {
     "dsa_topk_rowsplit_big": (dsa_topk, "ROWSPLIT_BIG", True, True),
