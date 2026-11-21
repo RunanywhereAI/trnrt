@@ -657,8 +657,10 @@ def cmd_engine(argv: list[str]) -> int:
     ap.add_argument("--served-model-name", default="glm")
     add_compile_arg(ap)
     a = ap.parse_args(argv)
+    # before anything imports trnrt.kernels (EngineConfig checks the DSA layouts with the kernels' parsers); the ranks the
+    # engine spawns inherit it
+    apply_preset_env(argv)
     cfg = engine_config(argv, a.core_base)
-    apply_preset_env(argv)  # before anything imports trnrt.kernels; the ranks the engine spawns inherit it
     from .engine import start_checks
 
     why = start_checks.refusal(cfg.device, a.core_base, cfg.tp)  # its devices free, enough contiguous host memory

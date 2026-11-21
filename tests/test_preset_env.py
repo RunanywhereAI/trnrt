@@ -76,12 +76,14 @@ def test_every_build_needs_the_hardware_dge_knob():
     "argv", [[], ["--preset", "latency"], ["--preset", "throughput"], ["--users", "12"], ["--preset", "batch8"]]
 )
 def test_engine_sets_it_for_every_build_before_any_kernel_import(argv, plain_rev):
-    """No preset is the balanced build, --users picks one, an earlier release's name runs one: every build sets it."""
+    """No preset is the balanced build, --users picks one, an earlier release's name runs one: every build sets it. A
+    build with DSA row classes imports the layout parsers' kernel modules when its EngineConfig is checked, after the
+    environment is set; the kernels' revision proves the order (it holds the hardware-DGE span only when the knob was set
+    at import)."""
     r = _run(ENGINE, argv)
     assert r["rc"] == cli.START_REFUSED_STATUS  # the test's start check stopped it, after the environment was set
     assert r["env"] == "1"
-    assert r["kernels"] == []
-    assert r["rev"] == plain_rev ^ r["span"]  # the kernels imported afterwards are the hardware-DGE form
+    assert r["rev"] == plain_rev ^ r["span"]  # every kernel imported is the hardware-DGE form
 
 
 def test_engine_keeps_a_value_the_caller_set(plain_rev):
