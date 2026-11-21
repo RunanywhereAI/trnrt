@@ -120,7 +120,7 @@ def run(S, pend_a, blobs: dict, w_blob, *, Is: int, K: int, scale: float, group:
                 bb=blobs[BF16], bf=blobs[F32], wb=w_blob, hc=int(hc), iters=int(iters), eps=float(hc_eps),
                 rms_eps=float(rms_eps), sig=MP.SIGMOID, skf=MP.SK, Is=int(Is), K=int(K), rsc=float(scale),
                 group=int(group), ring=int(ring), limit=float(limit), rsp=int(rsp), dbg=int(dbg), fin=int(fin),
-                rev=REV, **MH.offsets(E, H, Is, grid))
+                rev=REV ^ SH.mix_rev_term(), **MH.offsets(E, H, Is, grid))
     if build_only:  # the kernel's arguments, nothing run (the fused kernels compose them with their own)
         return args
     k = FB.ffn_half_kernel

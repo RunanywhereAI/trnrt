@@ -779,7 +779,7 @@ def run(S, blobs: dict, conv_pool, rec_pool, slots, *, H: int, nv: int, hc: int,
     if fin is None:
         fin = RI.FIN
     T = S.shape[0]
-    rev = REV
+    rev = REV ^ SH.mix_rev_term()  # (the mix's row split, shell.MIX_ROW_SPLIT, at the call)
     if kda_shell_kernel is None:
         raise RuntimeError("the NKI KDA shell needs the nki package (the Neuron venv)")
     if grid is None:

@@ -123,6 +123,9 @@ def set_decode_routes(cfg: EngineConfig) -> None:
     # -- KDA, mHC and FFN-half routes
     hybrid.KDA_SHELL = bool(cfg.kda_shell)
     hybrid.MHC_SEAM = bool(cfg.mhc_seam)
+    from ..kernels import shell
+
+    shell.MIX_ROW_SPLIT = bool(cfg.shell_mix_row_split)
 
 
 def local_k_counts(model) -> list[float] | None:

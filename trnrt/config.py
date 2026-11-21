@@ -163,6 +163,10 @@ class EngineConfig:
     #   the fused DSA layer runs the previous layer's FFN mix and its own attention pre as one kernel call
     #   (kernels/mhc_seam.py, rows split over the LNC pair), its fn re-laid at load as a decode-only copy.
     mhc_seam: bool = False
+    # - shell_mix_row_split (kernels/shell.py MIX_ROW_SPLIT): the stream mix inside the decode kernels (the FFN half's,
+    #   the dense half's and the KDA shell's mix_in) with its rows split over the LNC pair, each program mixing its half
+    #   and reading the other's back from the kernel's output; exact.
+    shell_mix_row_split: bool = False
 
     def __post_init__(self):
         if self.max_running is not None and self.max_running < 1:
