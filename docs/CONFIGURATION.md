@@ -74,7 +74,9 @@ only: no graph changes, so they run on the compile cache of the build they are a
 | `--pool-ascending` | on | off | hand out the lowest free KV pages in ascending order, so a request's pages form few runs for the batched copies |
 
 The save-once copies live in shared memory: the container needs the host's /dev/shm (`--ipc=host`, as in
-[DEPLOY.md](DEPLOY.md)), and an engine refuses to start when /dev/shm cannot hold its share at its fullest.
+[DEPLOY.md](DEPLOY.md)), and an engine refuses to start when /dev/shm cannot hold its arenas at their fullest beside what
+the arenas of engines already running on the host may still take. It is a check, not a reservation: engines started at
+the same moment are not checked against each other (`python -m trnrt serve` starts its engines one after another).
 
 ## Speculative decoding: the latency build
 
