@@ -175,7 +175,8 @@ def ls_records(out: str) -> list[dict]:
 
 def neuron_devices() -> list[dict]:
     """neuron-ls's device records: `--json-output`, else `--output-format json` (announced to replace -j /
-    --json-output in a later Neuron SDK). Raises when neither gives a device list."""
+    --json-output in a later Neuron SDK), also when the first exits 0 with output ls_records cannot read (a deprecated
+    flag's notice, another layout). Raises when neither gives a device list."""
     import shutil
     import subprocess
 
@@ -187,7 +188,10 @@ def neuron_devices() -> list[dict]:
         except subprocess.CalledProcessError as e:
             errs.append(f"{' '.join(flags)}: exit {e.returncode} ({(e.stderr or '').strip()[:120]})")
             continue
-        return ls_records(r.stdout)
+        try:
+            return ls_records(r.stdout)
+        except ValueError as e:  # json.JSONDecodeError is one
+            errs.append(f"{' '.join(flags)}: {e}")
     raise RuntimeError("neuron-ls gave no device JSON: " + "; ".join(errs))
 
 

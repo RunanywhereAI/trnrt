@@ -174,6 +174,22 @@ def test_neuron_devices_falls_back_to_the_newer_flag(monkeypatch):
         TP.neuron_devices()
 
 
+@pytest.mark.parametrize("old", ["the --json-output flag is deprecated", json.dumps({"devices": "moved"}), "[]"])
+def test_the_newer_flag_is_tried_when_the_old_one_exits_0_with_output_it_cannot_read(monkeypatch, old):
+    calls = []
+
+    def run(argv, **kw):
+        calls.append(argv[1:])
+        out = old if argv[1:] == ["--json-output"] else json.dumps({"neuron_devices": LS})
+        return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    assert TP.neuron_devices() == LS and calls == [["--json-output"], ["--output-format", "json"]]
+    monkeypatch.setattr(subprocess, "run", lambda argv, **kw: subprocess.CompletedProcess(argv, 0, stdout=old))
+    with pytest.raises(RuntimeError, match=r"neuron-ls gave no device JSON: --json-output: .*; --output-format json: "):
+        TP.neuron_devices()  # neither readable: a RuntimeError naming both, which numa_pin takes as a failed listing
+
+
 def test_fmt_cpus_inverts_parse_cpulist():
     for s in ("0-47,96-143", "7", "0-3,5,8-9", ""):
         assert TP.fmt_cpus(TP.parse_cpulist(s)) == s
