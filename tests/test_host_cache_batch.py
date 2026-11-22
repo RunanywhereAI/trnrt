@@ -199,6 +199,52 @@ def test_a_host_cache_smaller_than_one_offload_keeps_the_last_pages(batch):
     assert tier.saved == 4 and tier.dropped == 2
 
 
+def _failing_once(r):
+    """r.kv_save_many raises on its next call, then is r's own again."""
+    real = r.kv_save_many
+
+    def fail(*a, **k):
+        r.kv_save_many = real
+        raise RuntimeError("planted: the batch's device-to-host copy failed")
+
+    r.kv_save_many = fail
+
+
+def test_a_batched_save_that_fails_publishes_none_of_its_pages_and_frees_their_slots():
+    r = _runner(8, seed=7)
+    tier = HostTier(r, page_size=8, capacity_pages=4, capacity_ckpts=1, batch=True)
+    ids = list(range(300, 300 + 8 * 3))
+    _failing_once(r)
+    with pytest.raises(RuntimeError, match="planted"):
+        tier.offload(ids, 0, [5, 6, 7])
+    assert not tier.entries and not tier.slot_hash and sorted(tier.free_slots) == [0, 1, 2, 3] and tier.saved == 0
+    assert tier.lookup(ids, 0, 3) == []  # nothing a restore could take: no slot without its page
+    tier.offload(ids, 0, [5, 6, 7])  # the next eviction of the same pages keeps them
+    slots = tier.lookup(ids, 0, 3)
+    assert len(slots) == 3
+    want = [c[5 * 8 : 8 * 8].clone() for c in r._paged_caches()]
+    tier.load(slots, [10, 11, 12])  # every slot it found holds its page
+    for c, w in zip(r._paged_caches(), want):
+        assert torch.equal(c[10 * 8 : 13 * 8].view(torch.uint8), w.view(torch.uint8))
+
+
+def test_a_failed_save_flushed_by_an_eviction_keeps_the_entry_it_would_have_evicted():
+    """Two slots full with path X; path Y's second page evicts X's second (slot 1), and the flush of Y's first page, which
+    goes before that drop, fails: X's page stays mapped with its payload, Y's page is not mapped, slot 0 is free."""
+    r = _runner(8, seed=8)
+    tier = HostTier(r, page_size=8, capacity_pages=2, capacity_ckpts=1, batch=True)
+    x, y = list(range(100, 116)), list(range(900, 916))
+    tier.offload(x, 0, [3, 4])
+    x1 = tier.hashes(x, 2)[1]
+    kept = [t.clone() for t in r._host_kv[1]]
+    _failing_once(r)
+    with pytest.raises(RuntimeError, match="planted"):
+        tier.offload(y, 0, [8, 9])  # Y's first page takes slot 0 (X's first dropped), then the flush fails
+    assert list(tier.entries.items()) == [(x1, 1)] and tier.free_slots == [0] and tier.saved == 2
+    assert all(torch.equal(a.view(torch.uint8), b.view(torch.uint8)) for a, b in zip(r._host_kv[1], kept))
+    assert tier.lookup(y, 0, 2) == []
+
+
 def test_an_ascending_pool_hands_out_runs_and_takes_runs_back():
     p = PagePool(32, ascending=True)
     a = p.alloc(6)
@@ -213,8 +259,18 @@ def test_an_ascending_pool_hands_out_runs_and_takes_runs_back():
     assert q.alloc(4) == list(reversed(d[1:5])) and q.alloc(0) == []
 
 
+def test_an_ascending_pool_hands_out_the_lowest_free_page_one_page_at_a_time():
+    """A decode takes its pages one at a time: each is the lowest free id too, not the last one freed."""
+    p = PagePool(32, ascending=True)
+    assert p.alloc(8) == list(range(1, 9))
+    p.free([3, 4, 5])  # an evicted run, put back on top of the free list
+    assert [p.alloc(1)[0] for _ in range(3)] == [3, 4, 5]
+    p.free([7, 2])
+    assert p.alloc(1) == [2] and p.alloc(2) == [7, 9]
+
+
 def test_the_engine_builds_its_pool_in_the_configured_order():
-    src = inspect.getsource(E.LLMEngine.__init__)
+    src = inspect.getsource(E.LLMEngine._finish_init)  # (__init__ runs it past the shards)
     assert "PagePool(num_pages, ascending=cfg.pool_ascending)" in src
     assert "batch=cfg.host_cache_batch" in src and "cfg.host_cache_ckpt_frac" in src
 

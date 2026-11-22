@@ -27,7 +27,9 @@ The two ordering hazards an acknowledge-on-receipt channel leaves:
 
 Names are short (macOS caps a POSIX shared-memory name at 31 characters) and carry a tag unique to the engine; stale
 segments of a dead engine with the same tag are unlinked at start (cleanup_stale), and a rank unlinks its own at close,
-at exit and on SIGTERM. The arenas' worst case is checked against the free space of /dev/shm before any is created.
+at exit and on SIGTERM. The arenas' worst case is checked against the free space of /dev/shm before any is created,
+less what the arenas of other engines on the host may still take (check_capacity). It is a check, not a reservation: two
+engines that run it at the same moment can both pass (`python -m trnrt serve` starts its engines one after another).
 """
 
 from __future__ import annotations
@@ -269,9 +271,13 @@ class Board:
         self.seg, self.world = seg, world
         self.done = np.ndarray((world,), dtype=np.uint64, buffer=seg.shm.buf, offset=0)
 
+    @staticmethod
+    def total_bytes(world: int) -> int:
+        return _round(8 * world, 64)
+
     @classmethod
     def create(cls, name: str, world: int) -> Board:
-        b = cls(_Seg.create(name, _round(8 * world, 64)), world)
+        b = cls(_Seg.create(name, cls.total_bytes(world)), world)
         b.done[:] = 0
         return b
 
@@ -311,18 +317,40 @@ def cleanup_stale(tag: str, names: list[str] | None = None) -> list[str]:
     return gone
 
 
-def check_capacity(total_bytes: int, path: str = SHM_DIR, margin: float = 0.0) -> None:
+def engine_bytes(world: int, per_arena: int, slot_bytes: int) -> int:
+    """The shared memory an engine's save-once host cache takes once full: every rank's arena (its header, its generation
+    and tag cells, its payloads) and the board."""
+    return world * Arena.total_bytes(per_arena, slot_bytes) + Board.total_bytes(world)
+
+
+def unbacked_bytes(path: str = SHM_DIR, skip_tag: str | None = None) -> int:
+    """What the save-once segments in `path` (every engine's but skip_tag's) may still take from the tmpfs: each one's
+    size less the bytes already backed. A segment is sized when it is made and backed page by page as its host cache
+    fills, so the free space does not show what an engine that started earlier will go on to take."""
+    n = 0
+    for f in os.listdir(path):
+        if f.startswith(PREFIX) and not (skip_tag is not None and f.startswith(f"{PREFIX}{skip_tag}_")):
+            with contextlib.suppress(FileNotFoundError):  # unlinked since the listing
+                st = os.stat(os.path.join(path, f))
+                n += max(0, st.st_size - st.st_blocks * 512)
+    return n
+
+
+def check_capacity(total_bytes: int, path: str = SHM_DIR, margin: float = 0.0, tag: str | None = None) -> None:
     """Refuse (ValueError) when the arenas' worst case does not fit the tmpfs: the segments are committed lazily, but a
     leak or a second engine could leave less free than a full host cache needs, and a write into an unbacked page is a
-    SIGBUS in the middle of a save. Skipped where there is no such tmpfs."""
+    SIGBUS in the middle of a save. What other engines' segments (any tag but `tag`) may still take is not free. Skipped
+    where there is no such tmpfs."""
     if not os.path.isdir(path):
         return
     free = shutil.disk_usage(path).free
-    if total_bytes * (1.0 + margin) > free:
+    others = unbacked_bytes(path, skip_tag=tag)
+    if total_bytes * (1.0 + margin) > free - others:
         raise ValueError(
             f"the save-once host arenas need up to {total_bytes / 2**30:.1f} GiB of {path} and only "
-            f"{free / 2**30:.1f} GiB is free (another engine's arenas, or a leaked segment?): lower --host-cache-gb "
-            "or remove the stale segments"
+            f"{(free - others) / 2**30:.1f} GiB is free ({free / 2**30:.1f} GiB unused, of which other engines' arenas "
+            f"may still fill {others / 2**30:.1f} GiB; or a leaked segment?): lower --host-cache-gb or remove the "
+            "stale segments"
         )
 
 

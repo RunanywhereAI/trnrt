@@ -223,6 +223,30 @@ def test_the_capacity_guard_refuses_arenas_that_do_not_fit_the_tmpfs(monkeypatch
     H.check_capacity(11 * 2**30, path=str(tmp_path / "no-such-dir"))  # no tmpfs here: skipped, not refused
 
 
+def _sized(path, size: int, backed: int = 0) -> None:
+    with open(path, "wb") as f:
+        f.write(b"x" * backed)
+        f.truncate(size)
+
+
+def test_the_capacity_guard_counts_what_other_engines_arenas_may_still_take(monkeypatch, tmp_path):
+    """An engine that started earlier (core base 0) has sized its arenas, 6 GiB, and backed 1 MiB of them: the rest is
+    not free for the next engine (core base 64), though the tmpfs reports it free. Its own tag and other files are not
+    counted."""
+    monkeypatch.setattr(H.shutil, "disk_usage", lambda p: types.SimpleNamespace(free=10 * 2**30))
+    other = tmp_path / f"{H.PREFIX}c0_a0"
+    _sized(other, 6 * 2**30, backed=2**20)
+    _sized(tmp_path / f"{H.PREFIX}c64_a0", 4 * 2**30)
+    _sized(tmp_path / "unrelated", 4 * 2**30)
+    st = os.stat(other)
+    if st.st_blocks * 512 >= st.st_size:
+        pytest.skip("this filesystem keeps no sparse files")
+    assert H.unbacked_bytes(str(tmp_path), skip_tag="c64") == st.st_size - st.st_blocks * 512
+    H.check_capacity(3 * 2**30, path=str(tmp_path), tag="c64")  # about 4 GiB left
+    with pytest.raises(ValueError, match=r"other engines' arenas may still fill 6\.0 GiB"):
+        H.check_capacity(5 * 2**30, path=str(tmp_path), tag="c64")  # 10 GiB free by the tmpfs's count
+
+
 # -- attaching a segment that is still being made ----------------------------------------------------------------------------
 # The names are derived, not handed over after creation, so a reader can reach a name its creator has made but not yet
 # sized (and, for an arena, sized but its header not yet written). multiprocessing.shared_memory fails there and, on macOS,
