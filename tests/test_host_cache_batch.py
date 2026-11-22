@@ -258,6 +258,16 @@ def test_an_ascending_pool_hands_out_runs_and_takes_runs_back():
     assert len(mr.page_runs(q.alloc(4)[::-1])) == 1 and q.alloc(0) == []
 
 
+def test_an_ascending_pool_hands_out_the_lowest_free_page_one_page_at_a_time():
+    """A decode takes its pages one at a time: each is the lowest free id too, not the last one freed."""
+    p = PagePool(32, ascending=True)
+    assert p.alloc(8) == list(range(1, 9))
+    p.free([3, 4, 5])  # an evicted run, put back on top of the free list
+    assert [p.alloc(1)[0] for _ in range(3)] == [3, 4, 5]
+    p.free([7, 2])
+    assert p.alloc(1) == [2] and p.alloc(2) == [7, 9]
+
+
 def test_the_engine_builds_its_pool_in_the_configured_order():
     src = inspect.getsource(E.LLMEngine.__init__)
     assert "PagePool(num_pages, ascending=cfg.pool_ascending)" in src
