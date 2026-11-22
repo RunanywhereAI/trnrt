@@ -108,6 +108,9 @@ def run(S, pend_a, blobs: dict, w_blob, *, Is: int, K: int, scale: float, group:
         raise RuntimeError("the NKI FFN half needs the nki package (the Neuron venv)")
     if dbg >= 2 and rsp:
         raise ValueError("ffn_half dbg=2 (the router's choice) needs rsp 0: at rsp 1 / 2 a program holds half the experts")
+    if rsp and FB.IDS1:  # no build runs the router split (moe_half.RSPLIT 0)
+        raise ValueError("ffn_half rsp 1 / 2 (the router split) needs ffn_half_pb.IDS1 off: IDS1 loads the experts of "
+                         "each program's own top 8, before the two programs' candidates are merged into the routed 8")
     if grid is None:
         from .. import platform
 
