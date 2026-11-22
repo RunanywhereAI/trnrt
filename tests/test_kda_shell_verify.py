@@ -33,6 +33,7 @@ from trnrt.models import linear_attn as LA
 H, HC, BF = TKS.H, TKS.HC, TKS.bf
 STATE_SLOT = torch.tensor([[1, 2, 3], [4, 5, 6], [7, 8, 9]])  # [B 3, 1 + Q]: read, after position 0, after position 1
 POSITIONS = torch.tensor([[0, 1], [9, 10], [4, 5]])  # sequence 0 starts here: zero states, its read row unread
+needs_nki = pytest.mark.skipif(not TKS.NKI, reason="needs the NKI package (Neuron venv)")
 
 
 @pytest.fixture(autouse=True)
@@ -367,7 +368,7 @@ def _verify_forms(B: int, Q: int, grid: int, mix: bool, seed: int):
     return one, ref, st, scratch
 
 
-@pytest.mark.skipif(not TKS.NKI, reason="needs the NKI package (Neuron venv)")
+@needs_nki
 @pytest.mark.parametrize(("B", "grid", "mix"), [(1, 2, False), (2, 2, True), (4, 2, False), (8, 2, True), (3, 1, True)])
 def test_the_verify_in_one_call_is_the_decode_calls_bit_for_bit(B, grid, mix, monkeypatch):
     """vq 3 (recb 5): position q >= 1's conv taps and state from position q - 1's in SBUF, against decode calls of the
