@@ -293,10 +293,11 @@ def _kernel_rev() -> int:
 REV = _kernel_rev()
 
 
-def takes(x: torch.Tensor, Dk: int, Dv: int, kda: bool) -> bool:
+def takes(x: torch.Tensor, Dk: int, Dv: int, kda: bool, H: int) -> bool:
     """Whether a decode step of these shapes runs as the kernel: on the device (x not on the CPU), KDA (per-key
-    decay), 128 x 128 heads."""
-    return x.device.type != "cpu" and kda and Dk == 128 and Dv == 128
+    decay), 128 x 128 heads, H = 2 of them per rank (the kernel's ring of RING rows is sized for 2 heads a row, and
+    _body asserts it; GLM-5.3-Flash's KDA layers at attention TP 32). Another head count keeps the einsums."""
+    return x.device.type != "cpu" and kda and Dk == 128 and Dv == 128 and H == 2
 
 
 def decode_step(pool: torch.Tensor, state_slot: torch.Tensor, keep: torch.Tensor, q, k, v, g, beta) -> torch.Tensor:

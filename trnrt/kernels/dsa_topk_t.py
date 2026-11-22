@@ -76,14 +76,15 @@ else:
 
 
 def _kernel_rev() -> int:
-    """CRC-32 of this module's kernel source mixed with dsa_topk's REV (the _select code it runs), the static `rev`:
-    the compile-cache key does not hash NKI kernel source."""
+    """CRC-32 of this module's kernel source mixed with dsa_topk's REV (the _select code it runs) and the dsa_topk
+    constants _select compiles in, which sit above dsa_topk's REV span (BIG, VISIBLE, NEG_INF), the static `rev`: the
+    compile-cache key does not hash NKI kernel source."""
     import hashlib
 
     src = open(__file__).read()
     a = src.index("try:  # the Neuron venv")
     b = src.index("    dsa_topk_t_kernel = None", a)
-    return zlib.crc32(hashlib.sha256(repr((src[a:b], T.REV)).encode()).digest())
+    return zlib.crc32(hashlib.sha256(repr((src[a:b], T.REV, T.BIG, T.VISIBLE, T.NEG_INF)).encode()).digest())
 
 
 REV = _kernel_rev()

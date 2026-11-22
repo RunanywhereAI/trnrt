@@ -232,6 +232,45 @@ def test_run_launches_the_pb_kernel(monkeypatch):
     assert seen == [(kpb, FB.REV, RI.FIN, npg)], seen
 
 
+def _build_args(rsp: int):
+    """run(build_only=True)'s argument dict at a small shape (no kernel launched)."""
+    T, hc, H, E, npg = 1, 4, 256, 8, 2
+    blobs = {k: torch.zeros(1) for k in (torch.bfloat16, torch.float32, "fn", "base", "scale", "post_norm")}
+    pend = (torch.zeros(T, hc), torch.zeros(T, hc, hc), torch.zeros(npg, T, H, dtype=torch.bfloat16))
+    return FH.run(
+        torch.zeros(T, hc, H, dtype=torch.bfloat16),
+        pend,
+        blobs,
+        torch.zeros(E, 1),
+        Is=128,
+        K=8,
+        scale=2.5,
+        group=4,
+        ring=3,
+        limit=10.0,
+        rsp=rsp,
+        hc=hc,
+        iters=20,
+        hc_eps=1e-6,
+        rms_eps=1e-5,
+        grid=npg,
+        build_only=True,
+    )
+
+
+@pytest.mark.parametrize("rsp", [1, 2])
+def test_the_router_split_is_refused_with_the_early_expert_ids(monkeypatch, rsp):
+    """IDS1 builds the ring's expert ids from each program's own top 8 before the router split merges the two programs'
+    candidates, so the split would run the wrong experts: run() refuses it, and takes it with IDS1 off. No build sets it."""
+    monkeypatch.setattr(FB, "ffn_half_kernel", object())
+    assert mh.RSPLIT == 0
+    assert _build_args(0)["rsp"] == 0
+    with pytest.raises(ValueError, match=r"needs ffn_half_pb\.IDS1 off"):
+        _build_args(rsp)
+    monkeypatch.setattr(FB, "IDS1", False)
+    assert _build_args(rsp)["rsp"] == rsp
+
+
 def test_the_ring_by_rows_then_page_bucket():
     """ring_for: 3 for a graph of at most 3 rows (a one-sequence verify), else 3 at the 4096-page bucket, else 5; with
     the graph's width or rows unknown, the page rule or RING alone."""

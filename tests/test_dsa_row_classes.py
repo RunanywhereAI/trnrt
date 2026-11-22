@@ -115,6 +115,35 @@ def test_parse_refuses(spec):
         C.parse(spec)
 
 
+@pytest.mark.parametrize("spec", ["4:2x8+2x4,4:4x4", "4:2x8+2x4, 4:2x8+2x4", "4:4x4,16:4x24+12x8,04:2x8+2x4"])
+def test_parse_refuses_a_batch_size_given_twice(spec):
+    """A repeated batch size would replace the first layout without a word (the last one won)."""
+    with pytest.raises(ValueError, match="batch size 4 has a layout already"):
+        C.parse(spec)
+
+
+def test_parse_takes_a_class_up_to_the_kernels_score_tile():
+    """The kernel holds a score tile of at most 512 columns (NTM = NG PPP <= 512): NG 64 at PPP 8 parses, 65 does not."""
+    widest = 512 // PPP
+    assert widest * PPP == 512
+    assert C.parse(f"4:2x{widest}+2x4") == {4: (widest, widest, 4, 4)}
+    for spec in (f"4:2x{widest + 1}+2x4", f"4:2x{widest}+2x{widest + 1}", f"16:16x{widest + 1}"):
+        with pytest.raises(ValueError, match="above the kernel's 512"):
+            C.parse(spec)
+
+
+def test_engine_config_refuses_a_class_wider_than_the_score_tile():
+    """The case that passed every other check: a 65-group class at a page bucket of its own, below the largest."""
+    with pytest.raises(ValueError, match="above the kernel's 512"):
+        EngineConfig(
+            model_path="m",
+            dsa_row_classes="16:16x65",
+            dsa_rowsplit_layout="16:2x65+2x65",
+            decode_batch_buckets=(16,),
+            page_buckets=(8320, 8448),
+        )
+
+
 def _decode_ints(ints):
     """The test's own reading of _rc_ints' tuple (as _rc_layout reads it): {B: [NG per slot]}."""
     out = {}
@@ -260,6 +289,13 @@ def test_parse_w_refuses(spec):
         W.parse_w(spec)
 
 
+@pytest.mark.parametrize("spec", ["24:2x24+4x6,24:2x24+4x8", "16:2x24+2x8,24:2x24+4x8, 24:2x24+4x8"])
+def test_parse_w_refuses_a_batch_size_given_twice(spec):
+    """A repeated batch size would replace the first layout without a word (the last one won)."""
+    with pytest.raises(ValueError, match="batch size 24 has a layout already"):
+        W.parse_w(spec)
+
+
 def test_w_args_take_the_row_groups_rows(layouts):
     C.set_layouts(CLASSES["17+"])
     W.set_layouts(FORM_W["17+"])
@@ -329,6 +365,32 @@ def test_dispatch_refuses_a_classed_call_form_w_does_not_take(routes):
         dsa_satwf.satwf(*_args(24, 3072), comb_a=pend)  # no row group
 
 
+SAT_POS = ("q", "w", "pkc", "table", "nloc", "positions", "q_all", "kc", "w_uv_p", "o_p", "ident", "keep", "A", "rank")
+SAT_POS += ("world", "scale")
+
+
+@pytest.mark.parametrize("npos", [0, 4, 15])
+def test_dispatch_takes_the_keyword_form(routes, monkeypatch, npos):
+    """A call that names sat_args' parameters by keyword routes as the positional one does, and form W gets the same
+    positional arguments (no IndexError before the dispatch)."""
+    dsa_satwf, pend, seen = routes
+    got = []
+    monkeypatch.setattr(W, "satwf", lambda *a, **k: got.append((a, k)) or "w")
+    from trnrt.kernels import dsa_sat
+
+    assert tuple(dsa_sat.sat_args.__code__.co_varnames[:16]) == SAT_POS
+    for pages, want in ((3072, "w"), (4096, "pre")):
+        pos = _args(24, pages)
+        assert dsa_satwf.satwf(*pos, comb_a=pend, rowgroup=3) == want
+        kw = dict(zip(SAT_POS[npos:], pos[npos:], strict=True))
+        assert dsa_satwf.satwf(*pos[:npos], comb_a=pend, rowgroup=3, **kw) == want
+    (a0, k0), (a1, k1) = got
+    assert len(a0) == len(a1) == 16 and all(x is y for x, y in zip(a0, a1, strict=True)) and k0 == k1
+    assert seen == [("pre", False), ("pre", False)]
+    kw = dict(zip(SAT_POS[npos:-1], _args(24, 3072)[npos:-1], strict=True))  # no scale: sat_args' own error, below
+    assert dsa_satwf.satwf(*_args(24, 3072)[:npos], comb_a=pend, rowgroup=3, **kw) == "pre"
+
+
 def test_dispatch_without_classes_is_the_function_below(routes):
     dsa_satwf, pend, seen = routes
     C.set_layouts("")
@@ -368,6 +430,8 @@ def test_engine_config_takes_the_bands_layouts(band):
     ("kw", "why"),
     [
         ({"dsa_row_classes_cw": True}, "need dsa_row_classes"),
+        ({"dsa_row_classes": ",", "dsa_rowsplit_layout": ""}, "holds no layout"),
+        ({"dsa_row_classes": " , ", "dsa_rowsplit_layout": ","}, "holds no layout"),
         ({"dsa_rowsplit_layout": FORM_W["17+"]}, "need dsa_row_classes"),
         ({"dsa_row_classes": CLASSES["9-16"], "dsa_rowsplit_layout": "24:2x24+4x8"}, "must cover"),
         (

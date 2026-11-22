@@ -73,6 +73,15 @@ def test_route_defaults_off():
     assert mla.CP_FAIL_TRIP is False
 
 
+@pytest.mark.parametrize(("name", "value"), [("BIG", float(2**21)), ("VISIBLE", -4e29), ("NEG_INF", -2e30)])
+def test_rev_moves_with_the_constants_select_compiles_in(name, value, monkeypatch):
+    """_select reads dsa_topk's BIG / VISIBLE / NEG_INF, which lie above dsa_topk's REV span: each moves dsa_topk_t's
+    rev, so a changed constant can't replay a NEFF built with the old one."""
+    assert dkt._kernel_rev() == dkt.REV
+    monkeypatch.setattr(dk, name, value)
+    assert dkt._kernel_rev() != dkt.REV
+
+
 @pytest.mark.skipif(importlib.util.find_spec("nki") is None, reason="needs the NKI package (Neuron venv)")
 @pytest.mark.parametrize(("grid", "rowsplit"), [(1, False), (2, False), (2, True)])
 @pytest.mark.parametrize("kind", ["randn", "ties", "few"])

@@ -29,15 +29,21 @@ def parse(spec: str) -> dict:
     """A row-class layout spec, "B:NxG+NxG..,B:.." (e.g. "24:6x24+6x8+12x4,16:4x24+12x8") -> {B: (NG per slot, ...)}, the
     classes in the order given, which must be widest first (the runner's slot order: the longest rows first). Each
     class's count is even (slots alternate between the two LNC programs, so both get the same mix) and the counts add
-    up to B."""
+    up to B. A batch size appears once: a repeat would silently replace the first layout. A class is at most 512 // PPP
+    page groups wide: the kernel's widest score tile, NG PPP columns, holds at most 512 (dsa_sel2gc_kernel's NTM)."""
     out = {}
     for part in filter(None, (p.strip() for p in spec.split(","))):
         b, cls = part.split(":")
+        if int(b) in out:
+            raise ValueError(f"row classes {part!r}: batch size {int(b)} has a layout already")
         ngs = []
         for c in cls.split("+"):
             n, g = c.split("x")
             if int(n) % 2 or int(n) < 0 or int(g) < 1:
                 raise ValueError(f"row classes {part!r}: {c!r} needs an even count and NG >= 1")
+            if int(g) * dsh.PPP > 512:
+                raise ValueError(f"row classes {part!r}: {c!r}'s score tile is {int(g) * dsh.PPP} columns, above the "
+                                 f"kernel's 512 (NG at most {512 // dsh.PPP})")
             ngs += [int(g)] * int(n)
         if len(ngs) != int(b):
             raise ValueError(f"row classes {part!r}: {len(ngs)} slots for B {b}")

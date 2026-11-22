@@ -352,6 +352,8 @@ def satwf(*args, rowgroup: int, S, post_a, comb_a, blobs: dict, w_blob, ffn: dic
     fargs = FH.run(S, (post_a, comb_a.c, S.new_zeros(1)), blobs, w_blob, grid=grid, build_only=True, **ffn)
     fargs.pop("Yp")  # built in the kernel
     fargs.pop("rev")  # REV carries FS.REV (through SATWF.REV)
+    # the FFN half's stream mix with its rows split (shell.MIX_ROW_SPLIT) is a different kernel: its term, as run()'s
+    sargs["rev"] = int(sargs["rev"]) ^ SH.mix_rev_term()
     fargs["fscale"], fargs["fwb"] = fargs.pop("scale"), fargs.pop("wb")
     clash = set(fargs) & set(sargs)
     if clash:
@@ -368,10 +370,13 @@ def satwf(*args, rowgroup: int, S, post_a, comb_a, blobs: dict, w_blob, ffn: dic
 
 def parse_w(spec: str) -> dict:
     """A form-W layout spec, "B:naxqa+nbxqb[,B:..]" (e.g. "24:2x24+4x6") -> {B: (na, qa, nb, qb)}: a row group's two runs
-    of slots (na slots of class qa, nb of qb; each count even, slots alternating between the LNC programs as sel2gc's)."""
+    of slots (na slots of class qa, nb of qb; each count even, slots alternating between the LNC programs as sel2gc's).
+    A batch size appears once: a repeat would silently replace the first layout."""
     out = {}
     for part in filter(None, (p.strip() for p in spec.split(","))):
         b, cls = part.split(":")
+        if int(b) in out:
+            raise ValueError(f"form W layout {part!r}: batch size {int(b)} has a layout already")
         runs = [tuple(int(v) for v in c.split("x")) for c in cls.split("+")]
         if len(runs) != 2 or any(n % 2 or n < 2 or g < 1 for n, g in runs):
             raise ValueError(f"form W layout {part!r}: two runs NxG of even N >= 2")

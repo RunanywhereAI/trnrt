@@ -236,6 +236,8 @@ class EngineConfig:
         from .kernels import dsa_satwfcga, dsa_sel2gc  # (at construction: no import cycle with this module)
 
         lay = dsa_sel2gc.parse(self.dsa_row_classes)
+        if not lay:  # e.g. "," or " ": set_layouts would install no classes, so the route would be off without a word
+            raise ValueError(f"dsa_row_classes {self.dsa_row_classes!r} holds no layout (\"\" turns the classes off)")
         dsa_sel2gc._rc_ints(lay)  # the kernel's form: at most 2 batch sizes of at most 4 runs
         w = dsa_satwfcga.parse_w(self.dsa_rowsplit_layout)
         if set(w) != set(lay):
