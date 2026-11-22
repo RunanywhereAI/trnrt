@@ -305,6 +305,75 @@ def test_satwf_dispatches_by_comb_type(monkeypatch):
     assert SATWF_M.satwf(comb_a=torch.zeros(1)) == "served"
 
 
+class _Launched(Exception):
+    """Raised by the stand-in launch: the fused call's kernel arguments, nothing run."""
+
+    def __init__(self, kw):
+        super().__init__("launched")
+        self.kw = kw
+
+
+def _launch_rev(monkeypatch, call, form_w: bool) -> int:
+    """The `rev` a fused DSA call hands its kernel, with the section's and the FFN half's arguments stood in."""
+    import sys
+    import types
+
+    from trnrt.kernels import ffn_half as FH
+
+    class Wrapped:  # wrap_nki(k)[grid](**args)
+        def __init__(self, k):
+            pass
+
+        def __getitem__(self, grid):
+            def go(**kw):
+                raise _Launched(kw)
+
+            return go
+
+    hop = types.ModuleType("libtorch_neuronx_lite.nki.nki_hop")
+    hop.wrap_nki = Wrapped
+    for name in ("libtorch_neuronx_lite", "libtorch_neuronx_lite.nki"):
+        monkeypatch.setitem(sys.modules, name, sys.modules.get(name) or types.ModuleType(name))
+    monkeypatch.setitem(sys.modules, "libtorch_neuronx_lite.nki.nki_hop", hop)
+    monkeypatch.setattr(SAT, "sat_args", lambda *a, grid, _kernel, _rev, **k: ({"rev": _rev}, "kernel", 2, 1, 1, 1))
+    monkeypatch.setattr(FH, "run", lambda *a, **k: {"Yp": 0, "rev": 12345, "scale": 0, "wb": 0})
+    kw = {
+        "S": torch.zeros(1, 4, 8),
+        "post_a": None,
+        "comb_a": MF.PendingComb(torch.zeros(1)),
+        "blobs": {},
+        "w_blob": None,
+        "ffn": {},
+    }
+    if form_w:
+        from trnrt.kernels import dsa_satwfcga as W
+
+        monkeypatch.setattr(W, "_w_args", lambda *a: {})
+        kw.update(rowgroup=0, fz=1)
+    with pytest.raises(_Launched) as e:
+        call(torch.zeros(1), **kw)
+    return e.value.kw["rev"]
+
+
+@pytest.mark.parametrize("name", ["dsa_satwf", "dsa_satwfc", "dsa_satwfg", "dsa_satwfcg", "dsa_satwfcga"])
+def test_the_fused_call_folds_the_mix_row_split_term(monkeypatch, name):
+    """The fused DSA kernels run the FFN half's stream mix (ffn_half_shared's SH.mix_in_h), whose row-split form
+    (shell.MIX_ROW_SPLIT) is other code: each fused call's rev moves by that form's term when it is on, as
+    ffn_half.run's does, and is the kernel's REV when it is off."""
+    import importlib
+
+    from trnrt.kernels import mix_wide
+
+    mod = importlib.import_module(f"trnrt.kernels.{name}")
+    call = getattr(mod, "_satwf_served", mod.satwf)
+    revs = {}
+    for split in (False, True):
+        monkeypatch.setattr(SH, "MIX_ROW_SPLIT", split)
+        revs[split] = _launch_rev(monkeypatch, call, form_w=name == "dsa_satwfcga")
+    assert revs[False] == mod.REV  # off: no build's key moves (no row-class layout is set here, so no layout term)
+    assert revs[True] ^ revs[False] == mix_wide.RSPLIT_REV != 0
+
+
 def test_comb_done_recomputes_only_a_pending_comb(monkeypatch):
     """Where the fused call does not take, hybrid._comb_done replaces a PendingComb by mhc_pre's comb; other combs
     pass."""
