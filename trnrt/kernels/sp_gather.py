@@ -141,11 +141,12 @@ else:
 
 
 def _direct_rev() -> int:
-    """CRC-32 of the direct form's section: its kernel's static `rev`."""
+    """CRC-32 of the direct form's kernel source, its kernel's static `rev`: from the NKI imports through the direct
+    section, since the direct kernel traces _groups (the replica groups) and the imports above the copy-out kernel."""
     import zlib
 
     src = open(__file__).read()
-    a = src.index("# -- the direct form")
+    a = src.index("try:  # the Neuron venv")
     b = src.index("    sp_gather_dupfd_kernel = None", a)
     return zlib.crc32(src[a:b].encode())
 
