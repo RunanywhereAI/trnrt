@@ -269,7 +269,7 @@ def test_an_ascending_pool_hands_out_the_lowest_free_page_one_page_at_a_time():
 
 
 def test_the_engine_builds_its_pool_in_the_configured_order():
-    src = inspect.getsource(E.LLMEngine.__init__)
+    src = inspect.getsource(E.LLMEngine._finish_init)  # (__init__ runs it past the shards)
     assert "PagePool(num_pages, ascending=cfg.pool_ascending)" in src
     assert "batch=cfg.host_cache_batch" in src and "cfg.host_cache_ckpt_frac" in src
 

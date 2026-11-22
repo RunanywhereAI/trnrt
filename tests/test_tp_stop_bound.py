@@ -7,7 +7,8 @@ terminated.
   returns False at once, a healthy one True, and 0 waits without a bound; unacked_ranks names the ranks that lag the
   shared-memory channel and waits for a close in progress, and a diagnostic that raises still lets close() go on;
 - close() in a child process with one real spawned worker (the process tests): a hung stop is bounded and the worker
-  terminated, a raising one too, a healthy one joins its worker, and without the bound close() hangs (the control)."""
+  terminated, a raising one too, a healthy one joins its worker, and without the bound close() hangs (the control);
+- a start that fails after its workers started (stand-in workers) stops them and gives rank 0 its state back."""
 
 from __future__ import annotations
 
@@ -19,8 +20,10 @@ import sys
 import textwrap
 import threading
 import time
+import types
 
 import pytest
+import torch
 
 from trnrt.engine import engine as E
 from trnrt.engine import tp as TP
@@ -217,3 +220,80 @@ def test_unacked_ranks_waits_for_a_close_in_progress_and_never_reads_the_unmappe
     reader.join(10)
     assert got == ["unknown (the channel closed meanwhile)"]
     monkeypatch.setitem(TP._CH, "ch", None)
+
+
+class _Proc:
+    """A worker process that runs until it is terminated (multiprocessing.Process's surface that LLMEngine uses)."""
+
+    def __init__(self, **kw):
+        self.pid, self.exitcode, self.terminated = None, None, False
+
+    def start(self):
+        self.pid = 1 << 22
+
+    def is_alive(self):
+        return self.pid is not None and self.exitcode is None
+
+    def join(self, timeout=None):
+        pass
+
+    def terminate(self):
+        self.terminated, self.exitcode = True, -15
+
+    def kill(self):
+        self.exitcode = -9
+
+
+def test_a_start_that_fails_after_its_workers_started_stops_them_and_gives_rank_0_its_state_back(monkeypatch):
+    """Past build_shard (here the save-once /dev/shm refusal) the workers run and the process group is up, and the
+    caller gets no engine to close: the constructor stops the workers (terminated: no broadcast to them), gives this
+    process its state back and closes rank 0's arena, then raises the start's own error."""
+    import multiprocessing
+
+    from trnrt.config import EngineConfig
+
+    procs: list[_Proc] = []
+    events: list[str] = []
+
+    def proc(**kw):
+        procs.append(_Proc(**kw))
+        return procs[-1]
+
+    def refuse(tag, pages):
+        raise ValueError("planted: the save-once host arenas need more of /dev/shm than is free")
+
+    mcfg = types.SimpleNamespace(eos_token_ids=(0,))
+    runner = types.SimpleNamespace(
+        device=torch.device("cpu"),
+        tp_send=None,
+        watchdog=None,
+        state=types.SimpleNamespace(free_ckpt=lambda *a: None, bytes_per_row=lambda: 1024),
+        kv_page_bytes=lambda: 4096,
+        so_possible=lambda: True,
+        kv_arena_init=refuse,
+        kv_arena_close=lambda: events.append("arena closed"),
+    )
+    monkeypatch.setattr(multiprocessing, "get_context", lambda kind: types.SimpleNamespace(Process=proc))
+    monkeypatch.setattr(TP, "free_port", lambda core_base=None: 0)
+    monkeypatch.setattr(TP, "init_rank", lambda rank, world, port: events.append("process group up"))
+    monkeypatch.setattr(TP, "restore_process_state", lambda saved: events.append("process restored"))
+    monkeypatch.setattr(E, "resolve_model_path", lambda path, revision=None: path)
+    monkeypatch.setattr(E.ModelConfig, "from_pretrained", classmethod(lambda cls, path: mcfg))
+    monkeypatch.setattr(E, "resolve_attention_tp", lambda m, c: 2)
+    monkeypatch.setattr(E, "pool_pages", lambda c, m: 16)
+    monkeypatch.setattr(E, "build_shard", lambda c, path, n, rank: (types.SimpleNamespace(cp_rows=2), runner))
+
+    def no_tokenizer(path):
+        raise OSError("no tokenizer here")
+
+    tok = types.SimpleNamespace(from_pretrained=no_tokenizer)
+    monkeypatch.setitem(sys.modules, "transformers", types.SimpleNamespace(AutoTokenizer=tok))
+    cfg = EngineConfig(
+        model_path="no-model", device="cpu", tp=2, host_cache_gb=0.01, host_cache_batch=True, host_cache_save_once=True
+    )
+    n_open = len(E._OPEN)
+    with pytest.raises(ValueError, match="planted"):
+        E.LLMEngine(cfg)
+    assert len(procs) == 1 and procs[0].terminated
+    assert events == ["process group up", "process restored", "arena closed"]
+    assert len(E._OPEN) == n_open and runner.tp_send is None  # nothing left for the exit hook to close
