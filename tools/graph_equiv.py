@@ -300,8 +300,9 @@ _KCACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
 
 
 def kernel_digest(path, names):
-    """{'json': sha of the normalized JSON frames, 'records': count, 'tables': [sha of each binary frame]}."""
-    key = (path, tuple(names.packages))
+    """{'json': sha of the normalized JSON frames, 'records': count, 'tables': [sha of each binary frame]}. Cached by
+    the path and everything the normalization reads (the prefixes and the name map)."""
+    key = (path, tuple(names.packages), tuple(sorted(names.name_map.items())))
     if key in _KCACHE:
         return _KCACHE[key]
     with open(path, "rb") as f:
