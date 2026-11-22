@@ -29,7 +29,7 @@ same places. The per-page calls, not the bytes, were the cost of a restore at th
 Save-once (EngineConfig.host_cache_save_once, engine/host_arena.py): the ranks that hold identical
 bytes keep one shared copy of a page instead of one each. The host cache then stamps every save with
 the page's chain hash and has every restore check it, and it does not evict a slot a restore may
-still be reading on a slower rank (ModelRunner.so_busy).
+still be reading on a slower rank (ModelRunner.so_busy), nor hand one out again after clear().
 """
 
 from __future__ import annotations
@@ -59,6 +59,9 @@ class HostTier:
         self.looked: dict[int, int] = {}
         self.free_slots = list(range(capacity_pages - 1, -1, -1))
         self.pinned: set[int] = set()
+        # save-once: slots clear() took back while a restore may still be reading them on a slower rank (so_busy), kept
+        # out of free_slots until that copy is done (_slot returns them)
+        self.held: set[int] = set()
         self.saved = self.restored = self.dropped = 0
         # Recurrent-state checkpoints: hash of the page a checkpoint ends on -> host slot.
         self.ckpt_capacity = capacity_ckpts
@@ -160,9 +163,13 @@ class HostTier:
         return {"tags": [tag_of(want[s] if s in want else self.slot_hash[s]) for s in slots]}
 
     def _slot(self, pend: list[tuple[int, int]] | None = None) -> int | None:
+        busy = getattr(self.runner, "so_busy", None)  # save-once: a slot a restore may still be reading is not evicted
+        if self.held:
+            done = {s for s in self.held if busy is None or not busy(s)}
+            self.held -= done
+            self.free_slots.extend(sorted(done, reverse=True))
         if self.free_slots:
             return self.free_slots.pop()
-        busy = getattr(self.runner, "so_busy", None)  # save-once: a slot a restore may still be reading is not evicted
         for h, slot in self.entries.items():  # least recently used first
             if slot not in self.pinned and not (busy is not None and busy(slot)):
                 del self.entries[h]
@@ -207,13 +214,18 @@ class HostTier:
         self.unpin(slots)
 
     def clear(self) -> None:
+        busy = getattr(self.runner, "so_busy", None)
         for slot in self.entries.values():
             self.runner.kv_drop(slot)
+        # save-once: a slot a restore may still be reading on a slower rank is not handed out again until that copy is
+        # done, as _slot's eviction never takes one: the next save would stamp a newer generation under the copy
+        held = {*self.entries.values(), *self.held}
+        self.held = {s for s in held if busy is not None and busy(s)}
         self.entries.clear()
         self.slot_hash.clear()
         self.looked.clear()
         self.pinned.clear()
-        self.free_slots = list(range(self.capacity - 1, -1, -1))
+        self.free_slots = [s for s in range(self.capacity - 1, -1, -1) if s not in self.held]
         for slot in self.ckpts.values():
             self.runner.state_drop(slot)
         self.ckpts.clear()

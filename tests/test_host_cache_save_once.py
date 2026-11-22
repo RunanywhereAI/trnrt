@@ -403,6 +403,45 @@ def test_without_the_busy_rule_a_reused_slot_is_a_loud_error_on_the_lagging_rank
     assert any("reused under a pending load" in m for m in msgs), (msgs, w.errors)
 
 
+def _flush_under_a_lagging_load(w: World, plant: bool):
+    """A full host cache; rank 3 lags a restore of slots 0 and 1; the cache is flushed (HostTier.clear) and a new path
+    offloaded. plant: clear() as it was, every slot free at once."""
+    tier, ids = _tier_slots(w, 4)
+    w.gates[3].clear()
+    slots = tier.lookup(ids, 0, 2)
+    assert slots == [0, 1]
+    tier.load(slots, [10, 11])
+    w.sync(skip=(3,))
+    tier.clear()
+    if plant:
+        tier.free_slots, tier.held = list(range(3, -1, -1)), set()
+    tier.offload(list(range(700, 700 + 8 * 4)), 0, [12, 13, 14, 15])
+    w.sync(skip=(3,))
+    return tier, slots
+
+
+def test_a_flush_keeps_the_slots_a_lagging_rank_still_reads_out_of_use(world):
+    """A cache flush while rank 3 still copies a restore: the slots it reads are held, not freed, so the next offload
+    cannot stamp a newer generation under the copy (its other slots are used and reused); they come back once it is done."""
+    w = world(8, 16, save_once=True, cap=4)
+    tier, slots = _flush_under_a_lagging_load(w, plant=False)
+    assert tier.held == set(slots) and set(tier.entries.values()).isdisjoint(slots)
+    assert tier.saved == 8  # the four pages of the new path all went to the two other slots
+    w.gates[3].set()
+    w.sync()
+    assert not w.errors, w.errors
+    assert tier._slot() in slots and not tier.held  # rank 3 is done: the held slots are back
+
+
+def test_plant_a_flush_that_frees_every_slot_at_once_fails_the_lagging_rank(world):
+    w = world(8, 17, save_once=True, cap=4)
+    _flush_under_a_lagging_load(w, plant=True)
+    w.gates[3].set()
+    w.sync()
+    msgs = [str(e) for r, e in w.errors if r == 3]
+    assert any("reused under a pending load" in m for m in msgs), (msgs, w.errors)
+
+
 def _tier_history(w: World):
     """tests/test_host_cache_batch.py's history on a world: offloads that fill the host cache and drop and reuse slots
     inside one offload, write-through, restores."""
