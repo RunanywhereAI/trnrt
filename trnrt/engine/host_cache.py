@@ -142,10 +142,23 @@ class HostTier:
         self.ckpts_restored += 1
 
     def _flush(self, pend: list[tuple[int, int]]) -> None:
-        """Send the batched saves collected so far, in one call."""
+        """Send the batched saves collected so far, in one call. offload() maps each page's hash to its slot before the
+        call: if the call raises, those slots may hold some, all or none of their pages, so their entries are taken
+        back and the slots freed (a single-rank engine serves on after a failed step, and a later lookup must not
+        return a slot with no payload)."""
         if pend:
             slots = [s for s, _ in pend]
-            self.runner.kv_save_many(slots, [p for _, p in pend], **self._tags(slots))
+            try:
+                self.runner.kv_save_many(slots, [p for _, p in pend], **self._tags(slots))
+            except BaseException:
+                for s in slots:
+                    h = self.slot_hash.pop(s, None)
+                    if h is not None and self.entries.get(h) == s:
+                        del self.entries[h]
+                    self.free_slots.append(s)
+                self.saved -= len(slots)
+                pend.clear()
+                raise
             self.save_runs += page_run_count([p for _, p in pend])
             pend.clear()
 
@@ -172,9 +185,9 @@ class HostTier:
             return self.free_slots.pop()
         for h, slot in self.entries.items():  # least recently used first
             if slot not in self.pinned and not (busy is not None and busy(slot)):
-                del self.entries[h]
                 if pend:  # the pending saves go before the drop, as they would one page at a time
-                    self._flush(pend)
+                    self._flush(pend)  # first: if it raises, the entry it would evict still holds its page
+                del self.entries[h]
                 self.slot_hash.pop(slot, None)  # after the flush: a pending save of this slot is stamped with its tag
                 self.runner.kv_drop(slot)
                 self.dropped += 1
