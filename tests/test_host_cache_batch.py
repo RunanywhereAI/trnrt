@@ -160,7 +160,8 @@ def _tier_run(batch: bool):
     other = list(range(500, 500 + 8 * 4))
     tier.offload(other, 0, [8, 9, 10, 11])  # drops and reuses inside one offload
     slots = tier.lookup(other, 0, 4)
-    tier.load(slots, [15, 16, 18][: len(slots)])  # a restore into fresh, fragmented pages
+    assert len(slots) == 4  # every page of the last offload is held
+    tier.load(slots, [15, 16, 18, 19])  # a restore into fresh, fragmented pages: one page per slot
     slots = tier.lookup(ids, 3, 6)
     tier.load(slots, [20, 21, 22][: len(slots)])
     return r, tier, sent
