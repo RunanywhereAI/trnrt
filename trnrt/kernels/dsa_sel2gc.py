@@ -29,10 +29,12 @@ def parse(spec: str) -> dict:
     """A row-class layout spec, "B:NxG+NxG..,B:.." (e.g. "24:6x24+6x8+12x4,16:4x24+12x8") -> {B: (NG per slot, ...)}, the
     classes in the order given, which must be widest first (the runner's slot order: the longest rows first). Each
     class's count is even (slots alternate between the two LNC programs, so both get the same mix) and the counts add
-    up to B."""
+    up to B. A batch size appears once: a repeat would silently replace the first layout."""
     out = {}
     for part in filter(None, (p.strip() for p in spec.split(","))):
         b, cls = part.split(":")
+        if int(b) in out:
+            raise ValueError(f"row classes {part!r}: batch size {int(b)} has a layout already")
         ngs = []
         for c in cls.split("+"):
             n, g = c.split("x")

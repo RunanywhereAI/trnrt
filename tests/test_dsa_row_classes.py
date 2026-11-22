@@ -115,6 +115,13 @@ def test_parse_refuses(spec):
         C.parse(spec)
 
 
+@pytest.mark.parametrize("spec", ["4:2x8+2x4,4:4x4", "4:2x8+2x4, 4:2x8+2x4", "4:4x4,16:4x24+12x8,04:2x8+2x4"])
+def test_parse_refuses_a_batch_size_given_twice(spec):
+    """A repeated batch size would replace the first layout without a word (the last one won)."""
+    with pytest.raises(ValueError, match="batch size 4 has a layout already"):
+        C.parse(spec)
+
+
 def _decode_ints(ints):
     """The test's own reading of _rc_ints' tuple (as _rc_layout reads it): {B: [NG per slot]}."""
     out = {}
