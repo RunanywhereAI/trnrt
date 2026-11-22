@@ -25,6 +25,7 @@ and versions follow [Semantic Versioning](https://semver.org/). Rebuild the comp
   once per run of consecutive pages), save-once (`--host-cache-save-once`: the ranks of one context-parallel index keep
   one shared copy of a page in /dev/shm instead of one each), ascending page allocation (`--pool-ascending`) and the
   checkpoints' share of the host cache (`--host-cache-ckpt-frac`). Host only; on in the balanced and throughput builds.
+  An engine with save-once refuses to start when /dev/shm cannot hold its arenas beside those of engines already running.
 - `--no-plain-decode`: no plain decode graph, for a build whose speculation never turns off.
 - The runner's side of the DSA selection's row classes: a plain decode batch in class-slot order, and a batch whose rows
   do not fit their classes sent to the next page bucket.
