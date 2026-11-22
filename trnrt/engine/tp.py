@@ -237,8 +237,8 @@ def numa_pin(rank: int, core_base: int, devices: list[dict] | None = None, world
     """Pin the calling thread, and so every thread it starts after, to pin_mask of logical core core_base + rank
     (the runtime's NEURON_LOGICAL_NC_CONFIG when set, else neuron-ls's). Returns the mask, or None.
 
-    A failed device listing (neuron-ls missing, failing, or JSON it cannot read) raises NumaPinError, so the engine's
-    start fails: it used to leave every rank unpinned with one warning each, which is easy to miss and costs host time
+    A failed device listing (neuron-ls missing, failing, or JSON it cannot read; or a NEURON_LOGICAL_NC_CONFIG that is
+    not a number) raises NumaPinError, so the engine's start fails: it used to leave every rank unpinned with one warning each, which is easy to miss and costs host time
     on every step. TRNRT_NUMA_PIN_OPTIONAL=1 runs unpinned instead, with a warning. A rank whose node has no CPU in the
     launch mask still runs as launched (a launcher's CPU set bounds the pin by design), with a warning. `world` (rank 0
     passes the engine's tp): also log the engine's NUMA-PIN line, how many of its ranks pin."""
@@ -247,11 +247,14 @@ def numa_pin(rank: int, core_base: int, devices: list[dict] | None = None, world
     global _PIN  # noqa: PLW0603  # what the last pin saw, process-wide state that rank_threads reads (tests reset it)
     _PIN = None
     lnc = os.environ.get("NEURON_LOGICAL_NC_CONFIG")
-    lnc_i = int(lnc) if lnc else None
     launched = os.sched_getaffinity(0)  # type: ignore[attr-defined, unused-ignore]  # Linux-only: mypy elsewhere has no os.sched_*affinity
     try:
+        if lnc and not lnc.strip().isdigit():
+            raise ValueError(f"NEURON_LOGICAL_NC_CONFIG={lnc!r} is not a logical core count")
+        lnc_i = int(lnc) if lnc else None
         devs = neuron_devices() if devices is None else devices
         mask = pin_mask(core_base + rank, devs, launched, lnc_i)
+        n = pin_count(core_base, world, devs, launched, lnc_i) if world else 0  # every record of the engine's ranks
     except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as e:
         why = f"{type(e).__name__}: {e}"
         if os.environ.get(PIN_OPTIONAL) != "1":
@@ -265,7 +268,6 @@ def numa_pin(rank: int, core_base: int, devices: list[dict] | None = None, world
         return None
     _PIN = {"core_base": core_base, "devices": devs, "launched": set(launched), "lnc": lnc_i}
     if world:
-        n = pin_count(core_base, world, devs, launched, lnc_i)
         if n == world:
             logger.info("NUMA-PIN: on, %s/%s ranks pinned", n, world)
         else:

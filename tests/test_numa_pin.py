@@ -82,6 +82,23 @@ def test_the_override_runs_unpinned_with_a_warning_and_an_off_line(monkeypatch, 
     assert "rank 0 NOT PINNED" in caplog.text and "NUMA-PIN: off, 0/32 ranks pinned" in caplog.text
 
 
+@pytest.mark.parametrize("what", ["lnc", "another rank's record"])
+def test_a_bad_lnc_or_another_ranks_bad_record_takes_the_failed_listing_path(affinity, monkeypatch, caplog, what):
+    """NEURON_LOGICAL_NC_CONFIG not a number, or (rank 0, which counts the engine's pins) a record of a device only other
+    ranks use (device 5: ranks 20-23): NumaPinError, or unpinned under the override, never a bare ValueError."""
+    devs = LS
+    if what == "lnc":
+        monkeypatch.setenv("NEURON_LOGICAL_NC_CONFIG", "two")
+    else:
+        devs = [*LS[:5], {**LS[5], "nc_count": None}, *LS[6:]]
+    with pytest.raises(TP.NumaPinError, match="NEURON_LOGICAL_NC_CONFIG='two'" if what == "lnc" else "device record"):
+        TP.numa_pin(0, 0, devs, world=32)
+    monkeypatch.setenv(TP.PIN_OPTIONAL, "1")
+    with caplog.at_level(logging.WARNING, logger="trnrt"):
+        assert TP.numa_pin(0, 0, devs, world=32) is None
+    assert affinity["sets"] == 0 and "NUMA-PIN: off, 0/32 ranks pinned" in caplog.text
+
+
 @pytest.mark.parametrize(
     ("launched", "line"),
     [
