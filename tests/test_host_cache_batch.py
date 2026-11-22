@@ -207,10 +207,10 @@ def test_an_ascending_pool_hands_out_runs_and_takes_runs_back():
     p.free(a[1:5])  # an evicted leaf's run
     c = p.alloc(4)
     assert c == a[1:5] and len(mr.page_runs(c)) == 1
-    q = PagePool(32)  # the default order: a freed run comes back reversed, one page a run
+    q = PagePool(32)  # the default order, last in first out: a freed run comes back reversed
     d = q.alloc(6)
     q.free(d[1:5])
-    assert len(mr.page_runs(q.alloc(4)[::-1])) == 1 and q.alloc(0) == []
+    assert q.alloc(4) == list(reversed(d[1:5])) and q.alloc(0) == []
 
 
 def test_the_engine_builds_its_pool_in_the_configured_order():
