@@ -269,9 +269,13 @@ class Board:
         self.seg, self.world = seg, world
         self.done = np.ndarray((world,), dtype=np.uint64, buffer=seg.shm.buf, offset=0)
 
+    @staticmethod
+    def total_bytes(world: int) -> int:
+        return _round(8 * world, 64)
+
     @classmethod
     def create(cls, name: str, world: int) -> Board:
-        b = cls(_Seg.create(name, _round(8 * world, 64)), world)
+        b = cls(_Seg.create(name, cls.total_bytes(world)), world)
         b.done[:] = 0
         return b
 
@@ -309,6 +313,12 @@ def cleanup_stale(tag: str, names: list[str] | None = None) -> list[str]:
             continue
         gone.append(n)
     return gone
+
+
+def engine_bytes(world: int, per_arena: int, slot_bytes: int) -> int:
+    """The shared memory an engine's save-once host cache takes once full: every rank's arena (its header, its generation
+    and tag cells, its payloads) and the board."""
+    return world * Arena.total_bytes(per_arena, slot_bytes) + Board.total_bytes(world)
 
 
 def check_capacity(total_bytes: int, path: str = SHM_DIR, margin: float = 0.0) -> None:

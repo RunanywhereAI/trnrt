@@ -542,6 +542,23 @@ def test_a_dead_engines_arenas_are_removed_before_the_shm_check(monkeypatch, tmp
         r.kv_arena_close()
 
 
+def test_the_shm_check_counts_every_byte_the_arenas_and_the_board_ask_for(world, monkeypatch):
+    """The bytes the capacity guard is handed are the bytes the four ranks' arenas (headers and cells included) and the
+    board then ask the tmpfs for."""
+    asked, checked = [], []
+    real_create, real_check = HA._Seg.create, HA.check_capacity
+
+    def create(name, size):
+        asked.append(size)
+        return real_create(name, size)
+
+    monkeypatch.setattr(HA._Seg, "create", staticmethod(create))
+    monkeypatch.setattr(HA, "check_capacity", lambda total, **kw: checked.append(total) or real_check(total, **kw))
+    w = world(8, 18, save_once=True, cap=16)
+    assert len(asked) == WORLD + 1 and checked == [sum(asked)]
+    assert sum(asked) > WORLD * (16 // R) * w.drv._so.layout.slot_bytes  # the payloads alone would undercount it
+
+
 def test_save_once_needs_row_groups():
     r = _rank(0, 8, 1)
     assert r.so_possible()
