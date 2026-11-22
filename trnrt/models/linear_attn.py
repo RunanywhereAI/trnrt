@@ -520,7 +520,7 @@ def _mix_rows(model, layer, x: torch.Tensor, positions: torch.Tensor, slot_mappi
         # which reads, updates and writes the pool rows in place (kernels/kda_decode.py); the einsums below elsewhere.
         from ..kernels import kda_decode
 
-        if kda_decode.takes(x, dk, dv, sp.kind == "kda" and g.dim() == 3):
+        if kda_decode.takes(x, dk, dv, sp.kind == "kda" and g.dim() == 3, nv):
             o = kda_decode.decode_step(layer.rec_state, state_slot, keep.view(T), q, k, v, g, beta)
         else:
             keep4 = keep.view(T, 1, 1, 1)

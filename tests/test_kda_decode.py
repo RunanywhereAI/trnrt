@@ -7,6 +7,7 @@ core (rows that start from a zero state, a shared padding write row, an odd row 
 from __future__ import annotations
 
 import importlib.util
+import inspect
 
 import pytest
 import torch
@@ -56,10 +57,24 @@ def test_emulation_is_the_decode_form():
 
 def test_takes_a_kda_step_of_128_wide_heads_on_the_device_only():
     dev, cpu = torch.empty(2, 8, device="meta"), torch.empty(2, 8)
-    assert kd.takes(dev, 128, 128, True)
-    assert not kd.takes(cpu, 128, 128, True)  # the CPU keeps the einsums
-    assert not kd.takes(dev, 128, 128, False)  # a scalar (GDN) gate
-    assert not kd.takes(dev, 64, 128, True) and not kd.takes(dev, 128, 64, True)
+    assert kd.takes(dev, 128, 128, True, 2)
+    assert not kd.takes(cpu, 128, 128, True, 2)  # the CPU keeps the einsums
+    assert not kd.takes(dev, 128, 128, False, 2)  # a scalar (GDN) gate
+    assert not kd.takes(dev, 64, 128, True, 2) and not kd.takes(dev, 128, 64, True, 2)
+
+
+@pytest.mark.parametrize("H", [1, 3, 4, 8])
+def test_takes_only_the_rings_two_heads_a_row(H):
+    """The kernel's ring (RING rows: two chunks of CH // 2 rows and PD ahead) is sized for H 2 and _body asserts it, so a
+    layer of another per-rank head count keeps the einsums instead of failing in the trace."""
+    assert kd.CH // 2 * 2 + kd.PD == kd.RING
+    assert not kd.takes(torch.empty(2, 8, device="meta"), 128, 128, True, H)
+
+
+def test_the_decode_form_passes_its_per_rank_head_count():
+    src = inspect.getsource(LA._mix_rows)
+    assert 'kda_decode.takes(x, dk, dv, sp.kind == "kda" and g.dim() == 3, nv)' in src
+    assert "nk, nv, dk, dv = layer.nk, layer.nv, sp.head_k_dim, sp.head_v_dim" in src
 
 
 def test_the_shell_cap_sends_16_and_24_row_steps_to_the_decode_form(monkeypatch):
