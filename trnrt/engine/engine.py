@@ -74,10 +74,12 @@ def _bounded_stop(send, timeout: float | None = None) -> bool:
         from . import tp
 
         why = f"raised {err[0]!r}" if err else f"no answer in {t:g} s"
+        try:
+            ranks: Any = tp.unacked_ranks()
+        except Exception as e:  # noqa: BLE001  a diagnostic, never a reason not to stop the workers
+            ranks = f"unknown ({e!r})"
         logger.warning(
-            "engine close: the tensor-parallel stop %s; ranks not acknowledged: %s; terminating the workers",
-            why,
-            tp.unacked_ranks(),
+            "engine close: the tensor-parallel stop %s; ranks not acknowledged: %s; terminating the workers", why, ranks
         )
         return False
     return True

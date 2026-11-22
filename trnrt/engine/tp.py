@@ -21,6 +21,7 @@ import errno
 import logging
 import os
 import socket
+import threading
 from typing import Any
 
 import torch.distributed as dist
@@ -397,6 +398,9 @@ class ShmChannel:
         import numpy as np
 
         self.shm, self.world, self.rank, self.owner = shm, world, rank, owner
+        # close() holds it while it unmaps the segment, and lagging() while it reads the acknowledgements from another
+        # thread (engine._bounded_stop's log, as a late stop's own close may run): numpy views do not keep a mapping
+        self._lock = threading.Lock()
         # numpy arrays over the segment, None once the channel is closed (close, drop_channel): a party still waiting
         # then fails instead of reading an unmapped segment
         self.ctl: Any = np.ndarray((4,), dtype=np.uint64, buffer=shm.buf, offset=0)
@@ -497,9 +501,17 @@ class ShmChannel:
             raise RuntimeError(f"a shared-memory call in unknown mode {mode}")
         return pickle.loads(data)  # noqa: S301  # rank 0 of this engine wrote it, the trust of broadcast_object_list
 
+    def lagging(self) -> list[int] | None:
+        """The ranks whose acknowledged seq lags the last call written, or None once the channel is closed. Safe from a
+        thread other than the one that closes it."""
+        with self._lock:
+            acks = self.acks
+            return None if acks is None else [r for r in range(1, self.world) if int(acks[r]) < self.seen]
+
     def close(self) -> None:
-        self.ctl = self.acks = None
-        self.shm.close()
+        with self._lock:
+            self.ctl = self.acks = None
+            self.shm.close()
         if self.owner:
             self.shm.unlink()
 
@@ -517,9 +529,10 @@ def unacked_ranks():
     """For a stuck stop (engine._bounded_stop's log): over the shared-memory channel, the ranks whose acknowledged seq
     lags the last call rank 0 wrote; over gloo (no channel open), a note that its broadcast gives no per-rank answer."""
     ch = _CH["ch"]
-    if ch is None or ch.acks is None:
+    if ch is None:
         return "unknown (gloo broadcast: no per-rank acknowledgement)"
-    return [r for r in range(1, ch.world) if int(ch.acks[r]) < ch.seen]
+    lag = ch.lagging()  # under the channel's lock: the stop's thread may be closing it right now
+    return "unknown (the channel closed meanwhile)" if lag is None else lag
 
 
 def send(msg) -> None:

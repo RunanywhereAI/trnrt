@@ -5,7 +5,7 @@ terminated.
 
 - _bounded_stop on threads: a hung stop returns False after the bound and logs who never answered, a raising one
   returns False at once, a healthy one True, and 0 waits without a bound; unacked_ranks names the ranks that lag the
-  shared-memory channel;
+  shared-memory channel and waits for a close in progress, and a diagnostic that raises still lets close() go on;
 - close() in a child process with one real spawned worker (the process tests): a hung stop is bounded and the worker
   terminated, a raising one too, a healthy one joins its worker, and without the bound close() hangs (the control)."""
 
@@ -53,6 +53,19 @@ def test_a_healthy_stop_is_unchanged(caplog):
     with caplog.at_level(logging.WARNING, logger="trnrt"):
         assert E._bounded_stop(got.append, timeout=10) is True
     assert got == [None] and "engine close" not in caplog.text
+
+
+def test_a_failing_diagnostic_does_not_stop_close_from_stopping_the_workers(monkeypatch, caplog):
+    def broken():
+        raise TypeError("planted: the channel went away under the read")
+
+    def send(msg):
+        raise ConnectionError("planted: a peer reset the broadcast")
+
+    monkeypatch.setattr(TP, "unacked_ranks", broken)
+    with caplog.at_level(logging.WARNING, logger="trnrt"):
+        assert E._bounded_stop(send, timeout=10) is False
+    assert "ranks not acknowledged: unknown (TypeError(" in caplog.text
 
 
 def test_no_bound_calls_the_stop_on_this_thread():
@@ -172,3 +185,35 @@ def test_unacked_ranks_names_the_lagging_ranks(monkeypatch):
     finally:
         monkeypatch.setitem(TP._CH, "ch", None)
         ch.close()
+
+
+def test_unacked_ranks_waits_for_a_close_in_progress_and_never_reads_the_unmapped_channel(monkeypatch):
+    """A stop that finishes just after the bound closes the channel on its own thread while close() logs who lagged:
+    the read waits for that close (the channel's lock), then says the channel closed. Unlocked, it read the
+    acknowledgements while the segment was being unmapped (numpy views do not keep the mapping)."""
+    ch = TP.ShmChannel.create(4, 1 << 16)
+    monkeypatch.setitem(TP._CH, "ch", ch)
+    inside, release = threading.Event(), threading.Event()
+    unmap = ch.shm.close
+
+    def slow_unmap():
+        inside.set()
+        release.wait(10)
+        unmap()
+
+    monkeypatch.setattr(ch.shm, "close", slow_unmap)
+    closer = threading.Thread(target=ch.close)
+    closer.start()
+    try:
+        assert inside.wait(10)
+        got: list = []
+        reader = threading.Thread(target=lambda: got.append(TP.unacked_ranks()))
+        reader.start()
+        reader.join(0.3)
+        assert reader.is_alive() and not got, got  # held behind the close in progress
+    finally:
+        release.set()
+        closer.join(10)
+    reader.join(10)
+    assert got == ["unknown (the channel closed meanwhile)"]
+    monkeypatch.setitem(TP._CH, "ch", None)
