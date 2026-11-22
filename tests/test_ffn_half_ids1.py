@@ -20,6 +20,7 @@ from trnrt.kernels import ffn_half_pb as FB
 
 SRC = pathlib.Path(FB.__file__).read_text()
 NKI = importlib.util.find_spec("nki") is not None
+needs_nki = pytest.mark.skipif(not NKI, reason="needs the NKI package (Neuron venv)")
 
 
 def _fn(name: str) -> ast.FunctionDef:
@@ -112,7 +113,7 @@ def test_xc1_branch_mirrors_the_h_layout_ops():
     assert k[-1] == "return (xnk, xc)"
 
 
-@pytest.mark.skipif(not NKI, reason="needs the NKI package (Neuron venv)")
+@needs_nki
 @pytest.mark.parametrize("T", [16, 24])
 def test_xc1_traces_one_expansion(monkeypatch, T):
     """The positive control: XC1 traces T fewer start-only matmuls (one masked expansion's)."""
