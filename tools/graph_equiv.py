@@ -75,9 +75,12 @@ class Names:
         """A kernel binary's JSON frame with the package prefixes dropped and the name map applied: a renamed kernel's
         module JSON names its functions too (functions[].name), so the map must reach them as well as func_name."""
         out = self.rxb.sub(b"", b) if self.rxb else b
-        for old, new in self.name_map.items():
-            out = re.sub(rb"(?<![\w.])" + re.escape(old.encode()) + rb"(?![\w.])", new.encode(), out)
-        return out
+        if not self.name_map:
+            return out
+        # one pass over every old name at once: a new name that is another entry's old name is not renamed again
+        olds = sorted(self.name_map, key=len, reverse=True)
+        rx = re.compile(rb"(?<![\w.])(?:" + b"|".join(re.escape(o.encode()) for o in olds) + rb")(?![\w.])")
+        return rx.sub(lambda m: self.name_map[m.group().decode()].encode(), out)
 
 
 # ---- captures ----

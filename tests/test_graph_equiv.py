@@ -183,6 +183,25 @@ def test_a_kernel_digest_is_cached_per_name_map(tmp_path, monkeypatch):
     assert G.kernel_digest(path, G.Names([REF])) == plain
 
 
+def test_the_name_map_renames_each_name_once_in_a_kernel_binary():
+    """A map whose new names are other entries' old names (a chain and a swap): the module JSON takes each name's own
+    new name, as func_name does (Names.name), never a second rename; a longer name that starts with a mapped one stays."""
+    nmap = {
+        "kernels.a.a_kernel": "kernels.b.b_kernel",
+        "kernels.b.b_kernel": "kernels.c.c_kernel",
+        "kernels.x.x_kernel": "kernels.y.y_kernel",
+        "kernels.y.y_kernel": "kernels.x.x_kernel",
+    }
+    names = G.Names([REF], nmap)
+    full = [f"{REF}.kernels.{m}.{REF}_{m}_kernel" for m in ("a", "b", "x", "y", "k1")]
+    full.append(f"{REF}.kernels.a.a_kernel_v2")
+    frame = json.dumps({"functions": [{"name": n} for n in full]}).encode()
+    got = [f["name"] for f in json.loads(names.blob(frame))["functions"]]
+    assert got == [names.name(n) for n in full], got
+    assert got[:4] == ["kernels.b.b_kernel", "kernels.c.c_kernel", "kernels.y.y_kernel", "kernels.x.x_kernel"]
+    assert got[4:] == ["kernels.k1.k1_kernel", "kernels.a.a_kernel_v2"]
+
+
 def test_one_kernel_constant_differs_exactly_its_graph(tmp_path):
     rc, rep = run(tmp_path, {"eps": 1e-5})
     assert rc == 1
