@@ -122,6 +122,28 @@ def test_parse_refuses_a_batch_size_given_twice(spec):
         C.parse(spec)
 
 
+def test_parse_takes_a_class_up_to_the_kernels_score_tile():
+    """The kernel holds a score tile of at most 512 columns (NTM = NG PPP <= 512): NG 64 at PPP 8 parses, 65 does not."""
+    widest = 512 // PPP
+    assert widest * PPP == 512
+    assert C.parse(f"4:2x{widest}+2x4") == {4: (widest, widest, 4, 4)}
+    for spec in (f"4:2x{widest + 1}+2x4", f"4:2x{widest}+2x{widest + 1}", f"16:16x{widest + 1}"):
+        with pytest.raises(ValueError, match="above the kernel's 512"):
+            C.parse(spec)
+
+
+def test_engine_config_refuses_a_class_wider_than_the_score_tile():
+    """The case that passed every other check: a 65-group class at a page bucket of its own, below the largest."""
+    with pytest.raises(ValueError, match="above the kernel's 512"):
+        EngineConfig(
+            model_path="m",
+            dsa_row_classes="16:16x65",
+            dsa_rowsplit_layout="16:2x65+2x65",
+            decode_batch_buckets=(16,),
+            page_buckets=(8320, 8448),
+        )
+
+
 def _decode_ints(ints):
     """The test's own reading of _rc_ints' tuple (as _rc_layout reads it): {B: [NG per slot]}."""
     out = {}
