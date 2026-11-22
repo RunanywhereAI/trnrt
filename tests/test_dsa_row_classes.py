@@ -289,6 +289,13 @@ def test_parse_w_refuses(spec):
         W.parse_w(spec)
 
 
+@pytest.mark.parametrize("spec", ["24:2x24+4x6,24:2x24+4x8", "16:2x24+2x8,24:2x24+4x8, 24:2x24+4x8"])
+def test_parse_w_refuses_a_batch_size_given_twice(spec):
+    """A repeated batch size would replace the first layout without a word (the last one won)."""
+    with pytest.raises(ValueError, match="batch size 24 has a layout already"):
+        W.parse_w(spec)
+
+
 def test_w_args_take_the_row_groups_rows(layouts):
     C.set_layouts(CLASSES["17+"])
     W.set_layouts(FORM_W["17+"])
