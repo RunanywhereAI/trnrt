@@ -120,9 +120,16 @@ def test_init_without_layouts_or_on_cpu_is_off(sel2gc):
     assert MR.rowclass_init(_runner(device=torch.device("cpu")), MTP2) == {} and sel2gc.RUNNER is None
 
 
-def test_init_without_the_kernel_module_is_off(monkeypatch):
-    monkeypatch.setattr(MR, "_row_class_layouts", dict)  # (a tree without kernels/dsa_sel2gc.py has none)
-    assert MR.rowclass_init(_runner(), MTP2) == {}
+def test_init_without_the_kernel_module_is_off(sel2gc, monkeypatch):
+    """A tree without kernels/dsa_sel2gc.py: the import system finds no such module, so rowclass_init has no layouts
+    and installs no guard, whatever a module of that name would hold (the stand-in holds the build's layouts)."""
+    import importlib.util
+
+    find = importlib.util.find_spec
+    monkeypatch.setattr(
+        importlib.util, "find_spec", lambda name, *a, **k: None if name == sel2gc.__name__ else find(name, *a, **k)
+    )
+    assert MR.rowclass_init(_runner(), MTP2) == {} and sel2gc.RUNNER is None
 
 
 @pytest.mark.parametrize(

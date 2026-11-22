@@ -15,6 +15,7 @@ import contextlib
 import itertools
 import multiprocessing as mp
 import os
+import queue
 import signal
 import threading
 import time
@@ -496,9 +497,12 @@ def _run_four(rounds, nslots, **kw):
         p.start()
     done = []
     try:
-        deadline = time.time() + 90
-        while len(done) < 4 and time.time() < deadline:
-            m = q.get(timeout=90)
+        deadline = time.time() + 90  # the whole round's: a rank that never reports ends the wait here, not 90 s later
+        while len(done) < 4 and (left := deadline - time.time()) > 0:
+            try:
+                m = q.get(timeout=left)
+            except queue.Empty:
+                break  # the caller's assert names the ranks that reported
             if m[0] == "done":
                 done.append(m)
     finally:

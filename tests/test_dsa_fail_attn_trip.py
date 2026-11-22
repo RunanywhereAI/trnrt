@@ -104,7 +104,9 @@ def test_forced_failures_combine_bit_for_bit(nfail):
 
 
 def test_trip_class_counts(monkeypatch):
-    """The class calls' n add up to the live count: 0 and 0 with no failed row (the kernel's row loop runs no iteration)."""
+    """Each class call's n is its class's live count, small first: entries() puts live row r in the small class when r is
+    even (its last selected entry before SMALL - 1) and in the full one when odd, so nf live rows are (nf + 1) // 2 small
+    and nf // 2 full; 0 and 0 with no failed row (the kernel's row loop runs no iteration)."""
     seen = []
     real = dsa_slots_n.attend
 
@@ -113,11 +115,11 @@ def test_trip_class_counts(monkeypatch):
         return real(q, kc, rows, bias, scale, n, lse=lse, fallback=fallback)
 
     monkeypatch.setattr(dsa_slots_n, "attend", spy)
-    for nf in (0, 5, 16):
+    for nf in (0, 1, 5, 16):
         seen.clear()
         args = entries(16, nf, seed=nf)
         attend(args, args[-1])
-        assert len(seen) == 2 and sum(seen) == nf, (nf, seen)
+        assert seen == [(nf + 1) // 2, nf // 2], (nf, seen)
     seen.clear()
     attend(entries(16, 0, seed=0), None)
     assert seen == [16, 0]  # unmasked: all 16 (selection-less) entries take the small class, as without the route

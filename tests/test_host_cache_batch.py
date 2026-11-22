@@ -160,7 +160,8 @@ def _tier_run(batch: bool):
     other = list(range(500, 500 + 8 * 4))
     tier.offload(other, 0, [8, 9, 10, 11])  # drops and reuses inside one offload
     slots = tier.lookup(other, 0, 4)
-    tier.load(slots, [15, 16, 18][: len(slots)])  # a restore into fresh, fragmented pages
+    assert len(slots) == 4  # every page of the last offload is held
+    tier.load(slots, [15, 16, 18, 19])  # a restore into fresh, fragmented pages: one page per slot
     slots = tier.lookup(ids, 3, 6)
     tier.load(slots, [20, 21, 22][: len(slots)])
     return r, tier, sent
@@ -206,10 +207,10 @@ def test_an_ascending_pool_hands_out_runs_and_takes_runs_back():
     p.free(a[1:5])  # an evicted leaf's run
     c = p.alloc(4)
     assert c == a[1:5] and len(mr.page_runs(c)) == 1
-    q = PagePool(32)  # the default order: a freed run comes back reversed, one page a run
+    q = PagePool(32)  # the default order, last in first out: a freed run comes back reversed
     d = q.alloc(6)
     q.free(d[1:5])
-    assert len(mr.page_runs(q.alloc(4)[::-1])) == 1 and q.alloc(0) == []
+    assert q.alloc(4) == list(reversed(d[1:5])) and q.alloc(0) == []
 
 
 def test_the_engine_builds_its_pool_in_the_configured_order():

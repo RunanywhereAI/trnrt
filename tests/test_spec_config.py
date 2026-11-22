@@ -91,6 +91,8 @@ def test_no_plain_decode_without_dynamic_speculation_is_refused():
     c = _cfg("--preset", "latency", "--spec-max-batch", "0", "--spec-bucket-max", "0", "--no-dyn-mtp-kv")
     why = mr.plain_none_refusal(c)
     assert why is not None and "no dynamic speculation" in why
+    with pytest.raises(ValueError, match=r"no plain decode buckets\) refused: .*no dynamic speculation"):
+        mr.family_buckets(c, c.resolved_decode_batch_buckets())
 
 
 def test_the_latency_build_has_no_plain_launch_path():

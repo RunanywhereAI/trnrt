@@ -9,8 +9,9 @@ let `--preset auto --users N` pick it:
 | `--preset balanced` (the default) | 9-16 | plain decode, buckets 8,16,24 | 24 (32) | 1024,3072,4096 | 4 GiB | 16 GiB, one copy per context-parallel index |
 | `--preset throughput` | 17 and up | plain decode, buckets 16,24 | 24 (32) | 1024,3072,4096 | 5.25 GiB | 16 GiB, one copy per context-parallel index |
 
-With `E` engines behind the router (`serve --engines`, 2 by default), `N` concurrent users are about `ceil(N / E)` per
-engine: 16 users on two engines run the latency build. `--users N` alone means `--preset auto --users N`.
+`--users N` counts users per engine, not in total. With `E` engines behind the router (`serve --engines`, 2 by default),
+`N` concurrent users are about `ceil(N / E)` per engine: for 16 users on two engines pass `--users 8`, which runs the
+latency build (`--users 16` would run balanced). `--users N` alone means `--preset auto --users N`.
 
 Every build has a 1M-token context, 256-token FP8 KV pages, 4,096-token prefill chunks (buckets 512,1024,2048,4096;
 prefill page buckets 1024,4096 from 2,048 rows), and the fused decode kernels up to 24 rows. Each build also fixes the
@@ -111,9 +112,9 @@ deprecation warning. Their graphs are the build's, so a cache captured under an 
 
 ### Batch 8
 
-`--preset batch8`, decode batches of up to 8 requests per engine without speculation, now runs the latency build, which
-serves up to 8 requests per engine with MTP speculation at every step. Batch 4 is `--preset latency --max-running 4`
-([Fewer requests](#fewer-requests---max-running)).
+`--preset batch8` is a deprecated alias for the latency build: it serves up to 8 requests per engine with MTP speculation
+at every step, where release 0.1.0's `batch8` decoded them without speculation. Batch 4 is
+`--preset latency --max-running 4` ([Fewer requests](#fewer-requests---max-running)).
 
 ### Speculative decoding: the `mtp-*` presets
 

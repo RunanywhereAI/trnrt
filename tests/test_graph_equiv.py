@@ -167,6 +167,41 @@ def test_a_renamed_kernel_is_equal_under_the_name_map_and_differs_without_it(tmp
     assert rc == 0 and rep["verdict"] == "EQUAL", rep
 
 
+def test_a_kernel_digest_is_cached_per_name_map(tmp_path, monkeypatch):
+    """One kernel binary digested under two name maps, in either order: each digest is its own map's (the cache key
+    holds the map), and the renamed one is the new tree's digest of the renamed kernel."""
+    monkeypatch.setattr(G, "_KCACHE", {})
+    path, new = str(tmp_path / "k1.colz"), str(tmp_path / "k2.colz")
+    write_colz(path, REF)
+    write_colz(new, "trnrt", kname="k2")
+    rename = {"kernels.k1.k1_kernel": "kernels.k2.k2_kernel"}
+    plain = G.kernel_digest(path, G.Names([REF]))
+    mapped = G.kernel_digest(path, G.Names([REF], rename))
+    assert mapped["json"] != plain["json"] and mapped == G.kernel_digest(new, G.Names(["trnrt"]))
+    monkeypatch.setattr(G, "_KCACHE", {})
+    assert G.kernel_digest(path, G.Names([REF], rename)) == mapped  # the other order
+    assert G.kernel_digest(path, G.Names([REF])) == plain
+
+
+def test_the_name_map_renames_each_name_once_in_a_kernel_binary():
+    """A map whose new names are other entries' old names (a chain and a swap): the module JSON takes each name's own
+    new name, as func_name does (Names.name), never a second rename; a longer name that starts with a mapped one stays."""
+    nmap = {
+        "kernels.a.a_kernel": "kernels.b.b_kernel",
+        "kernels.b.b_kernel": "kernels.c.c_kernel",
+        "kernels.x.x_kernel": "kernels.y.y_kernel",
+        "kernels.y.y_kernel": "kernels.x.x_kernel",
+    }
+    names = G.Names([REF], nmap)
+    full = [f"{REF}.kernels.{m}.{REF}_{m}_kernel" for m in ("a", "b", "x", "y", "k1")]
+    full.append(f"{REF}.kernels.a.a_kernel_v2")
+    frame = json.dumps({"functions": [{"name": n} for n in full]}).encode()
+    got = [f["name"] for f in json.loads(names.blob(frame))["functions"]]
+    assert got == [names.name(n) for n in full], got
+    assert got[:4] == ["kernels.b.b_kernel", "kernels.c.c_kernel", "kernels.y.y_kernel", "kernels.x.x_kernel"]
+    assert got[4:] == ["kernels.k1.k1_kernel", "kernels.a.a_kernel_v2"]
+
+
 def test_one_kernel_constant_differs_exactly_its_graph(tmp_path):
     rc, rep = run(tmp_path, {"eps": 1e-5})
     assert rc == 1

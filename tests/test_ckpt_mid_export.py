@@ -101,17 +101,45 @@ def test_the_chunk_form_takes_the_export_only_with_the_switch(monkeypatch, on):
 
 
 def _sim_chunk(q, k, v, g, beta, S0, keep_pad=False, ug=None, states=False, mrow=None):
-    """delta_rule.chunk's contract through nki.simulate (grid 1)."""
-    import os
-
+    """delta_rule.chunk's contract through nki.simulate (grid 1). The simulator's target is set for the call only, and
+    the variable restored after it: the module-scoped fixtures call this too, where no test's monkeypatch reaches."""
     import nki
 
-    os.environ["NEURON_PLATFORM_TARGET_OVERRIDE"] = "trn2"
-    a = dr.kernel_inputs(q, k, v, g, beta, S0, device=torch.device("cpu"), ug=ug, states=states, mrow=mrow)
-    out = tuple(torch.as_tensor(x) for x in nki.simulate(dr.kernel())(**a))
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("NEURON_PLATFORM_TARGET_OVERRIDE", "trn2")
+        a = dr.kernel_inputs(q, k, v, g, beta, S0, device=torch.device("cpu"), ug=ug, states=states, mrow=mrow)
+        out = tuple(torch.as_tensor(x) for x in nki.simulate(dr.kernel())(**a))
     if states:
         return (*out[:3], dr.split_rows(out[3], k.shape[1], v.shape[1], g.dim() == 3))
     return out
+
+
+def test_the_simulator_target_is_set_for_the_call_only(monkeypatch):
+    """_sim_chunk leaves the process environment as it found it, so a later test does not compile for its target. A
+    stand-in nki.simulate records the variable during the call."""
+    import os
+    import sys
+    import types
+
+    seen = []
+
+    def simulate(kernel):
+        def run(**a):
+            seen.append(os.environ.get("NEURON_PLATFORM_TARGET_OVERRIDE"))
+            return (torch.zeros(1), torch.zeros(1))
+
+        return run
+
+    monkeypatch.setitem(sys.modules, "nki", types.SimpleNamespace(simulate=simulate))
+    monkeypatch.setattr(dr, "kernel", lambda: None)
+    q, k, v, g, beta, S0 = inputs(T, H, seed=5)
+    for before in (None, "trn1"):
+        if before is None:
+            monkeypatch.delenv("NEURON_PLATFORM_TARGET_OVERRIDE", raising=False)
+        else:
+            monkeypatch.setenv("NEURON_PLATFORM_TARGET_OVERRIDE", before)
+        _sim_chunk(q, k, v, g, beta, S0, ug=6)
+        assert seen[-1] == "trn2" and os.environ.get("NEURON_PLATFORM_TARGET_OVERRIDE") == before
 
 
 def _bits(t):

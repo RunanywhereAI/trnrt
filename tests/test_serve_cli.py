@@ -24,9 +24,13 @@ MISS = (
 
 @pytest.fixture(autouse=True)
 def _kernel_env_already_set(monkeypatch):
-    """Every build puts TRNRT_DMA_HW into the environment before the kernels are imported, and refuses in a process that
-    imported them without it (tests/test_preset_env.py), as this test session may have: the value is set here, as the
-    environment that starts a real engine has it. A value the caller set is kept."""
+    """Every build puts TRNRT_DMA_HW=1 into the environment before the kernels are imported, and refuses in a process
+    that imported them without it (tests/test_preset_env.py), as this test session may have. The kernels read it once,
+    at import, so an engine in this process cannot run a build's real environment: the value set here is the form this
+    session's kernels are bound in (the caller's value, else "0", which is what its absence means). "1" would bind every
+    kernel the stand-in engines import first in the hardware-DGE form for the rest of the session, after the variable is
+    restored (tests/test_dsa_fused_layer.py's REV check then fails). Each build's own value and its effect on the
+    kernels are tested in fresh interpreters (tests/test_preset_env.py)."""
     monkeypatch.setenv("TRNRT_DMA_HW", os.environ.get("TRNRT_DMA_HW", "0"))
 
 
