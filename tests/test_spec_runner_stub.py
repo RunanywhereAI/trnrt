@@ -5,9 +5,10 @@ only), so what runs for real is the runner: its bucket families and page ladders
 speculative board and the small graphs around the verify (engine/spec_async.py, executed on the CPU here, so their
 argument lists and shapes must agree with what the runner passes them), the MTP passes and the order of it all.
 
-For the speculative build the warmup must request exactly the graphs its families name: the verify family only at the
-speculative buckets and the speculative ladder, and no plain decode graph at all (its speculation never turns off); the
-builds without speculation warm the plain decode at their buckets and build none of the speculative machinery."""
+Every build's warmup must request exactly the graphs its families name. The speculative build: the verify family only at
+the speculative buckets and the speculative ladder, and no plain decode graph at all (its speculation never turns off).
+The builds without speculation: the plain decode at their buckets and page ladder, and none of the speculative
+machinery. Each warms its prefill chunks at their page buckets."""
 
 from __future__ import annotations
 
@@ -201,14 +202,17 @@ def keys_of(runner):
 
 
 def expected(c):
-    """The graph keys a speculative engine's warmup builds, from its configuration alone."""
+    """The graph keys an engine's warmup builds, from its configuration alone: the plain decode at the plain buckets and
+    the page ladder (a build without speculation, or one whose speculation turns off), the verify family at the
+    speculative buckets and ladder, the prefill chunks, and the MTP passes over them when the build speculates."""
+    spec = c.spec_method == "mtp"
     Q, k = 1 + c.spec_k, c.spec_k
     dec, pb = c.resolved_decode_batch_buckets(), c.resolved_page_buckets()
     sp = tuple(sorted(c.spec_page_buckets or pb))
     plain_b = [b for b in dec if not c.plain_bucket_min or b >= c.plain_bucket_min]
-    spec_b = [b for b in dec if not c.spec_bucket_max or b <= c.spec_bucket_max]
+    spec_b = [b for b in dec if not c.spec_bucket_max or b <= c.spec_bucket_max] if spec else []
     out = set()
-    if c.spec_max_batch and c.plain_decode:
+    if not spec or (c.spec_max_batch and c.plain_decode):
         out |= {("decode", B, P) for B in plain_b for P in pb}
     for B in spec_b:
         for P in sp:
@@ -224,6 +228,8 @@ def expected(c):
     for C in c.resolved_prefill_token_buckets():
         for P in prefill_pages(c.resolved_prefill_page_buckets(), c.prefill_page_min_rows, C):
             out.add(("prefill", C, P))
+            if not spec:
+                continue
             Pm = P if not c.spec_page_buckets else min(x for x in sp if x >= P)
             q = C if not fill or fill >= C else fill
             out |= {("mtp", 1, q, Pm, C, k), ("mtp_prefill_ids", 1, q), ("mtp_post", 1, Q), ("spec_init", 1)}
@@ -233,10 +239,12 @@ def expected(c):
     return out
 
 
-def test_the_warmup_requests_exactly_the_graphs_the_families_name(monkeypatch):
-    runner, ecfg, _ = build("latency", monkeypatch)
+@pytest.mark.parametrize("build_name", sorted(cli.PRESETS))
+def test_the_warmup_requests_exactly_the_graphs_the_families_name(monkeypatch, build_name):
+    runner, ecfg, _ = build(build_name, monkeypatch)
     runner.warmup()
     got, want = keys_of(runner), expected(ecfg)
+    assert {k[0] for k in want} >= {"prefill", "verify" if ecfg.spec_method else "decode"}  # not an empty comparison
     copies = {k for k in got if k[0] == "copy"}
     got -= copies
     want = {k for k in want if k[0] != "copy"}
