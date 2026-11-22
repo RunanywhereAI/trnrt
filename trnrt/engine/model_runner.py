@@ -1356,7 +1356,7 @@ class ModelRunner:
         lay = HA.Layout(self._paged_caches(), self.lps)
         R = self.model.attn_tp // self.model.cp
         gone = HA.cleanup_stale(tag)
-        HA.check_capacity(HA.engine_bytes(self.model.tp_size, -(-capacity_slots // R), lay.slot_bytes))
+        HA.check_capacity(HA.engine_bytes(self.model.tp_size, -(-capacity_slots // R), lay.slot_bytes), tag=tag)
         if self.tp_send is not None:
             self.tp_send(("kv_arena_init", None, [tag, capacity_slots]))
         self._kv_arena_init(tag, capacity_slots)
