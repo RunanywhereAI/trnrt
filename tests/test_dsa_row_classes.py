@@ -404,6 +404,8 @@ def test_engine_config_takes_the_bands_layouts(band):
     ("kw", "why"),
     [
         ({"dsa_row_classes_cw": True}, "need dsa_row_classes"),
+        ({"dsa_row_classes": ",", "dsa_rowsplit_layout": ""}, "holds no layout"),
+        ({"dsa_row_classes": " , ", "dsa_rowsplit_layout": ","}, "holds no layout"),
         ({"dsa_rowsplit_layout": FORM_W["17+"]}, "need dsa_row_classes"),
         ({"dsa_row_classes": CLASSES["9-16"], "dsa_rowsplit_layout": "24:2x24+4x8"}, "must cover"),
         (
