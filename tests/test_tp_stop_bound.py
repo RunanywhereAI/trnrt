@@ -7,7 +7,8 @@ terminated.
   returns False at once, a healthy one True, and 0 waits without a bound; unacked_ranks names the ranks that lag the
   shared-memory channel and waits for a close in progress, and a diagnostic that raises still lets close() go on;
 - close() in a child process with one real spawned worker (the process tests): a hung stop is bounded and the worker
-  terminated, a raising one too, a healthy one joins its worker, and without the bound close() hangs (the control);
+  terminated, a raising one too, a healthy one joins its worker, an engine left open is closed by the exit hook
+  (its stop thread starts at interpreter exit), and without the bound close() hangs (the control);
 - a start that fails after its workers started (stand-in workers) stops them and gives rank 0 its state back."""
 
 from __future__ import annotations
@@ -94,13 +95,21 @@ PROG = textwrap.dedent(
 
     if __name__ == "__main__":
         mode, pid_file, wait = sys.argv[1], sys.argv[2], float(sys.argv[3])
+        import atexit
+        workers = []
+
+        def report():
+            if workers:
+                print(f"AT EXIT exitcode {{workers[0].exitcode}}", flush=True)
+
+        atexit.register(report)  # before the engine module's own exit hook, so after it at exit (last in, first out)
         from trnrt import log
         from trnrt.engine import engine as E
         log.configure()
         E.TP_STOP_WAIT_S = wait
         ctx = mp.get_context("spawn")
         eng = E.LLMEngine.__new__(E.LLMEngine)
-        if mode == "healthy":
+        if mode in ("healthy", "exit"):
             ev = ctx.Event()
             w = ctx.Process(target=healthy, args=(pid_file, ev), daemon=True)
             send = lambda msg: ev.set()
@@ -112,10 +121,13 @@ PROG = textwrap.dedent(
                 while True:   # the stuck stop: never returns
                     time.sleep(1)
         w.start()
+        workers.append(w)
         while not os.path.exists(pid_file):
             time.sleep(0.05)
         eng.__dict__.update(_workers=[w], runner=types.SimpleNamespace(tp_send=send), _tp_saved=None)
         E._OPEN.add(eng)
+        if mode == "exit":  # left open: the engine module's exit hook closes it
+            sys.exit(0)
         t0 = time.time()
         eng.close()
         print(f"CLOSED in {{time.time() - t0:.1f}} s exitcode {{w.exitcode}}", flush=True)
@@ -167,6 +179,15 @@ def test_process_a_healthy_stop_joins_its_worker(tmp_path):
     assert rc == 0, out[-800:]
     assert "engine close:" not in out, out[-800:]  # nothing logged
     assert "exitcode 0" in out, out[-800:]  # the worker exited on its own, joined, not terminated
+    assert dt < 30, dt
+
+
+def test_process_an_engine_left_open_releases_its_worker_through_the_exit_hook(tmp_path):
+    """engine._close_open closes an engine still open at interpreter exit: its bounded stop starts its thread there, and
+    the worker takes the stop and exits 0 (joined, not terminated)."""
+    rc, out, dt = _run(tmp_path, "exit", "120", 60)
+    assert rc == 0, out[-800:]
+    assert "engine close:" not in out and "AT EXIT exitcode 0" in out, out[-800:]
     assert dt < 30, dt
 
 
