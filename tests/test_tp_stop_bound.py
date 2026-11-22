@@ -8,7 +8,8 @@ terminated.
   shared-memory channel and waits for a close in progress, and a diagnostic that raises still lets close() go on;
 - close() in a child process with one real spawned worker (the process tests): a hung stop is bounded and the worker
   terminated, a raising one too, a healthy one joins its worker, an engine left open is closed by the exit hook
-  (its stop thread starts at interpreter exit), and without the bound close() hangs (the control);
+  (its stop thread starts at interpreter exit), and without the bound close() hangs (the control); over gloo, the
+  group close() destroys under a stuck stop broadcast does not hold close() and the next group of the process works;
 - a start that fails after its workers started (stand-in workers) stops them and gives rank 0 its state back."""
 
 from __future__ import annotations
@@ -195,6 +196,80 @@ def test_process_the_control_without_a_bound_hangs(tmp_path):
     """TP_STOP_WAIT_S = 0 is the unbounded stop: the same hung worker holds close()."""
     rc, out, _ = _run(tmp_path, "hang", "0", 12)
     assert rc is None and out == "TIMEOUT", (rc, out[-300:])
+
+
+GLOO = textwrap.dedent(
+    """
+    import multiprocessing as mp, os, sys, time, types
+    sys.path.insert(0, {root!r})
+
+    def stuck(port):
+        from trnrt.engine import tp
+        tp.init_rank(1, 2, port)
+        while True:  # never takes rank 0's stop
+            time.sleep(1)
+
+    def takes(port):
+        import torch.distributed as dist
+        from trnrt.engine import tp
+        tp.init_rank(1, 2, port)
+        for _ in range(2):
+            box = [None]
+            dist.broadcast_object_list(box, src=0)
+            print("WORKER GOT", box[0], flush=True)
+        dist.destroy_process_group()
+
+    if __name__ == "__main__":
+        os.environ["TRNRT_TP_SHM"] = "0"  # the calls over gloo: the stop is a broadcast on its thread
+        import torch.distributed as dist
+        from trnrt import log
+        from trnrt.engine import engine as E
+        from trnrt.engine import tp
+        log.configure()
+        E.TP_STOP_WAIT_S = 2.0
+        ctx = mp.get_context("spawn")
+        port = tp.free_port()
+        w = ctx.Process(target=stuck, args=(port,), daemon=True)
+        w.start()
+        eng = E.LLMEngine.__new__(E.LLMEngine)
+        eng.__dict__.update(_workers=[w], runner=types.SimpleNamespace(tp_send=tp.send), _tp_saved=tp.process_state())
+        tp.init_rank(0, 2, port)
+        E._OPEN.add(eng)
+        t0 = time.time()
+        eng.close()  # past the bound: the worker terminated, the group destroyed under the stop's broadcast
+        print(f"CLOSED in {{time.time() - t0:.1f}} s exitcode {{w.exitcode}} group {{dist.is_initialized()}}", flush=True)
+        port = tp.free_port()
+        w2 = ctx.Process(target=takes, args=(port,), daemon=True)
+        w2.start()
+        tp.init_rank(0, 2, port)  # the next engine of this process
+        dist.broadcast_object_list(["hello"], src=0)
+        dist.broadcast_object_list(["again"], src=0)
+        w2.join(30)
+        dist.destroy_process_group()
+        print(f"NEW GROUP exitcode {{w2.exitcode}}", flush=True)
+    """
+).format(root=ROOT)
+
+
+def test_process_a_group_destroyed_under_a_stuck_stop_broadcast_leaves_the_next_group_working(tmp_path):
+    """Over gloo, close() past the bound terminates the workers and destroys the process group while the stop's thread is
+    still inside its broadcast (it does not return when its peer dies, so waiting for it would only hold close()). The
+    destroy must not wait for that thread, and the next engine's group in the same process must work."""
+    script = tmp_path / "gloo.py"
+    script.write_text(GLOO)
+    p = subprocess.run(
+        [sys.executable, str(script)],
+        capture_output=True,
+        text=True,
+        timeout=90,
+        env=dict(os.environ, PYTHONPATH=ROOT),
+        check=False,
+    )
+    out = p.stdout + p.stderr
+    assert p.returncode == 0, out[-1200:]
+    assert "the tensor-parallel stop no answer in 2 s" in out, out[-1200:]
+    assert "exitcode -15 group False" in out, out[-1200:]  # terminated, and the group is gone
+    assert out.count("WORKER GOT") == 2 and "NEW GROUP exitcode 0" in out, out[-1200:]
 
 
 def test_unacked_ranks_names_the_lagging_ranks(monkeypatch):
