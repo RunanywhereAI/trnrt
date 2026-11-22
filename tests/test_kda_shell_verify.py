@@ -117,7 +117,14 @@ def test_verify_is_the_xla_verify_form(monkeypatch, npg, mix):
     rest = torch.ones(layer.rec_state.shape[0], dtype=torch.bool)
     rest[rows] = False
     assert torch.equal(layer.conv_state[rest], conv0[rest]) and torch.equal(layer.rec_state[rest], rec0[rest])
-    assert torch.equal(layer.conv_state[rows, :-1], want_conv[rows, :-1])  # the shifted history, bit for bit
+    # The history carried over from before this verify, bit for bit (copies): position q keeps the K - 1 - q oldest
+    # entries, shifted. The entries this verify computed (an earlier position's input) are the two forms' own bf16
+    # products, which round alike only on some CPUs (bitwise on two hosts, not on CI's): within tolerance below.
+    K1 = layer.conv_state.shape[1]
+    for q in range(1, Q + 1):
+        old = K1 - q
+        if old > 0:
+            assert torch.equal(layer.conv_state[STATE_SLOT[:, q], :old], want_conv[STATE_SLOT[:, q], :old]), q
     assert torch.allclose(layer.conv_state[rows].float(), want_conv[rows].float(), rtol=1e-2, atol=1e-3)
     dr = (layer.rec_state[rows] - want_rec[rows]).abs()
     assert torch.allclose(layer.rec_state[rows], want_rec[rows], rtol=1e-3, atol=1e-4), dr.max()
