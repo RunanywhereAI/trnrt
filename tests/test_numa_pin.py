@@ -114,9 +114,44 @@ def test_ranks_other_than_0_log_no_engine_line(affinity, caplog):
 def test_ls_records_reads_both_forms_and_guesses_nothing():
     assert TP.ls_records(json.dumps(LS)) == LS
     assert TP.ls_records(json.dumps({"instance": {"type": "trn2.48xlarge"}, "neuron_devices": LS})) == LS
-    for bad in ({"a": LS, "b": LS}, {"instance": {}}, {"devices": [{"x": 1}]}, "text", 3):
+    for bad in (
+        [],
+        [{"x": 1}],
+        [*LS, 3],
+        [1, 2],
+        {"a": LS, "b": LS},
+        {"instance": {}},
+        {"devices": [{"x": 1}]},
+        "text",
+        3,
+    ):
         with pytest.raises(ValueError, match="neuron-ls JSON"):
             TP.ls_records(json.dumps(bad))
+
+
+# Records neuron-ls could print that numa_cpus cannot read: device 0's field null, missing, not a number, or zero cores.
+BAD_RECORDS = {
+    "nc_count null": {"nc_count": None},
+    "nc_count zero": {"nc_count": 0},
+    "nc_count text": {"nc_count": "four"},
+    "cpu_affinity null": {"cpu_affinity": None},
+    "neuron_device null": {"neuron_device": None},
+    "lnc a list": {"logical_neuroncore_config": [2]},
+}
+
+
+def _bad(case):
+    return [{**LS[0], **BAD_RECORDS[case]}, *LS[1:]]
+
+
+@pytest.mark.parametrize("case", sorted(BAD_RECORDS))
+def test_a_device_record_it_cannot_read_fails_the_start_as_a_failed_listing(affinity, monkeypatch, caplog, case):
+    with pytest.raises(TP.NumaPinError, match="neuron-ls device record"):
+        TP.numa_pin(0, 0, _bad(case))
+    monkeypatch.setenv(TP.PIN_OPTIONAL, "1")
+    with caplog.at_level(logging.WARNING, logger="trnrt"):
+        assert TP.numa_pin(0, 0, _bad(case)) is None  # the override runs it unpinned
+    assert affinity["sets"] == 0 and "rank 0 NOT PINNED" in caplog.text
 
 
 def test_neuron_devices_falls_back_to_the_newer_flag(monkeypatch):

@@ -154,6 +154,16 @@ def test_numa_check_refuses_a_launch_set_of_one_node(monkeypatch, caplog):
     assert "starting anyway" in caplog.text
 
 
+@pytest.mark.parametrize("bad", [{"nc_count": None}, {"nc_count": 0}, {"cpu_affinity": None}, {"neuron_device": "x"}])
+def test_numa_check_refuses_a_device_record_it_cannot_read(monkeypatch, bad):
+    monkeypatch.delenv(TP.PIN_OPTIONAL, raising=False)
+    devs = [{**PIN_LS[0], **bad}, *PIN_LS[1:]]
+    why, _ = S.numa_check(0, 32, 2, devs, set(range(192)))
+    assert why is not None and "the device listing failed (ValueError: neuron-ls device record" in why
+    monkeypatch.setenv(TP.PIN_OPTIONAL, "1")
+    assert S.numa_check(0, 32, 2, devs, set(range(192))) == (None, "NUMA pin not complete (TRNRT_NUMA_PIN_OPTIONAL=1)")
+
+
 def test_numa_check_refuses_a_failed_listing(monkeypatch):
     monkeypatch.delenv(TP.PIN_OPTIONAL, raising=False)
 

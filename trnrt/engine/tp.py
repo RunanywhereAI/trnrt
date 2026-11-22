@@ -158,7 +158,9 @@ def ls_records(out: str) -> list[dict]:
 
     d = json.loads(out)
     if isinstance(d, list):
-        return d
+        if d and all(isinstance(x, dict) and "neuron_device" in x for x in d):
+            return d
+        raise ValueError(f"neuron-ls JSON: a list of {len(d)} entries, not a device list")
     if isinstance(d, dict):
         lists = [
             v
@@ -191,12 +193,16 @@ def neuron_devices() -> list[dict]:
 
 def numa_cpus(core: int, devices: list[dict], lnc: int | None = None) -> set[int] | None:
     """The CPUs local to the device holding logical NeuronCore `core` at logical config `lnc` (default: the one
-    neuron-ls reports), or None if no device holds it."""
+    neuron-ls reports), or None if no device holds it. A record it cannot read (a field missing, null, not a number, a
+    zero core count) is a ValueError, which its callers take as a failed device listing."""
     for d in devices:
-        ls_lnc = int(d.get("logical_neuroncore_config") or 1)
-        per_device = int(d["nc_count"]) * ls_lnc // (lnc or ls_lnc)
-        if int(d["neuron_device"]) == core // per_device:
-            return parse_cpulist(d["cpu_affinity"])
+        try:
+            ls_lnc = int(d.get("logical_neuroncore_config") or 1)
+            per_device = int(d["nc_count"]) * ls_lnc // (lnc or ls_lnc)
+            if int(d["neuron_device"]) == core // per_device:
+                return parse_cpulist(d["cpu_affinity"])
+        except (AttributeError, KeyError, TypeError, ValueError, ZeroDivisionError) as e:
+            raise ValueError(f"neuron-ls device record {str(d)[:200]} cannot be read ({type(e).__name__}: {e})") from e
     return None
 
 
