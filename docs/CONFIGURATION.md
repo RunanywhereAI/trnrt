@@ -111,9 +111,9 @@ deprecation warning. Their graphs are the build's, so a cache captured under an 
 
 ### Batch 8
 
-`--preset batch8`, decode batches of up to 8 requests per engine without speculation, now runs the latency build, which
-serves up to 8 requests per engine with MTP speculation at every step. Batch 4 is `--preset latency --max-running 4`
-([Fewer requests](#fewer-requests---max-running)).
+`--preset batch8` is a deprecated alias for the latency build: it serves up to 8 requests per engine with MTP speculation
+at every step, where release 0.1.0's `batch8` decoded them without speculation. Batch 4 is
+`--preset latency --max-running 4` ([Fewer requests](#fewer-requests---max-running)).
 
 ### Speculative decoding: the `mtp-*` presets
 
