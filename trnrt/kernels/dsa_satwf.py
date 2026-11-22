@@ -298,10 +298,28 @@ def satwf(*args, **kw):  # noqa: F811
 _satwf_pre_rowsplit = satwf
 
 
+def _positional(args: tuple, kw: dict):
+    """(args, kw, whole) with dsa_sat.sat_args' positional parameters (q .. scale) that a call names by keyword moved
+    into args, in order: the dispatch below reads q, table, A and world by position, whichever form the call took.
+    models/mla.py passes them all positionally, so its call is unchanged. whole False: some are missing (the call is
+    left as it is, to sat_args' own error)."""
+    import inspect
+
+    names = [n for n, p in inspect.signature(SAT.sat_args).parameters.items() if p.kind is p.POSITIONAL_OR_KEYWORD]
+    rest = names[len(args):]
+    if any(n not in kw for n in rest):
+        return args, kw, False
+    kw = dict(kw)
+    return args + tuple(kw.pop(n) for n in rest), kw, True
+
+
 def satwf(*args, rowgroup=None, **kw):  # noqa: F811
     from . import dsa_sel2gc
 
     if dsa_sel2gc.LAYOUTS:  # (positional, as models/mla.py calls it: q, w, pkc, table, ..., A at 12, world at 14)
+        args, kw, whole = _positional(args, kw)
+        if not whole:  # an incomplete call: sat_args' own error
+            return _satwf_pre_rowsplit(*args, **kw)
         q, table = args[0], args[3]
         if dsa_sel2gc.takes(q.shape[0], table):
             from . import dsa_satwfcga

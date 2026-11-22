@@ -365,6 +365,32 @@ def test_dispatch_refuses_a_classed_call_form_w_does_not_take(routes):
         dsa_satwf.satwf(*_args(24, 3072), comb_a=pend)  # no row group
 
 
+SAT_POS = ("q", "w", "pkc", "table", "nloc", "positions", "q_all", "kc", "w_uv_p", "o_p", "ident", "keep", "A", "rank")
+SAT_POS += ("world", "scale")
+
+
+@pytest.mark.parametrize("npos", [0, 4, 15])
+def test_dispatch_takes_the_keyword_form(routes, monkeypatch, npos):
+    """A call that names sat_args' parameters by keyword routes as the positional one does, and form W gets the same
+    positional arguments (no IndexError before the dispatch)."""
+    dsa_satwf, pend, seen = routes
+    got = []
+    monkeypatch.setattr(W, "satwf", lambda *a, **k: got.append((a, k)) or "w")
+    from trnrt.kernels import dsa_sat
+
+    assert tuple(dsa_sat.sat_args.__code__.co_varnames[:16]) == SAT_POS
+    for pages, want in ((3072, "w"), (4096, "pre")):
+        pos = _args(24, pages)
+        assert dsa_satwf.satwf(*pos, comb_a=pend, rowgroup=3) == want
+        kw = dict(zip(SAT_POS[npos:], pos[npos:], strict=True))
+        assert dsa_satwf.satwf(*pos[:npos], comb_a=pend, rowgroup=3, **kw) == want
+    (a0, k0), (a1, k1) = got
+    assert len(a0) == len(a1) == 16 and all(x is y for x, y in zip(a0, a1, strict=True)) and k0 == k1
+    assert seen == [("pre", False), ("pre", False)]
+    kw = dict(zip(SAT_POS[npos:-1], _args(24, 3072)[npos:-1], strict=True))  # no scale: sat_args' own error, below
+    assert dsa_satwf.satwf(*_args(24, 3072)[:npos], comb_a=pend, rowgroup=3, **kw) == "pre"
+
+
 def test_dispatch_without_classes_is_the_function_below(routes):
     dsa_satwf, pend, seen = routes
     C.set_layouts("")
