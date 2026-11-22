@@ -525,6 +525,23 @@ def test_the_per_page_calls_are_refused_and_drops_send_nothing_under_save_once(w
     assert len(w.sent) == sent  # empty batches send nothing either
 
 
+def test_a_dead_engines_arenas_are_removed_before_the_shm_check(monkeypatch, tmp_path):
+    """A restart: the engine killed before it left arenas of the same tag that fill the tmpfs (a fake one here, whose free
+    space comes back when cleanup_stale unlinks them). The check must see the space the cleanup gives back."""
+    tag = f"t{os.getpid() % 100000}x{next(_tags)}"
+    stale = {HA.arena_name(tag, 0): 10 * 2**30}  # the dead engine's segment, the whole 10 GiB tmpfs
+    monkeypatch.setattr(HA.shutil, "disk_usage", lambda p: types.SimpleNamespace(free=10 * 2**30 - sum(stale.values())))
+    monkeypatch.setattr(HA, "cleanup_stale", lambda t, names=None: [n for n in list(stale) if stale.pop(n)])
+    real = HA.check_capacity
+    monkeypatch.setattr(HA, "check_capacity", lambda total, **kw: real(total, path=str(tmp_path), **kw))
+    r = _rank(0, 8, 1)
+    try:
+        assert r.kv_arena_init(tag, 4) == [HA.arena_name(tag, 0)]
+        assert r.so_active()
+    finally:
+        r.kv_arena_close()
+
+
 def test_save_once_needs_row_groups():
     r = _rank(0, 8, 1)
     assert r.so_possible()
