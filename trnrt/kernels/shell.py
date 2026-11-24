@@ -9,6 +9,7 @@ kernels/kda_half.py's, device-proven on trn2.
 
 from __future__ import annotations
 
+import os
 import zlib
 
 import torch
@@ -426,6 +427,30 @@ if nisa is not None:
 REV = (kernel_rev(__file__, "# -- in-kernel (NKI)", "# -- end of the in-kernel helpers")
        ^ zlib.crc32(repr((P,)).encode()))  # and P, which its helpers read (kda_shell, ffn_half, ...)
 
+# -- the hardware-DGE span (TRNRT_DMA_HW): with TRNRT_DMA_HW=1 this module's static DMA helper (dma_static) issues its DMAs in
+# hardware DGE (dge_mode hwdge) instead of static descriptors, which cost a descriptor-ring entry per contiguous run in
+# every loaded NEFF (the decode spill rings). Every MTP preset sets it (it is in every build behind the published MTP
+# numbers); the default presets do not. Read at import, before any kernel module binds dma_static by name or folds REV, so the
+# process environment has to carry it (trnrt/__main__.py sets it for a preset that needs it). Below the hashed span;
+# REV folds this span's source when it is set (_dma_hw_rev), so every kernel folding REV re-keys, and unset no source,
+# REV or key moves.
+if os.environ.get("TRNRT_DMA_HW", "0") == "1" and nisa is not None:
+    def dma_static(dst, src):  # noqa: F811
+        """dma_static under TRNRT_DMA_HW=1: hardware DGE."""
+        nisa.dma_copy(dst=dst, src=src, dge_mode=nisa.dge_mode.hwdge)
+# -- the hardware-DGE span end
+
+
+def _dma_hw_rev() -> int:
+    """CRC-32 of the hardware-DGE span above (the TRNRT_DMA_HW variant's source): REV's term when it is set."""
+    src = open(os.path.abspath(__file__)).read()
+    a = src.index("# -- the hardware-DGE span (TRNRT_DMA_HW)")
+    return zlib.crc32(src[a:src.index("# -- the hardware-DGE span end", a)].encode())
+
+
+if os.environ.get("TRNRT_DMA_HW", "0") == "1":
+    REV ^= _dma_hw_rev()
+
 # mix_in_h's served form is kernels/mix_wide.py's wide-cast, rebound here, outside the hashed span. The helper above
 # (fin) stays as its reference: wide-cast equals its bits on every normal value. MIX_REV is what each caller of
 # mix_in_h (kda_shell, ffn_half, ffn_half_pb) folds into its REV. Kernels that fold REV but never call mix_in_h
@@ -433,6 +458,23 @@ REV = (kernel_rev(__file__, "# -- in-kernel (NKI)", "# -- end of the in-kernel h
 from . import mix_wide as _MW  # noqa: E402
 
 MIX_REV = _MW.MIX_REV
+# MIX_ROW_SPLIT (EngineConfig.shell_mix_row_split, set on every rank by engine.build_shard): mix_in_h's mix with the
+# rows split over the LNC pair (mix_wide.mix_in_h_rsplit: each program mixes its half and reads the other's back from
+# S_out), exact. Read when a kernel is traced; mix_rev_term() is what a caller folds into its kernel's rev at the call.
+MIX_ROW_SPLIT = False
+
+
+def mix_rev_term() -> int:
+    """The call-time term of a mix_in_h caller's rev: mix_wide.RSPLIT_REV with the row split on, else 0."""
+    return _MW.RSPLIT_REV if MIX_ROW_SPLIT else 0
+
+
 if nisa is not None:
     mix_in_h_fin = mix_in_h  # fin's form (tests compare the served form against it)
-    mix_in_h = _MW.mix_in_h_wide_cast
+
+    def mix_in_h(sh, S, post_p, comb_p, Yp, S_out, hc: int, T: int, H: int, npg: int):  # noqa: F811
+        """The served mix: mix_wide's wide-cast, or with MIX_ROW_SPLIT its row-split form."""
+        if MIX_ROW_SPLIT:
+            _MW.mix_in_h_rsplit(sh, S, post_p, comb_p, Yp, S_out, hc, T, H, npg)
+        else:
+            _MW.mix_in_h_wide_cast(sh, S, post_p, comb_p, Yp, S_out, hc, T, H, npg)

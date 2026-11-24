@@ -27,6 +27,12 @@ to bf16 before the all-reduce.
 Weights: one bf16 blob and one fp32 blob per layer (shell.register_packed, prefix "ks_"), the offsets static int
 arguments of the call (shell.packed_layout of shapes(), computed on the host).
 
+Speculative verify (verify()): a verify call of B sequences x Q positions runs as ONE call over its B Q rows (the
+kernel's vq): the prologue once, then the positions in sequence inside it, each continuing from the previous one's
+conv window and state in SBUF, so every element sees the decode calls' fp32 operations. On trn2 it was bitwise the Q
+per-position decode calls, and at 24 rows (6 sequences x 4 positions, an isolated chain of the kernel) 353 us a
+verify against 1231 us as 4 calls.
+
 Forms. The kernel body keeps some forms the served build does not take, behind module constants: SKL (the comb's
 Sinkhorn issued late, split or serialized: scheduling probes, off), OPB (the out projection's PSUM copies over several
 banks, off), and kda_oob's RCLAMP (off). Their lines end in "# SKL", "# OPB" and "# RCLAMP". The served form batches
@@ -195,7 +201,10 @@ if nki is not None:
         (updated in place, returned); slots int32 [2, T]; cidx int32 [2, T (K - 1)] the conv rows slot (K - 1) + k
         (read, write) of cbat 1, any [2, 1] for 0. fin (default 1): each row's NaN / inf zeroed before the PE
         transposes that contract over rows, so it cannot reach other rows; 0 none; 2 (served) rowiso's: xn zeroed
-        (not pr) and only this program's conv history columns, by finite_or_zero3. Returns
+        (not pr) and only this program's conv history columns, by finite_or_zero3. recb 2 vq - 1 with vq > 1
+        (verify()): a speculative verify of T / vq sequences x vq positions, rows sequence-major (b vq + q), the
+        row-batched recurrence; position q >= 1 takes its conv taps and its state from position q - 1's in SBUF (its
+        read slots are not read), and every row writes its own write slot. Returns
         ([S_n bf16 [T, hc H]] with mix_in, post fp32 [T, hc], comb fp32 [T, hc hc], P bf16 [npg, T, H], conv_pool,
         rec_pool)."""
         T = S.shape[0]
@@ -213,6 +222,9 @@ if nki is not None:
         NCp = 3 * hp * P + 2 * P + hp
         jq = W // KH.JQ
         B = T
+        # recb 2 vq - 1 with vq > 1: a speculative verify of vq positions a sequence (verify()), position by position
+        vq, recb = ((recb + 1) // 2, 1) if recb else (1, 0)
+        assert T % vq == 0, "a verify's rows are vq positions a sequence"
         # outputs and scratch, before anything that depends on the program
         S_out = nl.ndarray((T, F), dtype=BF16, buffer=nl.shared_hbm)
         post_out = nl.ndarray((T, hc), dtype=F32, buffer=nl.shared_hbm)
@@ -442,6 +454,18 @@ if nki is not None:
                     nisa.nc_matmul(dst=pc[:, i * hp + j, :], stationary=stc[0:KC, cb:cb + P], moving=IB[0:KC, 0:KC],
                                    accumulate=False)
             nisa.tensor_copy(dst=prv[:, :, b, :], src=pc, engine=nisa.vector_engine)
+        if vq > 1:  # a verify's position q >= 1 (rows b vq + q): its taps are position q - 1's window after that
+            # position, [its taps 1 .. K - 2, its input], copied in SBUF (the rows are on the free axis)
+            nb = B // vq
+            for q in range(1, vq):
+                nisa.tensor_copy(dst=prv.ap(pattern=[[NT * BK, P], [BK, NT], [vq * KC, nb], [1, KC - 1]],
+                                            offset=q * KC),
+                                 src=prv.ap(pattern=[[NT * BK, P], [BK, NT], [vq * KC, nb], [1, KC - 1]],
+                                            offset=(q - 1) * KC + 1), engine=nisa.vector_engine)
+                nisa.tensor_copy(dst=prv.ap(pattern=[[NT * BK, P], [BK, NT], [vq * KC, nb], [1, 1]],
+                                            offset=q * KC + KC - 1),
+                                 src=ft.ap(pattern=[[NF * B, P], [B, NT], [vq, nb], [1, 1]], offset=q - 1),
+                                 engine=nisa.vector_engine)
         cwf = _sb((P, NT, 4))
         nisa.tensor_copy(dst=cwf, src=cw, engine=nisa.vector_engine)
         yca = _sb((P, NT, B))
@@ -562,6 +586,8 @@ if nki is not None:
             Sall = _sb((P, N, D))
             nisa.memset(dst=Sall, value=0.0, engine=nisa.gpsimd_engine)
             for col in range(N):
+                if vq > 1 and (col % B) % vq:  # a verify's position q >= 1: its state is position q - 1's (SBUF)
+                    continue
                 ridx = sl.ap(pattern=[[2 * B, 1], [1, 1]], offset=col % B)
                 nisa.dma_copy(dst=Sall[:, col, :], src=rec_pool.ap(pattern=[[D, P], [1, D]],
                                                                    offset=(h0 + col // B) * D * D, scalar_offset=ridx,
@@ -571,7 +597,7 @@ if nki is not None:
                     KO.zero(Sall[:, col, :], nk, P, D, col % B, B)  # RCLAMP
             Snew = _sb((P, N, D))
             Orow = _sb((1, N, D))
-            for g0 in range(0, N, G):
+            for g0 in range(0, N if vq == 1 else 0, G):
                 gn = min(G, N - g0)
                 pa = _ps((1, G, D))
                 pb = _ps((1, G, D))
@@ -620,6 +646,67 @@ if nki is not None:
                     nisa.dma_copy(dst=rec_pool.ap(pattern=[[D, P], [1, D]], offset=(h0 + col // B) * D * D,
                                                   scalar_offset=widx, indirect_dim=0), src=Snew[:, col, :],
                                   oob_mode=nisa.oob_mode.skip, dge_mode=KO.HW)
+            # A verify (vq > 1): position by position, each position's columns (j B + b vq + q) in groups of G at
+            # stride vq, the group above's operations on them; position q >= 1's state operand is Snew's column before
+            # (position q - 1's state after it), so the same fp32 operations per element as vq decode calls.
+            nb = B // vq
+            for q in range(vq if vq > 1 else 0):
+                for j in range(hp):
+                    for b0 in range(0, nb, G):
+                        gn = min(G, nb - b0)
+                        c0 = j * B + b0 * vq + q  # the group's first column; its columns c0 + i vq
+                        so = c0 if q == 0 else c0 - 1  # the state operand's first column (Sall's, or Snew's before)
+                        St = Sall if q == 0 else Snew
+                        pa = _ps((1, G, D))
+                        pb = _ps((1, G, D))
+                        pv = _ps((1, G, D))
+                        pk = _ps((1, G, D))
+                        for i in range(gn):
+                            col = c0 + i * vq
+                            nisa.nc_matmul(dst=pa[:, i, :], stationary=QE[:, col:col + 1], moving=St[:, so + i * vq, :],
+                                           accumulate=False)
+                            nisa.nc_matmul(dst=pb[:, i, :], stationary=KE[:, col:col + 1], moving=St[:, so + i * vq, :],
+                                           accumulate=False)
+                            nisa.nc_matmul(dst=pv[:, i, :], stationary=NVT[:, col:col + 1], moving=I, accumulate=False)
+                            nisa.nc_matmul(dst=pk[:, i, :], stationary=KT[:, col:col + 1], moving=I, accumulate=False)
+                        vs = _sb((1, G, D))
+                        nisa.tensor_copy(dst=vs[:, 0:gn, :], src=pv[:, 0:gn, :], engine=nisa.vector_engine)
+                        rv = _sb((1, G, D))  # r1 - v
+                        nisa.tensor_tensor(dst=rv[:, 0:gn, :], data1=pb[:, 0:gn, :], data2=vs[:, 0:gn, :], op=nl.add,
+                                           engine=nisa.vector_engine)
+                        dl = _sb((1, G, D))  # delta = -beta (r1 - v)
+                        nisa.tensor_tensor(dst=dl[:, 0:gn, :], data1=rv[:, 0:gn, :],
+                                           data2=NBR.ap(pattern=[[HB, 1], [vq, gn], [0, D]], offset=c0),
+                                           op=nl.multiply, engine=nisa.vector_engine)
+                        kr = _sb((1, G, D))
+                        nisa.tensor_copy(dst=kr[:, 0:gn, :], src=pk[:, 0:gn, :], engine=nisa.vector_engine)
+                        tq = _sb((1, G, D))  # o = delta (q . k) + r0
+                        nisa.tensor_tensor(dst=tq[:, 0:gn, :], data1=dl[:, 0:gn, :],
+                                           data2=QK.ap(pattern=[[HB, 1], [vq, gn], [0, D]], offset=c0), op=nl.multiply,
+                                           engine=nisa.vector_engine)
+                        nisa.tensor_tensor(dst=Orow.ap(pattern=[[N * D, 1], [vq * D, gn], [1, D]], offset=c0 * D),
+                                           data1=tq[:, 0:gn, :], data2=pa[:, 0:gn, :], op=nl.add,
+                                           engine=nisa.vector_engine)
+                        po = _ps((P, G, D))  # k delta^T per pair (K = 1)
+                        for i in range(gn):
+                            nisa.nc_matmul(dst=po[:, i, :], stationary=kr[:, i, :], moving=dl[:, i, :],
+                                           accumulate=False)
+                        se = _sb((P, G, D))  # S' = diag(e) S + k delta^T
+                        nisa.tensor_tensor(dst=se[:, 0:gn, :],
+                                           data1=St.ap(pattern=[[N * D, P], [vq * D, gn], [1, D]], offset=so * D),
+                                           data2=E.ap(pattern=[[HB, P], [vq, gn], [0, D]], offset=c0), op=nl.multiply,
+                                           engine=nisa.vector_engine)
+                        nisa.tensor_tensor(dst=Snew.ap(pattern=[[N * D, P], [vq * D, gn], [1, D]], offset=c0 * D),
+                                           data1=se[:, 0:gn, :], data2=po[:, 0:gn, :], op=nl.add,
+                                           engine=nisa.vector_engine)
+                        for i in range(gn):
+                            col = c0 + i * vq
+                            nisa.nc_matmul(dst=POT[:, col:col + 1], stationary=Orow[:, col, :], moving=one,
+                                           accumulate=False)
+                            widx = sl.ap(pattern=[[2 * B, 1], [1, 1]], offset=B + col % B)
+                            nisa.dma_copy(dst=rec_pool.ap(pattern=[[D, P], [1, D]], offset=(h0 + col // B) * D * D,
+                                                          scalar_offset=widx, indirect_dim=0), src=Snew[:, col, :],
+                                          oob_mode=nisa.oob_mode.skip, dge_mode=KO.HW)
 
         obf = _sb((P, HB), BF16)
         nisa.tensor_copy(dst=obf, src=POT, engine=nisa.vector_engine)
@@ -682,15 +769,17 @@ REV = zlib.crc32(repr((_kernel_rev(), KH.REV, SH.REV, RI.REV, P)).encode()) ^ SH
 
 def run(S, blobs: dict, conv_pool, rec_pool, slots, *, H: int, nv: int, hc: int, iters: int, hc_eps: float,
         rms_eps: float, lb: float, pend=None, simulate: bool = False, grid: int | None = None, recb: int | None = None,
-        cbat: int | None = None, fin: int | None = None, build_only: bool = False):
+        cbat: int | None = None, fin: int | None = None, build_only: bool = False, vq: int = 1):
     """The kernel in the caller's graph on the device (or in the NKI simulator): (S_n or None, post [T, hc],
     comb [T, hc, hc], P [npg, T, H] bf16, conv_pool, rec_pool). S bf16 [T, hc, H]; blobs {dtype: flat blob} packed for
     this grid's program count; pend = (post_p, comb_p, Y_p) to mix the previous block's output in first. fin None:
-    the served form (rowiso.FIN). build_only: the kernel's arguments, nothing run."""
+    the served form (rowiso.FIN). build_only: the kernel's arguments, nothing run. vq > 1: one verify call of T / vq
+    sequences x vq positions (rows sequence-major, the row-batched recurrence), slots each row's read row (position
+    0's; later positions' are not read) and write row."""
     if fin is None:
         fin = RI.FIN
     T = S.shape[0]
-    rev = REV
+    rev = REV ^ SH.mix_rev_term()  # (the mix's row split, shell.MIX_ROW_SPLIT, at the call)
     if kda_shell_kernel is None:
         raise RuntimeError("the NKI KDA shell needs the nki package (the Neuron venv)")
     if grid is None:
@@ -705,6 +794,8 @@ def run(S, blobs: dict, conv_pool, rec_pool, slots, *, H: int, nv: int, hc: int,
     else:
         pend_t = (pend[0].float(), pend[1].float().reshape(T, hc * hc), pend[2].to(torch.bfloat16))
     recb, cbat = forms(T, recb, cbat)
+    if vq > 1:  # a verify: the row-batched recurrence, vq positions a sequence (the kernel's recb)
+        recb = 2 * vq - 1
     if cbat:  # the conv rows slot (K - 1) + k of every row, read and write: [2, T (K - 1)]
         cidx = (slots.to(torch.int32).reshape(2, T, 1) * (K - 1)
                 + torch.arange(K - 1, dtype=torch.int32, device=slots.device)).reshape(2, T * (K - 1))
@@ -822,3 +913,52 @@ def decode(model, layer, S, positions, state_slot, pend=None):
                                    iters=hy.sinkhorn_iters, hc_eps=hy.hc_eps, rms_eps=model.cfg.rms_norm_eps,
                                    lb=layer.spec.lower_bound, pend=pend, grid=npg, fin=RI.FIN)
     return (S if Sn is None else Sn), (post, comb, model._attn_all_reduce(Pp))
+
+
+def verify(model, layer, S, positions, state_slot, pend=None):
+    """decode()'s call for a speculative verify: B sequences x Q positions, rows sequence-major (row b Q + q), as
+    linear_attn's verify form takes them: state_slot [B, 1 + Q], column 0 each sequence's read row, column 1 + q the
+    row that receives the states after position q (linear_attn.verify_scan). One call of every row (the kernel's vq):
+    position 0 reads its row (zero states for a sequence at position 0), position q >= 1 continues from position
+    q - 1's conv window and state in SBUF, the same fp32 operations per element as Q decode calls, and every position
+    writes its row. Its partials are all-reduced once. On host tensors (models/hybrid.py SHELL_HOST, tests) the Q
+    decode calls' emulation, position q's rows reading row state_slot[:, q] (the states position q - 1 wrote) and
+    writing row state_slot[:, q + 1]. Returns decode()'s outputs over the B Q rows."""
+    hy = model.cfg.hybrid
+    H, nv, K, npg, hc = layer.ks_dims
+    R = layer.rec_state.shape[0]
+    B, Q = state_slot.shape[0], state_slot.shape[1] - 1
+    pos = positions.view(B, Q)
+    from ..models import hybrid
+
+    if hybrid.SHELL_HOST and S.device.type == "cpu":
+        return _verify_host(model, layer, S, pos, state_slot, pend)
+    blobs = {torch.bfloat16: getattr(layer, PREFIX + "blob_bf16"), torch.float32: getattr(layer, PREFIX + "blob_f32")}
+    st = torch.full_like(state_slot[:, 0], SH.start_row(R))
+    rd = torch.stack([torch.where(pos[:, 0] > 0, state_slot[:, 0], st)] + [st] * (Q - 1), 1)
+    slots = torch.stack([rd.reshape(B * Q), state_slot[:, 1:].reshape(B * Q)]).to(torch.int32)
+    Sn, post, comb, Pp, _, _ = run(S, blobs, layer.conv_state, layer.rec_state, slots, H=H, nv=nv, hc=hc,
+                                   iters=hy.sinkhorn_iters, hc_eps=hy.hc_eps, rms_eps=model.cfg.rms_norm_eps,
+                                   lb=layer.spec.lower_bound, pend=pend, grid=npg, fin=RI.FIN, vq=Q)
+    return (S if Sn is None else Sn), (post, comb, model._attn_all_reduce(Pp))
+
+
+def _verify_host(model, layer, S, pos, state_slot, pend):
+    """verify() on host tensors: Q decode calls' emulation (_host), position by position."""
+    H, nv, K, npg, hc = layer.ks_dims
+    R = layer.rec_state.shape[0]
+    B, Q = state_slot.shape[0], state_slot.shape[1] - 1
+    Ss, outs = S.view(B, Q, hc, H), []
+    for q in range(Q):
+        rd = state_slot[:, q]
+        slots = torch.stack([torch.where(pos[:, q] > 0, rd, torch.full_like(rd, SH.start_row(R))),
+                             state_slot[:, q + 1]]).to(torch.int32)
+        pq = None if pend is None else (pend[0].view(B, Q, hc)[:, q], pend[1].view(B, Q, hc, hc)[:, q],
+                                        pend[2].view(npg, B, Q, H)[:, :, q])
+        Sn, post, comb, Pp = _host(model, layer, Ss[:, q], slots, pq)
+        outs.append((Ss[:, q] if Sn is None else Sn.view(B, hc, H), post, comb, Pp.view(npg, B, H)))
+    Sn = torch.stack([o[0] for o in outs], 1).reshape(B * Q, hc, H)
+    post = torch.stack([o[1] for o in outs], 1).reshape(B * Q, hc)
+    comb = torch.stack([o[2] for o in outs], 1).reshape(B * Q, hc, hc)
+    Pp = torch.stack([o[3] for o in outs], 2).reshape(npg, B * Q, H)
+    return (S if pend is None else Sn), (post, comb, model._attn_all_reduce(Pp))

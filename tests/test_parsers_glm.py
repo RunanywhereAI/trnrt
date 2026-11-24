@@ -6,11 +6,10 @@ Outputs are written the way the chat templates write an assistant turn:
   https://huggingface.co/zai-org/GLM-5/blob/c183ef8c61faee82855eca1ed9bb3a9a7ce3b0b2/chat_template.jinja):
   `<tool_call>N<arg_key>K</arg_key><arg_value>V</arg_value></tool_call>`; the generation
   prompt ends `<|assistant|><think>` (output starts inside reasoning) or `<|assistant|></think>`.
-- GLM-4.5 and GLM-4.6's newline layout, which the parser also reads (as vLLM's glm47_moe does)
+- GLM-4.5 and GLM-4.6's newline layout, which the parser also reads
   (https://huggingface.co/zai-org/GLM-4.5/blob/cbb2c7cfb52fa128a9660cb1a7a78e017899e115/chat_template.jinja):
   `\\n<think>R</think>\\nC\\n<tool_call>N\\n<arg_key>K</arg_key>\\n<arg_value>V</arg_value>\\n</tool_call>`.
-Strings are written raw, other values with tojson. Expected values follow vLLM v0.30
-tests/tool_parsers/test_glm47_moe_tool_parser.py where it has a case.
+Strings are written raw, other values with tojson.
 """
 
 from tests.parser_util import args, check_streaming, names
@@ -108,8 +107,7 @@ def test_parallel_calls():
 
 
 def test_unknown_function_is_content():
-    """vLLM glm47_moe validate_tool_names and SGLang parse_base_json reject a name the request
-    did not offer; TrnRT returns the block as content rather than dropping it."""
+    """A tool block naming a function the request did not offer is returned as content, not dropped."""
     out = "Let me look.<tool_call>search_web<arg_key>q</arg_key><arg_value>x</arg_value></tool_call>"
     m = check_streaming(out, **KW)
     assert "tool_calls" not in m and m["content"] == out
@@ -137,7 +135,7 @@ def test_tool_call_inside_reasoning_ends_it():
 
 
 def test_second_reasoning_block_reopens():
-    """vLLM glm47_moe (CONTENT, THINK_START): a later `<think>` opens reasoning again."""
+    """A later `<think>` opens reasoning again."""
     out = "<think>first</think>Step one.<think>second</think>Step two."
     m = check_streaming(out, forbidden=TAGS, **KW)
     assert m["reasoning_content"] == "firstsecond" and m["content"] == "Step one.Step two."

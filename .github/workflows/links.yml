@@ -1,0 +1,30 @@
+name: Links
+
+# Weekly: every external link in the Markdown docs still answers. Relative links are checked on every PR by
+# tools/check_docs.py (pre-commit).
+
+on:
+  schedule:
+    - cron: "41 7 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  links:
+    name: External links
+    if: github.repository == 'RunanywhereAI/trnrt'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
+        with:
+          args: >-
+            --no-progress --max-retries 3 --accept 200,206,429
+            --exclude-path docs/assets
+            '**/*.md'
+          fail: true

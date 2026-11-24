@@ -15,16 +15,21 @@ from ..config import EngineConfig, ModelConfig
 from ..models.loader import load_model, resolve_model_path
 from . import watchdog
 from .kv_pool import PagePool
-from .model_runner import ModelRunner
+from .model_runner import ModelRunner, rowclass_order
 from .radix_cache import RadixCache
 from .request import Request, SamplingParams, Status, unsupported
-from .sampler import unpack
-from .scheduler import NeedSync, Scheduler, SchedulerConfig, StepPlan
+from .sampler import NUM_TOP_LOGPROBS, unpack
+from .scheduler import BLIND, NeedSync, Scheduler, SchedulerConfig, Scheduling, StepPlan
 
 if TYPE_CHECKING:
+    from .guided import HostSampling
     from .host_cache import HostTier
 
 logger = logging.getLogger(__name__)
+
+# The position a speculative decode checkpoint is pending at until its step is read back (LLMEngine._reserve_async_ckpts):
+# past any real position, so the scheduler's _cache keeps it pending and _release frees its row with the request.
+ASYNC_CKPT = 1 << 60
 
 # Tensor-parallel engines not closed yet, held weakly: close() at exit (stopping the workers) without
 # keeping every engine a process ever made alive. atexit.register(self.close) did, so a test session
@@ -36,6 +41,59 @@ _OPEN: weakref.WeakSet = weakref.WeakSet()
 def _close_open() -> None:
     for eng in list(_OPEN):
         eng.close()
+
+
+# How long close() waits for the workers to take rank 0's stop (seconds; 0: no bound). Over gloo the stop is a broadcast
+# bounded only by the process group's timeout (hours); over the shared-memory channel, an acknowledgement wait bounded by
+# nothing. A rank that never answers (one still inside a collective, or a graph rank 0 never joined) held the process
+# until an outer timeout killed it, 3,600 s twice in a row on trn2. Past the bound, close() logs the ranks that never
+# acknowledged and terminates the workers. A healthy stop is unchanged: the same call, joined well inside the bound.
+TP_STOP_WAIT_S = 120.0
+
+
+def _bounded_stop(send, timeout: float | None = None) -> bool:
+    """send(None), rank 0's stop, on a daemon thread joined for at most `timeout` (TP_STOP_WAIT_S) seconds. True when the
+    stop went out and every worker took it; False, after logging who did not, when it raised or did not return in time."""
+    t = TP_STOP_WAIT_S if timeout is None else timeout
+    if t <= 0:
+        send(None)
+        return True
+    import threading
+
+    err: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            send(None)
+        except BaseException as e:  # noqa: BLE001  reported below, on the closing thread
+            err.append(e)
+
+    th = threading.Thread(target=run, name="tp-stop", daemon=True)
+    th.start()
+    th.join(t)
+    if th.is_alive() or err:
+        from . import tp
+
+        why = f"raised {err[0]!r}" if err else f"no answer in {t:g} s"
+        try:
+            ranks: Any = tp.unacked_ranks()
+        except Exception as e:  # noqa: BLE001  a diagnostic, never a reason not to stop the workers
+            ranks = f"unknown ({e!r})"
+        logger.warning(
+            "engine close: the tensor-parallel stop %s; ranks not acknowledged: %s; terminating the workers", why, ranks
+        )
+        return False
+    return True
+
+
+def host_tier_split(budget: float, row_bytes: int, page_bytes: int, frac: float = 0.5) -> tuple[int, int]:
+    """Per-rank host cache capacities (checkpoint slots, KV pages) from a byte budget: `frac` of it for state checkpoints
+    (at least one slot), the remainder for pages. frac 0.5 is the even split."""
+    if not 0.0 < frac < 1.0:
+        raise ValueError(f"the checkpoints' share of the host cache must be in (0, 1), not {frac}")
+    ckpts = max(1, int(budget * frac // row_bytes)) if row_bytes else 0
+    rest = budget - ckpts * row_bytes
+    return ckpts, (int(rest // page_bytes) if page_bytes else 0)
 
 
 @dataclass
@@ -53,10 +111,10 @@ class StepStats:
 
 
 def resolve_attention_tp(mcfg: ModelConfig, cfg: EngineConfig) -> int:
-    """The token mixers' TP degree (models/decoder.py attention_tp)."""
+    """The token mixers' TP degree (models/decoder.py attention_tp), the MTP layer's attention included when it speculates."""
     from ..models.decoder import attention_tp
 
-    return attention_tp(mcfg, cfg.tp)
+    return attention_tp(mcfg, cfg.tp, mtp=cfg.spec_method == "mtp")
 
 
 def _cp_degree(mcfg: ModelConfig, attn_tp: int) -> int:
@@ -98,16 +156,45 @@ def pool_pages(cfg: EngineConfig, mcfg: ModelConfig) -> int:
 
 
 def set_decode_routes(cfg: EngineConfig) -> None:
-    """The decode kernel routes' row caps of `cfg` (EngineConfig.kda_shell_max_rows, dsa_layer_max_rows, ffn_half_below,
-    dsa_index_rows) into the model modules that read them when a graph is traced. Every rank's build_shard calls it
-    before building its shard (an engine's ranks and a capture's alike: each rank is its own process, given the
-    EngineConfig), so they all trace the same routes; it sets every cap, so an engine never inherits another's."""
-    from ..models import hybrid, mla
+    """The decode kernel routes of `cfg` (the row caps kda_shell_max_rows, dsa_layer_max_rows, ffn_half_below and
+    dsa_index_rows, the dense MLP's skipped row counts, the routes sp_gather, sp_gather_tp_experts and dsa_sel2g, and the MTP
+    layer's chunk form and plain-step KV write) into the modules that read them when a graph is traced. Every rank's
+    build_shard calls it before building its shard (an engine's ranks and a capture's alike: each rank is its own process,
+    given the EngineConfig), so they all trace the same routes; it sets every one, so an engine never inherits another's."""
+    from ..kernels import dense_half, dsa_satwf, sp_gather
+    from ..models import decoder, hybrid, mla
 
     hybrid.KDA_SHELL_MAXB = int(cfg.kda_shell_max_rows)
     hybrid.MOE_HALF_BELOW = int(cfg.ffn_half_below)
     mla.LAYER_MK_MAXB = int(cfg.dsa_layer_max_rows)
     mla.CP_INDEX_ROWS = int(cfg.dsa_index_rows)
+    sp_gather.MODE = cfg.sp_gather
+    sp_gather.TP_EXPERTS = cfg.sp_gather_tp_experts
+    dsa_satwf.SEL2G = cfg.dsa_sel2g
+    dense_half.SKIP_T = frozenset(cfg.dense_half_skip_rows)
+    decoder.MTP_CHUNK_Q = int(cfg.mtp_chunk_q)
+    decoder.DYN_MTP_KV = "1" if cfg.dyn_mtp_kv else "0"
+    # -- KDA, mHC and FFN-half routes
+    hybrid.KDA_SHELL = bool(cfg.kda_shell)
+    hybrid.MHC_SEAM = bool(cfg.mhc_seam)
+    from ..kernels import shell
+
+    shell.MIX_ROW_SPLIT = bool(cfg.shell_mix_row_split)
+    from ..models import linear_attn
+
+    linear_attn.MID_EXPORT = bool(cfg.state_ckpt_mid_export)
+    # -- the DSA layers' routes (the dsa area's block: one line a field) --
+    from ..kernels import dsa_satwfcga, dsa_sel2gc, dsa_slots_n_p, dsa_topk
+
+    dsa_topk.ROWSPLIT_BIG = bool(cfg.dsa_topk_rowsplit_big)
+    mla.CP_FAIL_TRIP = bool(cfg.dsa_cp_fail_trip)
+    mla.CP_FAIL_ATTN_TRIP = bool(cfg.dsa_cp_fail_attn_trip)
+    dsa_slots_n_p.PIPE_ROWS = int(cfg.dsa_slots_pipe_rows)
+    sp_gather.DIRECT = bool(cfg.sp_gather_direct)
+    mla.ODEC_DROP = bool(cfg.dsa_drop_unread_o_dec)
+    dsa_sel2gc.set_layouts(cfg.dsa_row_classes)
+    dsa_sel2gc.CW = bool(cfg.dsa_row_classes_cw)
+    dsa_satwfcga.set_layouts(cfg.dsa_rowsplit_layout)  # (after dsa_sel2gc's: checked against them)
 
 
 def local_k_counts(model) -> list[float] | None:
@@ -146,14 +233,13 @@ def build_shard(cfg: EngineConfig, path: str, num_pages: int, rank: int = 0):
     if cfg.num_layers is not None:
         mcfg = mcfg.truncated(cfg.num_layers)
     if cfg.device == "neuron":
-        # Runtime knobs vllm-neuron sets for serving (neuron_worker.py,
-        # _init_neuron_distributed_environment_and_runtime). Piecewise execution launches several graphs per step:
-        # take the runtime's maximum queue depth (libnrt clamps larger values to 63, with a warning).
+        # Runtime knobs for serving. Piecewise execution launches several graphs per step: take the runtime's
+        # maximum queue depth (libnrt clamps larger values to 63, with a warning).
         os.environ.setdefault("NEURON_RT_XU_COMPUTE_MAX_QUEUED_REQUESTS", "63")
         os.environ.setdefault("NEURON_RT_IO_RING_CACHE_SIZE", "32")
-        # NOT NEURON_RT_DISABLE_EXECUTION_BARRIER=1, the third knob vllm-neuron sets there (neuron_worker.py): without
-        # the runtime's per-execution barrier a collective mismatch returns silently wrong numbers, and ranks
-        # alternating world and attention-group collectives under host jitter deadlock.
+        # NOT NEURON_RT_DISABLE_EXECUTION_BARRIER=1: without the runtime's per-execution barrier a collective
+        # mismatch returns silently wrong numbers, and ranks alternating world and attention-group collectives under
+        # host jitter deadlock.
         from .. import platform
 
         platform.configure_runtime_env()  # NEURON_LOGICAL_NC_CONFIG, before the runtime
@@ -198,6 +284,7 @@ def build_shard(cfg: EngineConfig, path: str, num_pages: int, rank: int = 0):
         moe_kernel=cfg.resolved_moe_kernel(),
         attn_tp=atp,
         attn_group=attn_group,
+        mtp=cfg.spec_method == "mtp",  # the checkpoint's MTP layer is built and loaded only when the engine speculates
     )
     if cp_group is not None:
         model.cp_group = cp_group
@@ -206,8 +293,15 @@ def build_shard(cfg: EngineConfig, path: str, num_pages: int, rank: int = 0):
 
 
 class LLMEngine:
-    def __init__(self, cfg: EngineConfig):
+    scheduling = Scheduling()  # the defaults, for an engine assembled without __init__ (the tests' stand-ins)
+    # Guided decoding, thinking budgets and min_tokens (engine/guided.py), set in __init__; None on an engine assembled
+    # without it (the tests' fake engines), which then serves none of them.
+    host_sampling: HostSampling | None = None
+
+    def __init__(self, cfg: EngineConfig, scheduling: Scheduling | None = None):
         self.cfg = cfg
+        # Host-only scheduling settings (policy, priorities, queue limits, eviction): outside cfg, which keys the graphs.
+        self.scheduling = scheduling or Scheduling()
         self.t_start = time.perf_counter()  # startup_seconds counts from here to the end of warmup()
         self.startup_seconds: float | None = None
         path = resolve_model_path(cfg.model_path, cfg.model_revision)
@@ -235,7 +329,7 @@ class LLMEngine:
                 for w in self._workers:
                     w.start()
                 if cfg.device == "neuron":
-                    tp.neuron_env(0, port, cfg.tp_core_base)
+                    tp.neuron_env(0, port, cfg.tp_core_base, world=cfg.tp)
                 tp.init_rank(0, cfg.tp, port)
             except BaseException:
                 self._stop_tp()
@@ -247,6 +341,21 @@ class LLMEngine:
         except BaseException:
             self._stop_tp()
             raise
+        try:
+            self._finish_init(cfg, path, num_pages)
+        except BaseException:
+            # The workers run and the process group is up, and the caller gets no engine to close: stop the workers
+            # without another word to them (close_failed), then close() destroys the group, restores this process and
+            # closes a save-once arena rank 0 has made (a /dev/shm refusal lands here).
+            try:
+                self.close_failed()
+                self.close()
+            except Exception:  # the start's own error, re-raised below, is the one to report
+                logger.exception("engine start failed, and so did the teardown after it")
+            raise
+
+    def _finish_init(self, cfg: EngineConfig, path: str, num_pages: int) -> None:
+        """The engine past its shards: the tokenizer, the pool, the radix cache, the scheduler and the host cache."""
         # The tokenizer (and so transformers) loads only AFTER tensor-parallel workers are spawned: a process that
         # imported transformers and then spawned a child traces torch.topk differently from every other process, which
         # gave rank 0 its own compile cache keys and doubled every compile. And only after build_shard, so rank 0 imports
@@ -259,13 +368,19 @@ class LLMEngine:
         except (OSError, ValueError, TypeError):
             self.tokenizer = None  # token-id-only use; stop strings need one
         self.device = self.runner.device
+        # Guided decoding, thinking budgets and min_tokens (engine/guided.py): the reasoning tags' ids and, from the first
+        # guided request, the grammar backend.
+        from .guided import HostSampling
+
+        self.host_sampling = HostSampling(self.tokenizer, self.mcfg.vocab_size, self.mcfg.eos_token_ids, self.runner)
         if cfg.tp > 1:
             from . import tp
 
             self.runner.tp_send = tp.send
             _OPEN.add(self)
-        self.pool = PagePool(num_pages)
-        self.radix = RadixCache(self.pool, cfg.page_size)
+        self.pool = PagePool(num_pages, ascending=cfg.pool_ascending)
+        sch = self.scheduling
+        self.radix = RadixCache(self.pool, cfg.page_size, sch.eviction_policy, sch.eviction_config)
         scfg = SchedulerConfig(
             page_size=cfg.page_size,
             max_num_seqs=cfg.max_num_seqs,
@@ -274,44 +389,89 @@ class LLMEngine:
             eos_token_ids=self.mcfg.eos_token_ids,
             admission_decode_tokens=cfg.admission_decode_tokens,
             max_running=cfg.max_running,
+            **sch.scheduler_fields(),
         )
         # The scheduler (engine/scheduler.py) runs the served prefix-cache rules for a recurrent model: a hit resumes from
         # the deepest state checkpoint at or below it, checkpoints are written inside prefill chunks and at every page
         # boundary in decode, and a checkpoint a newer one dominates is freed when its path is released.
         if self.runner.state is None:
             raise ValueError("TrnRT serves models with linear-attention layers: this model has no recurrent state")
-        self.scheduler = Scheduler(scfg, self.pool, self.radix)
+        self.scheduler = Scheduler(scfg, self.pool, self.radix, draft_fn=self._propose if cfg.spec_method else None)
         self.scheduler.states = self.runner.state  # checkpoint rows of the state pool back the radix nodes
+        self.scheduler.on_preempt = self.runner.release_slot
         self.radix.free_ckpt = self.runner.state.free_ckpt
-        # Host memory under the radix cache (engine/host_cache.py), per rank: half for state checkpoints, the rest for
-        # KV pages. Evicted pages and checkpoints go there (a checkpoint on a running request's path too, when no row is
-        # free), and a later hit copies them back.
+        # Host memory under the radix cache (engine/host_cache.py), per rank: host_cache_ckpt_frac of it for state
+        # checkpoints, the rest for KV pages. Evicted pages and checkpoints go there (a checkpoint on a running request's
+        # path too, when no row is free), and a later hit copies them back.
         self.host_tier: HostTier | None = None
         if cfg.host_cache_gb > 0:
             from .host_cache import HostTier
 
-            budget = cfg.host_cache_gb * 2**30
-            ckpts = max(1, int(budget / 2 // self.runner.state.bytes_per_row()))
-            budget -= ckpts * self.runner.state.bytes_per_row()
             page_bytes = self.runner.kv_page_bytes()
-            pages = int(budget // page_bytes) if page_bytes else cfg.max_num_seqs * cfg.max_pages_per_seq
-            self.host_tier = HostTier(self.runner, cfg.page_size, max(1, pages), ckpts)
+            ckpts, pages = host_tier_split(
+                cfg.host_cache_gb * 2**30, self.runner.state.bytes_per_row(), page_bytes, cfg.host_cache_ckpt_frac
+            )
+            if not page_bytes:
+                pages = cfg.max_num_seqs * cfg.max_pages_per_seq
+            if cfg.host_cache_save_once and page_bytes and pages:
+                if self.runner.so_possible():
+                    # The ranks of one CP index pool their budgets: each page is kept once, not once per row group.
+                    R = self.model.cp_rows
+                    tag = f"c{cfg.tp_core_base}" if cfg.device == "neuron" else f"p{os.getpid() % 100000}"
+                    pages *= R
+                    gone = self.runner.kv_arena_init(tag, pages)
+                    if gone:
+                        logger.info("removed %d stale host-arena segments of tag %s", len(gone), tag)
+                    logger.info("save-once host cache: %d pages over %d row groups (tag %s)", pages, R, tag)
+                else:
+                    logger.info("save-once host cache off: no context-parallel row groups; every rank keeps its copy")
+            self.host_tier = HostTier(self.runner, cfg.page_size, max(1, pages), ckpts, batch=cfg.host_cache_batch)
             self.radix.offload, self.radix.offload_ckpt = self.host_tier.offload, self.host_tier.offload_ckpt
             self.radix.offload_ckpt_hash = self.host_tier.offload_ckpt_hash
             self.scheduler.host = self.host_tier
         self._ids = itertools.count()
         self.last_step = StepStats()
+        # Speculative decoding (engine/spec_async.py): drafts proposed and accepted over the engine's run, per request in
+        # Request.spec_proposed / spec_accepted, and per draft position (reached, accepted).
+        self.spec_proposed = 0
+        self.spec_accepted = 0
+        self.spec_verifies = 0  # drafts verified (one per sequence and step); tokens per verify = 1 + accepted / this
+        self.spec_pos_reached: list[int] = []
+        self.spec_pos_accepted: list[int] = []
+        # Dynamic speculation (EngineConfig.spec_max_batch): whether the engine is stepping its requests with the plain
+        # decode graph, and what the flips between the two modes did.
+        self._dyn_plain = False
+        self.dyn_flips = 0
+        self.dyn_seat_moves = 0  # requests moved into speculative state seats at plain -> speculative flips
+        self.dyn_plain_steps = 0  # steps launched in plain mode / in speculative mode (decode steps only)
+        self.dyn_spec_steps = 0
         # (plan, launches) of a step whose results are not read yet
         self._inflight: tuple[StepPlan, list[Any]] | None = None
 
     def add_request(
-        self, prompt_ids: list[int], params: SamplingParams, rid: str | None = None, session_id: str | None = None
+        self,
+        prompt_ids: list[int],
+        params: SamplingParams,
+        rid: str | None = None,
+        session_id: str | None = None,
+        priority: int | None = None,
     ) -> Request:
-        why = unsupported(params)
+        """Queue a request. ValueError for one the engine does not serve; scheduler.QueueFull when the waiting queue is
+        at its limit. A waiting request a higher-priority one displaced from a full queue ends with Request.error set."""
+        why = unsupported(params, self.cfg.structured_outputs, self.cfg.penalties)
         if why:  # before anything is built or queued: the request never reaches a step
             raise ValueError(f"{why} is not supported; send the request without it")
+        self.scheduling.check_priority(priority)
         req = Request(rid or f"req-{next(self._ids)}", list(prompt_ids), params, session_id=session_id)
-        self.scheduler.add(req)
+        req.priority = priority
+        if self.host_sampling is not None:
+            # A request the queue refuses (QueueFull, a 503) is refused before its grammar matcher is built, and one
+            # admit refuses (ValueError, a 400) is refused before it displaces a waiting request.
+            self.scheduler.check_add(req)
+            self.host_sampling.admit(req)  # its grammar matcher and thinking-budget state (ValueError: a 400)
+        displaced = self.scheduler.add(req)
+        if displaced is not None:
+            self.runner.forget(displaced)
         return req
 
     def flush_cache(self) -> None:
@@ -323,7 +483,7 @@ class LLMEngine:
         self.radix.offload = offload
 
     def close_session(self, session_id: str) -> bool:
-        """SGLang /close_session: drop the session's prefix references (nothing is freed)."""
+        """/close_session: drop the session's prefix references (nothing is freed)."""
         return self.scheduler.close_session(session_id)
 
     def abort(self, req: Request) -> None:
@@ -369,10 +529,13 @@ class LLMEngine:
         if self._workers and runner is not None and runner.tp_send is not None:
             if self.dead_ranks():  # a broadcast to a dead peer raises or never returns: stop the rest instead
                 wait = 0.0
-            else:
-                runner.tp_send(None)
+            elif not _bounded_stop(runner.tp_send):
+                wait = 0.0  # a rank never took the stop: terminate them all now (_stop_workers)
             runner.tp_send = None
         self._stop_tp(wait)
+        arena_close = getattr(runner, "kv_arena_close", None)
+        if arena_close is not None:
+            arena_close()  # the save-once arenas: rank 0's own and the board, after the workers have gone
 
     def _stop_tp(self, wait: float = 30.0) -> None:
         """Workers that did not exit within `wait` seconds (and every worker of an engine whose
@@ -424,6 +587,12 @@ class LLMEngine:
         """
         t = time.perf_counter()
         self.last_step = StepStats()
+        flipped: list[Request] = []
+        if self._dyn_active():
+            want = self._dyn_want_plain()
+            if want != self._dyn_plain:
+                flipped = self._dyn_flip(want)
+            self.runner.state.prefer_spec = not self._dyn_plain  # a request's first rows take the mode's kind of seat
         self.scheduler.in_flight = self._inflight is not None
         try:
             plan = self.scheduler.schedule()
@@ -439,6 +608,72 @@ class LLMEngine:
                 self._inflight = (plan, launches)
                 self.scheduler.in_flight = True
         self.last_step.seconds = time.perf_counter() - t
+        return flipped + finished
+
+    # -- speculative decoding (engine/spec_async.py) --------------------------------------
+
+    def _propose(self, req: Request) -> list[int]:  # noqa: ARG002  the scheduler's draft_fn signature
+        """The drafts of a decoding request's next step, for the scheduler: k blind slots, since the drafts, the newest
+        token, the positions and the state row are on the device and the verify always carries k of them (tokens past the
+        request's limits are dropped at commit); none in plain mode (dynamic speculation steps every request plain)."""
+        return [] if self._dyn_plain else [BLIND] * self.cfg.spec_k
+
+    @property
+    def dyn_plain(self) -> bool:
+        """Whether dynamic speculation is stepping the requests with the plain decode graph right now."""
+        return self._dyn_plain
+
+    def _dyn_active(self) -> bool:
+        """Whether the engine switches between speculative and plain steps with the number of decoding requests."""
+        return bool(self.cfg.spec_max_batch) and self.cfg.spec_method == "mtp"
+
+    def _dyn_want_plain(self) -> bool:
+        """Whether the decoding requests are more than the speculation limit (with hysteresis: once plain, stay until at
+        most limit - h decode). With speculative seats fewer than the running cap, a verify needs one: plain -> speculative
+        only when every running request can sit in a speculative seat (the flip moves them), and in speculative mode a
+        request admitted into a plain seat (no speculative seat was free) is stepped plain, never moved blind."""
+        if any(r.needs_host_inputs for r in self.scheduler.running if r.status is Status.RUNNING):
+            return True  # a mask or penalties ride only the plain decode graph: such a request never speculates
+        n = sum(1 for r in self.scheduler.running if r.status is Status.RUNNING and r.is_decoding)
+        m = self.cfg.spec_max_batch
+        want = n > (m - max(self.cfg.spec_hysteresis, 0) if self._dyn_plain else m)
+        st = self.runner.state
+        if not want and st.mixed_seats:
+            run = [r for r in self.scheduler.running if r.status is Status.RUNNING]
+            if self._dyn_plain:
+                want = sum(1 for r in run if not st.is_spec(r)) > st.spec_available()
+            else:
+                want = any(st.holds(r) and not st.is_spec(r) for r in run)
+        return want
+
+    def _dyn_flip(self, want_plain: bool) -> list[Request]:
+        """Switch every request between speculative and plain stepping at a step boundary. The step in flight is read first
+        (its tokens, the accepted counts, positions and pages become the host's): a blind step launched in one mode cannot be
+        followed by a step of the other, whose inputs are on a different board. speculative -> plain: each request's current
+        state row is the one its last blind step left (rows[acc]); plain -> speculative: each request's board row is rebuilt
+        from the host at its next verify (spec_host_init), after its state moved into a speculative seat if it sat in a
+        plain one."""
+        finished = self._drain() if self._inflight is not None else []
+        state = self.runner.state
+        moves: tuple[list[int], list[int]] = ([], [])
+        for r in list(self.scheduler.running):
+            if want_plain:
+                if r.spec_cur is not None:
+                    state.set_current(r, r.spec_cur)
+                r.spec_cur = None
+            else:
+                r.spec_ready = False
+                if state.mixed_seats and state.holds(r) and not state.is_spec(r):
+                    mv = state.move(r, to_spec=True)  # its current row copied into the new seat (after the drain)
+                    if mv is None:
+                        raise RuntimeError(f"no speculative seat for request {r.rid} at a plain -> speculative flip")
+                    moves[0].append(mv[0])
+                    moves[1].append(mv[1])
+        if moves[0]:
+            self.runner.copy_state(*moves)
+            self.dyn_seat_moves += len(moves[0])
+        self._dyn_plain = want_plain
+        self.dyn_flips += 1
         return finished
 
     def _drain(self) -> list[Request]:
@@ -454,13 +689,30 @@ class LLMEngine:
         """Every call of the step, launched before the first read-back: (seqs, device output, kind)."""
         max_b = self.runner.decode_buckets[-1]
         launches = []
+        # Speculative decoding: every decode of a speculative step is a blind verify (a row without drafts rides in the
+        # verify graph too); in plain mode, and without speculation, every decode is the plain graph.
+        merged = bool(self.cfg.spec_method) and not self._dyn_plain
+        plain = [s for s in plan.decodes if not s.draft and not merged]
+        spec = [s for s in plan.decodes if s.draft or merged]
+        if self._dyn_active():
+            self.dyn_plain_steps += bool(plain)
+            self.dyn_spec_steps += bool(spec)
         self._restore_states(plan)
-        for i in range(0, len(plan.decodes), max_b):
-            chunk = plan.decodes[i : i + max_b]
+        for i in range(0, len(plain), max_b):
+            # in the DSA selection's class-slot order when its row classes are on (model_runner.rowclass_order)
+            chunk = rowclass_order(self.runner, plain[i : i + max_b])
             launches.append((chunk, self.runner.decode(chunk), "decode"))
             self._save_states(chunk)
+        Q = 1 + self.cfg.spec_k
+        for i in range(0, len(spec), max_b):
+            chunk = spec[i : i + max_b]
+            self._reserve_async_ckpts(chunk)
+            launches.append((chunk, self.runner.verify_async(chunk, Q), "verify_async"))
+            self.runner.mtp_async()
         for s in plan.prefills:
             launches.append(([s], self.runner.prefill(s), "prefill"))
+            if self.cfg.spec_method:
+                self._spec_after_prefill(s, self.runner.last_hidden)
             self._save_states([s])
         self.last_step = StepStats(
             len(plan.decodes),
@@ -491,8 +743,11 @@ class LLMEngine:
 
     def _collect(self, plan, launches) -> list:
         """Read a step's outputs; returns tokens aligned with plan.seqs()."""
-        results: dict[int, int] = {}
+        results: dict[int, Any] = {}
         for chunk, out, kind in launches:
+            if kind == "verify_async":
+                self._collect_blind(chunk, out, results)
+                continue
             with watchdog.watched(self.runner.watchdog, f"reading back a {kind} call"):
                 host_out = out.cpu()
             self.runner.launch_bound.done_through(out)  # this call and every launch before it are done
@@ -504,26 +759,164 @@ class LLMEngine:
                     s.req.logprobs.append((lps[i], top_ids[i][:n], top_lps[i][:n]))
         return [results[id(s)] for s in plan.seqs()]
 
+    def _spec_after_prefill(self, s, hkey: str) -> None:
+        """ModelRunner.spec_after_prefill, with the pages of a final chunk's later draft passes (k > 1: MTP KV up to
+        end + k - 2) reserved first."""
+        if self.cfg.spec_k > 1 and s.sample:
+            self.scheduler._reserve(s.req, min(s.end + self.cfg.spec_k, self.cfg.max_model_len))
+        self.runner.spec_after_prefill([s], hkey)
+
+    def _reserve_async_ckpts(self, chunk) -> None:
+        """Decode checkpoints of a speculative step (ModelRunner spec_ckpt): a checkpoint row for each request whose blind
+        verify may cross a page boundary (its computed positions lie between its newest committed token and the step's upper
+        bound s.start + Q), pending at a sentinel position until _collect_blind reads the step back: released with the
+        request if it ends first, kept by the scheduler's _cache meanwhile. Taken as Scheduler.track takes one, evicting a
+        tree checkpoint when no row is free: in serving the pool is mostly full of the tree's, so free rows alone would
+        almost never come (a row that goes back unused is free for the next reservation)."""
+        t = self.runner.async_ckpt_t
+        if not t:
+            return
+        Q = 1 + self.cfg.spec_k
+        for s in chunk:
+            req = s.req
+            if (s.start + Q) // t <= (len(req.token_ids) - 1) // t:
+                continue
+            row = self.scheduler._alloc_ckpt()
+            if row is None:
+                continue
+            s.ckpt_row = row
+            req.ckpt_pending.append((ASYNC_CKPT + row, row, True))
+
+    def _resolve_async_ckpt(self, s, acc: int) -> None:
+        """The step's verify computed positions old .. old + acc (old its newest token's, this step's tokens not yet
+        committed): if they crossed a multiple b of the page size, spec_ckpt copied the state after b - 1 into the reserved
+        row, now the request's decode checkpoint at b (superseding its older one, as Scheduler.track); else the row goes
+        back."""
+        row = s.ckpt_row
+        if row is None:
+            return
+        req = s.req
+        item = next((x for x in req.ckpt_pending if x[1] == row and x[0] >= ASYNC_CKPT), None)
+        if item is None:  # released first: the scheduler's _release freed the row
+            return
+        req.ckpt_pending.remove(item)
+        states = self.runner.state
+        t = self.runner.async_ckpt_t
+        old = len(req.token_ids) - 1
+        b = (old + acc + 1) // t * t
+        if b > old:
+            for x in [x for x in req.ckpt_pending if x[2] and x[0] < ASYNC_CKPT]:
+                req.ckpt_pending.remove(x)
+                states.free_ckpt(x[1])
+            req.ckpt_pending.append((b, row, True))
+        else:
+            states.free_ckpt(row)
+
+    def _collect_blind(self, chunk, outs, results) -> None:
+        """A blind verify's read-back (engine/spec_async.py): spec_post's (tokens, acc) row per sequence gives the emitted
+        tokens; the verify's own rows give their logprobs, chosen as a synchronous verify chooses them (the draft's for an
+        accepted position, then the replacement's or the bonus token's)."""
+        out, res = outs
+        with watchdog.watched(self.runner.watchdog, "reading back a blind verify"):
+            out, res = out.cpu(), res.cpu()
+        Q = 1 + self.cfg.spec_k
+        N = NUM_TOP_LOGPROBS
+        k = self.cfg.spec_k
+        for i, s in enumerate(chunk):
+            row = res[i].tolist()
+            acc, drafted = int(row[Q]), row[Q + 1] > 0.5
+            results[id(s)] = [int(t) for t in row[: acc + 1]]
+            req = s.req
+            self._resolve_async_ckpt(s, acc)
+            req.spec_cur = acc  # the row of its state rows that holds its state after this step (the host's current row if it leaves speculation)
+            if drafted:  # a draftless row (its newest token from the host, spec_host_init) is a decode
+                self.spec_proposed += k
+                self.spec_accepted += acc
+                self.spec_verifies += 1
+                req.spec_proposed += k
+                req.spec_accepted += acc
+                for j in range(min(acc + 1, k)):
+                    if j == len(self.spec_pos_reached):
+                        self.spec_pos_reached.append(0)
+                        self.spec_pos_accepted.append(0)
+                    self.spec_pos_reached[j] += 1
+                    self.spec_pos_accepted[j] += j < acc
+            n = req.params.logprobs
+            if n is not None and req.status is Status.RUNNING:
+                rows = out[i * Q : (i + 1) * Q].tolist()
+                for j in range(acc + 1):
+                    r_ = rows[j]
+                    # the draft's (accepted), the replacement's, the bonus token's; a draftless row's is y_0's. Synthetic
+                    # acceptance: a rejected position emits the target's own sample y there, not the recovered token.
+                    lp = (
+                        r_[5]
+                        if j < acc
+                        else (r_[4] if drafted and acc < k and not self.runner.synth_active() else r_[3])
+                    )
+                    req.logprobs.append((lp, [int(x) for x in r_[6 : 6 + n]], r_[6 + N : 6 + N + n]))
+
     def _finish(self, plan, finished: list[Request]) -> list[Request]:
-        finished += self._check_stop_strings(plan.seqs())
+        for s in plan.seqs():
+            # commit() stops at the first finishing token; drop logprobs past it.
+            if s.draft and s.req.params.logprobs is not None:
+                del s.req.logprobs[len(s.req.output_ids) :]
+        finished += self._check_stop_strings(plan.seqs(), finished)
+        # Thinking budgets count, and grammars accept, the committed tokens; a grammar that terminated finishes its request.
+        if self.host_sampling is not None:
+            finished += self.host_sampling.advance(plan.seqs(), self.scheduler.finish_now)
         for r in finished:
             self.runner.forget(r)
         return finished
 
-    def _check_stop_strings(self, seqs) -> list[Request]:
+    def _check_stop_strings(self, seqs, finished=()) -> list[Request]:
         done = []
+        ended = {id(r) for r in finished}  # finished by this step's commit (EOS, a stop id, the length)
         for s in seqs:
             req = s.req
             stops = req.params.stop
-            if not stops or not s.sample or req.status is not Status.RUNNING:
+            # A speculative step can complete a stop string and then reach EOS or the length in the same step; one-token
+            # steps would have stopped at the stop string, so it is checked for those requests too.
+            ended_here = s.draft and id(req) in ended
+            if not stops or not s.sample or (req.status is not Status.RUNNING and not ended_here):
+                continue
+            out = req.output_ids
+            if len(out) <= req.params.min_tokens:  # stop strings are checked from min_tokens on
                 continue
             # Only the tail can newly contain a stop string; decode enough of it to cover
             # the longest one plus multi-token characters.
-            tail = self.tokenizer.decode(req.output_ids[-(max(len(x) for x in stops) + 8) :])
-            if any(x in tail for x in stops):
-                self.scheduler.finish_now(req, "stop")
-                done.append(req)
+            w = max(len(x) for x in stops) + 8
+            if self._stop_in(out, len(out), stops, w, req.params.min_tokens):
+                if s.draft:
+                    self._trim_past_stop(req, stops, w)
+                if ended_here:
+                    req.finish_reason = "stop"  # already released by the commit, and already in `finished`
+                else:
+                    self.scheduler.finish_now(req, "stop")
+                    done.append(req)
         return done
+
+    def _stop_in(self, out: list[int], n: int, stops, w: int, protect: int) -> bool:
+        """Whether the last w tokens of out[:n] decode to text holding a stop string that ends past the first `protect`
+        tokens (min_tokens). Only the newly decoded text is matched, so a stop string that ended among the protected
+        tokens stays in the output and never ends the request later."""
+        start = max(0, n - w)
+        tail = self.tokenizer.decode(out[start:n])
+        head = len(self.tokenizer.decode(out[start : min(protect, n)])) if start < protect else 0
+        return any(tail.find(x, max(0, head - len(x) + 1)) >= 0 for x in stops)
+
+    def _trim_past_stop(self, req: Request, stops, w: int) -> None:
+        """A speculative step appends up to 1 + spec_k tokens at once, so the stop string can end before its newest one.
+        Drop the tokens past it, and their logprobs, so the output (and its usage count) is what one-token steps would
+        have stopped at: the shortest prefix whose last w tokens decode to a stop string."""
+        out = req.output_ids
+        n = len(out)
+        while n > 1 and self._stop_in(out, n - 1, stops, w, req.params.min_tokens):
+            n -= 1
+        if n < len(out):
+            del req.token_ids[req.num_prompt + n :]
+            req.num_computed = min(req.num_computed, len(req.token_ids) - 1)
+            if req.params.logprobs is not None:
+                del req.logprobs[n:]
 
     def generate(self, prompts: list[list[int]], params: SamplingParams | list[SamplingParams]) -> list[Request]:
         plist = params if isinstance(params, list) else [params] * len(prompts)

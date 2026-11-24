@@ -23,6 +23,9 @@ collective's result, or of a shared buffer program 0 wrote, are not reliable. Ev
 
 from __future__ import annotations
 
+import os
+import zlib
+
 from . import shell as SH
 
 # The heads stacked on partitions (_tail_heads_hs below): every per-row op once for all heads, each (head, row)'s
@@ -319,3 +322,27 @@ if nki is not None:  # the heads-stacked form (HS)
 
 REV = (SH.kernel_rev(__file__, "LP = 16", "# -- the tail end")
        ^ SH.kernel_rev(__file__, "    def _tail_heads_hs(", "# -- _tail_heads_hs end"))
+
+# -- the hardware-DGE span (TRNRT_DMA_HW): with TRNRT_DMA_HW=1 this module's static DMA helper (_dma) issues its DMAs in
+# hardware DGE (dge_mode hwdge) instead of static descriptors, which cost a descriptor-ring entry per contiguous run in
+# every loaded NEFF (the decode spill rings). Every MTP preset sets it (it is in every build behind the published MTP
+# numbers); the default presets do not. Read at import, before any kernel module binds _dma by name (dsa_sat and the
+# dsa_satwf family's `from .cc_tail import _dma`) or folds REV, so the process environment has to carry it
+# (trnrt/__main__.py sets it for a preset that needs it). Below the hashed spans; REV folds this span's source when it
+# is set (_dma_hw_rev), so every kernel folding REV re-keys, and unset no source, REV or key moves.
+if os.environ.get("TRNRT_DMA_HW", "0") == "1" and nki is not None:
+    def _dma(dst, src):  # noqa: F811
+        """_dma under TRNRT_DMA_HW=1: hardware DGE."""
+        nisa.dma_copy(dst=dst, src=src, dge_mode=nisa.dge_mode.hwdge)
+# -- the hardware-DGE span end
+
+
+def _dma_hw_rev() -> int:
+    """CRC-32 of the hardware-DGE span above (the TRNRT_DMA_HW variant's source): REV's term when it is set."""
+    src = open(os.path.abspath(__file__)).read()
+    a = src.index("# -- the hardware-DGE span (TRNRT_DMA_HW)")
+    return zlib.crc32(src[a:src.index("# -- the hardware-DGE span end", a)].encode())
+
+
+if os.environ.get("TRNRT_DMA_HW", "0") == "1":
+    REV ^= _dma_hw_rev()

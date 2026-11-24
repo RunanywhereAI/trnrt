@@ -17,8 +17,9 @@ KimiLinearForgetGate, chunk_kimi_delta_attention) and models/glm5_next/modeling_
 lower_bound * sigmoid(exp(A_log) * g)).
 
 Static-shape formulation (the same code runs on CPU and on a NeuronCore):
-- decode (B sequences x 1 token): the recurrent step above as batched einsums. On the device a
-  decode step's KDA layers run as the KDA shell instead (models/hybrid.py, kernels/kda_shell.py).
+- decode (B sequences x 1 token): the recurrent step above as batched einsums; on the device the
+  recurrence runs as kernels/kda_decode.py. A build with the KDA shell (models/hybrid.py KDA_SHELL,
+  kernels/kda_shell.py) runs the decode steps up to the shell's row cap, and its verifies, as the shell instead.
 - prefill chunk (one sequence x C tokens): the chunked form (fla / the transformers chunk
   kernels) over fixed sub-chunks of CHUNK tokens, unrolled at trace time; on the device the NKI
   chunked delta rule (kernels/delta_rule.py). The per-chunk triangular solve (I + A)^-1, which
@@ -178,8 +179,8 @@ def _unit_lower_inverse(N: torch.Tensor, eye: torch.Tensor) -> torch.Tensor:
 
     Blocks of up to INVERSE_BASE rows are inverted as I + N + ... + N^(b-1) = (I + N)(I + N^2)
     (I + N^4)...; larger ones by merging halves, [[A, 0], [C, D]]^-1 = [[A^-1, 0], [-D^-1 C A^-1,
-    D^-1]] (fla's solve_tril: 16 x 16 diagonal blocks merged into 32 and 64, vLLM v0.30.0
-    third_party/flash_linear_attention/ops/solve_tril.py). Repeated squaring over a whole sub-chunk
+    D^-1]] (fla's solve_tril: 16 x 16 diagonal blocks merged into 32 and 64).
+    Repeated squaring over a whole sub-chunk
     is exact algebra but not exact arithmetic: the powers of N grow like binomial coefficients
     before they cancel, and with real weights (63 tokens, fp32) one sub-chunk of 64 came out wrong
     by 9.5e7 (32: 0.21, 16: 1.8e-6) against the token-by-token recurrence; the blocked form is
@@ -287,12 +288,65 @@ def kernel_takes(spec: LinearSpec) -> bool:
     return spec.head_k_dim == 128 and spec.head_v_dim == 128 and spec.lower_bound is not None
 
 
+# MID_EXPORT (EngineConfig.state_ckpt_mid_export, set on every rank by engine.build_shard): a chunk with an in-chunk
+# checkpoint takes the checkpoint's state from the main scan instead of a second, masked scan over the whole chunk. The
+# kernel also returns every chunk-end state (delta_rule.chunk(states=True)); the checkpoint after k rows is the state
+# at the boundary j = k // 128 when k is a multiple of 128, else one 128-row call over rows [128 j, 128 j + 128) with
+# the rows from k masked, from that boundary state. Bitwise the second scan's state on trn2: the scalar engine's exp(0)
+# is exactly 1.0 and an identity product with the state moving is exact, so a fully masked chunk leaves the state
+# unchanged (a device probe: the aligned and unaligned forms equal the masked full scan, 0 of 32768 elements differ).
+# The 128-row call reads the main kernel's own copy of its rows: a form that fed it XLA gathers of the operands was
+# bitwise in a one-layer graph and changed the main kernel's results in a multi-layer one (any extra reader of an NKI
+# kernel's operands can). NKI path only; the CPU keeps the second scan.
+MID_EXPORT = False
+
+
+def _scan_mid_export(q, k, v, g, beta, S0, mid_k, vf, keep_pad: bool, ug: int | None):
+    """The NKI chunk scan with the in-chunk checkpoint's state after mid_k rows (0 < mid_k <= T), as the masked second
+    scan computes it: o, the final state, and the checkpoint state. beta and g arrive valid-masked (vf [T, 1]), so the
+    128-row call masks only the rows from mid_k. Its rows are the main kernel's own copy (delta_rule.chunk(states=True,
+    mrow)): no op but the kernel reads q, k, v, g or beta."""
+    from ..kernels import delta_rule
+
+    T = q.shape[0]
+    L = delta_rule.L
+    Tp = T + (-T % L)  # the kernel's padded length
+    mk = mid_k.to(torch.long).view(1)
+    j = torch.div(mk, L, rounding_mode="floor")  # chunks wholly before the checkpoint, 0 .. ceil(T / L)
+    r0 = torch.clamp(j * L, max=Tp - L)  # the 128 rows holding row mid_k (any rows when mid_k is aligned: unused)
+    o, S, S_all, rows = delta_rule.chunk(q, k, v, g, beta, S0, keep_pad=keep_pad, ug=ug, states=True, mrow=r0)
+    S_b = torch.cat([S0.float().unsqueeze(0), S_all]).index_select(0, j).squeeze(0)
+    q_r, k_r, v_r, g_r, beta_r = rows
+    mm = (r0 + torch.arange(L, device=q.device)) < mk
+    beta_x = torch.where(mm.view(L, 1), beta_r, torch.zeros_like(beta_r))
+    g_x = torch.where(mm.view(L, 1, 1) if g.dim() == 3 else mm.view(L, 1), g_r, torch.zeros_like(g_r))
+    _, S_x = delta_rule.chunk(q_r, k_r, v_r, g_x, beta_x, S_b, ug=ug)
+    S_m = torch.where((mk % L == 0).view(1, 1, 1), S_b, S_x)
+    return o, S, S_m
+
+
 def _nki_chunk(q, k, v, g, beta, S, keep_pad: bool = False, ug: int | None = None):
     """chunk_scan's contract through the NKI kernel; keep_pad: o with the kernel's padding rows, ug: its unit group
     (delta_rule.chunk)."""
     from ..kernels import delta_rule
 
     return delta_rule.chunk(q, k, v, g, beta, S, keep_pad=keep_pad, ug=ug)
+
+
+def verify_scan(q, k, v, g, beta, S):
+    """B sequences x Q tokens each, from their own state (speculative verify): q, k [B, Q, H, Dk] (q scaled),
+    v [B, Q, H, Dv], g [B, Q, H, Dk], beta [B, Q, H], S [B, H, Dk, Dv]; fp32. recurrent_step once per position, the
+    decode step's own arithmetic. Returns o [B, Q, H, Dv] and the state after EVERY position, [B, Q, H, Dk, Dv]: a
+    rejected draft is rolled back by continuing from the state after the last accepted position
+    (num_spec + 1 state slots per request, the next step
+    reading the one at num_accepted_tokens - 1;
+    one state per draft token)."""
+    outs, states = [], []
+    for t in range(k.shape[1]):
+        o, S = recurrent_step(q[:, t], k[:, t], v[:, t], g[:, t], beta[:, t], S)
+        outs.append(o)
+        states.append(S)
+    return torch.stack(outs, 1), torch.stack(states, 1)
 
 
 def _write_rows(pool: torch.Tensor, rows: torch.Tensor, values: torch.Tensor) -> None:
@@ -366,6 +420,10 @@ def _mix_rows(model, layer, x: torch.Tensor, positions: torch.Tensor, slot_mappi
     mid_row = mid_k = None
     if state_slot is None:
         form = "sequence"
+    elif state_slot.dim() == 2:  # a speculative verify (decoder.forward_extend): B sequences x Q positions
+        form = "verify"
+        B, Q = state_slot.shape[0], state_slot.shape[1] - 1
+        read, write = state_slot[:, 0], state_slot[:, 1:].reshape(B * Q)
     elif state_slot.dim() != 1:
         raise ValueError(f"state_slot {tuple(state_slot.shape)} matches no batch form of {T} tokens")
     elif state_slot.shape[0] == T:
@@ -383,7 +441,15 @@ def _mix_rows(model, layer, x: torch.Tensor, positions: torch.Tensor, slot_mappi
         raise ValueError(f"state_slot {tuple(state_slot.shape)} matches no batch form of {T} tokens")
 
     # Short conv over q, k, v, with the K - 1 previous inputs from the state.
-    if form == "decode":
+    if form == "verify":  # each sequence's window read once, then one window written per position
+        keep = (positions.view(B, Q)[:, 0] > 0).view(B, 1, 1)
+        prev = layer.conv_state[read]
+        prev = torch.where(keep, prev, torch.zeros_like(prev)).to(qkv.dtype)
+        xe = torch.cat([prev, qkv.view(B, Q, -1)], dim=1)  # [B, K - 1 + Q, D]
+        y = _causal_conv(xe, layer.conv_w, Q).reshape(T, -1)
+        win = torch.stack([xe[:, t + 1 : t + K] for t in range(Q)], dim=1)  # the last K - 1 inputs after each position
+        _write_rows(layer.conv_state, write, win.reshape(B * Q, K - 1, -1).to(layer.conv_state.dtype))
+    elif form == "decode":
         keep = (positions > 0).view(T, 1, 1)
         if T == 1:  # one row is a direct copy already
             prev = layer.conv_state[state_slot]
@@ -442,12 +508,26 @@ def _mix_rows(model, layer, x: torch.Tensor, positions: torch.Tensor, slot_mappi
     else:
         scan = lambda *a: chunk_scan(*a, CHUNK)  # noqa: E731
 
-    if form == "decode":
-        keep4 = keep.view(T, 1, 1, 1)
-        S = layer.rec_state[state_slot]
-        S = torch.where(keep4, S, torch.zeros_like(S))
-        o, S = recurrent_step(q, k, v, g, beta, S)
-        _write_rows(layer.rec_state, state_slot, S)
+    if form == "verify":  # from each sequence's state; the state after every position written to its own row
+        S = layer.rec_state[read]
+        S = torch.where(keep.view(B, 1, 1, 1), S, torch.zeros_like(S))
+        o, states = verify_scan(q.view(B, Q, nv, dk), k.view(B, Q, nv, dk), v.view(B, Q, nv, dv),
+                                g.view(B, Q, *g.shape[1:]), beta.view(B, Q, nv), S)
+        _write_rows(layer.rec_state, write, states.reshape(B * Q, nv, dk, dv))
+        o = o.reshape(T, nv, dv)
+    elif form == "decode":
+        # A step the KDA shell does not take (hybrid.kda_shell_takes), on the device: the recurrence as one kernel,
+        # which reads, updates and writes the pool rows in place (kernels/kda_decode.py); the einsums below elsewhere.
+        from ..kernels import kda_decode
+
+        if kda_decode.takes(x, dk, dv, sp.kind == "kda" and g.dim() == 3, nv):
+            o = kda_decode.decode_step(layer.rec_state, state_slot, keep.view(T), q, k, v, g, beta)
+        else:
+            keep4 = keep.view(T, 1, 1, 1)
+            S = layer.rec_state[state_slot]
+            S = torch.where(keep4, S, torch.zeros_like(S))
+            o, S = recurrent_step(q, k, v, g, beta, S)
+            _write_rows(layer.rec_state, state_slot, S)
     elif form == "chunk":
         S = layer.rec_state[state_slot][0]
         S = torch.where(keep.view(1, 1, 1), S, torch.zeros_like(S))
@@ -455,17 +535,22 @@ def _mix_rows(model, layer, x: torch.Tensor, positions: torch.Tensor, slot_mappi
         beta = torch.where(vf, beta, torch.zeros_like(beta))
         g = torch.where(vf.view(T, 1, 1), g, torch.zeros_like(g))
         S0 = S
-        o, S = scan(q, k, v, g, beta, S)
-        if mid_k is not None:
-            # The state after the first k rows: the same scan with the rows from k on masked as padding is (beta and
-            # the gate's log-decay zero leave the state untouched), so the checkpoint costs one more pass, not a call.
-            mf = vf & (torch.arange(T, device=vf.device).view(T, 1) < mid_k)
-            beta_m = torch.where(mf, beta, torch.zeros_like(beta))
-            g_m = torch.where(mf.view(T, 1, 1), g, torch.zeros_like(g))
-            _, S_m = scan(q, k, v, g_m, beta_m, S0)
+        if MID_EXPORT and mid_k is not None and nki_prefill:  # the checkpoint from the main scan (_scan_mid_export)
+            o, S, S_m = _scan_mid_export(q, k, v, g, beta, S0, mid_k, vf, keep_pad=False, ug=6)
             _write_rows(layer.rec_state, torch.cat([state_slot, mid_row]), torch.stack([S, S_m]))
         else:
-            _write_rows(layer.rec_state, state_slot, S.unsqueeze(0))
+            o, S = scan(q, k, v, g, beta, S)
+            if mid_k is not None:
+                # The state after the first k rows: the same scan with the rows from k on masked as padding is (beta
+                # and the gate's log-decay zero leave the state untouched), so the checkpoint costs one more pass, not a
+                # call.
+                mf = vf & (torch.arange(T, device=vf.device).view(T, 1) < mid_k)
+                beta_m = torch.where(mf, beta, torch.zeros_like(beta))
+                g_m = torch.where(mf.view(T, 1, 1), g, torch.zeros_like(g))
+                _, S_m = scan(q, k, v, g_m, beta_m, S0)
+                _write_rows(layer.rec_state, torch.cat([state_slot, mid_row]), torch.stack([S, S_m]))
+            else:
+                _write_rows(layer.rec_state, state_slot, S.unsqueeze(0))
     else:
         o, _ = scan(q, k, v, g, beta, q.new_zeros(nv, dk, dv))
 

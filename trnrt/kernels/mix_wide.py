@@ -18,6 +18,7 @@ fin's by construction.
 
 from __future__ import annotations
 
+import os
 import zlib
 
 P = 128
@@ -97,5 +98,103 @@ def _kernel_rev() -> int:
 
 
 REV = _kernel_rev()
+
+# -- the hardware-DGE span (TRNRT_DMA_HW): with TRNRT_DMA_HW=1 this module's static DMA helper (_dma) issues its DMAs in
+# hardware DGE (dge_mode hwdge) instead of static descriptors, which cost a descriptor-ring entry per contiguous run in
+# every loaded NEFF (the decode spill rings). Every MTP preset sets it (it is in every build behind the published MTP
+# numbers); the default presets do not. Read at import, before any kernel module binds _dma by name or folds REV, so the
+# process environment has to carry it (trnrt/__main__.py sets it for a preset that needs it). Below the hashed span;
+# REV folds this span's source when it is set (_dma_hw_rev), so every kernel folding REV re-keys, and unset no source,
+# REV or key moves.
+if os.environ.get("TRNRT_DMA_HW", "0") == "1" and nki is not None:
+    def _dma(dst, src):  # noqa: F811
+        """_dma under TRNRT_DMA_HW=1: hardware DGE."""
+        nisa.dma_copy(dst=dst, src=src, dge_mode=nisa.dge_mode.hwdge)
+# -- the hardware-DGE span end
+
+
+def _dma_hw_rev() -> int:
+    """CRC-32 of the hardware-DGE span above (the TRNRT_DMA_HW variant's source): REV's term when it is set."""
+    src = open(os.path.abspath(__file__)).read()
+    a = src.index("# -- the hardware-DGE span (TRNRT_DMA_HW)")
+    return zlib.crc32(src[a:src.index("# -- the hardware-DGE span end", a)].encode())
+
+
+if os.environ.get("TRNRT_DMA_HW", "0") == "1":
+    REV ^= _dma_hw_rev()
+
 # What a mix_in_h caller folds into its REV: a CRC of this module's REV and the form.
 MIX_REV = zlib.crc32(repr((REV, "wide-cast")).encode())
+
+
+# -- the row-split span: wide-cast's mix with the rows split over the LNC pair (shell.MIX_ROW_SPLIT,
+# EngineConfig.shell_mix_row_split). Program p mixes rows [p T / 2, (p + 1) T / 2) only (its own S / Yp / post / comb rows;
+# every op at half the free size, as kernels/mhc_mix.py's row-split kernel does for the standalone mix), writes them to
+# S_out (a kernel output: the one cross-program channel a later read of the other program's rows may use), barriers on
+# S_out, then reloads the other program's rows from S_out into sh. Each element sees wide-cast's fp32 ops in wide-cast's
+# order, and the reload is a bf16 copy of the bits the other program wrote: exact. npg != 2 or an odd T: wide-cast itself.
+if nki is not None:
+    def _mix_rows(sh, S, post_p, comb_p, Yp, S_out, hc: int, T: int, H: int, npg: int, r0, Th: int):
+        """wide-cast's _mix on rows r0 .. r0 + Th: sh's rows and S_out's rows (sh [128, hc, T, W] bf16)."""
+        f32, bf16 = nl.float32, nl.bfloat16
+        VE = nisa.vector_engine
+        W, F = H // P, hc * H
+        pb0 = nl.ndarray((P, Th, hc), dtype=f32, buffer=nl.sbuf)
+        _dma(pb0, post_p.ap(pattern=[[0, P], [hc, Th], [1, hc]], offset=r0 * hc))
+        cb0 = nl.ndarray((P, Th, hc * hc), dtype=f32, buffer=nl.sbuf)
+        _dma(cb0, comb_p.ap(pattern=[[0, P], [hc * hc, Th], [1, hc * hc]], offset=r0 * hc * hc))
+        st0 = nl.ndarray((P, hc, Th, W), dtype=bf16, buffer=nl.sbuf)
+        for n in range(hc):
+            _dma(st0[:, n, :, :], S.ap(pattern=[[W, P], [F, Th], [1, W]], offset=n * H + r0 * F))
+        ya = nl.ndarray((P, Th, W), dtype=f32, buffer=nl.sbuf)
+        for g in range(npg):
+            yg = nl.ndarray((P, Th, W), dtype=bf16, buffer=nl.sbuf)
+            _dma(yg, Yp.ap(pattern=[[W, P], [H, Th], [1, W]], offset=g * T * H + r0 * H))
+            if g == 0:
+                nisa.tensor_copy(dst=ya, src=yg, engine=VE)
+            else:
+                nisa.tensor_tensor(dst=ya, data1=ya, data2=yg, op=nl.add, engine=VE)
+        ybf = nl.ndarray((P, Th, W), dtype=bf16, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=ybf, src=ya, engine=VE)
+        o = nl.ndarray((P, hc, Th, W), dtype=f32, buffer=nl.sbuf)
+        nisa.tensor_tensor(dst=o, data1=ybf.ap(pattern=[[Th * W, P], [0, hc], [W, Th], [1, W]], offset=0),
+                           data2=pb0.ap(pattern=[[Th * hc, P], [1, hc], [hc, Th], [0, W]], offset=0),
+                           op=nl.multiply, engine=VE)
+        for m in range(hc):
+            pr = nl.ndarray((P, hc, Th, W), dtype=f32, buffer=nl.sbuf)
+            nisa.tensor_tensor(dst=pr, data1=st0.ap(pattern=[[hc * Th * W, P], [0, hc], [W, Th], [1, W]], offset=m * Th * W),
+                               data2=cb0.ap(pattern=[[Th * hc * hc, P], [1, hc], [hc * hc, Th], [0, W]], offset=m * hc),
+                               op=nl.multiply, engine=VE)
+            nisa.tensor_tensor(dst=o, data1=o, data2=pr, op=nl.add, engine=VE)
+        sb = nl.ndarray((P, hc, Th, W), dtype=bf16, buffer=nl.sbuf)  # wide-cast's one cast (cast = 1)
+        nisa.tensor_copy(dst=sb, src=o, engine=VE)
+        for n in range(hc):
+            nisa.tensor_copy(dst=sh[:, n, r0:r0 + Th, :], src=sb[:, n, :, :], engine=VE)
+            _dma(S_out.ap(pattern=[[W, P], [F, Th], [1, W]], offset=n * H + r0 * F), sb[:, n, :, :])
+
+    def mix_in_h_rsplit(sh, S, post_p, comb_p, Yp, S_out, hc: int, T: int, H: int, npg: int):
+        """wide-cast with the rows split over the LNC pair (npg 2, T even), else wide-cast."""
+        if npg != 2 or T % 2:
+            mix_in_h_wide_cast(sh, S, post_p, comb_p, Yp, S_out, hc, T, H, npg)
+            return
+        W, F = H // P, hc * H
+        Th = T // 2
+        pid = nl.program_id(axis=0)
+        r0, o0 = pid * Th, (1 - pid) * Th
+        _mix_rows(sh, S, post_p, comb_p, Yp, S_out, hc, T, H, npg, r0, Th)
+        nisa.core_barrier(data=S_out, cores=(0, 1))  # both programs' rows in S_out before either reads the other's
+        for n in range(hc):
+            _dma(sh[:, n, o0:o0 + Th, :], S_out.ap(pattern=[[W, P], [F, Th], [1, W]], offset=n * H + o0 * F))
+else:
+    mix_in_h_rsplit = None
+# -- the row-split span end
+
+
+def _rsplit_rev() -> int:
+    """CRC-32 of the row-split span above: what a mix_in_h caller folds into its kernel's rev with the split on."""
+    src = open(os.path.abspath(__file__)).read()
+    a = src.index("# -- the row-split span: ")
+    return zlib.crc32(src[a:src.index("# -- the row-split span end", a)].encode())
+
+
+RSPLIT_REV = _rsplit_rev()

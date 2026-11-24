@@ -41,6 +41,29 @@ import torch
 # keeps one slot of margin.
 POOL_K = 4
 POOL_NAMES = frozenset({"decode"})
+# An engine with speculative decoding pools every call of its blind step as well (engine/spec_async.py): their inputs and
+# outputs move every step like a decode call's. "mtp_kv" is the draft layer's KV-only window graph (EngineConfig.mtp_kv_only).
+SPEC_NAMES = frozenset(
+    {
+        "decode",
+        "verify",
+        "spec_prep",
+        "spec_post",
+        "mtp",
+        "mtp_post",
+        "spec_ckpt",
+        "spec_init",
+        "spec_host_init",
+        "mtp_prefill_ids",
+        "mtp_board",
+    }
+)
+
+
+def pool_names(spec: bool, kv_only: bool = False) -> frozenset:
+    """The graph calls whose IO the pool takes: decode's, and with speculative decoding the blind step's too."""
+    return (SPEC_NAMES | {"mtp_kv"} if kv_only else SPEC_NAMES) if spec else POOL_NAMES
+
 
 # The call running now (one engine thread per process runs every graph call): set by Pool.begin, read by the
 # executor proxies the call's NEFFs run through. None between calls and for calls that are not pooled.
@@ -63,10 +86,11 @@ def _sid(t) -> int:
 
 
 class Pool:
-    """One per ModelRunner (rank)."""
+    """One per ModelRunner (rank). warm: warmup runs each pooled call's block k times (ModelRunner._pool_warm_reps), so a
+    pool's slots 1 .. k - 1, and the ring sets the runtime builds for them, exist before the engine serves."""
 
-    def __init__(self, k: int = POOL_K, names=POOL_NAMES, rank: int = 0):
-        self.k, self.names, self.rank = int(k), frozenset(names), rank
+    def __init__(self, k: int = POOL_K, names=POOL_NAMES, rank: int = 0, warm: bool = False):
+        self.k, self.names, self.rank, self.warm = int(k), frozenset(names), rank, warm
         self.count: dict = {}  # key -> calls so far
         self.inputs: dict = {}  # (key, j, path) -> device buffer
         self.outs: dict = {}  # (id(proxy), key, j, occurrence, output index) -> [buffer, weakref to the view handed out]

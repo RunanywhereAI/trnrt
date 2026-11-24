@@ -1,0 +1,126 @@
+"""The environment a build needs before trnrt.kernels is imported (trnrt/__main__.py PRESET_ENV, apply_preset_env).
+
+TRNRT_DMA_HW is read at kernel import (tests/test_dma_hw.py). So the CLI puts it into the process environment of
+`trnrt engine`, and through it of every engine `trnrt serve` starts, and of `trnrt compile capture`, before anything
+imports trnrt.kernels; the ranks they spawn inherit it. The CLI cases run in a fresh interpreter, since the knob is read
+once per process, and each records the environment and the loaded kernel modules at the point the command hands on (the
+start checks, the compile farm), then imports the kernels and records shell's REV: the import-time effect itself."""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+
+import pytest
+
+from trnrt import __main__ as cli
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BUILDS = sorted(cli.PRESETS)
+SEEN = (
+    "def seen():\n"
+    "    return {'env': os.environ.get('TRNRT_DMA_HW'),\n"
+    "            'kernels': sorted(m for m in sys.modules if m.startswith('trnrt.kernels'))}\n"
+    "def after(rec, rc):\n"
+    "    from trnrt.kernels import shell\n"
+    "    print(json.dumps(dict(rec, rc=rc, rev=shell.REV, span=shell._dma_hw_rev())))\n"
+)
+ENGINE = (
+    "import json, os, sys\n"
+    "from trnrt import __main__ as cli\n"
+    "from trnrt.engine import start_checks\n" + SEEN + "rec = {}\n"
+    "def refusal(*_):\n"
+    "    rec.update(seen())\n"
+    "    return 'stopped by the test'\n"
+    "start_checks.refusal = refusal\n"
+    "after(rec, cli.cmd_engine(['--model', 'm', *sys.argv[1:]]))\n"
+)
+COMPILE = (
+    "import json, os, sys\n"
+    "from trnrt import __main__ as cli\n"
+    "from trnrt.compile import farm\n" + SEEN + "rec = {}\n"
+    "def main(argv, engine_config=None):\n"
+    "    rec.update(seen())\n"
+    "    return 0\n"
+    "farm.main = main\n"
+    "after(rec, cli.cmd_compile(sys.argv[1:]))\n"
+)
+
+
+def _run(code: str, args: list[str], env_value: str | None = None) -> dict:
+    env = {k: v for k, v in os.environ.items() if k != "TRNRT_DMA_HW"}
+    if env_value is not None:
+        env["TRNRT_DMA_HW"] = env_value
+    env["PYTHONPATH"] = ROOT + os.pathsep + env.get("PYTHONPATH", "")
+    out = subprocess.run(
+        [sys.executable, "-c", code, *args], env=env, capture_output=True, text=True, check=True, cwd=ROOT
+    )
+    return json.loads(out.stdout.strip().splitlines()[-1])
+
+
+@pytest.fixture(scope="module")
+def plain_rev() -> int:
+    """shell.REV with the knob off (the caller's 0, which every build keeps): what a run without hardware DGE imports."""
+    return _run(ENGINE, [], env_value="0")["rev"]
+
+
+def test_every_build_needs_the_hardware_dge_knob():
+    assert BUILDS == ["balanced", "latency", "throughput"]
+    assert set(cli.PRESET_ENV) == set(BUILDS)
+    assert all(cli.PRESET_ENV[p] == {"TRNRT_DMA_HW": "1"} for p in BUILDS)
+
+
+@pytest.mark.parametrize(
+    "argv", [[], ["--preset", "latency"], ["--preset", "throughput"], ["--users", "12"], ["--preset", "batch8"]]
+)
+def test_engine_sets_it_for_every_build_before_any_kernel_import(argv, plain_rev):
+    """No preset is the balanced build, --users picks one, an earlier release's name runs one: every build sets it. A
+    build with DSA row classes imports the layout parsers' kernel modules when its EngineConfig is checked, after the
+    environment is set; the kernels' revision proves the order (it holds the hardware-DGE span only when the knob was set
+    at import)."""
+    r = _run(ENGINE, argv)
+    assert r["rc"] == cli.START_REFUSED_STATUS  # the test's start check stopped it, after the environment was set
+    assert r["env"] == "1"
+    assert r["rev"] == plain_rev ^ r["span"]  # every kernel imported is the hardware-DGE form
+
+
+def test_engine_keeps_a_value_the_caller_set(plain_rev):
+    r = _run(ENGINE, ["--preset", "latency"], env_value="0")
+    assert r["env"] == "0"
+    assert r["rev"] == plain_rev
+
+
+@pytest.mark.parametrize("argv", [["--preset", "latency"], []])
+def test_compile_capture_sets_it_from_the_engine_arguments_before_the_farm_runs(argv, plain_rev):
+    r = _run(COMPILE, ["capture", "--out", "o", "--", "--model", "m", *argv])
+    assert r["rc"] == 0
+    assert r["env"] == "1"
+    assert r["kernels"] == []
+    assert r["rev"] == plain_rev ^ r["span"]
+
+
+def test_the_other_compile_subcommands_leave_it_unset(plain_rev):
+    r = _run(COMPILE, ["strip", "--out", "o"])
+    assert r["env"] is None
+    assert r["rev"] == plain_rev
+
+
+def test_a_process_that_imported_the_kernels_without_it_is_refused(monkeypatch):
+    import trnrt.kernels.shell  # noqa: F401  this session's kernels, bound without the knob
+
+    monkeypatch.setenv("TRNRT_DMA_HW", "x")  # so that teardown restores the variable's absence
+    monkeypatch.delenv("TRNRT_DMA_HW")
+    with pytest.raises(RuntimeError, match=r"before trnrt\.kernels is imported"):
+        cli.apply_preset_env(["--model", "m", "--preset", "latency"])
+    assert "TRNRT_DMA_HW" not in os.environ
+
+
+def test_a_value_already_set_is_kept_and_not_refused_after_a_kernel_import(monkeypatch):
+    import trnrt.kernels.shell  # noqa: F401
+
+    monkeypatch.setenv("TRNRT_DMA_HW", "1")
+    assert cli.apply_preset_env(["--model", "m", "--preset", "latency"]) == {}
+    assert cli.apply_preset_env(["--model", "m"]) == {}
+    assert os.environ["TRNRT_DMA_HW"] == "1"

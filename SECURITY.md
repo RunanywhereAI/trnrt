@@ -19,7 +19,7 @@ reasonable time to release a fix before you disclose it publicly.
 
 ## Supported versions
 
-Security fixes go to the latest release and to `main`.
+Security fixes land on `development` and ship in the next release from `main`. Only the latest release gets them.
 
 ## Deployment notes
 

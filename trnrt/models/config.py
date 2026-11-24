@@ -86,6 +86,13 @@ class ModelConfig:
     router_logit_bias: bool = False  # the router linear has no bias
     # The hyper-connection residual streams and the model's extras, a models/hybrid.py HybridSpec.
     hybrid: object | None = None
+    # Multi-token prediction (models/mtp.py): the checkpoint's MTP layers (num_nextn_predict_layers; the first one is
+    # applied recursively for every draft), the attention spec of that layer, its checkpoint prefix
+    # (model.layers.<num_hidden_layers>) and whether its MLP is the MoE.
+    mtp_layers: int = 0
+    mtp_spec: AttnSpec | None = None
+    mtp_prefix: str | None = None
+    mtp_moe: bool = False
 
     def truncated(self, n: int) -> "ModelConfig":
         """The first n layers only (debugging a large checkpoint layer by layer)."""

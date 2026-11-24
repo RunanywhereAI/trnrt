@@ -1,0 +1,17 @@
+name: Docs
+description: Something in the docs is wrong, missing or unclear
+labels: ["docs"]
+body:
+  - type: input
+    id: where
+    attributes:
+      label: Page or section
+      placeholder: docs/DEPLOY.md, "Build the compile cache"
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What is wrong or missing, and what it should say
+    validations:
+      required: true

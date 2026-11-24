@@ -19,9 +19,9 @@ TRNRT_EXEC_TIMEOUT_S: the timeout in seconds (default 300; 0 turns the watchdog 
 measured is a few seconds (a 4096-token prefill call is about a second, and a read-back waits behind at most
 the 63 executions the runtime queues), so the default leaves two orders of magnitude.
 
-Not a licence to turn off the runtime's per-execution barrier (NEURON_RT_DISABLE_EXECUTION_BARRIER=1, which
-vllm-neuron 0.24 sets): without it a collective mismatch returns silently wrong numbers, and ranks alternating a
-world-collective graph with an attention-group one under host jitter deadlock. TrnRT leaves it on.
+Not a licence to turn off the runtime's per-execution barrier (NEURON_RT_DISABLE_EXECUTION_BARRIER=1): without
+it a collective mismatch returns silently wrong numbers, and ranks alternating a world-collective graph with an
+attention-group one under host jitter deadlock. TrnRT leaves it on.
 """
 
 from __future__ import annotations

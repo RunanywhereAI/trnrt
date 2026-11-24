@@ -7,8 +7,8 @@ shape. Randomness comes in as uniform noise generated on the host per request, s
 request is reproducible and the graph has no RNG state. Rows with temperature <= 0 are greedy
 over the full vocab.
 
-Logprobs follow vLLM's default (`logprobs_mode=raw_logprobs`): log-softmax of the raw
-model logits, before temperature, penalties and filtering.
+Logprobs are the log-softmax of the raw model logits, before temperature, penalties and
+filtering.
 
 Two forms of the same draw:
 - sample(): from the full logits [B, V];
@@ -20,13 +20,16 @@ Two forms of the same draw:
   0.44 ms at batch 1 and 1.70 ms at batch 2 per decode step: the gather is bf16 [B, 154,880] and
   the sampler reads it in at least three full passes from HBM. The candidates, the token and the
   top N are the same as sample()'s; the log-sum-exp is combined from the shards', so a logprob may
-  differ in its last fp32 bits. A call with penalties samples from the gathered logits (sample()).
+  differ in its last fp32 bits. A call with penalties or a token mask samples from the gathered logits (sample()).
 
 The graph returns ONE fp32 tensor per call, so a step is a single device-to-host read:
     out[:, 0]          sampled token id (exact in fp32 for ids < 2**24)
     out[:, 1]          its logprob
     out[:, 2:2+N]      top-N token ids
     out[:, 2+N:2+2N]   top-N logprobs
+
+A speculative verify (verify_sample) returns VERIFY_COLS columns per row instead: y, accept, r, then the raw logprobs of
+y, r and the draft, then the top N ids and logprobs.
 """
 
 from __future__ import annotations
@@ -91,7 +94,7 @@ def apply_penalties(
     freq: torch.Tensor,
     pres: torch.Tensor,
 ) -> torch.Tensor:
-    """vLLM semantics. hist_ids [B, M]: every distinct token in the prompt or the output
+    """hist_ids [B, M]: every distinct token in the prompt or the output
     (rows padded by repeating their first entry, which makes the scatter idempotent);
     out_counts [B, M]: occurrences in the output only. repetition_penalty divides positive
     and multiplies negative logits of any seen token; frequency and presence penalties
@@ -141,20 +144,20 @@ def sample(
     penalties: tuple | None = None,
 ) -> torch.Tensor:
     """logits [B, V] fp32; temperature/top_p/min_p [B] fp32; top_k [B] int64 (0 = off);
-    noise [B, K] uniform in (0, 1); bitmask: always None (no guided decoding; the parameter keeps
-    the models' call sites); penalties: optional (hist_ids, out_counts, rep, freq, pres) for
-    apply_penalties, which shape what is sampled, never the reported raw logprobs.
+    noise [B, K] uniform in (0, 1); bitmask: optional packed token mask, int32 [B, ceil(V / 32)]
+    (engine/grammar.py); penalties: optional (hist_ids, out_counts, rep, freq, pres) for
+    apply_penalties. Both shape what is sampled, never the reported raw logprobs (shaped_logits).
     Returns [B, 2 + 2N] fp32."""
-    if bitmask is not None:
-        raise ValueError("guided decoding (a token bitmask) is not supported")
     K = noise.shape[1]
     N = NUM_TOP_LOGPROBS
     lse = logsumexp_large(logits)
     raw_vals, raw_idx = topk_large(logits, max(K, N))  # sorted descending
-    if penalties is None:
+    if penalties is None and bitmask is None:
         vals, idx = raw_vals, raw_idx
     else:
-        vals, idx = topk_large(apply_penalties(logits, *penalties), max(K, 1))
+        # shaped_logits sits at the end of this module: no traced line above it moved when it was added (the compile
+        # cache key holds each op's source line), so every graph without a mask or penalties keeps its key
+        vals, idx = topk_large(shaped_logits(logits, bitmask, penalties), max(K, 1))
     greedy = idx[:, 0]
     if K > 1:
         sampled, _ = _draw(vals[:, :K], idx[:, :K], temperature, top_p, top_k, min_p, noise)
@@ -202,6 +205,74 @@ def sample_candidates(
     return torch.cat([token.unsqueeze(1), token_lp, idx[:, :N], top_lp], dim=1)
 
 
+VERIFY_COLS = 6 + 2 * NUM_TOP_LOGPROBS
+
+
+def verify_sample(
+    logits: torch.Tensor,
+    temperature: torch.Tensor,
+    top_p: torch.Tensor,
+    top_k: torch.Tensor,
+    min_p: torch.Tensor,
+    noise: torch.Tensor,
+    u_accept: torch.Tensor,
+    draft: torch.Tensor,
+) -> torch.Tensor:
+    """Speculative verification for one draft token per row (R = B x Q rows).
+
+    Row i scores the draft for the NEXT position, d = draft[i], under the request's own
+    sampling distribution p (temperature, top-k, top-p, min-p over the K candidates):
+    accept with probability p(d) (greedy rows: d == argmax), else the replacement is a
+    sample from p with d removed. For a deterministic proposal, such as the MTP head's greedy draft,
+    this is exact rejection sampling, so the output distribution is unchanged.
+
+    Columns: y (sample from p, the bonus token after a fully accepted draft), accept,
+    r (replacement), raw logprobs of y, r and d, then top-N ids and logprobs.
+    """
+    K = noise.shape[1]
+    N = NUM_TOP_LOGPROBS
+    lse = logsumexp_large(logits)
+    vals, idx = topk_large(logits, max(K, N))
+    cv, ci = vals[:, :K], idx[:, :K]
+    t = torch.clamp(temperature, min=1e-5).unsqueeze(1)
+    probs = torch.softmax(cv / t, dim=-1)
+    cum = torch.cumsum(probs, dim=-1)
+    rank = torch.arange(K, device=logits.device).unsqueeze(0)
+    keep = (cum - probs) < top_p.unsqueeze(1)
+    keep = keep & ((rank < top_k.unsqueeze(1)) | (top_k.unsqueeze(1) <= 0))
+    keep = keep & (probs >= min_p.unsqueeze(1) * probs[:, :1])
+    keep = keep | (rank == 0)
+    kept = torch.where(keep, probs, 0.0)
+    kept = kept / kept.sum(dim=-1, keepdim=True)
+    greedy = ci[:, 0]
+    is_d = ci == draft.unsqueeze(1)
+    p_d = (kept * is_d.float()).sum(dim=-1)
+    sampling = temperature > 0
+    accept = torch.where(sampling, u_accept < p_d, draft == greedy)
+    gumbel = -torch.log(-torch.log(torch.clamp(noise, 1e-10, 1.0 - 1e-7)))
+    scores = torch.where(keep, torch.log(kept) + gumbel, -1e30)
+    pick = lambda sc: torch.argmax(_selectable(sc), -1, keepdim=True).clamp(0, K - 1)  # noqa: E731
+    y = torch.where(sampling, torch.gather(ci, 1, pick(scores)).squeeze(1), greedy)
+    rscores = torch.where(is_d, -1e30, scores)
+    rsampled = torch.gather(ci, 1, pick(rscores)).squeeze(1)
+    greedy_r = torch.where(draft == greedy, ci[:, 1], greedy)
+    r = torch.where(sampling, rsampled, greedy_r)
+    lp = lambda tok: torch.gather(logits, 1, tok.unsqueeze(1)) - lse  # noqa: E731
+    return torch.cat(
+        [
+            y.unsqueeze(1).float(),
+            accept.unsqueeze(1).float(),
+            r.unsqueeze(1).float(),
+            lp(y),
+            lp(r),
+            lp(draft),
+            idx[:, :N].float(),
+            vals[:, :N] - lse,
+        ],
+        dim=1,
+    )
+
+
 def unpack(out, n: int):
     """Host side: the first `n` rows of a sampler output as (tokens, logprobs, top_ids, top_lps)."""
     out = out[:n]
@@ -212,3 +283,22 @@ def unpack(out, n: int):
         out[:, 2 : 2 + N].long().tolist(),
         out[:, 2 + N : 2 + 2 * N].tolist(),
     )
+
+
+def unpack_bitmask(bitmask: torch.Tensor, vocab: int) -> torch.Tensor:
+    """A packed token mask, int32 [B, ceil(V / 32)] with bit t % 32 of word t // 32 set when token t is allowed
+    (xgrammar's layout, engine/grammar.py), as bool [B, vocab]."""
+    shifts = torch.arange(32, dtype=torch.int32, device=bitmask.device)
+    bits = torch.bitwise_and(torch.bitwise_right_shift(bitmask.unsqueeze(-1), shifts), 1)
+    return bits.reshape(bitmask.shape[0], -1)[:, :vocab] != 0
+
+
+def shaped_logits(logits: torch.Tensor, bitmask: torch.Tensor | None, penalties: tuple | None) -> torch.Tensor:
+    """The logits sample() draws from when a call carries host inputs: the penalties applied (apply_penalties), then
+    every token the mask forbids at -1e30, so a penalty never brings a forbidden token back. The candidates of a row
+    with fewer allowed tokens than K hold forbidden ones at -1e30, whose probability is 0 and whose draw score is
+    -inf: never drawn (the best candidate, an allowed one, is always kept)."""
+    out = logits if penalties is None else apply_penalties(logits, *penalties)
+    if bitmask is not None:
+        out = torch.where(unpack_bitmask(bitmask, logits.shape[1]), out, torch.full_like(out, -1e30))
+    return out

@@ -33,8 +33,8 @@ LNC = 2
 DEVICE_NAME = "Trainium2"
 DMI_PRODUCT = "/sys/class/dmi/id/product_name"
 SYSFS_DEVICE_NAME = "/sys/devices/virtual/neuron_device/neuron*/info/architecture/device_name"
-# vllm-neuron's neuronx-cc arguments for every graph (neuron_model_runner.py, compile_options), except the
-# optimization level: trnRT keeps neuronx-cc's own default -O2, where vllm-neuron 0.24 defaults to -O1.
+# neuronx-cc's arguments for every graph (the compile options), except the optimization level: trnRT keeps
+# neuronx-cc's own default -O2, passed explicitly in CC_ARGS so that every call names the level in use.
 CC_ARGS = ("--auto-cast=none", "--verbose=35", "-O2")
 HLO2TENSORIZER_ARGS = ("--modular-flow-mac-threshold=10",)
 BACKEND_ARGS = "--internal-backend-options=--enable-verifier=false --enable-nested-dynamic-loop"
@@ -122,14 +122,14 @@ def configure_runtime_env() -> None:
 
 
 def fp8_max(target_str: str | None = None) -> float:
-    """Largest finite FP8 E4M3 value on trn2: vllm-neuron 0.24 (utils/dtype_utils.py): "TRN2 uses e4m3 (with inf),
-    max finite = 240"."""
+    """Largest finite FP8 E4M3 value on trn2: it uses e4m3 (with inf), so the
+    max finite is 240."""
     return 240.0
 
 
 def neuronx_cc_args(target_str: str, fp8: bool) -> list[str]:
-    """Platform arguments for every neuronx-cc call: --logical-nc-config matching the runtime, plus vllm-neuron's
-    argument set. The FP8 option joins the one --internal-hlo2tensorizer-options argument, since a second one
+    """Platform arguments for every neuronx-cc call: --logical-nc-config matching the runtime, plus the
+    fixed argument set. The FP8 option joins the one --internal-hlo2tensorizer-options argument, since a second one
     would replace the first."""
     family_of(target_str)
     h2t = list(HLO2TENSORIZER_ARGS) + ([UNSAFE_FP8] if fp8 else [])

@@ -2,8 +2,7 @@
 
 Every step runs all decoding sequences (one query token each) and, within a token budget,
 chunks of prefill. Decodes never pause for a prefill, which bounds inter-token latency by
-the chunk size; the managed Neuron scheduler instead runs one prefill per step and pauses
-decodes during it (vllm-neuron docs, "neuron-scheduler").
+the chunk size.
 
 Admission reserves KV for what the running requests will need (SchedulerConfig.admission_decode_tokens),
 so a KV-short pool runs fewer requests instead of admitting prompts it must later preempt. When the
@@ -13,11 +12,10 @@ radix cache, so the recompute resumes from its last state checkpoint.
 State checkpoints. GLM-5.3-Flash's linear-attention (KDA) layers resume a prefix only from a state
 checkpoint (engine/state_pool.py, RadixNode.ckpt), so a prefill leaves one at:
 - the radix junction past the last checkpoint of a request's matched path (another request shares
-  those tokens: SGLang v0.5.21 unified_cache/components/mamba.py mamba_branching_seqlen, vLLM v0.30.0
-  Scheduler._mamba_block_aligned_split's shared-prefix junction);
-- the prompt's last page boundary (vLLM's "replay boundary"): the prompt-end checkpoint, from which a
+  those tokens);
+- the prompt's last page boundary: the prompt-end checkpoint, from which a
   session's next turn resumes when its replay of this turn's reply differs from the cached tokens;
-and decode leaves one at every page boundary it crosses (SGLang mamba_track_interval at the page size),
+and decode leaves one at every page boundary it crosses,
 the newest superseding the older, so a finished turn leaves the state after its last full page for the
 next turn to resume from.
 
@@ -34,11 +32,21 @@ before either computes it: the longest page-aligned prefix a request shares with
 running request becomes a checkpoint target of the one computing it first (at its admission, or, when
 the other arrives while it is still prefilling, added to its targets then), and the other waits until
 it can resume from it.
+
+Scheduling policies (SchedulerConfig.policy and the fields after it, all host only; the defaults schedule exactly as
+before they existed). The waiting queue is ordered before each admission round: fcfs keeps arrival order; lpm puts the
+longest cached prefix first; lof the longest max_new_tokens first; spf the shortest prompt first. With priority
+scheduling (--enable-priority-scheduling) a request's `priority` comes first, higher values first unless
+low_priority_first; preemption under KV pressure takes the worst priority first; and a waiting request better than the
+worst running one by more than priority_preemption_threshold takes that one's seat. A
+queue limit (max_queued_requests, max_queued_tokens) refuses a request with QueueFull; under priority scheduling a
+request better than the worst waiting one displaces it instead.
 """
 
 from __future__ import annotations
 
 import bisect
+import math
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -47,17 +55,36 @@ from typing import TYPE_CHECKING
 from .request import Request, Status
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from .host_cache import HostTier
     from .kv_pool import PagePool
     from .radix_cache import RadixCache
     from .state_pool import StatePool
 
 PENDING = -1  # placeholder for a token sampled by a step whose results are not read yet
+# A blind speculative draft (engine/spec_async.py): the drafts are on the device, not known to the host.
+BLIND = -2
 
 
 class NeedSync(Exception):
     """Scheduling needs a preemption while a step is in flight. A preempted request must be
     recomputed from REAL tokens, so the caller commits the in-flight step and retries."""
+
+
+class QueueFull(Exception):
+    """The waiting queue is at its limit (SchedulerConfig.max_queued_requests / max_queued_tokens): the request is
+    refused before it is queued. The API answers it with 503 and a message beginning "The request queue is full".
+    """
+
+
+# The --schedule-policy names; "priority" is fcfs with priority scheduling on.
+POLICIES = ("fcfs", "lpm", "lof", "spf", "priority")
+# lpm's prefix matching is off above this many waiting requests: each match walks the radix tree, once per waiting
+# request per step.
+LPM_MAX_QUEUE = 128
+# Displaced from a full queue by a request of higher priority.
+DISPLACED = "The request is aborted by a higher priority request."
 
 
 @dataclass
@@ -71,11 +98,78 @@ class SchedulerConfig:
     # prompt and up to admission_decode_tokens of its decode, on top of what the running requests still
     # need: the rest of their prompts plus up to admission_decode_tokens of decode each (_still_needs).
     # A KV-short pool then runs fewer requests instead of admitting prompts it must later preempt, and
-    # every preemption recomputes from the request's last state checkpoint. (vLLM's v1 scheduler admits
-    # whenever the first chunk fits.)
+    # every preemption recomputes from the request's last state checkpoint.
     admission_decode_tokens: int = 256
     # EngineConfig.max_running: running requests at most (None: max_num_seqs). Admission only, never the graphs' seats.
     max_running: int | None = None
+    # Scheduling policy (module docstring, POLICIES). Host only; the defaults are the scheduling without them.
+    policy: str = "fcfs"
+    priority_scheduling: bool = False
+    low_priority_first: bool = False
+    priority_preemption: bool = True  # --disable-priority-preemption turns it off
+    priority_preemption_threshold: int = 10
+    max_queued_requests: int | None = None
+    max_queued_tokens: int | None = None  # prompt tokens waiting, at most
+
+    def __post_init__(self) -> None:
+        if self.policy not in POLICIES:
+            raise ValueError(f"schedule policy must be one of {', '.join(POLICIES)}")
+        if self.policy == "priority":
+            self.policy, self.priority_scheduling = "fcfs", True
+        if self.priority_scheduling and self.policy == "lpm":
+            # an order by priority and one by cached prefix cannot both lead
+            raise ValueError("priority scheduling takes schedule policy fcfs, lof or spf, not lpm")
+        for name in ("max_queued_requests", "max_queued_tokens"):
+            v = getattr(self, name)
+            if v is not None and v < 1:
+                raise ValueError(f"{name} must be at least 1")
+        if self.priority_preemption_threshold < 0:
+            # As the CLI (--priority-scheduling-preemption-threshold): below 0, a waiting request would preempt a running
+            # one of equal priority, which would preempt it back, recomputing both prefills without end.
+            raise ValueError("priority_preemption_threshold must be at least 0")
+
+
+@dataclass(frozen=True)
+class Scheduling:
+    """The host-only scheduling settings (the `serve` and `engine` scheduling flags, trnrt/__main__.py), kept out of
+    EngineConfig, whose fields the captured graphs are keyed on. The defaults schedule and evict exactly as an engine
+    built without them."""
+
+    policy: str = "fcfs"
+    priority_scheduling: bool = False
+    low_priority_first: bool = False
+    priority_preemption: bool = True
+    priority_preemption_threshold: int = 10
+    max_queued_requests: int | None = None
+    max_queued_tokens: int | None = None
+    eviction_policy: str = "lru"  # radix_cache.EVICTION_POLICIES
+    eviction_config: dict | None = None  # the eviction policy's own settings (radix_cache.POLICY_PARAMS)
+
+    @property
+    def takes_priority(self) -> bool:
+        """Whether a request's `priority` changes anything: priority scheduling (by the policy's name or the flag) or
+        the priority eviction. A request that sends one otherwise is refused, not silently ignored."""
+        return self.priority_scheduling or self.policy == "priority" or self.eviction_policy == "priority"
+
+    def check_priority(self, priority: int | None) -> None:
+        """ValueError (the API's 400) for a request's priority that these settings would ignore."""
+        if priority is not None and not self.takes_priority:
+            raise ValueError(
+                "priority needs priority scheduling (--enable-priority-scheduling) or the priority eviction "
+                "(--radix-eviction-policy priority); send the request without it"
+            )
+
+    def scheduler_fields(self) -> dict:
+        """The SchedulerConfig fields these settings give."""
+        return {
+            "policy": self.policy,
+            "priority_scheduling": self.priority_scheduling,
+            "low_priority_first": self.low_priority_first,
+            "priority_preemption": self.priority_preemption,
+            "priority_preemption_threshold": self.priority_preemption_threshold,
+            "max_queued_requests": self.max_queued_requests,
+            "max_queued_tokens": self.max_queued_tokens,
+        }
 
 
 def shared_pages(a: list[int], b: list[int], ps: int, limit: int) -> int:
@@ -158,6 +252,9 @@ class ScheduledSeq:
     start: int  # first position computed this step
     num_tokens: int
     sample: bool  # this chunk reaches the newest token, so it produces the next one
+    # Speculative draft slots verified after the newest token (decode only), [BLIND] * k: the drafts themselves are on the
+    # device. The step then covers positions start .. start + len(draft) and may emit up to len(draft) + 1 tokens.
+    draft: list[int] = field(default_factory=list)
     # Recurrent-state checkpoint rows (engine/state_pool.py): copied into the request's state row
     # before this entry runs (a prefix hit), and receiving a copy of it after (the state at end).
     restore: int | None = None
@@ -165,6 +262,9 @@ class ScheduledSeq:
     # (k, row): the state after this entry's first k tokens goes to checkpoint row `row`, written by the
     # entry's own graph, not copied after it.
     mid: tuple[int, int] | None = None
+    # A blind speculative step's decode-checkpoint row, reserved by the engine (LLMEngine._reserve_async_ckpts) for the
+    # state after the page boundary the step may cross.
+    ckpt_row: int | None = None
 
     @property
     def end(self) -> int:
@@ -186,8 +286,11 @@ class StepPlan:
 class Scheduler:
     MAX_AHEAD = 4  # junction checkpoints one admission may add ahead (each costs a row and a copy)
 
-    def __init__(self, cfg: SchedulerConfig, pool: PagePool, radix: RadixCache):
+    def __init__(self, cfg: SchedulerConfig, pool: PagePool, radix: RadixCache, draft_fn=None):
         self.cfg = cfg
+        # draft_fn(req) -> [BLIND] * k for a decoding request that speculates in this step, else [] (speculative decoding,
+        # engine/spec_async.py).
+        self.draft_fn = draft_fn
         self.pool = pool
         self.radix = radix
         # Set by the engine before the first schedule(): the state pool whose checkpoint rows back the
@@ -195,11 +298,15 @@ class Scheduler:
         # radix cache (engine/host_cache.HostTier), when one is configured.
         self._states: StatePool | None = None
         self.host: HostTier | None = None
+        # Set by the engine: frees a preempted request's token-board slot (ModelRunner.release_slot). A request preempted
+        # to the queue may wait behind higher priorities while others take slots, so it must not keep one.
+        self.on_preempt: Callable[[Request], None] | None = None
         # Set by an overlapping engine while a launched step's results are unread.
         self.in_flight = False
         self.waiting: deque[Request] = deque()
         self.running: list[Request] = []  # admission order, oldest first
         self.num_preemptions = 0
+        self.num_priority_preemptions = 0  # of which for a waiting request of higher priority (_priority_preempt)
         # In-chunk checkpoints placed, and skipped for want of a free row (the chunk is not split instead).
         self.ckpt_mid_placed = 0
         self.ckpt_mid_skipped = 0
@@ -220,13 +327,65 @@ class Scheduler:
     def close_session(self, sid: str) -> bool:
         return self.radix.session_close(sid)
 
-    def add(self, req: Request) -> None:
+    def rank(self, req: Request) -> float:
+        """req's priority as a sort key, smaller first: higher priority values first, lower ones with
+        low_priority_first; a request without one comes last (it ranks as sys.maxsize). Kept an
+        int: the API takes signed 64-bit priorities, which a float would round together above 2**53."""
+        p = req.priority
+        if p is None:
+            return math.inf
+        return p if self.cfg.low_priority_first else -p
+
+    def check_add(self, req: Request) -> None:
+        """Raise what add(req) would (ValueError, QueueFull), changing nothing: the engine calls it before it builds a
+        request's grammar matcher, so a refused request costs none."""
+        self._check_len(req)
+        self._queue_room(req, apply=False)
+
+    def _check_len(self, req: Request) -> None:
         if req.num_tokens >= self.cfg.max_model_len:
             raise ValueError(f"prompt of {req.num_tokens} tokens does not fit max_model_len={self.cfg.max_model_len}")
+
+    def add(self, req: Request) -> Request | None:
+        """Queue `req`. Returns the waiting request it displaced from a full queue (already finished, finish_reason
+        "abort", Request.error set), or None; raises QueueFull when the queue is at its limit and nothing is displaced."""
+        self._check_len(req)
+        displaced = self._queue_room(req)
         if req.session_id is not None:
             req.session_gen = self.radix.session_open(req.session_id)
         self._mark_running_junctions(req)
         self.waiting.append(req)
+        return displaced
+
+    def _importance(self, req: Request) -> float:
+        """req's priority for the priority eviction, larger kept longer: the request priority, 0 when it has none
+        (radix_cache.py _insert_helper), negated with low_priority_first so that eviction keeps what scheduling favours."""
+        p = req.priority or 0
+        return -p if self.cfg.low_priority_first else p  # an int, exact as rank's
+
+    def _queue_room(self, req: Request, apply: bool = True) -> Request | None:
+        """Make room for `req` under the queue limits, or raise QueueFull. Over max_queued_requests with priority
+        scheduling, the worst waiting request (the newest among equals) is displaced if `req` ranks strictly better;
+        one that has already generated tokens (a preempted request, partly streamed) is never displaced. With apply
+        False nothing is displaced: the request that would be is returned."""
+        c = self.cfg
+        if c.max_queued_tokens is not None:
+            queued = sum(r.num_tokens for r in self.waiting)
+            if queued + req.num_tokens > c.max_queued_tokens:
+                raise QueueFull(f"The request queue is full: {queued} prompt tokens are waiting.")
+        if c.max_queued_requests is None or len(self.waiting) < c.max_queued_requests:
+            return None
+        if c.priority_scheduling:
+            fresh = [r for r in self.waiting if not r.output_ids]
+            if fresh:
+                worst = max(fresh, key=lambda r: (self.rank(r), r.arrival_time))
+                if self.rank(req) < self.rank(worst):
+                    if not apply:
+                        return worst
+                    self.abort(worst)
+                    worst.error = (503, DISPLACED)
+                    return worst
+        raise QueueFull("The request queue is full.")
 
     def has_work(self) -> bool:
         return bool(self.waiting or self.running)
@@ -260,20 +419,29 @@ class Scheduler:
     def advance(self, plan: StepPlan) -> None:
         """Move every scheduled request past this step BEFORE its results are known, so the
         next step can be scheduled while this one runs (overlap scheduling). A sampling
-        entry gets a PENDING placeholder where its new token will go."""
+        entry gets a PENDING placeholder where its new token will go. A blind speculative entry moves nothing: its tokens
+        and its progress stay on the device until its commit, and the request counts the step in flight."""
         for s in plan.seqs():
+            if s.draft:
+                s.req.spec_inflight += 1
+                continue
             s.req.num_computed = s.end
             if s.sample:
                 s.req.token_ids.append(PENDING)
 
     def commit(self, plan: StepPlan, tokens: list) -> list[Request]:
         """Fill in a step's results. `tokens[i]` is the sampled id for `plan.seqs()[i]` (ignored for
-        an entry that does not sample). An entry whose request already finished in an earlier commit
-        is ignored. Returns requests finished by this commit."""
+        an entry that does not sample), or for a speculative entry the list it emitted (accepted drafts, then one more).
+        An entry whose request already finished in an earlier commit is ignored. Returns requests finished by this commit."""
         now = time.monotonic()
         finished = []
         for s, tok in zip(plan.seqs(), tokens):
             req = s.req
+            if s.draft:
+                req.spec_inflight -= 1
+                if req.status is Status.RUNNING and self._commit_blind(req, tok, now) is not None:
+                    finished.append(req)
+                continue
             if req.status is not Status.RUNNING:
                 continue  # finished or aborted while this step was in flight
             if not s.sample:
@@ -297,6 +465,25 @@ class Scheduler:
             elif s.num_tokens > 1:
                 self._cache(req)
         return finished
+
+    def _commit_blind(self, req: Request, tok: list, now: float) -> str | None:
+        """A blind speculative entry's emitted tokens (accepted drafts, then the replacement or the bonus), in order:
+        appended as a plain step's are, the newest one's position becoming num_computed (the KV of the newest token and
+        of the accepted drafts is written; a rejected draft's lies beyond). Returns the finish reason."""
+        reason = None
+        for t in tok:
+            req.token_ids.append(int(t))
+            reason = self._finish_reason(req, int(t), length=len(req.token_ids))
+            if reason is not None:
+                break
+        req.num_computed = len(req.token_ids) - 1
+        if req.first_token_time is None:
+            req.first_token_time = now
+        if reason is not None:
+            req.finish_reason = reason
+            req.finish_time = now
+            self._release(req, Status.FINISHED)
+        return reason
 
     def finish_now(self, req: Request, reason: str) -> None:
         """Finish a running request outside update(), e.g. on a stop string."""
@@ -354,17 +541,97 @@ class Scheduler:
         cap = self.cfg.max_running
         return self.cfg.max_num_seqs if cap is None else min(self.cfg.max_num_seqs, cap)
 
+    def _order_waiting(self) -> None:
+        """Sort the waiting queue by the scheduling policy (stable: arrival order among equals). fcfs without priority
+        scheduling leaves it as it is."""
+        c = self.cfg
+        if (c.policy == "fcfs" and not c.priority_scheduling) or len(self.waiting) < 2:
+            return
+        if c.policy == "lpm":
+            if len(self.waiting) > LPM_MAX_QUEUE:
+                # Arrival order, as documented: the queue may still be in an earlier round's cache-hit order.
+                self.waiting = deque(sorted(self.waiting, key=lambda r: r.arrival_time))
+                return
+            ps = c.page_size
+            hit = {
+                id(r): self.radix.match_checkpoint(r.token_ids, self._prompt_pages(r, ps))[0].num_pages
+                for r in self.waiting
+            }
+            self.waiting = deque(sorted(self.waiting, key=lambda r: -hit[id(r)]))
+            return
+        self.waiting = deque(sorted(self.waiting, key=self._wait_key))
+
+    def _wait_key(self, req: Request) -> tuple[float, int]:
+        """The admission order of the fcfs, lof and spf policies, smallest first: the priority (priority scheduling),
+        then the longest max_new_tokens (lof) or the shortest prompt (spf)."""
+        c = self.cfg
+        rank = self.rank(req) if c.priority_scheduling else 0.0
+        if c.policy == "lof":
+            return (rank, -req.params.max_new_tokens)
+        if c.policy == "spf":
+            return (rank, req.num_tokens)
+        return (rank, 0)
+
+    def _victim_key(self, req: Request) -> tuple[float, float]:
+        """Preemption order under priority scheduling, the largest first: the worst priority, then the youngest."""
+        return (self.rank(req), req.arrival_time)
+
+    def _priority_preempt(self) -> None:
+        """Priority scheduling: when every seat is taken and the best waiting request (that is not waiting for a prefix
+        another request is computing) ranks better than the worst running one by more than
+        priority_preemption_threshold, that one is preempted for its seat (the difference must exceed the
+        threshold). Before anything is planned, so the victim is in no
+        entry of this step; with a step in flight, NeedSync first (a preempted request recomputes from real tokens)."""
+        c = self.cfg
+        if not (c.priority_scheduling and c.priority_preemption) or not self.waiting:
+            return
+        if len(self.running) < self._seats():
+            return
+        best = next((r for r in self.waiting if not self._prefix_in_progress(r)), None)
+        if best is None:
+            return
+        victim = self._youngest_running()
+        if not self.rank(victim) - self.rank(best) > c.priority_preemption_threshold:
+            return
+        if self.in_flight:
+            raise NeedSync()
+        self._preempt(victim)
+        self.num_priority_preemptions += 1
+
     def _schedule(self) -> StepPlan:
         plan = StepPlan()
         ps = self.cfg.page_size
+        preempted = self.num_preemptions
+        self._order_waiting()
+        self._priority_preempt()
 
         # 1. Every decoding sequence gets its one token, preempting the youngest if KV
         #    runs out. Iterating oldest-first while preempting youngest-first means a
-        #    victim is never a sequence already scheduled this step.
-        for req in list(self.running):
+        #    victim is never a sequence already scheduled this step. Under priority
+        #    scheduling the victim is the worst priority: the loop then visits the best
+        #    first (the same invariant) and the entries go back to running order.
+        order = list(self.running)
+        if self.cfg.priority_scheduling:
+            pos = {id(r): i for i, r in enumerate(order)}
+            order.sort(key=lambda r: (self._victim_key(r), pos[id(r)]))
+        for req in order:
             if req.status is not Status.RUNNING or not req.is_decoding:
                 continue
-            while not self._reserve(req, req.num_computed + 1):
+            if req.token_ids[-1] == PENDING and req.host_bound:
+                # Its next step's mask or penalties need its newest token, still in flight: it waits for the read-back
+                # (the next schedule), and every other row runs as before (engine/host_inputs.py).
+                continue
+            draft = self.draft_fn(req) if self.draft_fn is not None else []
+            # A blind speculative row (engine/spec_async.py): the steps still in flight may each have advanced the request by
+            # up to 1 + k positions, so its newest token is at most this far on, and its pages cover the verify past that
+            # bound. The request finishes by max_model_len, so pages past it are never needed (padding writes go to the null
+            # page).
+            start = req.num_computed
+            end = start + 1
+            if draft:
+                start = min(start + (1 + len(draft)) * req.spec_inflight, self.cfg.max_model_len - 1)
+                end = min(start + 1 + len(draft), self.cfg.max_model_len)
+            while not self._reserve(req, end):
                 if self.in_flight:
                     raise NeedSync()
                 victim = self._youngest_running()
@@ -372,8 +639,11 @@ class Scheduler:
                 if victim is req:
                     break
             if req.status is Status.RUNNING:
-                save = self.track(req, req.num_computed, 1)
-                plan.decodes.append(ScheduledSeq(req, req.num_computed, 1, True, save=save))
+                save = None if draft else self.track(req, req.num_computed, 1)
+                plan.decodes.append(ScheduledSeq(req, start, 1 + len(draft), True, draft, save=save))
+        if self.cfg.priority_scheduling:
+            at = {id(r): i for i, r in enumerate(self.running)}
+            plan.decodes.sort(key=lambda s: at[id(s.req)])
 
         # 2. Continue partial prefills, oldest first.
         budget = self.cfg.max_prefill_tokens
@@ -388,7 +658,10 @@ class Scheduler:
             plan.prefills.append(self._chunk(req, req.num_computed, n))
             budget -= n
 
-        # 3. Admit waiting requests, first come first served, while budget and capacity remain.
+        # 3. Admit waiting requests, first come first served (or in the policy's order), while budget and capacity
+        #    remain. A request preempted above went to the queue's head; the policy puts it where it ranks.
+        if self.num_preemptions != preempted:
+            self._order_waiting()
         owed = sum(self._still_needs(r) for r in self.running)
         deferred = []  # waiting for a running request to checkpoint the prefix they share
         while self.waiting and budget > 0 and len(self.running) < self._seats():
@@ -421,6 +694,8 @@ class Scheduler:
             self.waiting.popleft()
             req.pages = list(match.pages) + new_pages
             req.node = match.node
+            if self.radix.tracks_use:  # a hit on the prefix it resumes from (the lfu, slru and priority evictions)
+                self.radix.touch(match.node, self._importance(req))
             req.num_computed = cached
             if req.num_cached_tokens < 0:
                 req.num_cached_tokens = cached
@@ -484,7 +759,11 @@ class Scheduler:
         return True
 
     def _youngest_running(self) -> Request:
-        """Preemption victim: the youngest running request."""
+        """Preemption victim: the youngest running request, or under priority scheduling the worst priority (then the
+        youngest; _schedule visits the decodes in the order that keeps a victim out of the plan)."""
+        if self.cfg.priority_scheduling:
+            pos = {id(r): i for i, r in enumerate(self.running)}
+            return max(self.running, key=lambda r: (self._victim_key(r), pos[id(r)]))
         return max(self.running, key=lambda r: r.arrival_time)
 
     # -- recurrent-state checkpoints ------------------------------------------------------
@@ -663,6 +942,8 @@ class Scheduler:
         if n_full == 0:
             return
         res = self.radix.insert(req.token_ids[: n_full * ps], req.pages[:n_full])
+        if self.radix.tracks_use:
+            self.radix.touch(res.node, self._importance(req), hit=False)
         for i, page in enumerate(res.pages):
             if req.pages[i] != page:
                 self.pool.free([req.pages[i]])
@@ -709,7 +990,13 @@ class Scheduler:
 
     def _preempt(self, req: Request) -> None:
         self._release(req, Status.WAITING)
+        if self.on_preempt is not None:
+            self.on_preempt(req)
         req.num_computed = 0
+        req.spec_ready = False  # its recompute rebuilds the speculative board row (engine/spec_async.py)
+        req.spec_cur = (
+            None  # its recompute writes row 0; a flip to plain before its next verify must not pick an old row
+        )
         req.num_preemptions += 1
         self.num_preemptions += 1
         self.waiting.appendleft(req)

@@ -127,10 +127,11 @@ class _Checkpoint:
 def load_model(path: str, cfg: ModelConfig, dtype: torch.dtype, device: torch.device, max_positions: int,
                tp_rank: int = 0, tp_size: int = 1, tp_group=None, keep_fp8: bool = False,
                fp8_max: float = 240.0, vocab_parallel: bool = False, moe_kernel: str = "xla",
-               attn_tp: int | None = None, attn_group=None):
+               attn_tp: int | None = None, attn_group=None, mtp: bool = False):
     """keep_fp8: weights the checkpoint quantizes stay FP8 on the device (dequantized in-graph);
     otherwise they are dequantized to `dtype` here. fp8_max: the device's largest finite e4m3.
-    attn_tp / attn_group: the attention TP (DecoderForCausalLM; None = its default)."""
+    attn_tp / attn_group: the attention TP (DecoderForCausalLM; None = its default). mtp: build and load the
+    checkpoint's multi-token-prediction layer (DecoderForCausalLM's mtp; cfg.mtp_layers must be set)."""
     cls = ARCHITECTURES.get(cfg.architecture)
     if cls is None:
         raise NotImplementedError(f"architecture {cfg.architecture} is not supported (have: {sorted(ARCHITECTURES)})")
@@ -139,7 +140,8 @@ def load_model(path: str, cfg: ModelConfig, dtype: torch.dtype, device: torch.de
     # allocated, so host memory peaks at one layer per rank instead of the whole shard.
     with torch.device("meta"):
         model = cls(cfg, dtype, max_positions, tp_rank, tp_size, tp_group, keep_fp8=keep_fp8,
-                    vocab_parallel=vocab_parallel, moe_kernel=moe_kernel, attn_tp=attn_tp, attn_group=attn_group)
+                    vocab_parallel=vocab_parallel, moe_kernel=moe_kernel, attn_tp=attn_tp, attn_group=attn_group,
+                    mtp=mtp)
     model.materialize = lambda mod: _materialize(mod, device)
     _load_decoder(model, path, dtype, fp8_max)
     model.register_buffer("vocab_start_t", torch.tensor(model.vocab_start, dtype=torch.int64).to(device),
@@ -242,13 +244,23 @@ def _load_decoder(model: DecoderForCausalLM, path: str, dtype: torch.dtype, fp8_
         if "lm_head.weight" not in ck:
             raise KeyError("checkpoint has untied embeddings but no lm_head.weight")
         put_vocab(model.lm_head, "lm_head.weight")
+    mtp = getattr(model, "mtp", None)
+    if mtp is not None:  # the MTP head's own parameters live on the model (enorm, hnorm, eh_proj, shared_head.norm)
+        m = cfg.mtp_prefix + "."
+        put_norm(model.mtp_enorm, m + "enorm.weight")
+        put_norm(model.mtp_hnorm, m + "hnorm.weight")
+        put_norm(model.mtp_norm, m + "shared_head.norm.weight")
+        w, sc = ck.linear(m + "eh_proj")  # bf16 in the released checkpoint; dequantized if not
+        model.mtp_eh.data.copy_((dequant(w, sc, torch.float32) if sc is not None else w).to(dtype))
     top_done()
     r, n = model.tp_rank, model.tp_size  # MLP / experts shard
     ar, an = model.attn_rank, model.attn_tp  # token-mixer shard (attention TP)
     blk = cfg.quant_block
     nm = names(cfg)
-    for i, layer in enumerate(model.layers):
-        pre = f"model.layers.{i}."
+    jobs = [(i, layer, f"model.layers.{i}.") for i, layer in enumerate(model.layers)]
+    if mtp is not None:  # a whole decoder layer under the MTP prefix (its own indexer, the MoE)
+        jobs.append(("mtp", mtp, cfg.mtp_prefix + "."))
+    for i, layer, pre in jobs:
         layer_done = materialize(layer)
         sp = layer.spec
         try:
@@ -285,7 +297,8 @@ def _load_decoder(model: DecoderForCausalLM, path: str, dtype: torch.dtype, fp8_
                     from ..kernels import dense_half
 
                     dense_half.fill(layer, dtype)
-            hybrid.load_layer(layer, ck, pre, cfg, r, n, dtype)
+            if not getattr(layer, "plain", False):  # the MTP layer has no hyper-connections
+                hybrid.load_layer(layer, ck, pre, cfg, r, n, dtype)
         except KeyError as e:
             raise KeyError(f"layer {i}: checkpoint is missing {e}") from None
         layer_done()

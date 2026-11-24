@@ -4,22 +4,24 @@
     python -m trnrt engine --model DIR --core-base 0       # one engine and its OpenAI API, no router
     python -m trnrt compile {shapes,decisions,capture,compile,strip} ...   # the compile cache (trnrt/compile/farm.py)
 
-Every default is the served configuration of GLM-5.3-Flash on one trn2.48xlarge: two engines of 32 tensor-parallel ranks
-each (logical NeuronCores 0-31 and 32-63 at LNC 2), 1M-token context, FP8 KV cache, 256-token pages, decode batches of
-up to 12 per engine (16 seats, 12 running), 4,096-token prefill chunks, and 4 GiB per rank of host memory under the
-prefix cache (`--preset batch12` names it). `--preset batch8` is the other supported configuration: decode batches of up
-to 8 per engine (PRESETS below). The bucket ladders and the decode kernel routes are graph structure: a server finds its
-graphs in the compile cache only if `compile capture` ran with the same arguments (the same --preset included).
---max-running (fewer requests running than the compiled seats) is host only. An engine compiles nothing on the serving
-host: a graph missing from the cache ends its start-up with the likely cause (NEURON_LIBTORCH_ASSERT_CACHE_HIT=1;
---allow-compile compiles it there instead, minutes to hours a graph). Before it starts, an engine on Neuron checks its
-host (engine/start_checks.py): its devices free of other processes, and enough contiguous free host memory for the
-runtime.
+GLM-5.3-Flash on one trn2.48xlarge: two engines of 32 tensor-parallel ranks each (logical NeuronCores 0-31 and 32-63 at
+LNC 2), 1M-token context, FP8 KV cache, 256-token pages and 4,096-token prefill chunks, in one of three builds, chosen by
+the expected users per engine (PRESETS below): `--preset latency` (1-8 users, MTP speculative decoding), `--preset
+balanced` (9-16, decode batches of 8, 16 and 24; the default) or `--preset throughput` (17 and up), or `--preset auto
+--users N` to pick by N. The bucket ladders and the kernel routes are graph structure: a server finds its graphs in the
+compile cache only if `compile capture` ran with the same arguments (the same --preset and --users included).
+--max-running (fewer requests running than the compiled seats), the host cache's arguments and the scheduling flags
+(--schedule-policy, priorities, queue limits, --radix-eviction-policy) are host only. An engine
+compiles nothing on the serving host: a graph missing from the cache ends its start-up with the likely cause
+(NEURON_LIBTORCH_ASSERT_CACHE_HIT=1; --allow-compile compiles it there instead, minutes to hours a graph). Before it
+starts, an engine on Neuron checks its host (engine/start_checks.py): its devices free of other processes, enough
+contiguous free host memory for the runtime, and every rank able to run on its NeuronCore's NUMA node.
 """
 
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import signal
 import subprocess
@@ -28,6 +30,7 @@ import time
 
 from . import log
 
+logger = logging.getLogger(__name__)
 GiB = 2**30
 # libtorch-neuronx-lite raises on a graph missing from the compile cache instead of compiling it (neuronx-cc on the
 # serving host: minutes to hours per graph, while the engine is not serving).
@@ -51,37 +54,246 @@ def _at_least(lo: int):
     return parse
 
 
-# Named configurations: each sets the engine arguments below (argparse dests) as defaults, and an argument given
-# explicitly still wins. A preset's graphs are its own, so `compile capture -- --preset NAME ...` must run with the
-# preset the server runs with.
-# - batch12: the served configuration, the defaults below; the preset names them. Decode batches of up to 12 requests
-#   per engine: 16 seats (the state pool's rows), decode buckets 1, 2, 4, 6, 8 and 12, at most 12 requests running, and
-#   every decode step of up to 12 rows on the fused decode kernels: the KDA shell and the split KDA layer, the fused
-#   DSA layer and the FFN half.
-# - batch8: decode batches of up to 8 requests per engine. 8 seats (every graph that carries the linear-attention state
-#   is re-keyed against the defaults), decode buckets 1, 2, 4, 6 and 8, all 8 seats running (--max-running unset), and
-#   the fused decode kernels' row caps of steps of up to 8 rows: the model modules' own (hybrid.KDA_SHELL_MAXB,
-#   mla.LAYER_MK_MAXB, ...) and EngineConfig's.
+# The builds: three named configurations, one per band of expected users per engine, and `auto`, which picks one from
+# --users. Each sets the engine arguments below (argparse dests) as defaults, and an argument given explicitly still wins.
+# A build's graphs are its own, so `compile capture -- --preset NAME ...` must run with the preset the server runs with.
+# Every build: 1M-token context, 256-token pages, FP8 KV, 4,096-token prefill chunks (buckets 512 to 4096; prefill page
+# buckets 1024 and 4096 from 2,048 rows), the fused decode kernels up to 24 rows (the DSA layer and the FFN half), the dense
+# MLP's XLA graph at 2, 18 and 24 rows, the sequence-parallel all-gather as the NKI kernel over the experts' group, and the
+# DSA layer's two-stage selection in one kernel.
+# - latency (1-8 users per engine): MTP speculative decoding at every step. 16 seats of which 8 run, decode buckets 1, 2, 4,
+#   6 and 8, every one a verify (no plain decode graph at all: speculation never turns off below the running cap), page
+#   buckets 1024, 2048 and 4096, 8 state checkpoints, 4 GiB of host cache per rank.
+# - balanced (9-16 users per engine, and the default): no speculation. 32 seats of which 24 run, decode buckets 8, 16 and
+#   24, page buckets 1024, 3072 and 4096 (3072 is the DSA selection's row-class bucket), 24 state checkpoints, 16 GiB of
+#   host cache per rank kept once per context-parallel index (save-once, batched moves, ascending pages, 60% for state
+#   checkpoints).
+# - throughput (17+ users per engine): balanced's shapes with decode buckets 16 and 24 only and 5.25 GiB of KV per rank,
+#   and its own decode and prefill kernel forms (BUILD_FIELDS).
+_ALL_BUILDS = {
+    "dsa_layer_max_rows": 24,
+    "ffn_half_below": 25,
+    "dsa_index_rows": 8,
+    "dense_half_skip_rows": (2, 18, 24),
+    "sp_gather": "nki",
+    "sp_gather_tp_experts": True,
+    "dsa_sel2g": True,
+}
+_NO_SPEC = {
+    "spec_method": None,
+    "spec_max_batch": 0,
+    "spec_bucket_max": 0,
+    "plain_decode": True,
+    "plain_bucket_min": 0,
+    "spec_page_buckets": None,
+    "mtp_chunk_q": 0,
+    "mtp_fill_rows": None,
+    "mtp_kv_only": False,
+    "dyn_mtp_kv": False,
+    "state_spec_seats": None,
+}
+_HOST_SAVE_ONCE = {
+    "host_cache_gb": 16.0,
+    "host_cache_ckpt_frac": 0.6,
+    "host_cache_batch": True,
+    "host_cache_save_once": True,
+    "pool_ascending": True,
+}
 PRESETS: dict[str, dict] = {
-    "batch12": {
+    "latency": {
+        **_ALL_BUILDS,
         "max_num_seqs": 16,
-        "decode_buckets": (1, 2, 4, 6, 8, 12),
-        "max_running": 12,
-        "kda_shell_max_rows": 12,
-        "dsa_layer_max_rows": 16,
-        "ffn_half_below": 17,
-        "dsa_index_rows": 8,
-    },
-    "batch8": {
-        "max_num_seqs": 8,
+        "max_running": 8,
         "decode_buckets": (1, 2, 4, 6, 8),
-        "max_running": None,
-        "kda_shell_max_rows": 8,
-        "dsa_layer_max_rows": 8,
-        "ffn_half_below": 16,
-        "dsa_index_rows": 0,
+        "page_buckets": (1024, 2048, 4096),
+        "kv_cache_gb": 4.0,
+        "state_checkpoints": 8,
+        "state_seats": 8,
+        "kda_shell_max_rows": 24,
+        "spec_method": "mtp",
+        "spec_k": 2,
+        "spec_max_batch": 8,
+        "spec_hysteresis": 1,
+        "spec_bucket_max": 8,
+        "plain_decode": False,
+        "plain_bucket_min": 0,
+        "spec_page_buckets": (1024, 2048, 4096),
+        "mtp_chunk_q": 64,
+        "mtp_fill_rows": 1024,
+        "mtp_kv_only": True,
+        "dyn_mtp_kv": True,
+        "state_spec_seats": None,
+        "host_cache_gb": 4.0,
+        "host_cache_ckpt_frac": 0.5,
+        "host_cache_batch": False,
+        "host_cache_save_once": False,
+        "pool_ascending": False,
+    },
+    "balanced": {
+        **_ALL_BUILDS,
+        **_NO_SPEC,
+        **_HOST_SAVE_ONCE,
+        "max_num_seqs": 32,
+        "max_running": 24,
+        "decode_buckets": (8, 16, 24),
+        "page_buckets": (1024, 3072, 4096),
+        "kv_cache_gb": 4.0,
+        "state_checkpoints": 24,
+        "state_seats": 24,
+        "kda_shell_max_rows": 12,
     },
 }
+PRESETS["throughput"] = {**PRESETS["balanced"], "decode_buckets": (16, 24), "kv_cache_gb": 5.25}
+# The build with no --preset (and no --users): every argument default below is its value.
+DEFAULT_PRESET = "balanced"
+# auto: the build for the expected users per engine (--users N), by band: (build, fewest users, most users or None).
+# The bands are the user counts each build was measured and chosen at. With E engines behind the router (serve
+# --engines), N concurrent users are about ceil(N / E) per engine.
+BANDS: tuple[tuple[str, int, int | None], ...] = (("latency", 1, 8), ("balanced", 9, 16), ("throughput", 17, None))
+# The names of earlier releases, still accepted: each runs the build nearest its batch size, with a warning.
+DEPRECATED: dict[str, str] = {
+    "batch8": "latency",
+    "mtp-batch8": "latency",
+    "mtp-always": "latency",
+    "batch12": "balanced",
+    "mtp-batch12": "balanced",
+    "mtp-batch24": "throughput",
+}
+# EngineConfig fields a build sets that have no command-line argument: the kernel routes of the DSA and KDA layers, which
+# a build fixes and a user does not tune. engine_config applies them after the arguments. Each build's entry must name
+# every such field, so that no engine inherits a route from the EngineConfig default by accident.
+# - kda_shell: a KDA layer's decode attention as the KDA shell's kernel (and its verify form), in latency only: from 8
+#   rows a step the KDA decode kernel costs less than the shell's per-row recurrence;
+# - mhc_seam, shell_mix_row_split, state_ckpt_mid_export: the mHC seam kernel, the decode kernels' stream mix split over
+#   the LNC pair, and the in-chunk state checkpoint from the main delta-rule scan, in throughput only.
+# - the DSA layers: the selection's row classes (kernels/dsa_sel2gc.py; the runner's side is model_runner.rowclass_init)
+#   and the form-W row split that serves them, with the in-kernel candidate bias in throughput; the pipelined prefill
+#   slots and the big top-k row split, and dropping the unread o_proj copy, in balanced and throughput; the
+#   context-parallel failure trips (selection and attention) and the direct sequence-parallel gather in throughput.
+BUILD_FIELDS: dict[str, dict] = {
+    "latency": {
+        "kda_shell": True,
+        "mhc_seam": False,
+        "shell_mix_row_split": False,
+        "state_ckpt_mid_export": False,
+        "dsa_topk_rowsplit_big": False,
+        "dsa_cp_fail_trip": False,
+        "dsa_cp_fail_attn_trip": False,
+        "dsa_slots_pipe_rows": 0,
+        "sp_gather_direct": False,
+        "dsa_drop_unread_o_dec": False,
+        "dsa_row_classes": "",
+        "dsa_row_classes_cw": False,
+        "dsa_rowsplit_layout": "",
+    },
+    "balanced": {
+        "kda_shell": False,
+        "mhc_seam": False,
+        "shell_mix_row_split": False,
+        "state_ckpt_mid_export": False,
+        "dsa_topk_rowsplit_big": True,
+        "dsa_cp_fail_trip": False,
+        "dsa_cp_fail_attn_trip": False,
+        "dsa_slots_pipe_rows": 64,
+        "sp_gather_direct": False,
+        "dsa_drop_unread_o_dec": True,
+        "dsa_row_classes": "24:6x24+6x8+12x4,16:4x24+12x8",
+        "dsa_row_classes_cw": False,
+        "dsa_rowsplit_layout": "16:2x24+2x8,24:2x24+4x8",
+    },
+    "throughput": {
+        "kda_shell": False,
+        "mhc_seam": True,
+        "shell_mix_row_split": True,
+        "state_ckpt_mid_export": True,
+        "dsa_topk_rowsplit_big": True,
+        "dsa_cp_fail_trip": True,
+        "dsa_cp_fail_attn_trip": True,
+        "dsa_slots_pipe_rows": 64,
+        "sp_gather_direct": True,
+        "dsa_drop_unread_o_dec": True,
+        "dsa_row_classes": "24:2x24+2x16+4x12+16x6",
+        "dsa_row_classes_cw": True,
+        "dsa_rowsplit_layout": "24:2x24+4x6",
+    },
+}
+
+
+# The DSA row classes and form W are the device selection kernel's layout: the runner orders a batch into the classes'
+# slots on a NeuronCore only (model_runner.rowclass_init), so a CPU engine runs the unclassed selection whatever its shapes.
+CPU_OFF_FIELDS = {"dsa_row_classes": "", "dsa_row_classes_cw": False, "dsa_rowsplit_layout": ""}
+
+
+def build_fields(build: str, device: str = "neuron") -> dict:
+    """BUILD_FIELDS[build], every name an EngineConfig field (a misspelt one would silently keep its default); on a CPU
+    engine without the device-only row-class layouts (CPU_OFF_FIELDS)."""
+    import dataclasses
+
+    from .config import EngineConfig
+
+    known = {f.name for f in dataclasses.fields(EngineConfig)}
+    unknown = sorted(set(BUILD_FIELDS[build]) - known)
+    if unknown:
+        raise ValueError(f"build {build!r} sets fields EngineConfig does not have: {unknown}")
+    fields = dict(BUILD_FIELDS[build])
+    if device == "cpu":
+        fields.update(CPU_OFF_FIELDS)
+    return fields
+
+
+# The environment a build needs before anything imports trnrt.kernels. TRNRT_DMA_HW (the static DMA helpers of
+# kernels/shell.py, kda_half.py and mix_wide.py in hardware DGE) is read at kernel import instead of being set from the
+# configuration like the decode routes: dsa_shell and mhc_pre_split bind dma_static by name at import, and every kernel
+# that folds shell.REV folds it at import. Every build runs with it.
+PRESET_ENV: dict[str, dict[str, str]] = {name: {"TRNRT_DMA_HW": "1"} for name in PRESETS}
+_warned: set[str] = set()
+
+
+def band_preset(users: int) -> str:
+    """The build for `users` expected users per engine (BANDS)."""
+    if users < 1:
+        raise ValueError(f"users must be at least 1, not {users}")
+    for name, lo, hi in BANDS:
+        if lo <= users and (hi is None or users <= hi):
+            return name
+    raise ValueError(f"no build's band holds {users} users")  # unreachable: the bands cover 1 and up
+
+
+def resolve_preset(preset: str | None, users: int | None) -> str:
+    """The build a --preset value (None: absent) and --users run: auto (and --users alone) picks by band, an earlier
+    release's name maps to the nearest build (with a warning, once per process), no preset is DEFAULT_PRESET."""
+    if preset is None:
+        return band_preset(users) if users is not None else DEFAULT_PRESET
+    if preset == "auto":
+        if users is None:
+            raise SystemExit("--preset auto needs --users N: the expected concurrent users per engine")
+        return band_preset(users)
+    if users is not None:
+        raise SystemExit(f"--users picks the build for --preset auto; it does not go with --preset {preset}")
+    if preset in DEPRECATED:
+        new = DEPRECATED[preset]
+        if preset not in _warned:
+            _warned.add(preset)
+            logger.warning("--preset %s is deprecated: it runs the %s build (--preset %s)", preset, new, new)
+        return new
+    return preset
+
+
+def apply_preset_env(argv: list[str]) -> dict[str, str]:
+    """Put the environment that the engine arguments `argv`'s --preset needs (PRESET_ENV) into this process before it
+    imports trnrt.kernels, so that it and the ranks it spawns, which inherit it, import the kernels in that form. A
+    value already in the environment wins, as an argument given explicitly wins over a preset's. Refuses when this
+    process has imported trnrt.kernels without a value it would set: those modules are bound in the other form.
+    Returns the values it set."""
+    want = PRESET_ENV.get(parse_engine_args(argv).preset or "", {})
+    new = {k: v for k, v in want.items() if k not in os.environ}
+    if new and any(m == "trnrt.kernels" or m.startswith("trnrt.kernels.") for m in sys.modules):
+        raise RuntimeError(
+            f"{', '.join(new)} must be set before trnrt.kernels is imported, and this process has already imported "
+            "it: set it in the environment that starts the process"
+        )
+    os.environ.update(new)
+    return new
 
 
 def add_engine_args(ap: argparse.ArgumentParser) -> None:
@@ -90,9 +302,17 @@ def add_engine_args(ap: argparse.ArgumentParser) -> None:
     g.add_argument(
         "--preset",
         default=None,
-        choices=sorted(PRESETS),
-        help="a named configuration (docs/CONFIGURATION.md): its values become the defaults of the "
-        "arguments it sets; an argument given explicitly still wins",
+        choices=[*sorted(PRESETS), "auto", *sorted(DEPRECATED)],
+        help="the build (docs/CONFIGURATION.md): latency, balanced (the default) or throughput, or auto to pick one "
+        "from --users. Its values become the defaults of the arguments it sets; an argument given explicitly still "
+        "wins. The names of earlier releases run the nearest build",
+    )
+    g.add_argument(
+        "--users",
+        type=_at_least(1),
+        default=None,
+        help="the expected concurrent users per engine, for --preset auto (implied by --users): 1-8 latency, 9-16 "
+        "balanced, 17 and up throughput",
     )
     g.add_argument("--model", required=True, help="the checkpoint directory (or a Hugging Face repo id)")
     g.add_argument(
@@ -109,27 +329,56 @@ def add_engine_args(ap: argparse.ArgumentParser) -> None:
     g.add_argument(
         "--max-num-seqs",
         type=int,
-        default=16,
-        help="request seats per engine: the state pool's rows, a graph shape (--max-running caps how many run at once)",
+        default=32,
+        help="request seats per engine: a graph shape (the token board's slots; --state-seats sizes the state pool, "
+        "--max-running caps how many run at once)",
     )
     g.add_argument(
         "--max-running",
         type=_at_least(1),
-        default=12,
+        default=24,
         help="at most this many requests running at once per engine, the rest waiting in arrival order "
-        "(default 12; --preset batch8: --max-num-seqs). Host only: no graph changes",
+        "(default 24; --preset latency: 8). Host only: no graph changes",
     )
     g.add_argument("--max-prefill-tokens", type=int, default=4096, help="prefill tokens per step (the chunk size)")
-    g.add_argument("--decode-buckets", type=_ints, default=(1, 2, 4, 6, 8, 12))
+    g.add_argument("--decode-buckets", type=_ints, default=(8, 16, 24))
     g.add_argument("--prefill-buckets", type=_ints, default=(512, 1024, 2048, 4096))
-    g.add_argument("--page-buckets", type=_ints, default=(512, 1024, 4096))
+    g.add_argument("--page-buckets", type=_ints, default=(1024, 3072, 4096))
     g.add_argument("--prefill-page-buckets", type=_ints, default=(1024, 4096))
     g.add_argument("--prefill-page-min-rows", type=int, default=2048)
     g.add_argument("--kv-cache-gb", type=float, default=4.0, help="KV pool per rank, GiB")
     g.add_argument("--kv-cache-dtype", default="fp8", choices=["auto", "fp8"])
-    g.add_argument("--state-checkpoints", type=int, default=16, help="state-pool rows kept for prefix checkpoints")
-    g.add_argument(
-        "--host-cache-gb", type=float, default=4.0, help="host memory under the prefix cache per rank, GiB (0: off)"
+    g.add_argument("--state-checkpoints", type=int, default=24, help="state-pool rows kept for prefix checkpoints")
+    hc = ap.add_argument_group(
+        "host cache", "host memory under the prefix cache (docs/CONFIGURATION.md). Host only: no graph changes"
+    )
+    hc.add_argument(
+        "--host-cache-gb", type=float, default=16.0, help="host memory under the prefix cache per rank, GiB (0: off)"
+    )
+    hc.add_argument(
+        "--host-cache-ckpt-frac",
+        type=float,
+        default=0.6,
+        help="the share of --host-cache-gb for linear-attention state checkpoints, the rest for KV pages",
+    )
+    hc.add_argument(
+        "--host-cache-batch",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="a restore's and an eviction's pages in one call each, every cache copied once per run of pages",
+    )
+    hc.add_argument(
+        "--host-cache-save-once",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="one shared host copy of a page per context-parallel index instead of one per rank (needs "
+        "--host-cache-batch): the same memory holds as many times the pages as there are row groups",
+    )
+    hc.add_argument(
+        "--pool-ascending",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="hand out the lowest free KV pages in ascending order, so the host cache's batched copies stay few",
     )
     g.add_argument(
         "--moe-kernel",
@@ -139,11 +388,97 @@ def add_engine_args(ap: argparse.ArgumentParser) -> None:
         "Neuron, xla on --device cpu, where NKI kernels do not run)",
     )
     g.add_argument("--num-layers", type=int, default=None, help="debugging: the first n layers only")
+    sp = ap.add_argument_group(
+        "speculative decoding",
+        "the model's MTP layer drafts --spec-k tokens a step and the target verifies them in the next step "
+        "(docs/AGENTX.md). Graph structure: a change needs a new capture. Supported: the latency build's values",
+    )
+    sp.add_argument("--spec-method", default=None, choices=["mtp"], help="speculative decoding with the MTP layer")
+    sp.add_argument("--spec-k", type=_at_least(1), default=2, help="drafts per step")
+    sp.add_argument(
+        "--spec-synth-al",
+        type=float,
+        default=None,
+        help="benchmark mode: draw each verify's accepted drafts from a schedule with this mean acceptance length "
+        "(1 + the accepted drafts a step, in [1, spec-k + 1]) instead of the draft head's own; for comparing serving "
+        "throughput at a published acceptance length, not for quality. Default: the TRNRT_SPEC_SYNTH_AL "
+        "environment variable, else off",
+    )
+    sp.add_argument(
+        "--spec-max-batch",
+        type=_at_least(0),
+        default=0,
+        help="speculate while at most this many requests decode, plain decode steps above it (0: always speculate)",
+    )
+    sp.add_argument(
+        "--spec-hysteresis",
+        type=_at_least(0),
+        default=1,
+        help="once plain, speculate again only when at most spec-max-batch minus this many requests decode",
+    )
+    sp.add_argument(
+        "--spec-bucket-max",
+        type=_at_least(0),
+        default=0,
+        help="with --spec-max-batch: the verify family's graphs only at decode buckets up to this (0: all)",
+    )
+    sp.add_argument(
+        "--plain-bucket-min",
+        type=_at_least(0),
+        default=0,
+        help="with --spec-max-batch: the plain decode graphs only at decode buckets from this (0: all)",
+    )
+    sp.add_argument(
+        "--plain-decode",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="--no-plain-decode: no plain decode graph at all, for a build whose --spec-max-batch covers its largest "
+        "decode bucket and its running cap (speculation never turns off)",
+    )
+    sp.add_argument(
+        "--spec-page-buckets",
+        type=_ints,
+        default=None,
+        help="the page buckets of every graph the MTP layer or a verify runs in (default: --page-buckets)",
+    )
+    sp.add_argument(
+        "--mtp-fill-rows",
+        type=_at_least(1),
+        default=None,
+        help="the MTP pass over a prefill chunk in calls of this many rows",
+    )
+    sp.add_argument(
+        "--mtp-chunk-q", type=_at_least(0), default=0, help="the MTP pass takes the prefill form from this many rows"
+    )
+    sp.add_argument(
+        "--mtp-kv-only",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="MTP windows of a prefill chunk that hold no last position write only the draft layer's KV",
+    )
+    sp.add_argument(
+        "--dyn-mtp-kv",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="plain decode steps write the draft layer's KV for their rows",
+    )
+    sp.add_argument(
+        "--state-seats",
+        type=_at_least(1),
+        default=24,
+        help="seats of the recurrent-state pool, apart from --max-num-seqs (a graph shape: every graph that carries "
+        "the linear-attention state)",
+    )
+    sp.add_argument(
+        "--state-spec-seats",
+        type=_at_least(1),
+        default=None,
+        help="of the state seats, how many hold the rows a verify writes (1 + spec-k); the rest hold one",
+    )
     k = ap.add_argument_group(
         "decode kernel routes",
         "the row counts at which a decode step takes each fused kernel. "
-        "Graph structure: a change needs a new capture. Supported: the defaults (the served "
-        "configuration) and --preset batch8's values",
+        "Graph structure: a change needs a new capture. Supported: the builds' values",
     )
     k.add_argument(
         "--kda-shell-max-rows",
@@ -154,13 +489,13 @@ def add_engine_args(ap: argparse.ArgumentParser) -> None:
     k.add_argument(
         "--dsa-layer-max-rows",
         type=_at_least(1),
-        default=16,
+        default=24,
         help="DSA layers' decode attention and FFN as the fused layer's one call up to this many rows",
     )
     k.add_argument(
         "--ffn-half-below",
         type=_at_least(1),
-        default=17,
+        default=25,
         help="decode FFN blocks as the FFN half's one call below this many rows",
     )
     k.add_argument(
@@ -169,19 +504,182 @@ def add_engine_args(ap: argparse.ArgumentParser) -> None:
         default=8,
         help="the context-parallel DSA indexer's decode scores in kernel calls of at most this many rows (0: one call)",
     )
+    k.add_argument(
+        "--sp-gather",
+        default="nki",
+        choices=["xla", "nki"],
+        help="the sequence-parallel stream's all-gather of a decode block's output: the XLA collective or the NKI kernel",
+    )
+    k.add_argument(
+        "--sp-gather-tp-experts",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="the NKI all-gather over the tensor-parallel group the experts run in",
+    )
+    k.add_argument(
+        "--dsa-sel2g",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="the DSA layer's two-stage selection in one kernel (needed by a page ladder with a 3072-page rung)",
+    )
+    k.add_argument(
+        "--dense-half-skip-rows",
+        type=_ints,
+        default=(2, 18, 24),
+        help="the decode row counts at which a dense MLP layer runs as the XLA graph instead of the dense half's kernel",
+    )
+    add_scheduling_args(ap)
+    add_host_sampling_args(ap)
+
+
+def _json_object(s: str) -> dict:
+    import json
+
+    try:
+        v = json.loads(s)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(f"not JSON: {e}") from None
+    if not isinstance(v, dict):
+        raise argparse.ArgumentTypeError("must be a JSON object")
+    return v
+
+
+def add_scheduling_args(ap: argparse.ArgumentParser) -> None:
+    """Each engine's scheduling (engine/scheduler.py,
+    engine/radix_cache.py). Host only: none of them changes a graph, and the defaults schedule as an engine without
+    them."""
+    g = ap.add_argument_group(
+        "scheduling", "host only, per engine (no graph changes); the defaults are first come, first served and LRU"
+    )
+    g.add_argument(
+        "--schedule-policy",
+        default="fcfs",
+        choices=["fcfs", "lpm", "lof", "spf", "priority"],
+        help="the order waiting requests are admitted in: fcfs arrival, lpm longest cached prefix, lof longest "
+        "max_tokens, spf shortest prompt; priority is fcfs with --enable-priority-scheduling",
+    )
+    g.add_argument(
+        "--enable-priority-scheduling",
+        action="store_true",
+        help="admit by each request's `priority` first (higher values first), preempt the worst priority first",
+    )
+    g.add_argument(
+        "--schedule-low-priority-values-first",
+        action="store_true",
+        help="with priority scheduling: lower priority values first",
+    )
+    g.add_argument(
+        "--priority-scheduling-preemption-threshold",
+        type=_at_least(0),
+        default=10,
+        help="with priority scheduling: a waiting request takes a running one's seat when its priority is better by "
+        "more than this",
+    )
+    g.add_argument(
+        "--disable-priority-preemption",
+        action="store_true",
+        help="with priority scheduling: never preempt a running request for a waiting one of higher priority",
+    )
+    g.add_argument(
+        "--max-queued-requests",
+        type=_at_least(1),
+        default=None,
+        help="waiting requests per engine at most; past it a request is answered 503 (default: no limit)",
+    )
+    g.add_argument(
+        "--max-queued-tokens",
+        type=_at_least(1),
+        default=None,
+        help="prompt tokens waiting per engine at most; past it a request is answered 503 (default: no limit)",
+    )
+    g.add_argument(
+        "--radix-eviction-policy",
+        default="lru",
+        choices=["lru", "lfu", "slru", "priority", "tlru"],
+        help="which cached prefix the prefix cache evicts first",
+    )
+    g.add_argument(
+        "--radix-eviction-policy-config",
+        type=_json_object,
+        default=None,
+        help='the eviction policy\'s settings as JSON: slru {"protected_threshold": 2}; tlru {"threshold": N, '
+        '"next_prompt_estimate": M} (both required)',
+    )
+
+
+def scheduling(argv: list[str]):
+    """The engine's host-only scheduling settings (engine/scheduler.Scheduling) from the serve or engine arguments
+    `argv`. ValueError for a combination the scheduler or the prefix cache refuses."""
+    from .engine.radix_cache import policy_params
+    from .engine.scheduler import SchedulerConfig, Scheduling
+
+    a = parse_engine_args(argv)
+    s = Scheduling(
+        policy=a.schedule_policy,
+        priority_scheduling=a.enable_priority_scheduling,
+        low_priority_first=a.schedule_low_priority_values_first,
+        priority_preemption=not a.disable_priority_preemption,
+        priority_preemption_threshold=a.priority_scheduling_preemption_threshold,
+        max_queued_requests=a.max_queued_requests,
+        max_queued_tokens=a.max_queued_tokens,
+        eviction_policy=a.radix_eviction_policy,
+        eviction_config=a.radix_eviction_policy_config,
+    )
+    # the checks the engine would make at start-up, made here so that serve refuses before it starts any engine
+    SchedulerConfig(page_size=1, max_num_seqs=1, max_prefill_tokens=1, max_model_len=2, **s.scheduler_fields())
+    policy_params(s.eviction_policy, s.eviction_config)
+    return s
+
+
+def add_host_sampling_args(ap: argparse.ArgumentParser) -> None:
+    """The graph variants with host inputs (engine/host_inputs.py), off by default: each adds graphs to warmup and to the
+    capture, and with both off every graph is the one an engine without them compiles."""
+    h = ap.add_argument_group(
+        "host-input sampling",
+        "graph variants that take inputs from the host (docs/API.md#structured-outputs-penalties-and-thinking-budgets). "
+        "Graph structure: they add graphs, so a capture must run with the same flags. Not with speculation at every "
+        "batch size (--spec-method without --spec-max-batch) or without plain decode graphs (--preset latency, "
+        "--no-plain-decode)",
+    )
+    h.add_argument(
+        "--structured-outputs",
+        action="store_true",
+        help="serve guided decoding (response_format, guided_*, json_schema / regex / ebnf; needs the xgrammar "
+        "package), thinking_token_budget and min_tokens: decode and prefill graphs that take a token mask",
+    )
+    h.add_argument(
+        "--penalties",
+        action="store_true",
+        help="serve repetition, frequency and presence penalties: decode and prefill graphs that take penalty inputs",
+    )
+    h.add_argument(
+        "--penalty-buckets",
+        type=_ints,
+        default=(1024, 16384),
+        help="with --penalties: the distinct-token counts a row's penalty inputs are compiled at (the vocabulary size "
+        "is always added as the last)",
+    )
+
+
+def _env_synth_al() -> float | None:
+    """TRNRT_SPEC_SYNTH_AL: the benchmark mode's mean acceptance length, when --spec-synth-al is not given."""
+    v = os.environ.get("TRNRT_SPEC_SYNTH_AL")
+    return float(v) if v else None
 
 
 def parse_engine_args(argv: list[str]) -> argparse.Namespace:
-    """The engine arguments of `argv` (serve's, engine's, or capture's after its `--`), its --preset applied: the
-    preset's values are the defaults, arguments given explicitly win."""
+    """The engine arguments of `argv` (serve's, engine's, or capture's after its `--`), its build applied: the build's
+    values are the defaults, arguments given explicitly win. a.preset is the build that runs (resolve_preset: auto and
+    --users pick by band, an earlier release's name maps to the nearest build, no preset is DEFAULT_PRESET)."""
     # No abbreviations: the server's own arguments pass through here unparsed, and one that is a prefix of an engine
     # argument would be read as it (serve's `--host 127.0.0.1` for each engine as --host-cache-gb).
     ap = argparse.ArgumentParser(prog="trnrt", allow_abbrev=False)
     add_engine_args(ap)
     a, _ = ap.parse_known_args(argv)  # the server's own arguments (--port, --engines, ...) are not the engine's
-    if a.preset is not None:
-        ap.set_defaults(**PRESETS[a.preset])
-        a, _ = ap.parse_known_args(argv)
+    build = resolve_preset(a.preset, a.users)
+    ap.set_defaults(**PRESETS[build])
+    a, _ = ap.parse_known_args(argv)
+    a.preset = build
     return a
 
 
@@ -219,6 +717,33 @@ def engine_config(argv: list[str], core_base: int = 0):
         dsa_layer_max_rows=a.dsa_layer_max_rows,
         ffn_half_below=a.ffn_half_below,
         dsa_index_rows=a.dsa_index_rows,
+        dense_half_skip_rows=tuple(a.dense_half_skip_rows),
+        sp_gather=a.sp_gather,
+        sp_gather_tp_experts=a.sp_gather_tp_experts,
+        dsa_sel2g=a.dsa_sel2g,
+        spec_method=a.spec_method,
+        spec_k=a.spec_k,
+        spec_synth_al=a.spec_synth_al if a.spec_synth_al is not None else _env_synth_al(),
+        spec_max_batch=a.spec_max_batch,
+        spec_hysteresis=a.spec_hysteresis,
+        spec_bucket_max=a.spec_bucket_max,
+        plain_bucket_min=a.plain_bucket_min,
+        spec_page_buckets=a.spec_page_buckets,
+        mtp_fill_rows=a.mtp_fill_rows,
+        mtp_chunk_q=a.mtp_chunk_q,
+        mtp_kv_only=a.mtp_kv_only,
+        dyn_mtp_kv=a.dyn_mtp_kv,
+        state_seats=a.state_seats,
+        state_spec_seats=a.state_spec_seats,
+        plain_decode=a.plain_decode,
+        host_cache_ckpt_frac=a.host_cache_ckpt_frac,
+        host_cache_batch=a.host_cache_batch,
+        host_cache_save_once=a.host_cache_save_once,
+        pool_ascending=a.pool_ascending,
+        structured_outputs=a.structured_outputs,
+        penalties=a.penalties,
+        penalty_buckets=tuple(a.penalty_buckets),
+        **build_fields(a.preset, a.device),
     )
 
 
@@ -228,6 +753,16 @@ def add_compile_arg(ap: argparse.ArgumentParser) -> None:
         action="store_true",
         help="compile a graph missing from the compile cache here (neuronx-cc: minutes to hours per graph) "
         "instead of failing start-up",
+    )
+
+
+def add_generation_config_arg(ap: argparse.ArgumentParser) -> None:
+    ap.add_argument(
+        "--generation-config",
+        choices=("auto", "none"),
+        default="auto",
+        help="where the sampling defaults come from: auto, the checkpoint's generation_config.json (the default); none, "
+        "the server's built-in defaults (temperature 1.0, top_p 1.0), whatever the checkpoint holds",
     )
 
 
@@ -274,9 +809,17 @@ def cmd_engine(argv: list[str]) -> int:
     ap.add_argument("--host", default="0.0.0.0")  # noqa: S104  an API server: reachable by design
     ap.add_argument("--port", type=int, default=8001)
     ap.add_argument("--served-model-name", default="glm")
+    add_generation_config_arg(ap)
     add_compile_arg(ap)
     a = ap.parse_args(argv)
+    # before anything imports trnrt.kernels (EngineConfig checks the DSA layouts with the kernels' parsers); the ranks the
+    # engine spawns inherit it
+    apply_preset_env(argv)
     cfg = engine_config(argv, a.core_base)
+    try:
+        sched = scheduling(argv)
+    except ValueError as e:
+        ap.error(str(e))
     from .engine import start_checks
 
     why = start_checks.refusal(cfg.device, a.core_base, cfg.tp)  # its devices free, enough contiguous host memory
@@ -289,7 +832,7 @@ def cmd_engine(argv: list[str]) -> int:
 
     t = time.perf_counter()
     try:
-        eng = LLMEngine(cfg)
+        eng = LLMEngine(cfg, sched)
         print(
             f"engine up in {time.perf_counter() - t:.1f} s (cores {a.core_base}-{a.core_base + cfg.tp - 1})", flush=True
         )
@@ -303,7 +846,15 @@ def cmd_engine(argv: list[str]) -> int:
     print(f"bucket warmup {w['seconds']:.1f} s over {w['graphs']} graphs", flush=True)
     # The router keeps its connections to the engines alive and drops idle ones after 30 s: uvicorn closing them first
     # (its default keep-alive is 5 s) raced a request onto a closing connection.
-    serve(build_app(eng, a.served_model_name), host=a.host, port=a.port, log_level="warning", timeout_keep_alive=600)
+    # name: the engine's own directory in the production log (TRNRT_PROD_DIR), by its port, stable across restarts
+    app = build_app(
+        eng,
+        a.served_model_name,
+        preset=parse_engine_args(argv).preset,
+        name=f"engine-{a.port}",
+        generation_config=a.generation_config,
+    )
+    serve(app, host=a.host, port=a.port, log_level="warning", timeout_keep_alive=600)
     return 0
 
 
@@ -378,6 +929,7 @@ def cmd_serve(argv: list[str]) -> int:
     ap.add_argument("--host", default="0.0.0.0")  # noqa: S104  an API server: reachable by design
     ap.add_argument("--port", type=int, default=8000, help="the router's port; engine i listens on port + 1 + i")
     ap.add_argument("--served-model-name", default="glm")
+    add_generation_config_arg(ap)  # goes on to the engines, which apply it
     ap.add_argument(
         "--timeout-keep-alive",
         type=int,
@@ -395,6 +947,10 @@ def cmd_serve(argv: list[str]) -> int:
     )
     add_compile_arg(ap)
     a = ap.parse_args(argv)
+    try:
+        scheduling(argv)  # refused here, before any engine starts, rather than by every engine
+    except ValueError as e:
+        ap.error(str(e))
     # The engines start one at a time, each healthy (its weights loaded, every graph warmed) before the next starts. The
     # host-wide start lock stays on too (engine/start_lock.py: each graph's first call holds it): two engines whose
     # ranks load collective graphs at the same moment collide in the runtime's collectives bootstrap.
@@ -450,6 +1006,9 @@ def cmd_serve(argv: list[str]) -> int:
 
 
 def cmd_compile(argv: list[str]) -> int:
+    if "--" in argv and "capture" in argv[: argv.index("--")]:
+        # capture's engine arguments: their preset's environment, before its spawned ranks import the kernels
+        apply_preset_env(argv[argv.index("--") + 1 :])
     from .compile import farm
 
     return farm.main(argv, engine_config=engine_config)

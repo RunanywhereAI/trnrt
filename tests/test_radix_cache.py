@@ -130,7 +130,7 @@ def _all_refs_zero(rc):
 
 
 def test_session_referenced_prefix_is_evicted_last_and_released_on_close():
-    """SGLang #29173 semantics: unreferenced first (whatever its recency), referenced KV still
+    """Eviction takes unreferenced first (whatever its recency), referenced KV still
     evictable when nothing else is, and close drops references without freeing."""
     pool, rc = make()
     a, b = list(range(100, 108)), list(range(200, 208))  # two 2-page prefixes
