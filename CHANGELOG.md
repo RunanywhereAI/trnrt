@@ -53,7 +53,8 @@ builds with `tools/graph_equiv.py` on CPU; the device check of this release's ow
   `tlru`). The defaults schedule as before ([docs/CONFIGURATION.md](docs/CONFIGURATION.md#scheduling)).
 - `GET /v1/stats` adds the engine's live state and request rates, TTFT, decode-speed and end-to-end percentiles over
   recent windows, and `GET /dashboard` draws them; the router serves both for each engine
-  ([docs/API.md](docs/API.md#statistics-and-the-dashboard)). The fields the router reads are unchanged.
+  ([docs/API.md](docs/API.md#statistics-and-the-dashboard)). The fields the router reads are unchanged. A choice
+  that a `stop_regex` match ends counts as a stop there, in the production log and in `/metrics`, not as an abort.
 - `TRNRT_PROD_DIR`: an opt-in on-disk log of request records (counts and times only) and gauges.
 - `TRNRT_PROMPT_CACHE_MB`: an opt-in prompt token cache that builds a chat turn's prompt ids from the previous turn's,
   with the same ids as a full encode or none.

@@ -297,10 +297,12 @@ class EngineLoop:
         self._put("add", sub)
         return sub
 
-    def abort(self, rid: str, out: asyncio.Queue | _Tagged | None = None) -> None:
+    def abort(self, rid: str, out: asyncio.Queue | _Tagged | None = None, finish: str | None = None) -> None:
         """Abort the request `rid`; with `out`, only while that submission still owns the rid (a refused submission
-        with a rid already in use must not end the request that holds it)."""
-        self.inbox.put(("abort", (rid, out)))
+        with a rid already in use must not end the request that holds it). `finish`: the request ended here rather than
+        in the engine (a stop_regex match, "stop"), so /metrics, /v1/stats and the production log record it as that
+        finish, not as an abort."""
+        self.inbox.put(("abort", (rid, out, finish)))
 
     def abort_all(self) -> None:
         """Abort every request the engine holds, and those queued for it before this call."""
@@ -360,12 +362,14 @@ class EngineLoop:
             if kind == "add":
                 self._add(payload)
             elif kind == "abort":
-                rid, out = payload
+                rid, out, finish = payload
                 st = self.streams.get(rid)
                 if st is not None and (out is None or st.out is out):
                     del self.streams[rid]
                     self._abort(st)
-                    self._finished(st, "abort")
+                    if finish is not None and st.metrics:  # ended by the host: counted as it finished, at this moment
+                        self.metrics.on_finish(st.req, finish, time.monotonic())
+                    self._finished(st, finish or "abort")
             elif kind == "abort_all":
                 streams, self.streams = self.streams, {}
                 for st in streams.values():
@@ -1759,8 +1763,8 @@ class Run:
                 drop = finish == "stop" and not self.rules.keep and bool(ids) and ids[-1] in self.stop_ids[i]
                 text = d.push(ids, finish is not None, drop_last=drop)
                 if d.matched is not None:
-                    if finish is None:  # a stop_regex match: the engine knows nothing of it
-                        self.loop_.abort(self.subs[i].rid)
+                    if finish is None:  # a stop_regex match: the engine knows nothing of it, so it ends there as a stop
+                        self.loop_.abort(self.subs[i].rid, finish="stop")
                     finish = "stop"
                 self.text[i] += text
                 if finish is not None:

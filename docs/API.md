@@ -87,7 +87,9 @@ is first come, first served, with no queue limit.
 | `GET /dashboard` | each engine, and the router | one self-contained page (no CDN) that draws `/v1/stats` every 2 s. The router's shows one engine at a time, with a link to each (`?engine=i`) |
 
 The times are measured inside the engine, from when it receives a request (after the chat template and tokenization)
-to its last token, so they exclude the client's network round trip. A record holds counts and times, never a prompt or
+to its last token, so they exclude the client's network round trip. A choice that a `stop_regex` match ends is
+recorded as a stop, here, in the production log and in `/metrics`, though the server ends it by aborting the engine
+request; its last token is when the abort reaches the engine. A record holds counts and times, never a prompt or
 an output. Like the rest of the router, these endpoints have no authentication.
 
 ## Sampling extras

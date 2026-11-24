@@ -233,6 +233,35 @@ def test_stop_regex_ends_the_output_after_its_match_and_aborts_the_request(app, 
     assert eng.aborted == [eng.added[-1].rid]
 
 
+def test_a_stop_regex_match_is_recorded_as_a_stop(app, monkeypatch, tmp_path):
+    """The server ends a stop_regex match by aborting the engine request, but the request finished as a stop: /v1/stats
+    counts it ok (so it is in the RPM and the latency percentiles), the production log records "stop", and /metrics
+    counts its finish reason and its latencies. An abort the client asks for is still an abort."""
+    from trnrt.serve import api
+    from trnrt.serve import prodlog as PL
+
+    monkeypatch.setenv(PL.ENV, str(tmp_path))
+    client, eng = app(PLAIN * 10, setup=lambda e: setattr(e, "step_delay", 0.01))
+    r = client.post("/v1/completions", json={"prompt": [1], "max_tokens": 40, "stop_regex": r"re\s?ag"})
+    assert r.json()["choices"][0]["finish_reason"] == "stop"
+    (lp,) = [lp for lp in api._LOOPS if lp.engine is eng]
+    deadline = time.monotonic() + 5
+    while not (eng.aborted and lp.prodlog.written["requests"]) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert eng.aborted == [eng.added[-1].rid]  # the engine request was aborted, as before
+    assert lp.stats.counts == {"ok": 1, "aborted": 0, "failed": 0}
+    (rec,) = lp.stats.records
+    assert rec["finish"] == "stop" and rec["e2e"] is not None and rec["output"] >= 3
+    w = client.get("/v1/stats").json()["windows"]["1m"]
+    assert w["ok"] == 1 and w["e2e"]["n"] == 1 and w["ttft"]["n"] == 1
+    m = client.get("/metrics").text
+    assert 'trnrt:request_success_total{finished_reason="stop"} 1' in m and 'finished_reason="abort"' not in m
+    assert "trnrt:e2e_request_latency_seconds_count 1" in m and "trnrt:time_per_output_token_seconds_count 1" in m
+    lp.stop()
+    (path,) = tmp_path.rglob("requests.jsonl")
+    assert [x["finish"] for x in PL.read_jsonl(str(path))] == ["stop"]
+
+
 def test_stop_regex_unbounded_and_anchored(app):
     """A pattern with an unbounded repeat is searched back over the text (STOP_REGEX_SPAN characters before the new
     text); an anchor keeps its meaning (the search starts at a position, never at a slice)."""
