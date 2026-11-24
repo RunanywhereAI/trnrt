@@ -32,6 +32,7 @@ import base64
 import binascii
 import glob
 import hashlib
+import importlib
 import json
 import os
 import re
@@ -50,11 +51,12 @@ _ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 def hlo_pb2(extra_path=None):
     if extra_path:
         sys.path.insert(0, extra_path)
+    # importlib rather than two `import ... as m`: with the Neuron packages installed, mypy sees both and reports a
+    # redefinition; without them (CI), it sees neither
     try:
-        from libtorch_neuronx_lite.pyhlo import hlo_pb2 as m
+        return importlib.import_module("libtorch_neuronx_lite.pyhlo.hlo_pb2")
     except ImportError:
-        import hlo_pb2 as m  # a plain directory holding hlo_pb2.py / xla_data_pb2.py
-    return m
+        return importlib.import_module("hlo_pb2")  # a plain directory holding hlo_pb2.py / xla_data_pb2.py
 
 
 class Names:
