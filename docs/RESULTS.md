@@ -215,11 +215,12 @@ Capacity Blocks, from AWS's public price list read on 24 Nov 2026: trn2.48xlarge
 instance-hour), p5.48xlarge $5.970 and p5e.48xlarge $6.866 per GPU-hour. trn2.48xlarge has no on-demand price in any US
 region. trn2 ran on Neuron SDK 2.32 (neuronx-cc 2.27), the SDK `docker/Dockerfile` pins.
 
-- **AgentX:** at 1-8 users trn2 delivers 1.61-1.75× H200's total tokens per $, 1.34× at 12, 1.07× at 16, 0.86× at 24
-  and 0.81× at 32. Each trn2 user is slower: P90 interactivity is 10.7-62.2 tok/s per user on trn2 against 50-272 on
-  H200, and at every per-user speed trn2 reaches, H200 delivers more tokens per $.
-- **8K/1K, MTP off on every system:** trn2 delivers 0.56-0.76× H200's tokens per $ at the same concurrency (1-32
-  users). This recipe has no prefix reuse.
+- **AgentX:** at the concurrencies both measured, trn2 delivers 1.61-1.75× H200's total tokens per $ at 1-8 users (with
+  MTP at InferenceX's golden acceptance, 2.519, not trn2's measured 2.20), 1.34× at 12, 1.07× at 16, 0.86× at 24 and
+  0.81× at 32. Each trn2 user is slower: P90 interactivity is 10.7-62.2 tok/s per user on trn2 against 50.1-272 on H200,
+  and where the two ranges overlap (50-62 tok/s), H200 delivers more tokens per $.
+- **8K/1K, MTP off on every system:** at the concurrencies both measured (1-32 users), trn2 delivers 0.56-0.76× H200's
+  tokens per $. This recipe has no prefix reuse.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/results-agentx-users-dark.png">
@@ -289,13 +290,15 @@ length of 3.6.
 ### How these were measured
 
 - **Metric:** total tokens per $ = tokens per second per accelerator × 3,600 ÷ price per accelerator-hour. P90
-  interactivity = 1000 ÷ the P90 time per output token, the slowest decile of per-user decode speed.
+  interactivity = 1000 ÷ the P90 time per output token in milliseconds, as InferenceX scores it. For AgentX that time
+  is end to end, so it includes the wait for the first token (the per-user measure under Methodology below).
 - **trn2, AgentX:** InferenceX AgentX harness 1.0.12, canonical workload, one hour per point. 1-8 users: an MTP build at
   golden acceptance, measured by 13 Nov 2026; 12 users: a build without MTP from the same period; 16, 24 and 32 users:
   the production builds, measured on 24 Nov 2026. Accuracy: GSM8K 97.42-97.65% on the MTP builds; needle recall passed.
 - **H200, AgentX:** InferenceX PR #4719, sweep run 42052004518 (2-32 users) and run 41968542163 (1 user).
 - **H100, AgentX:** InferenceX PR #4717, run 42026135483 (1-10 users, with HiCache) and run 41310662894 (12-32 users,
-  the only H100 MTP points past 10 users; prefix-cache hit 7-13% there).
+  the only H100 MTP points past 10 users; prefix-cache hit 7-13% there). Both runs use MTP speculation as that PR
+  configures it, at InferenceX's golden acceptance length.
 - **8K/1K:** InferenceX's fixed-sequence recipe: input 8,192 and output 1,024 tokens, range ratio 0.8, 10 × concurrency
   prompts. trn2: measured on 10 Nov 2026, one run per concurrency. GPUs: the sweeps of InferenceX PRs #4926 and #4927
   (MTP off) and #4913 and #4914 (MTP on).

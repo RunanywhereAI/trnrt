@@ -16,7 +16,6 @@ builds with `tools/graph_equiv.py` on CPU; the device check of this release's ow
 
 - Results against H100 and H200 on InferenceX AgentX and the 8K/1K recipe, per 8 accelerators at AWS Capacity Block
   prices ([docs/RESULTS.md](docs/RESULTS.md#against-h100-and-h200-inferencex-agentx-and-8k1k)).
-
 - `/tokenize` and `/detokenize` (also under `/v1`). A chat request is counted exactly as
   `/v1/chat/completions` would send it to the engine. The router sends them to any live engine without touching its
   routing state ([docs/API.md](docs/API.md)).
