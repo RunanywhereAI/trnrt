@@ -290,8 +290,12 @@ def _check(body: dict) -> list[str]:
     stream = body.get("stream")
     if stream is not None and not isinstance(stream, bool):
         raise _bad("stream must be true or false")
-    stops = body.get("stop_sequences") or []
-    return stops if isinstance(stops, list) else []
+    stops = body.get("stop_sequences")
+    if stops is None:
+        return []
+    if not isinstance(stops, list) or not all(isinstance(s, str) and s for s in stops):
+        raise _bad("stop_sequences must be a list of non-empty strings")
+    return stops
 
 
 async def respond(http: HTTPRequest, body: dict, start_chat: Callable[[dict], Awaitable[Run]], model: str) -> Response:

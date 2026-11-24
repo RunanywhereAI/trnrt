@@ -187,6 +187,8 @@ def test_stop_sequences_and_max_tokens(client):
         {**ASK, "mcp_servers": [{"type": "url", "url": "x"}]},
         {**ASK, "stream": "yes"},
         {**ASK, "temperature": -1},
+        {**ASK, "stop_sequences": " again"},  # a string, not a list: it would stop the text but report end_turn
+        {**ASK, "stop_sequences": [""]},
     ],
     ids=repr,
 )
