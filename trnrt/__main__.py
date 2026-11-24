@@ -956,6 +956,12 @@ def cmd_serve(argv: list[str]) -> int:
     )
     add_compile_arg(ap)
     a = ap.parse_args(argv)
+    synth_al = a.spec_synth_al if a.spec_synth_al is not None else _env_synth_al()
+    # The benchmark mode says so before the engines start and again when the router serves (serve/benchmark_mode.py)
+    if synth_al is not None:
+        from .serve.benchmark_mode import banner
+
+        print(banner(synth_al), flush=True)
     try:
         scheduling(argv)  # refused here, before any engine starts, rather than by every engine
     except ValueError as e:
@@ -1001,6 +1007,8 @@ def cmd_serve(argv: list[str]) -> int:
 
         from .serve.router import Router, build_router_app
 
+        if synth_al is not None:
+            print(banner(synth_al), flush=True)
         uvicorn.run(build_router_app(Router(urls)), host=a.host, port=a.port, timeout_keep_alive=a.timeout_keep_alive)
     finally:
         for p in procs:
