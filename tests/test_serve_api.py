@@ -12,6 +12,7 @@ tests/test_api*.py.
 from __future__ import annotations
 
 import json
+import os
 import time
 import types
 
@@ -874,3 +875,89 @@ def test_detokenize_refuses_ids_outside_the_vocabulary(serve, tokens):
     client, _ = serve(PLAIN)
     r = client.post("/detokenize", json={} if tokens is None else {"tokens": tokens})
     assert r.status_code == 400, r.text
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"bogus_field": 1},
+        {"top_a": 0.3},
+        {"prediction": {"type": "content", "content": "x"}},
+        {"modalities": ["audio"]},
+        {"audio": {"voice": "x"}},
+        {"web_search_options": {}},
+        {"max_token": 5},  # a typo of max_tokens
+    ],
+)
+def test_an_unknown_field_is_refused_with_a_400_that_names_it(serve, extra):
+    """AGENTS.md invariant 7: a field the server does not know was answered 200 as if it had been applied. Now 400,
+    naming the field; no request reaches the engine. The fields an SDK sends by default (SDK_CHAT, SDK_COMPLETION)
+    are still served (test_an_sdk_request_with_every_neutral_field_is_served)."""
+    client, eng = serve(PLAIN)
+    (name,) = extra
+    for path, base in (
+        ("/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}]}),
+        ("/v1/completions", {"prompt": [1]}),
+    ):
+        r = client.post(path, json={**base, "max_tokens": 2, **extra})
+        assert r.status_code == 400 and name in r.json()["detail"] and "unknown" in r.json()["detail"], r.text
+    assert eng.added == []
+
+
+def test_a_field_of_the_other_endpoint_is_refused(serve):
+    """`prompt` on a chat request, `messages` or `tools` on a completion: the endpoint would ignore them."""
+    client, eng = serve(PLAIN)
+    msgs = [{"role": "user", "content": "hi"}]
+    for extra in ({"prompt": "x"}, {"echo": False}, {"suffix": None}):  # a completion's fields, neutral there or not
+        r = client.post("/v1/chat/completions", json={"messages": msgs, **extra})
+        assert r.status_code == 400 and next(iter(extra)) in r.json()["detail"], r.text
+    r = client.post("/v1/chat/completions", json={"prompt": "x"})  # named before "messages is required"
+    assert r.status_code == 400 and "unknown field prompt" in r.json()["detail"], r.text
+    for extra in (
+        {"messages": msgs},
+        {"tools": TOOLS},
+        {"reasoning_effort": "low"},
+        {"top_logprobs": 2},
+        {"functions": []},
+    ):
+        r = client.post("/v1/completions", json={"prompt": [1], **extra})
+        assert r.status_code == 400 and next(iter(extra)) in r.json()["detail"], r.text
+    assert eng.added == []
+    for extra in (
+        {"user": "u"},
+        {"model": "glm"},
+        {"metadata": {"a": "b"}},
+        {"prompt_cache_key": "k"},
+        {"store": False},
+    ):
+        assert client.post("/v1/chat/completions", json={"messages": msgs, "max_tokens": 2, **extra}).status_code == 200
+    for path, base in (("/v1/chat/completions", {"messages": msgs}), ("/v1/completions", {"prompt": [1]})):
+        for store in (True, 0, "false"):  # only false or null: nothing is kept to retrieve later, and 0 is not false
+            r = client.post(path, json={**base, "store": store})
+            assert r.status_code == 400 and "store" in r.json()["detail"], (path, store, r.text)
+        assert client.post(path, json={**base, "max_tokens": 2, "store": None}).status_code == 200
+        assert client.post(path, json={**base, "max_tokens": 2, "min_new_tokens": 0.0}).status_code == 200  # 0.0 is 0
+
+
+def test_every_field_the_openai_endpoints_read_is_known():
+    """A field the chat or completion path reads but the accept lists (api._KNOWN) miss would refuse every request that
+    sends it: each `body.get("x")`, `_int(body, "x", ...)` and the like in serve/api.py and serve/structured.py is known
+    to at least one of the two endpoints. /tokenize's and /detokenize's own fields are theirs alone."""
+    import re
+    from pathlib import Path
+
+    from trnrt.serve import api
+
+    root = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "trnrt", "serve")
+    read = set()
+    for name in ("api.py", "structured.py"):
+        src = Path(root, name).read_text()
+        for pat in (
+            r'body\.get\("([a-z_]+)"',
+            r'body\["([a-z_]+)"\]',
+            r'\(\s*body,\s*"([a-z_]+)"',
+            r'\(\s*"([a-z_]+)",\s*lambda',
+        ):
+            read |= set(re.findall(pat, src))
+    tokenize_only = {"add_special_tokens", "return_token_strs", "tokens"}
+    assert read - tokenize_only - api._KNOWN[True] - api._KNOWN[False] == set()

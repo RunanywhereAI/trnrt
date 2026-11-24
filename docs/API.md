@@ -55,6 +55,10 @@ curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -
 - `tools` must be an array of function tools whose `name` is 1-128 characters of `[A-Za-z0-9_-]`, with an object
   `parameters` when given; `parallel_tool_calls` is `true`, `false` or null. Null `tools` and null `parameters` are the
   same as leaving them out. Anything else is a 400 naming the field.
+- On `/v1/chat/completions` and `/v1/completions`, an unknown request field is answered with 400 naming it, never
+  ignored. So is a field of the other endpoint (`prompt` on a chat request, `messages`, `tools` or `top_logprobs` on a
+  completion). `model`, `user`, `safety_identifier`, `metadata` and `prompt_cache_key` are accepted and do not change
+  the output; `store` is accepted only as `false` or null, since nothing is kept for later retrieval.
 - Status codes: 400 for a request that cannot be served as sent (a field of the wrong type or out of range, a prompt
   longer than the context, a chat template variable the template never reads); 500 for an error inside the engine;
   503 once the engine has failed, with the reason on `/health`, and 503 for a full queue

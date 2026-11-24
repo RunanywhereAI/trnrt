@@ -90,6 +90,9 @@ and versions follow [Semantic Versioning](https://semver.org/). Rebuild the comp
 
 ### Fixed
 
+- An unknown field on `/v1/chat/completions` or `/v1/completions`, or a field of the other endpoint, is refused with
+  400 naming it, as AGENTS.md invariant 7 requires. It was ignored, and the request answered 200 as if it had been
+  applied (`prediction`, `modalities`, `audio`, a misspelled field).
 - A malformed `tools` array, or a `parallel_tool_calls` that is not a boolean, is refused with a 400 that names the
   field. Before, a non-array `tools` reached the chat template and raised there (a 500), and a malformed entry or
   `"false"` was accepted silently: a different prompt, and parallel calls kept. A function tool with `strict: true` is
