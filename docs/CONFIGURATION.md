@@ -48,7 +48,7 @@ still wins over the build.
 | `--prefill-page-buckets`, `--prefill-page-min-rows` | 1024,4096; 2048 | | | prefill calls of at least this many rows take every prefill page bucket, smaller ones the largest |
 | `--kv-cache-gb`, `--kv-cache-dtype` | 4.0, fp8 | | 5.25 | KV pool per rank |
 | `--state-checkpoints` | 24 | 8 | | linear-attention state rows kept for the prefix cache |
-| `--kda-shell-max-rows` | 12 | 24 | | KDA layers' decode attention as one fused kernel up to this many rows |
+| `--kda-shell-max-rows` | 12, no effect | 24 | 12, no effect | KDA layers' decode attention as one fused kernel up to this many rows; no effect in the balanced and throughput builds, which have no KDA shell: raising or lowering it there changes no graph |
 | `--dsa-layer-max-rows`, `--ffn-half-below` | 24, 25 | | | DSA layers' decode attention and FFN as one fused kernel up to this many rows; decode FFN blocks as one fused kernel below this many |
 | `--dsa-index-rows` | 8 | | | the DSA indexer's decode scores in kernel calls of at most this many rows (0: one call) |
 | `--dense-half-skip-rows` | 2,18,24 | | | the decode row counts at which a dense MLP layer runs as the XLA graph instead of the dense half's kernel |
@@ -102,17 +102,19 @@ Behind the router, a session stays on one engine, so its requests are ordered by
 The model's own multi-token-prediction (MTP) layer drafts 2 tokens a step and the target model verifies them in the next
 step, with the accepted count, the newest token, the positions and the drafts kept on the device, so a step is scheduled
 before the previous one is read back. [AGENTX.md](AGENTX.md) has the commands. The latency build speculates at every
-step: its running cap (8) is its speculation limit, so it has no plain decode graph at all. Its speculation arguments:
+step: its running cap (8) is its speculation limit, so it has no plain decode graph at all. Its speculation arguments
+follow; `--plain-bucket-min`, `--dyn-mtp-kv` and `--spec-hysteresis` have no effect in the latency build, which has no
+plain decode steps for them to act on:
 
 | Argument | latency | |
 |---|---|---|
 | `--spec-method`, `--spec-k` | mtp, 2 | speculative decoding with the model's MTP layer, drafts per step |
-| `--spec-max-batch`, `--spec-hysteresis` | 8, 1 | speculate while at most this many requests decode; once plain, speculate again at this many fewer |
-| `--spec-bucket-max`, `--plain-bucket-min` | 8, 0 | the verify family's graphs only at decode buckets up to this, the plain decode graphs only from this |
+| `--spec-max-batch`, `--spec-hysteresis` | 8, 1 (no effect) | speculate while at most this many requests decode; once plain, speculate again at this many fewer |
+| `--spec-bucket-max`, `--plain-bucket-min` | 8, 0 (no effect) | the verify family's graphs only at decode buckets up to this, the plain decode graphs only from this |
 | `--no-plain-decode` | set | no plain decode graph: allowed only when `--spec-max-batch` covers the largest decode bucket and the running cap |
 | `--spec-page-buckets` | 1024,2048,4096 | the page buckets of every graph the MTP layer or a verify runs in |
 | `--mtp-chunk-q`, `--mtp-fill-rows` | 64, 1024 | the MTP pass over a prefill chunk takes the prefill form from 64 rows, in calls of at most 1024 |
-| `--mtp-kv-only`, `--dyn-mtp-kv` | on, on | KV-only windows for the MTP pass over a chunk, and the MTP layer's KV written by plain decode steps |
+| `--mtp-kv-only`, `--dyn-mtp-kv` | on, on (no effect) | KV-only windows for the MTP pass over a chunk, and the MTP layer's KV written by plain decode steps |
 | `--state-spec-seats` | unset | of the state seats, how many hold the 3 rows a verify writes (unset: all) |
 | `--spec-synth-al` | unset | the benchmark mode of [AGENTX.md](AGENTX.md#benchmark-mode) |
 

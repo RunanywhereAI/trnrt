@@ -402,6 +402,21 @@ def test_build_shard_sets_the_routes_first():
     assert ast.unparse(body[0]) == "set_decode_routes(cfg)"
 
 
+def test_the_docs_name_the_arguments_a_build_ignores():
+    """docs/CONFIGURATION.md marks an argument a build's graphs never read: --kda-shell-max-rows in a build without the
+    KDA shell, and --plain-bucket-min, --dyn-mtp-kv and --spec-hysteresis in one without plain decode steps. Unmarked, an
+    operator could tune --kda-shell-max-rows on balanced, capture again, and find nothing changed."""
+    with open(os.path.join(ROOT, "docs", "CONFIGURATION.md")) as f:
+        doc = f.read()
+    kda = next(ln for ln in doc.splitlines() if ln.startswith("| `--kda-shell-max-rows`"))
+    ignored = kda.split("no effect in the ", 1)[1].split(" builds", 1)[0]  # "balanced and throughput"
+    for build in ("latency", "balanced", "throughput"):
+        c = _cfg("--preset", build)
+        assert (build in ignored) == (not c.kda_shell), (build, kda)
+        quiet = f"`--plain-bucket-min`, `--dyn-mtp-kv` and `--spec-hysteresis` have no effect in the {build} build"
+        assert (quiet in doc.replace("\n", " ")) == (not c.plain_decode), build
+
+
 def test_the_docs_document_the_builds():
     with open(os.path.join(ROOT, "docs", "CONFIGURATION.md")) as f:
         doc = f.read()

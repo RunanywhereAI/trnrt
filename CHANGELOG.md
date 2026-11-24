@@ -108,7 +108,9 @@ builds with `tools/graph_equiv.py` on CPU; the device check of this release's ow
   `--users N` alone) picks the build for N users per engine ([docs/CONFIGURATION.md](docs/CONFIGURATION.md)). The
   earlier names still work and run the nearest build, with a deprecation warning: `batch8`, `mtp-batch8` and
   `mtp-always` run `latency`, `batch12` and `mtp-batch12` run `balanced`, `mtp-batch24` runs `throughput`. Every build
-  has its own graphs: rebuild the compile cache.
+  has its own graphs: rebuild the compile cache. docs/CONFIGURATION.md marks the arguments a build ignores:
+  `--kda-shell-max-rows` in balanced and throughput (no KDA shell), and `--plain-bucket-min`, `--dyn-mtp-kv` and
+  `--spec-hysteresis` in latency (no plain decode steps).
 - `TRNRT_DMA_HW=1` under every build.
 - An engine whose device listing fails, or whose launch CPU set cannot pin every rank to its NeuronCore's NUMA node,
   refuses to start; `TRNRT_NUMA_PIN_OPTIONAL=1` starts it anyway, with a warning. Rank 0 logs how many ranks pinned.
