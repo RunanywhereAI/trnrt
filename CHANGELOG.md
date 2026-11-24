@@ -42,7 +42,9 @@ builds with `tools/graph_equiv.py` on CPU; the device check of this release's ow
 - The OpenAI Responses API, `POST /v1/responses`, stateless: reasoning, message and function-call items, and the
   Responses stream events ([docs/API.md](docs/API.md#responses-api)).
 - The Anthropic Messages API, `POST /v1/messages` and `/v1/messages/count_tokens`: thinking, text and tool-use blocks,
-  Anthropic's stream events and error shape ([docs/API.md](docs/API.md#anthropic-messages-api)).
+  Anthropic's stream events and error shape ([docs/API.md](docs/API.md#anthropic-messages-api)). Messages that end
+  with an assistant message (a prefill) are refused with 400: the chat template would answer with a new turn instead
+  of continuing it.
 - The router routes `/v1/responses` and `/v1/messages` by session and prefix as it routes chat, and sends
   `/v1/messages/count_tokens` to any live engine.
 - Scheduling flags, host only and per engine: `--schedule-policy` (`fcfs`, `lpm`, `lof`, `spf`),

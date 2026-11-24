@@ -163,7 +163,10 @@ with 400: `thinking` `{"type": "disabled"}` (the template cannot turn reasoning 
 `budget_tokens` on an engine started without `--structured-outputs` (with it, the budget is enforced as
 `thinking_token_budget`), `tool_choice` `any` and `tool` (a tool-call grammar for GLM's format is not built),
 image and document blocks, `redacted_thinking`, a `tool_result` with `is_error` true (GLM's chat template cannot mark a
-failed call; put the error in the result's content), server tools, `mcp_servers`, `container` and `context_management`.
+failed call; put the error in the result's content), server tools, `mcp_servers`, `container` and `context_management`,
+and messages that end with an assistant message (a prefill): GLM's chat template closes that turn and opens a new
+one, so the reply would be a fresh answer rather than its continuation, as `continue_final_message` would be on the
+chat endpoint. `count_tokens` refuses it too.
 
 ## Tokenize and detokenize
 
