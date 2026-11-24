@@ -5,9 +5,18 @@ next step: the next verify's positions, KV slots, input tokens and recurrent-sta
 positions, tokens and hidden-state row all depend on it. That host round trip sits on the critical path of every
 step.
 
-Here that state stays on the device and the next step is scheduled blind: one fp32 board row per request slot
-(exact integers below 2^24) holds what the next speculative step needs, and five small graphs around the UNCHANGED
-verify and MTP graphs (so their compile keys stay the synchronous engine's) read and write it:
+The way off that path is to keep the state on the device and schedule the next step blind:
+- every decode row is scheduled with 1 + k tokens, as if every draft is accepted;
+- the computed-token counts, the last sampled tokens and the drafts stay on the device, and the verify's rejection
+  sampling corrects the counts there;
+- the next step's input ids and positions are built on the device from those buffers, so no host read sits between
+  two steps;
+- the sequence lengths and bonus tokens the next batch reads are published on the device, with slots reserved for
+  both steps in flight.
+
+The form used here: one fp32 board row per request slot (exact integers below 2^24) holds what the next speculative
+step needs, and five small graphs around the UNCHANGED verify and MTP graphs (so their compile keys stay the
+synchronous engine's) read and write it:
 
     columns 0 .. Q - 1   T: the tokens after positions base .. base + Q - 1 of the last verify, the first
                          acc + 1 meaningful (accepted drafts, then the replacement or the bonus token);

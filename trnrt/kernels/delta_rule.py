@@ -12,7 +12,7 @@ k^T under the decay, chunk_kda_fwd_intra in fla/ops/kda/chunk_intra.py; the UT
 transform T = (I + A)^-1 and w = T (beta k exp(G)), u = T (beta v),
 fla/ops/kda/wy_fast.py recompute_w_u_fwd and fla/ops/utils/solve_tril.py; the
 state recurrence fla/ops/common/chunk_delta_h.py chunk_gated_delta_rule_fwd_h;
-the output fla/ops/gla/chunk.py chunk_gla_fwd_o_gk),, which exist there as
+the output fla/ops/gla/chunk.py chunk_gla_fwd_o_gk), which exist there as
 Triton kernels. What differs here is how each piece is laid onto a 128 x 128
 systolic array, vector and scalar engines:
 
