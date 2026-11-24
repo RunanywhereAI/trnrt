@@ -763,6 +763,8 @@ _NEUTRAL: dict[str, tuple[object, ...]] = {
     "function_call": (None, "none", "auto"),
     # One tier of service: "flex" and "priority" would promise a latency or price class this server does not have.
     "service_tier": (None, "auto", "default"),
+    # Nothing is kept for a later retrieval, so a request asking for that is refused, as /v1/responses refuses it.
+    "store": (None, False),
 }
 
 
@@ -774,12 +776,12 @@ def _stream_flags(body: dict) -> tuple[bool, bool]:
 
 # Every top-level field /v1/chat/completions and /v1/completions know: read (_params, chat_prompt, _stop_rules,
 # structured.grammar_spec, Run), refused unless neutral (_NEUTRAL), or accepted and ignored because it never changes the
-# output: `model` (one model is served), `user`, `safety_identifier`, `metadata`, `store` and `prompt_cache_key` (OpenAI
+# output: `model` (one model is served), `user`, `safety_identifier`, `metadata` and `prompt_cache_key` (OpenAI
 # bookkeeping and hints that SDKs and agent harnesses send by default). Any other field is refused with a 400 naming
 # it, never ignored (invariant 7): an unknown one (`prediction`, `modalities`, `audio`, a typo such as `max_token`) used
 # to be answered 200 as if it had been applied. A field read here must be added here, or every request using it is
 # refused (tests/test_serve_api.py sends each).
-_IGNORED = frozenset({"model", "user", "safety_identifier", "metadata", "store", "prompt_cache_key"})
+_IGNORED = frozenset({"model", "user", "safety_identifier", "metadata", "prompt_cache_key"})
 _READ = frozenset(
     {
         "session_id", "stream", "stream_options", "priority",
