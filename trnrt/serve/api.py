@@ -999,16 +999,20 @@ MAX_N = 128
 # stop_regex: patterns per request, and characters per pattern, at most. Each pattern is searched on the event loop at
 # every streamed piece of text, over the new text and the longest span a match can have, at most STOP_REGEX_SPAN
 # characters before it. CPython's re holds the GIL through a search and cannot be stopped, so its cost is bounded
-# before it runs: _backtracking refuses the shapes whose search time grows faster than the square of the text's length,
-# and the span bounds the text. The worst admitted shape, one repeat over a broad class (`\w+@\w+\.\w+` over a run of
-# letters), measured 13 ms per search at 2048 characters and 51 ms at 4096 (CPython 3.14, one Apple M3 Max core). The
-# matches are those of a search over the whole output but for one that starts more than the span before the newest
-# text, which a stop pattern's match rarely does.
+# before it runs. The span bounds the text, and _search_cost bounds the time over it: it refuses the shapes whose search
+# time grows faster than the square of the text's length, and it prices the rest in units of one plain repeat's search
+# (`\w+@` over a run of letters), whose time does grow with that square. A pattern may cost MAX_STOP_REGEX_COST, a
+# request's patterns MAX_STOP_REGEX_REQUEST_COST in all. Measured over 2048 characters (CPython 3.13, one Apple M3 Max
+# core, _search_cost's own verdicts): one plain repeat, `\w+@\w+\.\w+` over a run of letters, 13 ms a search; the
+# slowest admitted pattern found, by hand and among 15,000 random admitted ones, `(?:a|a)(?:a|a)(?:a|a)(?:a|a)\w+@` (16
+# ways to match before a repeat), 0.21 s over a run of `a`; so a request of two such, 0.4 s at every streamed piece.
+# A search is slowest on a text its pattern matches a long way into, such as a long run of one letter. The matches are
+# those of a search over the whole output but for one that starts more than the span before the newest text, which a
+# stop pattern's match rarely does.
 MAX_STOP_REGEX = 16
 MAX_STOP_REGEX_CHARS = 1024
-# The ways one pattern may match a text through alternations whose branches can start alike ((a|a), (?:.|x)), in a row
-# or nested: the matcher tries them one by one, so 35 groups of (?:.|.) before a failing literal ran for hours.
-MAX_STOP_REGEX_WAYS = 16
+MAX_STOP_REGEX_COST = 16
+MAX_STOP_REGEX_REQUEST_COST = 32
 STOP_REGEX_SPAN = 2048
 
 
@@ -1054,23 +1058,37 @@ class _Backtracking(Exception):
 
 
 def _backtracking(pattern: str) -> str | None:
-    """Why Python's backtracking matcher could take more than about quadratic time on some text to search `pattern`,
-    or None. Two shapes do, and stop_regex refuses them (a linear-time engine would be a new dependency, and CPython's
-    re holds the GIL through a search, so a worker thread or a timeout cannot bound one):
+    """Why stop_regex refuses `pattern` (_search_cost), or None."""
+    return _search_cost(pattern)[0]
+
+
+def _search_cost(pattern: str) -> tuple[str | None, int]:
+    """Why Python's backtracking matcher could take more than quadratic time on some text to search `pattern`, or too
+    long a quadratic time, or None; and the pattern's cost, a bound on its search's time in units of one plain repeat's
+    (`\\w+@` over a run of letters). stop_regex refuses what this names (a linear-time engine would be a new dependency,
+    and CPython's re holds the GIL through a search, so a worker thread or a timeout cannot bound one). Three shapes
+    grow faster than the square of the text's length:
     - a repeat that can iterate more than once over a part that can match more than one way (a variable length or an
       alternation): `(a+)+b`, `(a|a)*b`, `(a{1,3}){1,10}b`, exponential in the text's length;
     - two repeats in a row that can take the same characters (nothing they cannot both match between them): `a*a*b`,
-      `\\d+\\s*\\d+`, `.*x.*y`, a power of the length per repeat.
-    Alternations whose branches can start alike also multiply the ways to match outside a repeat: past
-    MAX_STOP_REGEX_WAYS of them, `(?:.|.)(?:.|.)...x`, the pattern is refused too.
-    An alternation whose branches start with characters no other branch starts with is one way only, as is a single
-    repeat over a fixed part: `\\d+\\.\\d+`, `Answer:\\s*\\d+`, `(?:foo|bar)+`, `\\n\\n+` all pass."""
+      `\\d+\\s*\\d+`, `.*x.*y`, a power of the length per repeat. A possessive repeat or an atomic group after a repeat
+      counts too (`.+.*+x`, `.+(?>.*)x`): it gives nothing back itself, but the repeat before it runs it again at every
+      character it gives back;
+    - a lookaround whose part can match more than one way or texts of different lengths: `(?=.*x)`, `(?!a|ab)`. The
+      matcher runs a lookaround again at every position a repeat around it tries, so `[^~]+(?=[^~]*~~)~` and
+      `(?:.(?!.*@@))+@@` are cubic. A lookaround of one width that matches one way (`foo(?!bar)`) is served.
+    The rest grows with the square of the length, times the cost: the ways to match, which alternations whose branches
+    can start alike multiply (`(?:Answer|Ans)` 2, `(?:.|.)` 2), times one plus the longest walk, the steps the matcher
+    takes again at every character a repeat gives back: the part after the repeat that the repeat could also take (`.*`
+    then 15 characters, 15) and a lookaround's part, after a repeat or inside one. Past MAX_STOP_REGEX_COST the pattern
+    is refused too: `.+` then a thousand `.`, or `(?:.(?!.{30}@))+@`, takes about a second over 2048 characters.
+    `\\d+\\.\\d+`, `Answer:\\s*\\d+`, `\\n\\n+` cost 1; `(?:foo|bar)+` 2; `(?s)<think>.*</think>` 9."""
     try:
         parser = importlib.import_module("re._parser")
         c = importlib.import_module("re._constants")
         tree = parser.parse(pattern)
     except Exception as e:  # noqa: BLE001  a private module: without it no pattern can be checked
-        return f"it cannot be checked for backtracking ({type(e).__name__})"
+        return f"it cannot be checked for backtracking ({type(e).__name__})", 0
     probes = set(_STOP_REGEX_PROBES)
 
     def collect(items) -> None:  # every literal and range end, so two overlapping ranges share a probe
@@ -1194,21 +1212,61 @@ def _backtracking(pattern: str) -> str | None:
                 return frozenset(out)
         return frozenset(out)
 
-    def scan(items, live: list[frozenset]) -> list[frozenset]:
-        """Walk `items` left to right with the character sets of the variable repeats still able to take more (`live`):
-        raise _Backtracking at a shape above; return what is live after them."""
+    def steps(items) -> int:
+        """The most steps the matcher takes to match `items`, a part that matches one way (one_way), once at a position:
+        one per character and per check, a lookaround's part's own, a fixed count's that many times, an alternation's
+        longest branch and one more per other branch it tries."""
+        n = 0
+        for op, av in items:
+            if op is c.SUBPATTERN:
+                n += steps(av[3])
+            elif op in (c.ASSERT, c.ASSERT_NOT):
+                n += steps(av[1])
+            elif op is c.ATOMIC_GROUP:
+                n += steps(av)
+            elif op in (c.MAX_REPEAT, c.MIN_REPEAT, c.POSSESSIVE_REPEAT):
+                n += av[1] * steps(av[2])
+            elif op is c.BRANCH:
+                n += max(steps(alt) for alt in av[1]) + len(av[1]) - 1
+            else:
+                n += 1
+        return n
+
+    def walked(live: list[tuple[frozenset, int]], n: int) -> list[tuple[frozenset, int]]:
+        """`live` n steps further on: each repeat walks them again at every character it gives back."""
+        out = [(x, k + n) for x, k in live]
+        longest[0] = max([longest[0], *(k for _, k in out)])
+        return out
+
+    def merged(live: list[tuple[frozenset, int]]) -> list[tuple[frozenset, int]]:
+        """The repeats live after any of several branches: each once, with its longest walk."""
+        best: dict[frozenset, int] = {}
+        for x, k in live:
+            best[x] = max(best.get(x, 0), k)
+        return list(best.items())
+
+    def scan(items, live: list[tuple[frozenset, int]]) -> list[tuple[frozenset, int]]:
+        """Walk `items` left to right with the variable repeats still able to take more (`live`: each one's characters,
+        and the steps taken since it, its walk): raise _Backtracking at a shape above; return what is live after them."""
         for op, av in items:
             if op in (c.LITERAL, c.NOT_LITERAL, c.ANY, c.IN):
                 s = member(op, av)
-                live = [x for x in live if x & s]  # a character neither repeat can take ends it
+                live = walked([(x, k) for x, k in live if x & s], 1)  # a character neither repeat can take ends it
             elif op is c.AT:
-                pass
+                live = walked(live, 1)
             elif op is c.SUBPATTERN:
                 live = scan(av[3], live)
             elif op in (c.ASSERT, c.ASSERT_NOT):
+                if not one_way(av[1]):
+                    raise _Backtracking(
+                        "it has a lookaround that can match more than one way or texts of different lengths (as "
+                        "(?=.*x) or (?!a|ab) do), which Python's backtracking matcher runs again at every position a "
+                        "repeat around it tries; a lookaround must match one way, at one length"
+                    )
                 scan(av[1], [])
+                live = walked(live, steps(av[1]))  # it takes no character: a repeat before it does not end
             elif op is c.ATOMIC_GROUP:
-                scan(av, [])
+                live = scan(av, live)  # it gives nothing back, but a repeat before it runs it again
             elif op is c.BRANCH:
                 firsts = [first(alt) for alt in av[1]]
                 null = [alt.getwidth()[0] == 0 for alt in av[1]]  # can match the empty text, whatever it starts with
@@ -1218,21 +1276,21 @@ def _backtracking(pattern: str) -> str | None:
                     for i, f in enumerate(firsts)
                     if i and any(null[i] or null[j] or not f or not firsts[j] or f & firsts[j] for j in range(i))
                 )
-                if ways[0] > MAX_STOP_REGEX_WAYS:
+                if ways[0] > MAX_STOP_REGEX_COST:
                     raise _Backtracking(
                         f"it has alternations whose branches can start alike (as (a|a) or (?:.|x) do), more than "
-                        f"{MAX_STOP_REGEX_WAYS} ways to match a text, which Python's backtracking matcher tries one by one"
+                        f"{MAX_STOP_REGEX_COST} ways to match a text, which Python's backtracking matcher tries one by one"
                     )
-                out: list[frozenset] = []
+                out: list[tuple[frozenset, int]] = []
                 for alt in av[1]:
-                    out += [x for x in scan(alt, list(live)) if x not in out]
-                live = out
+                    out += scan(alt, list(live))
+                live = walked(merged(out), len(av[1]) - 1)
             elif op is c.GROUPREF_EXISTS:
                 out = []
                 for alt in (av[1], av[2]):
                     if alt is not None:
-                        out += [x for x in scan(alt, list(live)) if x not in out]
-                live = out
+                        out += scan(alt, list(live))
+                live = merged(out)
             elif op in (c.MAX_REPEAT, c.MIN_REPEAT, c.POSSESSIVE_REPEAT):
                 lo, hi, body = av
                 if lo == hi == 1:
@@ -1248,42 +1306,62 @@ def _backtracking(pattern: str) -> str | None:
                         "backtracking matcher can take exponential time over"
                     )
                 scan(body, [])
+                # An iterated part's steps past the characters it takes (a lookaround's, an alternation's tries): the
+                # matcher takes them for every iteration, so for about every character the repeat takes.
+                own = steps(body) - body.getwidth()[0] if hi > 1 else 0
+                longest[0] = max(longest[0], own)
                 s = first(body)  # a character a live repeat cannot take ends it, so only the first one can be shared
-                if lo == hi or op is c.POSSESSIVE_REPEAT:
+                if lo == hi:
                     if lo > 0:
-                        live = [x for x in live if x & s]
+                        live = [(x, k) for x, k in live if x & s]
+                    live = walked(live, lo * steps(body))
                     continue
-                if any(x & s for x in live):
+                if any(x & s for x, _ in live):
                     raise _Backtracking(
                         "it has two repeats in a row that can take the same characters (as a*a* or \\d+\\s*\\d+ do), "
                         "which Python's backtracking matcher can take time over that grows with a power of the text's "
                         "length"
                     )
-                live = ([] if lo > 0 else live) + [chars(body)]  # none live overlaps s: a mandatory one ends them
+                # None live overlaps s: a mandatory iteration ends them, an optional one is one step more. A possessive
+                # repeat gives nothing back, so it is not live after.
+                live = [] if lo > 0 else walked(live, 1)
+                if op is not c.POSSESSIVE_REPEAT:
+                    live.append((chars(body), own))
             elif op is c.GROUPREF:
                 if live:
                     raise _Backtracking(
                         "it has a back reference after a repeat that can take the same characters, which Python's "
                         "backtracking matcher can take time over that grows with a power of the text's length"
                     )
-                live = [everything]
+                live = [(everything, 0)]
             else:
                 raise _Backtracking(f"it uses {op}, which the backtracking check does not know")
         return live
 
-    ways = [1]  # the product over the alternations scanned so far (MAX_STOP_REGEX_WAYS)
+    ways = [1]  # the product over the alternations scanned so far
+    longest = [0]  # the longest walk of any repeat (walked)
     try:
         scan(tree, [])
     except _Backtracking as e:
-        return str(e)
+        return str(e), 0
     except RecursionError:
-        return "it nests too deeply to be checked for backtracking"
-    return None
+        return "it nests too deeply to be checked for backtracking", 0
+    cost = ways[0] * (1 + longest[0])
+    if cost > MAX_STOP_REGEX_COST:
+        why = (
+            f"it can take {cost} times as long to search as a single repeat (\\w+@) does, more than "
+            f"{MAX_STOP_REGEX_COST}: Python's backtracking matcher walks a part after a repeat that the repeat could "
+            f"also take, and a lookaround after a repeat or inside one, again at every character the repeat gives back "
+            f"({longest[0]} steps here), once for each of the {ways[0]} ways its alternations match"
+        )
+        return why, cost
+    return None, cost
 
 
 def _stop_rules(body: dict) -> StopRules:
-    """The request's StopRules, checked: 400 for a pattern that does not compile, and for keep or skip_special_tokens
-    that is not a boolean."""
+    """The request's StopRules, checked: 400 for a pattern that does not compile or that _search_cost refuses, for
+    patterns that cost more than MAX_STOP_REGEX_REQUEST_COST in all, and for keep or skip_special_tokens that is not a
+    boolean."""
     rx = body.get("stop_regex")
     rx = [] if rx is None else [rx] if isinstance(rx, str) else rx
     if not (isinstance(rx, list) and all(isinstance(x, str) and x for x in rx)):
@@ -1291,14 +1369,22 @@ def _stop_rules(body: dict) -> StopRules:
     if len(rx) > MAX_STOP_REGEX or any(len(x) > MAX_STOP_REGEX_CHARS for x in rx):
         raise _bad(f"stop_regex takes at most {MAX_STOP_REGEX} patterns of at most {MAX_STOP_REGEX_CHARS} characters")
     compiled = []
+    total = 0
     for x in rx:
         try:
             compiled.append((re.compile(x), _match_width(x)))
         except (re.error, RecursionError, OverflowError) as e:
             raise _bad(f"stop_regex {x!r} is not a valid regular expression: {e}") from None
-        why = _backtracking(x)
+        why, cost = _search_cost(x)
         if why is not None:
             raise _bad(f"stop_regex {x!r} is refused: {why}")
+        total += cost
+    if total > MAX_STOP_REGEX_REQUEST_COST:
+        raise _bad(
+            f"stop_regex patterns are refused: together they can take {total} times as long to search as a single "
+            f"repeat (\\w+@), more than {MAX_STOP_REGEX_REQUEST_COST}, at every streamed piece of the output; send "
+            "fewer or simpler patterns"
+        )
     include, no_trim = _flag(body, "include_stop_str_in_output"), _flag(body, "no_stop_trim")  # both checked, always
     keep = include or no_trim
     return StopRules(tuple(compiled), keep, _flag(body, "skip_special_tokens", True))

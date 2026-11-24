@@ -29,8 +29,14 @@ builds with `tools/graph_equiv.py` on CPU; the device check of this release's ow
   choice i `seed + i` ([docs/API.md](docs/API.md#sampling-extras)).
 - `stop_regex`, and keeping the stop text with `include_stop_str_in_output` or `no_stop_trim`.
 - `skip_special_tokens: false`, and `matched_stop` on every finished choice.
-- `stop_regex` refuses a pattern whose search can take more than about quadratic time in the text's length. Each search
-  reaches back about 2048 characters before the text already searched, so a match must start there or later.
+- `stop_regex` refuses a pattern whose search could stall the server: one whose time can grow faster than the square
+  of the text's length (nested or overlapping repeats, a possessive repeat or an atomic group after a repeat that can
+  take its characters, a lookaround that can match more than one way or length, an optional or exactly counted empty
+  part, an alternation that can match the empty text), and one whose quadratic time has too large a factor (16
+  times a single repeat's for a pattern, 32 for a request's patterns together). Each search reaches back about 2048
+  characters before the text already searched, so a match must start there or later. Over 2048 characters
+  (CPython 3.13, one Apple M3 Max core) the slowest admitted pattern found takes 0.21 s a search, a request 0.4 s
+  at every streamed piece; a lookaround over the rest of the text, admitted before, took a second or more.
 - `no_logs` on `/generate`: the request's record stays out of the production log.
 - The OpenAI Responses API, `POST /v1/responses`, stateless: reasoning, message and function-call items, and the
   Responses stream events ([docs/API.md](docs/API.md#responses-api)).
