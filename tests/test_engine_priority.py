@@ -117,3 +117,32 @@ def test_a_request_the_queue_refuses_is_refused_before_admit_builds_its_matcher(
     assert spy.admitted == [*before, "high"] and low[1].error == (503, DISPLACED)
     drain(eng)
     check_done(eng, [*running, low[0], high])
+
+
+def test_requests_preempted_into_the_queue_give_back_their_board_slots(tmp_path):
+    """Waves that each outrank the last preempt every running request into the queue, where it waits: more requests are
+    then live than the token board has slots (2 * max_num_seqs + 7), so a preempted request must not keep one. Greedy, the
+    outputs are those of the same requests without priorities."""
+    T = pytest.importorskip("tests.test_glm5_next")
+    pytest.importorskip("transformers.models.glm5_next.modeling_glm5_next")
+    path = str(tmp_path)
+    T.build(path, seed=4)
+    prompts_ = [[5 + w, 6 + j, 7, 8] for w in range(7) for j in range(2)]
+    sp = SamplingParams(max_new_tokens=40)
+    ref = T.engine(path, max_num_seqs=2)
+    try:
+        want = [r.output_ids for r in ref.generate(prompts_, sp)]
+    finally:
+        ref.close()
+    eng = with_scheduling(T.engine(path, max_num_seqs=2), priority_scheduling=True, priority_preemption_threshold=0)
+    try:
+        reqs = []
+        for w in range(7):
+            reqs += [eng.add_request(p, sp, priority=w) for p in prompts_[2 * w : 2 * w + 2]]
+            for _ in range(6):
+                eng.step()
+        drain(eng)
+        assert eng.scheduler.num_priority_preemptions > len(eng.runner._free_slots)
+        assert [r.output_ids for r in reqs] == want
+    finally:
+        eng.close()

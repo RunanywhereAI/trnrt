@@ -55,6 +55,8 @@ from typing import TYPE_CHECKING
 from .request import Request, Status
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from .host_cache import HostTier
     from .kv_pool import PagePool
     from .radix_cache import RadixCache
@@ -296,6 +298,9 @@ class Scheduler:
         # radix cache (engine/host_cache.HostTier), when one is configured.
         self._states: StatePool | None = None
         self.host: HostTier | None = None
+        # Set by the engine: frees a preempted request's token-board slot (ModelRunner.release_slot). A request preempted
+        # to the queue may wait behind higher priorities while others take slots, so it must not keep one.
+        self.on_preempt: Callable[[Request], None] | None = None
         # Set by an overlapping engine while a launched step's results are unread.
         self.in_flight = False
         self.waiting: deque[Request] = deque()
@@ -985,6 +990,8 @@ class Scheduler:
 
     def _preempt(self, req: Request) -> None:
         self._release(req, Status.WAITING)
+        if self.on_preempt is not None:
+            self.on_preempt(req)
         req.num_computed = 0
         req.spec_ready = False  # its recompute rebuilds the speculative board row (engine/spec_async.py)
         req.spec_cur = (

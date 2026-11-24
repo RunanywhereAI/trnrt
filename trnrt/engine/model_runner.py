@@ -695,6 +695,11 @@ class ModelRunner:
             self._synth.forget(req.rid)
         if self.state is not None:
             self.state.release(req)
+        self.release_slot(req)
+
+    def release_slot(self, req: Request) -> None:
+        """Give req's token-board slot back (also at a preemption: its recompute takes a slot again and rewrites it). Its
+        sampling generator stays, so a seeded request draws on where it was."""
         s = self._slot.pop(req.rid, None)
         if s is not None:
             self._free_slots.append(s)

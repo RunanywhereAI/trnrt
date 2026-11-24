@@ -309,6 +309,7 @@ class LLMEngine:
             raise ValueError("TrnRT serves models with linear-attention layers: this model has no recurrent state")
         self.scheduler = Scheduler(scfg, self.pool, self.radix, draft_fn=self._propose if cfg.spec_method else None)
         self.scheduler.states = self.runner.state  # checkpoint rows of the state pool back the radix nodes
+        self.scheduler.on_preempt = self.runner.release_slot
         self.radix.free_ckpt = self.runner.state.free_ckpt
         # Host memory under the radix cache (engine/host_cache.py), per rank: half for state checkpoints, the rest for
         # KV pages. Evicted pages and checkpoints go there (a checkpoint on a running request's path too, when no row is
