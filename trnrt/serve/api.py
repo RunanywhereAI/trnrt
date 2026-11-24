@@ -839,7 +839,8 @@ def generation_defaults(model_path: str | None) -> dict[str, float]:
     """The checkpoint's sampling defaults, from its generation_config.json, for a request that sets none.
     GLM-5.3-Flash's (eb9eb208) sets temperature 1.0 and top_p 0.95, so a
     request without top_p sampled the whole candidate set at top_p 1.0. A value of the wrong type or out of range is
-    left out (the server's own default stands) and logged; no file, no defaults."""
+    left out (the server's own default stands) and logged; no file, no defaults. Its max_new_tokens, a positive
+    integer, comes back too: the most a request that sets no token limit may generate (_params)."""
     if not model_path:
         return {}
     path = os.path.join(model_path, "generation_config.json")
@@ -860,6 +861,11 @@ def generation_defaults(model_path: str | None) -> dict[str, float]:
             out[k] = v
         else:
             logger.warning("trnrt: %s sets %s to %r, out of range; not used as a default", path, k, v)
+    max_new = gen.get("max_new_tokens") if isinstance(gen, dict) else None
+    if type(max_new) is int and max_new >= 1:
+        out["max_new_tokens"] = max_new
+    elif max_new is not None:
+        logger.warning("trnrt: %s sets max_new_tokens to %r, not a positive integer; not used", path, max_new)
     return out
 
 
@@ -868,7 +874,8 @@ def _params(
 ) -> SamplingParams:
     """A request's sampling. Every field is checked here, before the request is queued: 400 for a value of the wrong
     type or out of range, and the default for a null. default_max is used when the request sets no max_tokens;
-    `defaults` (generation_defaults) replace the server's own temperature, top_p, top_k and min_p defaults."""
+    `defaults` (generation_defaults) replace the server's own temperature, top_p, top_k and min_p defaults, and their
+    max_new_tokens caps default_max. A request's own max_tokens or max_completion_tokens is not capped."""
     d = defaults or {}
     asked = _refused(body)
     if asked:
@@ -889,6 +896,7 @@ def _params(
         logprobs = None if body.get("logprobs") is False else _int(body, "logprobs", None, 0, 20)
     max_new = _int(body, "max_tokens", None, 1)
     if max_new is None:
+        default_max = min(default_max, int(d.get("max_new_tokens", default_max)))
         max_new = _int(body, "max_completion_tokens", default_max, 1)
     min_tokens = _int(body, "min_tokens", 0, 0)
     if min_tokens > max_new:

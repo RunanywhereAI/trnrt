@@ -64,6 +64,9 @@ and versions follow [Semantic Versioning](https://semver.org/). Rebuild the comp
 
 ### Changed
 
+- A request without `max_tokens` or `max_completion_tokens` generates at most the `max_new_tokens` in the checkpoint's
+  `generation_config.json`, when it sets one (and `--generation-config` is `auto`). Such a chat request could run to
+  the end of the context. A request's own limit is unchanged.
 - The router parses a request's JSON in a worker thread and forwards the client's own bytes, and its prefix trees
   compare text by slices instead of one character at a time, so a large request stalls the streams it relays for less
   time (the JSON parser still holds the interpreter lock while it runs).

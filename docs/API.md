@@ -23,6 +23,9 @@ curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -
   `"low"`, `"high"` or `"max"`, the default. Other values are refused, since the template would answer them at max.
 - `max_tokens` counts reasoning too. Without it, a chat request may generate up to the rest of the context
   (`--max-model-len` minus the prompt); a completion stops at 16 tokens, the OpenAI API's default.
+  A `max_new_tokens` in the checkpoint's `generation_config.json` caps both defaults (`--generation-config none`
+  turns it off with the other defaults): with 32 there, a chat request without `max_tokens` or
+  `max_completion_tokens` generates at most 32 tokens. A request's own limit is not capped.
 - Sampling defaults come from the checkpoint's `generation_config.json`: a request that sets no
   `temperature`, `top_p`, `top_k` or `min_p` gets the checkpoint's value (GLM-5.3-Flash: temperature 1.0, top_p 0.95).
   Without one, temperature and top_p are 1.0. `--generation-config none` turns the checkpoint's values off and
