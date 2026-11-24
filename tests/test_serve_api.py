@@ -936,6 +936,7 @@ def test_a_field_of_the_other_endpoint_is_refused(serve):
             r = client.post(path, json={**base, "store": store})
             assert r.status_code == 400 and "store" in r.json()["detail"], (path, store, r.text)
         assert client.post(path, json={**base, "max_tokens": 2, "store": None}).status_code == 200
+        assert client.post(path, json={**base, "max_tokens": 2, "min_new_tokens": 0.0}).status_code == 200  # 0.0 is 0
 
 
 def test_every_field_the_openai_endpoints_read_is_known():

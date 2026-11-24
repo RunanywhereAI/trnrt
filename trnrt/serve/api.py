@@ -826,9 +826,14 @@ def _refuse_unknown(body: dict, chat: bool) -> None:
 
 
 def _neutral(v: object, neutral: tuple[object, ...]) -> bool:
-    """Whether v is one of the neutral values, by type as well as value: 0 == False in Python, and `store: 0` is not
-    `store: false`."""
-    return any(type(v) is type(n) and v == n for n in neutral)
+    """Whether v is one of the neutral values, with a boolean never equal to a number: 0 == False in Python, and
+    `store: 0` is not `store: false`. Numbers still match across int and float (`min_new_tokens: 0.0` is 0), as _int
+    takes an integral float."""
+
+    def num(x: object) -> bool:
+        return isinstance(x, (int, float)) and not isinstance(x, bool)
+
+    return any((type(v) is type(n) or (num(v) and num(n))) and v == n for n in neutral)
 
 
 def _refused(body: dict) -> list[str]:
