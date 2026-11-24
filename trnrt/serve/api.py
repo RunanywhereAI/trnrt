@@ -769,6 +769,8 @@ _NEUTRAL: dict[str, tuple[object, ...]] = {
     "service_tier": (None, "auto", "default"),
     # Nothing is kept for a later retrieval, so a request asking for that is refused, as /v1/responses refuses it.
     "store": (None, False),
+    # The output's modalities: text is what this server returns, so only text is served.
+    "modalities": (None, ["text"]),
 }
 
 
@@ -780,12 +782,13 @@ def _stream_flags(body: dict) -> tuple[bool, bool]:
 
 # Every top-level field /v1/chat/completions and /v1/completions know: read (_params, chat_prompt, _stop_rules,
 # structured.grammar_spec, Run), refused unless neutral (_NEUTRAL), or accepted and ignored because it never changes the
-# output: `model` (one model is served), `user`, `safety_identifier`, `metadata` and `prompt_cache_key` (OpenAI
-# bookkeeping and hints that SDKs and agent harnesses send by default). Any other field is refused with a 400 naming
-# it, never ignored (invariant 7): an unknown one (`prediction`, `modalities`, `audio`, a typo such as `max_token`) used
-# to be answered 200 as if it had been applied. A field read here must be added here, or every request using it is
-# refused (tests/test_serve_api.py sends each).
-_IGNORED = frozenset({"model", "user", "safety_identifier", "metadata", "prompt_cache_key"})
+# output: `model` (one model is served), `user`, `safety_identifier`, `metadata`, and `prompt_cache_key` and
+# `prompt_cache_retention` (OpenAI bookkeeping and prompt-cache hints that SDKs and agent harnesses send; the prefix
+# cache here matches every prompt by its tokens). Any other field is refused with a 400 naming it, never ignored
+# (invariant 7): an unknown one (`prediction`, `audio`, a typo such as `max_token`) used to be answered 200 as if it had
+# been applied. Sent as null it is unset, as every field is, and accepted: SDKs send null for an argument passed as
+# None. A field read here must be added here, or every request using it is refused (tests/test_serve_api.py sends each).
+_IGNORED = frozenset({"model", "user", "safety_identifier", "metadata", "prompt_cache_key", "prompt_cache_retention"})
 _READ = frozenset(
     {
         "session_id", "stream", "stream_options", "priority",
@@ -811,7 +814,9 @@ _CHAT_ONLY = frozenset(
 )
 _COMPLETION_ONLY = frozenset({"prompt"})
 # The neutral fields (_NEUTRAL) of one endpoint: the other refuses them like any field it does not know.
-_NEUTRAL_CHAT_ONLY = frozenset({"functions", "function_call", "add_generation_prompt", "continue_final_message"})
+_NEUTRAL_CHAT_ONLY = frozenset(
+    {"functions", "function_call", "add_generation_prompt", "continue_final_message", "modalities"}
+)
 _NEUTRAL_COMPLETION_ONLY = frozenset({"echo", "suffix"})
 _KNOWN = {
     True: _IGNORED | _READ | (_NEUTRAL.keys() - _NEUTRAL_COMPLETION_ONLY) | _CHAT_ONLY,
@@ -820,8 +825,9 @@ _KNOWN = {
 
 
 def _refuse_unknown(body: dict, chat: bool) -> None:
-    """400 naming every top-level field this endpoint does not know (_KNOWN), before anything is rendered or queued."""
-    unknown = sorted(k for k in body if k not in _KNOWN[chat])
+    """400 naming every top-level field this endpoint does not know (_KNOWN), before anything is rendered or queued. A
+    field sent as null is unset, as everywhere else, so it is not refused."""
+    unknown = sorted(k for k, v in body.items() if v is not None and k not in _KNOWN[chat])
     if unknown:
         raise _bad(
             f"unknown field{'s' if len(unknown) > 1 else ''} {', '.join(unknown)}: not supported by this endpoint, "

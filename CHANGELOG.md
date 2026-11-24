@@ -110,7 +110,9 @@ builds with `tools/graph_equiv.py` on CPU; the device check of this release's ow
 
 - An unknown field on `/v1/chat/completions` or `/v1/completions`, or a field of the other endpoint, is refused with
   400 naming it, as AGENTS.md invariant 7 requires. It was ignored, and the request answered 200 as if it had been
-  applied (`prediction`, `modalities`, `audio`, a misspelled field).
+  applied (`prediction`, `audio`, a misspelled field). A field sent as null is unset and accepted, as SDKs send null
+  for an argument passed as None; `prompt_cache_retention` is accepted and ignored, as `prompt_cache_key` is; chat's
+  `modalities` is accepted as `["text"]` and refused with any other modality.
 - A malformed `tools` array, or a `parallel_tool_calls` that is not a boolean, is refused with a 400 that names the
   field. Before, a non-array `tools` reached the chat template and raised there (a 500), and a malformed entry or
   `"false"` was accepted silently: a different prompt, and parallel calls kept. A function tool with `strict: true` is

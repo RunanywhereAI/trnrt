@@ -883,7 +883,6 @@ def test_detokenize_refuses_ids_outside_the_vocabulary(serve, tokens):
         {"bogus_field": 1},
         {"top_a": 0.3},
         {"prediction": {"type": "content", "content": "x"}},
-        {"modalities": ["audio"]},
         {"audio": {"voice": "x"}},
         {"web_search_options": {}},
         {"max_token": 5},  # a typo of max_tokens
@@ -908,7 +907,7 @@ def test_a_field_of_the_other_endpoint_is_refused(serve):
     """`prompt` on a chat request, `messages` or `tools` on a completion: the endpoint would ignore them."""
     client, eng = serve(PLAIN)
     msgs = [{"role": "user", "content": "hi"}]
-    for extra in ({"prompt": "x"}, {"echo": False}, {"suffix": None}):  # a completion's fields, neutral there or not
+    for extra in ({"prompt": "x"}, {"echo": False}, {"suffix": ""}):  # a completion's fields, neutral there or not
         r = client.post("/v1/chat/completions", json={"messages": msgs, **extra})
         assert r.status_code == 400 and next(iter(extra)) in r.json()["detail"], r.text
     r = client.post("/v1/chat/completions", json={"prompt": "x"})  # named before "messages is required"
@@ -928,7 +927,10 @@ def test_a_field_of_the_other_endpoint_is_refused(serve):
         {"model": "glm"},
         {"metadata": {"a": "b"}},
         {"prompt_cache_key": "k"},
+        {"prompt_cache_retention": "24h"},
         {"store": False},
+        {"modalities": ["text"]},
+        {"modalities": None},
     ):
         assert client.post("/v1/chat/completions", json={"messages": msgs, "max_tokens": 2, **extra}).status_code == 200
     for path, base in (("/v1/chat/completions", {"messages": msgs}), ("/v1/completions", {"prompt": [1]})):
@@ -937,6 +939,29 @@ def test_a_field_of_the_other_endpoint_is_refused(serve):
             assert r.status_code == 400 and "store" in r.json()["detail"], (path, store, r.text)
         assert client.post(path, json={**base, "max_tokens": 2, "store": None}).status_code == 200
         assert client.post(path, json={**base, "max_tokens": 2, "min_new_tokens": 0.0}).status_code == 200  # 0.0 is 0
+
+
+def test_an_unknown_field_sent_as_null_is_unset_and_served(serve):
+    """null means unset for every field: an SDK sends it for an argument passed as None (prediction, audio,
+    web_search_options are nullable in OpenAI's schema), so it is not refused as unknown; any other value still is. A
+    modality other than text is refused, and modalities is a chat field only."""
+    client, eng = serve(PLAIN)
+    msgs = [{"role": "user", "content": "hi"}]
+    nulls = {"prediction": None, "audio": None, "web_search_options": None, "max_token": None}
+    for path, base in (("/v1/chat/completions", {"messages": msgs}), ("/v1/completions", {"prompt": [1]})):
+        r = client.post(path, json={**base, "max_tokens": 2, **nulls})
+        assert r.status_code == 200, (path, r.text)
+        r = client.post(path, json={**base, "max_tokens": 2, **nulls, "audio": {"voice": "x"}})
+        assert r.status_code == 400 and "unknown field audio" in r.json()["detail"], r.text
+    assert len(eng.added) == 2
+    for modalities in (["audio"], ["text", "audio"], "text", []):
+        r = client.post("/v1/chat/completions", json={"messages": msgs, "modalities": modalities})
+        assert r.status_code == 400 and "modalities" in r.json()["detail"], (modalities, r.text)
+    r = client.post("/v1/completions", json={"prompt": [1], "modalities": ["text"]})
+    assert r.status_code == 400 and "unknown field modalities" in r.json()["detail"], r.text
+    r = client.post("/v1/completions", json={"prompt": [1], "prompt_cache_retention": "in-memory", "max_tokens": 2})
+    assert r.status_code == 200, r.text
+    assert len(eng.added) == 3
 
 
 def test_every_field_the_openai_endpoints_read_is_known():
