@@ -131,7 +131,9 @@ def test_verify_is_the_xla_verify_form(monkeypatch, npg, mix):
     # conv inputs round differently (above) and the states differ by 1.5e-3 at most, against a position step of 0.6-0.8.
     dr = (layer.rec_state[rows] - want_rec[rows]).abs()
     step = (want_rec[STATE_SLOT[:, 2]] - want_rec[STATE_SLOT[:, 1]]).abs()
-    assert dr.max() < 0.01 * step.max() and dr.mean() < 0.05 * step.mean(), (
+    # 2e-3 caps every element near CI's measured 1.5e-3: the scaled bounds alone let one row's whole state drift by up to
+    # 0.01 of the largest row's step
+    assert dr.max() <= 2e-3 and dr.max() < 0.01 * step.max() and dr.mean() < 0.05 * step.mean(), (
         dr.max(),
         dr.mean(),
         step.max(),

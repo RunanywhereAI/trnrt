@@ -343,8 +343,10 @@ def check_capacity(total_bytes: int, path: str = SHM_DIR, margin: float = 0.0, t
     where there is no such tmpfs."""
     if not os.path.isdir(path):
         return
-    free = shutil.disk_usage(path).free
+    # others before free: a segment another engine backs between the two reads then lowers free after it was counted
+    # as unbacked, so the headroom can only be understated, never counted twice
     others = unbacked_bytes(path, skip_tag=tag)
+    free = shutil.disk_usage(path).free
     if total_bytes * (1.0 + margin) > free - others:
         raise ValueError(
             f"the save-once host arenas need up to {total_bytes / 2**30:.1f} GiB of {path} and only "

@@ -799,9 +799,9 @@ class DecoderForCausalLM(nn.Module):
     # -- piecewise execution: one compiled graph per KIND of layer ---------------------
     #
     # The unit of compilation is a run of whole layers, not a whole model or a batch size.
-    # One layer is traced by itself, not the model: layer_fn(i) is a pure function of tensors, so
-    # every layer of one kind (same static attributes, same tensor shapes) traces to the
-    # same graph and shares one NEFF.
+    # Each run is traced by itself, not the whole model: group_fn(idxs) is a pure function of
+    # tensors, so every run with the same sequence of layer kinds (same static attributes, same
+    # tensor shapes) traces to the same graph and shares one NEFF.
 
     def _layer_split(self, i: int):
         layer = self.layers[i]
