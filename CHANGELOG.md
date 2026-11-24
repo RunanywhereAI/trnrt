@@ -24,7 +24,8 @@ builds with `tools/graph_equiv.py` on CPU; the device check of this release's ow
   ([docs/API.md](docs/API.md#generate)).
 - `/model_info`, `/server_info`, `/get_load`, `/health_generate`, `/abort_request` and `/flush_cache` (and
   their `get_` names), on each engine and on the router, which asks one engine or all of them
-  ([docs/API.md](docs/API.md#info-and-admin-endpoints)).
+  ([docs/API.md](docs/API.md#info-and-admin-endpoints)). An engine whose full waiting queue refuses the
+  `/health_generate` probe while its steps go on answers 200 `busy`, not 503: it is serving.
 - `n` choices on `/v1/chat/completions` and `/v1/completions`, sharing the prompt through the prefix cache; a seed gives
   choice i `seed + i` ([docs/API.md](docs/API.md#sampling-extras)).
 - `stop_regex`, and keeping the stop text with `include_stop_str_in_output` or `no_stop_trim`.

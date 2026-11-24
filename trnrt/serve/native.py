@@ -463,7 +463,9 @@ def add_routes(
     async def health_generate():
         """One token generated from prompt [0] (greedy, not counted in /metrics). A step that ends after the probe is
         sent shows the engine serving, so a busy engine answers as soon as its current step ends (and the probe is
-        aborted); 503 if no step ends within HEALTH_GENERATE_TIMEOUT_S, or once the engine failed."""
+        aborted); 503 if no step ends within HEALTH_GENERATE_TIMEOUT_S, or once the engine failed. A full waiting queue
+        (--max-queued-requests, --max-queued-tokens) refuses the probe as it refuses any request: that is an engine
+        serving others, so the answer is 200 {"status": "ok", "busy": true} once a step ends, not a failure."""
         tic = time.monotonic()
         err = loop_.health_error()
         if err is None:
@@ -474,22 +476,31 @@ def add_routes(
         if err is not None:
             return JSONResponse(status_code=503, content={"status": "failed", "error": err})
 
-        async def finished() -> str | None:
+        async def finished() -> tuple[str | None, bool]:
+            """(the probe's error or None, whether a full queue refused it)."""
             while True:
                 kind, *rest = await cast("asyncio.Queue", sub.out).get()
                 if kind == "error":
-                    return str(rest[0])
+                    return str(rest[0]), len(rest) > 2 and bool(rest[2])
                 if kind == "tokens" and rest[1] is not None:
-                    return None
+                    return None, False
 
         done = asyncio.ensure_future(finished())
+        busy = False
         try:
-            while not done.done() and loop_.last_step <= tic and time.monotonic() < tic + HEALTH_GENERATE_TIMEOUT_S:
-                await asyncio.wait({done}, timeout=0.05)
+            while loop_.last_step <= tic and time.monotonic() < tic + HEALTH_GENERATE_TIMEOUT_S:
+                if not done.done():
+                    await asyncio.wait({done}, timeout=0.05)
+                elif done.result()[1]:  # refused for a full queue: a step that ends now shows the engine serving
+                    await asyncio.sleep(0.05)
+                else:
+                    break  # generated, or refused for another reason
             if done.done():
-                err = done.result()
-            elif loop_.last_step <= tic:
+                err, busy = done.result()
+            if (busy or not done.done()) and loop_.last_step <= tic:
                 err = f"no engine step ended within {HEALTH_GENERATE_TIMEOUT_S:.0f} s"
+            elif busy:
+                err = None
         finally:
             if not done.done():
                 done.cancel()
@@ -497,7 +508,7 @@ def add_routes(
         err = loop_.health_error() or err
         if err is not None:
             return JSONResponse(status_code=503, content={"status": "failed", "error": err})
-        return {"status": "ok"}
+        return {"status": "ok", "busy": True} if busy else {"status": "ok"}
 
     @app.post("/abort_request")
     async def abort_request(http: HTTPRequest):

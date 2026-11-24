@@ -807,7 +807,9 @@ def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: floa
         "degraded" when some did, 503 "down" when none did. Each body names the engines that did not ("down"). An
         engine answers 503 when no step of its ended within HEALTH_GENERATE_TIMEOUT_S, which a long prefill can do to
         an engine still serving: that 503 counts toward down_after, as a stalled /health does, and does not move the
-        sessions pinned there at once. A failed engine's /health answers 503 too, which the poll takes as down."""
+        sessions pinned there at once. A failed engine's /health answers 503 too, which the poll takes as down. An
+        engine whose full queue refused the probe while its steps went on answers 200 busy: it counts as one that
+        generated, and "busy" names it."""
         from .native import HEALTH_GENERATE_TIMEOUT_S
 
         rs = await each("GET", "/health_generate", HEALTH_GENERATE_TIMEOUT_S + 10, hard_503=False)
@@ -817,7 +819,12 @@ def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: floa
                 router.note_ok(w)
         status = "ok" if all(ok) else "degraded" if any(ok) else "down"
         down = [u for u, good in zip(router.workers, ok) if not good]
-        return JSONResponse({"status": status, "down": down}, status_code=503 if status == "down" else 200)
+        busy = [
+            u for u, r in zip(router.workers, rs) if isinstance(got := json_of(r), dict) and got.get("busy") is True
+        ]
+        return JSONResponse(
+            {"status": status, "down": down, "busy": busy}, status_code=503 if status == "down" else 200
+        )
 
     @app.post("/abort_request")
     async def abort_request(http: Request):

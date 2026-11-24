@@ -25,7 +25,9 @@ def test_generate_prompts_are_the_routing_text():
     assert _session_key("/generate", {"text": "abc"}) != _session_key("/generate", {"text": "abd"})
 
 
-def _native_worker(i: int, flush_status: int = 200, health_status: int = 200, flush_s: float = 0.0):
+def _native_worker(
+    i: int, flush_status: int = 200, health_status: int = 200, flush_s: float = 0.0, health_busy: bool = False
+):
     """A worker with the native routes: it answers each with its index, and records what it was sent. (No
     `from __future__ import annotations` in this module: FastAPI resolves a handler's `req: Request` in the module's
     globals, where this local import is not, and would take `req` for a query parameter.)"""
@@ -62,7 +64,7 @@ def _native_worker(i: int, flush_status: int = 200, health_status: int = 200, fl
     async def health_generate():
         if health_status != 200:
             return JSONResponse(status_code=health_status, content={"status": "failed", "error": "stuck"})
-        return {"status": "ok"}
+        return {"status": "ok", "busy": True} if health_busy else {"status": "ok"}
 
     @app.post("/abort_request")
     async def abort_request(req: Request):
@@ -172,10 +174,19 @@ def test_health_generate_follows_every_worker():
     async def both(c, router) -> None:
         router.up = [False, False]
         r = await c.get("/health_generate")
-        assert r.status_code == 200 and r.json() == {"status": "ok", "down": []}
+        assert r.status_code == 200 and r.json() == {"status": "ok", "down": [], "busy": []}
         assert router.up == [True, True]  # each one generated: up
 
     _run([_native_worker(0), _native_worker(1)], both)
+
+    async def busy(c, router) -> None:
+        """An engine whose full queue refused the probe while its steps went on is serving: up, and named busy."""
+        router.up = [True, False]
+        r = await c.get("/health_generate")
+        assert r.status_code == 200 and r.json() == {"status": "ok", "down": [], "busy": [router.workers[1]]}, r.text
+        assert router.up == [True, True] and router.fails == [0, 0]
+
+    _run([_native_worker(0), _native_worker(1, health_busy=True)], busy)
 
 
 def test_abort_request_reaches_every_worker():

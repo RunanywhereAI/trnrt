@@ -392,6 +392,31 @@ def test_health_generate_runs_a_token_through_the_engine(monkeypatch):
         assert len(lp.stats.records) == 3 and not probes & {r["rid"] for r in lp.stats.records}
 
 
+def test_health_generate_reads_a_full_queue_as_busy_not_failed(monkeypatch):
+    """A full waiting queue (--max-queued-requests) refuses the probe as any request: while steps go on, the engine is
+    serving, so the answer is 200 busy, not 503 failed (a supervisor would restart a healthy, loaded engine). With no
+    step ending, it is still 503."""
+    import httpx
+
+    from tests.test_serve_sched import QueueEngine
+    from trnrt.engine.scheduler import Scheduling
+    from trnrt.serve import native
+
+    eng = QueueEngine(PLAIN * 40, Scheduling())
+    eng.step_delay = 0.02
+    with _uvicorn(eng) as base, httpx.Client(base_url=base, timeout=30) as c:
+        busy = _background(lambda: c.post("/v1/completions", json={"prompt": [1], "max_tokens": 100}))  # 2 s of steps
+        _wait_for(lambda: eng.scheduler.running)
+        eng.limit = 0  # the queue is full from here: the engine refuses every new request
+        r = c.get("/health_generate")
+        assert r.status_code == 200 and r.json() == {"status": "ok", "busy": True}, r.text
+        assert eng.priorities[-1] is None and len(eng.added) == 1  # the probe was refused, never added
+        assert busy().status_code == 200
+        monkeypatch.setattr(native, "HEALTH_GENERATE_TIMEOUT_S", 0.3)
+        r = c.get("/health_generate")  # idle, queue full: no step ends
+        assert r.status_code == 503 and "no engine step ended" in r.json()["error"], r.text
+
+
 def test_health_generate_is_503_once_a_rank_died(serve):
     client, eng = serve(PLAIN, tp=2)
     eng.dead = [1]
