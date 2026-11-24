@@ -1,5 +1,5 @@
-"""Speculative decoding's counters as the server exposes them (trnrt/metrics.py): the spec_decode_* lines of GET /metrics, under
-vLLM's names, and the spec block of GET /v1/stats. Nothing is exposed for an engine that does not speculate."""
+"""Speculative decoding's counters as the server exposes them (trnrt/metrics.py): the spec_decode_* lines of GET /metrics,
+and the spec block of GET /v1/stats. Nothing is exposed for an engine that does not speculate."""
 
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ def engine(**kw):
     return types.SimpleNamespace(**{**base, **kw})
 
 
-def test_the_counters_use_vllms_spec_decode_names():
+def test_the_counters_use_the_spec_decode_names():
     lines = spec_lines(engine())
     assert "trnrt:spec_decode_num_drafts_total 20" in lines
     assert "trnrt:spec_decode_num_draft_tokens_total 40" in lines
