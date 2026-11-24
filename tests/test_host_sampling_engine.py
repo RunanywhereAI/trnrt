@@ -4,7 +4,7 @@ decoding through xgrammar is tests/test_grammar_engine.py.
 
 - with the flags off the engine refuses what needs them, and with them on but no request using them every call is the
   graph (and every token the one) the engine without them gives;
-- a penalized request follows vLLM's formula, step by step, against its own raw logprobs, while the requests beside it
+- a penalized request follows the penalty formula, step by step, against its own raw logprobs, while the requests beside it
   decode exactly as alone;
 - min_tokens keeps the end-of-sequence and stop ids out of the first min_tokens tokens;
 - a thinking budget forces the reasoning's end at the budget.
@@ -93,7 +93,7 @@ def test_with_the_flags_on_and_no_request_using_them_every_call_is_todays(model)
 
 def test_a_penalized_request_follows_the_formula_beside_unchanged_neighbours(model):
     """Greedy with frequency and presence penalties: each token is the argmax of its raw logprobs (logprobs=20, before
-    penalties) minus vLLM's penalties over the output so far, and the plain requests decoding beside it (every other
+    penalties) minus the penalties over the output so far, and the plain requests decoding beside it (every other
     step it waits for its token) produce what they produce alone."""
     ps = T.prompts(22, (11, 8, 15))
     plain = SamplingParams(max_new_tokens=16, temperature=0.0, ignore_eos=True)

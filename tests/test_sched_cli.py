@@ -1,4 +1,4 @@
-"""The scheduling flags (trnrt/__main__.py add_scheduling_args, scheduling): SGLang's names, host only, refused before
+"""The scheduling flags (trnrt/__main__.py add_scheduling_args, scheduling): host only, refused before
 any engine starts when the scheduler or the prefix cache would refuse them, and handed by serve to every engine."""
 
 from __future__ import annotations

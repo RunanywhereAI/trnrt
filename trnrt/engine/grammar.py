@@ -1,5 +1,4 @@
-"""Structured outputs through xgrammar, the grammar engine SGLang and vLLM both default to, and the packed token masks
-the sampler takes (engine/sampler.py shaped_logits).
+"""Structured outputs through xgrammar, and the packed token masks the sampler takes (engine/sampler.py shaped_logits).
 
 The grammar runs on the host: a matcher per request fills its row of a packed token bitmask (int32 [rows, ceil(V / 32)],
 bit t % 32 of word t // 32 set when token t is allowed) before each step that samples for it, and accepting the sampled
@@ -29,8 +28,8 @@ MISSING = "guided decoding needs the xgrammar package on the engine's host: pip 
 @dataclass(frozen=True)
 class GrammarSpec:
     """One request's output constraint. kind: "json_schema" (value: the schema as JSON text), "regex" or "ebnf"
-    (value: the pattern or grammar). A JSON object without a schema is the schema {"type": "object"} (SGLang's reading of
-    response_format json_object), and a choice of strings is a regex of their alternatives (vLLM's guided_choice)."""
+    (value: the pattern or grammar). A JSON object without a schema is the schema {"type": "object"} (response_format
+    json_object), and a choice of strings is a regex of their alternatives (guided_choice)."""
 
     kind: str
     value: str

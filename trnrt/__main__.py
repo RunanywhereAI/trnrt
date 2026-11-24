@@ -390,7 +390,7 @@ def _json_object(s: str) -> dict:
 
 
 def add_scheduling_args(ap: argparse.ArgumentParser) -> None:
-    """Each engine's scheduling, under SGLang's flag names wherever SGLang has the setting (engine/scheduler.py,
+    """Each engine's scheduling (engine/scheduler.py,
     engine/radix_cache.py). Host only: none of them changes a graph, and the defaults schedule as an engine without
     them."""
     g = ap.add_argument_group(

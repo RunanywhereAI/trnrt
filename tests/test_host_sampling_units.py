@@ -76,7 +76,7 @@ def test_a_masked_draw_never_takes_a_forbidden_token_and_reports_raw_logprobs(te
 
 
 def _reference_penalized(logits, prompt, out, rep, freq, pres):
-    """vLLM's penalties, written out per token: repetition over prompt and output tokens, then frequency and presence
+    """The penalties, written out per token: repetition over prompt and output tokens, then frequency and presence
     over the output alone."""
     x = logits.clone()
     counts = {t: out.count(t) for t in set(out)}

@@ -17,7 +17,7 @@
 | `trnrt/platform.py` | Trainium2 facts, the neuronx-cc argument set and the runtime environment. |
 | `trnrt/metrics.py` | Prometheus text for each engine's `/metrics`. |
 | `trnrt/serve/api.py` | The OpenAI-compatible server for one engine: request validation, chat template, streaming. |
-| `trnrt/serve/native.py` | SGLang's native API on one engine: `/generate`, the info and load endpoints, `/health_generate`, `/abort_request`, `/flush_cache`. |
+| `trnrt/serve/native.py` | The native API on one engine: `/generate`, the info and load endpoints, `/health_generate`, `/abort_request`, `/flush_cache`. |
 | `trnrt/serve/router.py` | The session-affine, prefix-aware router in front of the engines, with failover. |
 | `trnrt/serve/parsers.py` | GLM reasoning and tool-call parsing, streamed and whole. |
 | `trnrt/serve/responses.py`, `anthropic.py` | The OpenAI Responses API and the Anthropic Messages API, translated into the chat path. |

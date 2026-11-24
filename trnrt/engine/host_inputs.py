@@ -77,15 +77,15 @@ def _mask_row(r: Request, row: np.ndarray, eos_ids, backend) -> bool:
         ends = [*(() if p.ignore_eos else eos_ids), *p.stop_token_ids]
         before = row.copy()
         grammar.forbid(row, ends)
-        if not row.any():  # a grammar that can only end now: its end wins over min_tokens (vLLM's conflict too)
+        if not row.any():  # a grammar that can only end now: its end wins over min_tokens
             row[:] = before
         used = True
     return used
 
 
 def _penalty_row(r: Request) -> tuple[list[int], list[float]]:
-    """r's distinct prompt-or-output tokens (prompt tokens only under a repetition penalty: vLLM applies frequency and
-    presence to the output alone) and each one's count in the output. The output counts are kept on the request and
+    """r's distinct prompt-or-output tokens (prompt tokens only under a repetition penalty: frequency and
+    presence apply to the output alone) and each one's count in the output. The output counts are kept on the request and
     extended as tokens arrive, and the prompt's distinct ids are taken once."""
     st = r.__dict__.get("_pen")
     out = r.output_ids

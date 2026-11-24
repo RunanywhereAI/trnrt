@@ -158,7 +158,7 @@ def test_lpm_admits_the_longest_cached_prefix_first():
 
 
 def test_lpm_past_its_queue_limit_returns_to_arrival_order():
-    """Above LPM_MAX_QUEUE waiting requests lpm stops matching prefixes and orders by arrival (SGLang's fcfs then); a
+    """Above LPM_MAX_QUEUE waiting requests lpm stops matching prefixes and orders by arrival; a
     queue an earlier round sorted by cache hits does not stay in that order."""
     sched = policy(make(), policy="lpm")
     reqs = [req(f"r{i}", 4) for i in range(LPM_MAX_QUEUE + 1)]
@@ -174,7 +174,7 @@ def test_lpm_past_its_queue_limit_returns_to_arrival_order():
 def test_priority_scheduling_orders_by_priority_both_ways_and_none_last():
     mk = lambda: [req("x", 3, priority=0), req("a", 4, priority=1), req("b", 4), req("c", 4, priority=5)]  # noqa: E731
     hi = policy(make(max_seqs=1, budget=64), priority_scheduling=True)
-    assert admitted(hi, mk()) == ["c", "a", "x", "b"]  # higher values first (SGLang's default), no priority last
+    assert admitted(hi, mk()) == ["c", "a", "x", "b"]  # higher values first, no priority last
     lo = policy(make(max_seqs=1, budget=64), priority_scheduling=True, low_priority_first=True)
     assert admitted(lo, mk()) == ["x", "a", "c", "b"]
     assert admitted(make(max_seqs=1, budget=64), mk()) == ["x", "a", "b", "c"]  # off: arrival order
@@ -339,7 +339,7 @@ def test_a_full_queue_displaces_its_worst_request_for_a_better_one():
         sched.add(r)
     with pytest.raises(QueueFull):  # no priority: never better than anyone
         sched.add(req("none", 4))
-    with pytest.raises(QueueFull):  # equal to the worst: refused, as SGLang (strictly better only)
+    with pytest.raises(QueueFull):  # equal to the worst: refused (strictly better only)
         sched.add(req("tie", 4, priority=1))
     best = req("best", 4, priority=9)
     assert sched.add(best) is cc  # of the two worst (1, 1) the newer

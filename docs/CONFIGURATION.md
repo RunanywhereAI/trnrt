@@ -71,14 +71,13 @@ docker run ... trnrt serve --model /model --port 8000 --preset batch8 --max-runn
 ## Scheduling
 
 Each engine schedules its own requests. These flags are host only: they change no graph, so they run on the compile
-cache of the configuration they are added to, and `serve` hands them to every engine. The names are SGLang's, except
-`--max-queued-tokens` and the policies SGLang does not have (`spf`, `tlru`). The defaults schedule and evict as an
-engine without these flags.
+cache of the configuration they are added to, and `serve` hands them to every engine. The defaults schedule and evict
+as an engine without these flags.
 
 | Argument | Default | |
 |---|---|---|
-| `--schedule-policy` | fcfs | the order waiting requests start in: `fcfs` arrival, `lpm` the longest cached prefix first (arrival order above 128 waiting, as SGLang), `lof` the longest `max_tokens` first, `spf` the shortest prompt first; `priority` is `fcfs` with `--enable-priority-scheduling` |
-| `--enable-priority-scheduling` | off | each request's `priority` first ([API.md](API.md#scheduling-and-priority)), higher values first; KV pressure preempts the worst priority first. Takes `fcfs`, `lof` or `spf`, not `lpm` (SGLang's rule) |
+| `--schedule-policy` | fcfs | the order waiting requests start in: `fcfs` arrival, `lpm` the longest cached prefix first (arrival order above 128 waiting), `lof` the longest `max_tokens` first, `spf` the shortest prompt first; `priority` is `fcfs` with `--enable-priority-scheduling` |
+| `--enable-priority-scheduling` | off | each request's `priority` first ([API.md](API.md#scheduling-and-priority)), higher values first; KV pressure preempts the worst priority first. Takes `fcfs`, `lof` or `spf`, not `lpm` |
 | `--schedule-low-priority-values-first` | off | lower priority values first |
 | `--priority-scheduling-preemption-threshold` | 10 | with every seat taken, a waiting request better than a running one by more than this takes its seat |
 | `--disable-priority-preemption` | off | never preempt a running request for a waiting one |

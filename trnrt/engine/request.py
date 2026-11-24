@@ -29,7 +29,7 @@ class SamplingParams:
     seed: int | None = None
     # Reasoning tokens before the engine forces the reasoning's end (engine/engine.py).
     thinking_token_budget: int | None = None
-    # Guided decoding (engine/grammar.py), and vLLM's min_tokens (SGLang min_new_tokens): no end-of-sequence or stop id
+    # Guided decoding (engine/grammar.py), and min_tokens: no end-of-sequence or stop id
     # among the first min_tokens output tokens.
     grammar: GrammarSpec | None = None
     min_tokens: int = 0
@@ -81,7 +81,7 @@ class Request:
     # is closed.
     session_id: str | None = None
     session_gen: int = -1
-    # SGLang's per-request priority (engine/scheduler.py: priority scheduling, the priority eviction); None: none given.
+    # The per-request priority (engine/scheduler.py: priority scheduling, the priority eviction); None: none given.
     priority: int | None = None
     # (HTTP status, message) when the scheduler ended the request without serving it (a full queue's displacement).
     error: tuple[int, str] | None = None
@@ -111,7 +111,7 @@ class Request:
     think_force: list[int] = field(default_factory=list)
     think_done: bool = False
     # Guided decoding: the request's grammar matcher (engine/grammar.py), and whether it constrains the output yet. Under a
-    # reasoning block the prompt opened, it waits for the block's end (vLLM's structured outputs outside reasoning).
+    # reasoning block the prompt opened, it waits for the block's end.
     matcher: Any = None  # an xgrammar GrammarMatcher
     grammar_armed: bool = True
     grammar_seen: int = 0  # output tokens its matcher has been given

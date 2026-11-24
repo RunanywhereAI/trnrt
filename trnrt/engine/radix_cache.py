@@ -79,11 +79,11 @@ class MatchResult:
         return len(self.pages)
 
 
-# SGLang's --radix-eviction-policy names (server_args.py RADIX_EVICTION_POLICY_CHOICES, mem_cache/evict_policy.py), plus
-# tlru. Each policy's own settings (--radix-eviction-policy-config) and their defaults; tlru's have none.
+# The --radix-eviction-policy names. Each policy's own settings (--radix-eviction-policy-config) and their defaults;
+# tlru's have none.
 EVICTION_POLICIES = ("lru", "lfu", "slru", "priority", "tlru")
 POLICY_PARAMS: dict[str, dict[str, int | None]] = {
-    "slru": {"protected_threshold": 2},  # SGLang SLRUStrategy's default
+    "slru": {"protected_threshold": 2},
     "tlru": {"threshold": None, "next_prompt_estimate": None},
 }
 
@@ -111,10 +111,10 @@ class RadixCache:
     """`eviction_policy` orders what eviction (evict, evict_checkpoints) takes first, within each session-reference
     class (unreferenced first, then fewer references):
     - lru (the default): the prefix unused for longest;
-    - lfu: the fewest hits (requests admitted on a path through it), then the least recent (SGLang LFUStrategy);
+    - lfu: the fewest hits (requests admitted on a path through it), then the least recent;
     - slru: every probationary prefix (fewer than protected_threshold hits) before any protected one, the least recent
-      first within each (SGLang SLRUStrategy);
-    - priority: the lowest importance of the requests that used it, then the least recent (SGLang PriorityStrategy);
+      first within each;
+    - priority: the lowest importance of the requests that used it, then the least recent;
     - tlru (Tail-Optimized LRU, arXiv 2510.15152): first the tail of each cached sequence that its next turn can
       recompute and still prefill at most `threshold` uncached tokens (threshold - next_prompt_estimate tokens from its
       end), then plain recency.

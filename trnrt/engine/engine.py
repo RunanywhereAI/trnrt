@@ -773,7 +773,7 @@ class LLMEngine:
             if not stops or not s.sample or (req.status is not Status.RUNNING and not ended_here):
                 continue
             out = req.output_ids
-            if len(out) <= req.params.min_tokens:  # vLLM checks stop strings from min_tokens on
+            if len(out) <= req.params.min_tokens:  # stop strings are checked from min_tokens on
                 continue
             # Only the tail can newly contain a stop string; decode enough of it to cover
             # the longest one plus multi-token characters.
@@ -790,7 +790,7 @@ class LLMEngine:
 
     def _stop_in(self, out: list[int], n: int, stops, w: int, protect: int) -> bool:
         """Whether the last w tokens of out[:n] decode to text holding a stop string that ends past the first `protect`
-        tokens (min_tokens). vLLM matches only the newly decoded text, so a stop string that ended among the protected
+        tokens (min_tokens). Only the newly decoded text is matched, so a stop string that ended among the protected
         tokens stays in the output and never ends the request later."""
         start = max(0, n - w)
         tail = self.tokenizer.decode(out[start:n])

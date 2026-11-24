@@ -7,29 +7,29 @@ and versions follow [Semantic Versioning](https://semver.org/). Rebuild the comp
 
 ### Added
 
-- `/tokenize` and `/detokenize` (also under `/v1`), as SGLang and vLLM serve them. A chat request is counted exactly as
+- `/tokenize` and `/detokenize` (also under `/v1`). A chat request is counted exactly as
   `/v1/chat/completions` would send it to the engine. The router sends them to any live engine without touching its
   routing state ([docs/API.md](docs/API.md)).
-- SGLang's native `/generate` (also PUT): `text` or `input_ids`, one prompt or a batch, SGLang's `sampling_params`,
+- The native `/generate` (also PUT): `text` or `input_ids`, one prompt or a batch, `sampling_params`,
   streaming, output logprobs and request ids. The router routes it by its prompt or session
   ([docs/API.md](docs/API.md#generate)).
-- SGLang's `/model_info`, `/server_info`, `/get_load`, `/health_generate`, `/abort_request` and `/flush_cache` (and
+- `/model_info`, `/server_info`, `/get_load`, `/health_generate`, `/abort_request` and `/flush_cache` (and
   their `get_` names), on each engine and on the router, which asks one engine or all of them
   ([docs/API.md](docs/API.md#info-and-admin-endpoints)).
 - `n` choices on `/v1/chat/completions` and `/v1/completions`, sharing the prompt through the prefix cache; a seed gives
-  choice i `seed + i`, as in vLLM ([docs/API.md](docs/API.md#sampling-extras)).
-- SGLang's `stop_regex`, and keeping the stop text with `include_stop_str_in_output` (vLLM) or `no_stop_trim` (SGLang).
-- `skip_special_tokens: false`, and SGLang's `matched_stop` on every finished choice.
+  choice i `seed + i` ([docs/API.md](docs/API.md#sampling-extras)).
+- `stop_regex`, and keeping the stop text with `include_stop_str_in_output` or `no_stop_trim`.
+- `skip_special_tokens: false`, and `matched_stop` on every finished choice.
 - `stop_regex` refuses a pattern whose search can take more than about quadratic time in the text's length. Each search
   reaches back about 2048 characters before the text already searched, so a match must start there or later.
-- SGLang's `no_logs` on `/generate`: the request's record stays out of the production log.
+- `no_logs` on `/generate`: the request's record stays out of the production log.
 - The OpenAI Responses API, `POST /v1/responses`, stateless: reasoning, message and function-call items, and the
   Responses stream events ([docs/API.md](docs/API.md#responses-api)).
 - The Anthropic Messages API, `POST /v1/messages` and `/v1/messages/count_tokens`: thinking, text and tool-use blocks,
   Anthropic's stream events and error shape ([docs/API.md](docs/API.md#anthropic-messages-api)).
 - The router routes `/v1/responses` and `/v1/messages` by session and prefix as it routes chat, and sends
   `/v1/messages/count_tokens` to any live engine.
-- Scheduling flags with SGLang's names, host only and per engine: `--schedule-policy` (`fcfs`, `lpm`, `lof`, `spf`),
+- Scheduling flags, host only and per engine: `--schedule-policy` (`fcfs`, `lpm`, `lof`, `spf`),
   priority scheduling with the request field `priority` and priority preemption, `--max-queued-requests` and
   `--max-queued-tokens` (a full queue answers 503), and `--radix-eviction-policy` (`lru`, `lfu`, `slru`, `priority`,
   `tlru`). The defaults schedule as before ([docs/CONFIGURATION.md](docs/CONFIGURATION.md#scheduling)).
@@ -39,8 +39,8 @@ and versions follow [Semantic Versioning](https://semver.org/). Rebuild the comp
 - `TRNRT_PROD_DIR`: an opt-in on-disk log of request records (counts and times only) and gauges.
 - `TRNRT_PROMPT_CACHE_MB`: an opt-in prompt token cache that builds a chat turn's prompt ids from the previous turn's,
   with the same ids as a full encode or none.
-- Structured outputs through xgrammar, an optional dependency: `response_format` `json_object` and `json_schema`, vLLM's
-  `guided_*` and `structured_outputs`, and SGLang's `json_schema`, `regex` and `ebnf`. Also `min_tokens` and
+- Structured outputs through xgrammar, an optional dependency: `response_format` `json_object` and `json_schema`,
+  `guided_*` and `structured_outputs`, and `/generate`'s `json_schema`, `regex` and `ebnf`. Also `min_tokens` and
   `thinking_token_budget`. They need `--structured-outputs`, which adds graphs that take a token mask
   ([docs/API.md](docs/API.md#structured-outputs-penalties-and-thinking-budgets)). Tested on CPU; not yet run on
   Trainium2, and the check that the default graphs are unchanged is pending.
@@ -51,8 +51,8 @@ and versions follow [Semantic Versioning](https://semver.org/). Rebuild the comp
 ### Changed
 
 - The stop token that ends a request (EOS or a `stop_token_ids` entry) is no longer part of its text when the tokenizer
-  does not mark it special, as in vLLM and SGLang.
-- `min_new_tokens` (SGLang's name for `min_tokens`) and `spaces_between_special_tokens: false` are refused with 400;
+  does not mark it special.
+- `min_new_tokens` on the OpenAI endpoints and `spaces_between_special_tokens: false` are refused with 400;
   they were ignored.
 - `service_tier` other than `"auto"` or `"default"` is refused with 400 on `/v1/chat/completions`, `/v1/completions`
   and `/v1/responses`.

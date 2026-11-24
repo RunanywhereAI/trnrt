@@ -1,6 +1,6 @@
 # API
 
-The router on `--port` (default 8000) speaks the OpenAI API: `/v1/chat/completions`, `/v1/completions`, `/v1/models` and `/health`, plus `/tokenize` and `/detokenize` ([below](#tokenize-and-detokenize)), and serves each engine's statistics and dashboard ([below](#statistics-and-the-dashboard)). Any OpenAI client works with `base_url="http://<host>:8000/v1"`. It also speaks SGLang's native API: [`/generate`](#generate) and the [info and admin endpoints](#info-and-admin-endpoints). It also serves the OpenAI Responses API ([below](#responses-api)) and the Anthropic Messages API ([below](#anthropic-messages-api)).
+The router on `--port` (default 8000) speaks the OpenAI API: `/v1/chat/completions`, `/v1/completions`, `/v1/models` and `/health`, plus `/tokenize` and `/detokenize` ([below](#tokenize-and-detokenize)), and serves each engine's statistics and dashboard ([below](#statistics-and-the-dashboard)). Any OpenAI client works with `base_url="http://<host>:8000/v1"`. It also serves the native API: [`/generate`](#generate) and the [info and admin endpoints](#info-and-admin-endpoints). It also serves the OpenAI Responses API ([below](#responses-api)) and the Anthropic Messages API ([below](#anthropic-messages-api)).
 
 ## Example
 
@@ -32,7 +32,7 @@ curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -
 - A client that disconnects aborts its request, streamed or not.
 - Endpoints on `--port` (the router): `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/messages`,
   `/v1/messages/count_tokens`, `/v1/models`, `/health`, `/tokenize`, `/detokenize`, `/v1/stats`, `/dashboard`, and
-  SGLang's `/generate`, `/model_info`, `/server_info`, `/get_load`, `/health_generate`, `/abort_request` and
+  `/generate`, `/model_info`, `/server_info`, `/get_load`, `/health_generate`, `/abort_request` and
   `/flush_cache`. Each
   engine also serves Prometheus metrics at `/metrics` on its own port (8001 and 8002 with the default `--port`), on
   127.0.0.1 only, among them the sparse-attention selection's counters (`trnrt:dsa_local_k_*`,
@@ -46,7 +46,7 @@ curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -
   `--penalties` ([below](#structured-outputs-penalties-and-thinking-budgets)); otherwise they are answered with 400,
   naming the flag.
 - Not supported, answered with 400: `tool_choice` `"required"` or a named tool, prompt logprobs (`prompt_logprobs`,
-  `echo` with `logprobs`), and SGLang's `min_new_tokens` on the OpenAI endpoints (use `min_tokens`).
+  `echo` with `logprobs`), and `min_new_tokens` on the OpenAI endpoints (use `min_tokens`).
 - Status codes: 400 for a request that cannot be served as sent (a field of the wrong type or out of range, a prompt
   longer than the context, a chat template variable the template never reads); 500 for an error inside the engine;
   503 once the engine has failed, with the reason on `/health`, and 503 for a full queue
@@ -59,8 +59,8 @@ is first come, first served, with no queue limit.
 
 | Field or answer | Behaviour |
 |---|---|
-| `priority` (integer, on `/v1/chat/completions` and `/v1/completions`) | SGLang's request field. With `--enable-priority-scheduling`, a waiting request with a higher value starts first (`--schedule-low-priority-values-first`: a lower one), and a request without one starts last. With `--radix-eviction-policy priority`, the prefix cache keeps the prefixes of high-priority requests longer. Without either flag the field is refused with 400, since nothing would use it |
-| A full queue | Past `--max-queued-requests` or `--max-queued-tokens` waiting on an engine, a request is answered 503 `{"detail": "The request queue is full."}`, as SGLang answers it, with the header `x-trnrt-queue-full: 1`. The router passes it on and keeps routing to that engine; OpenAI clients retry a 503 |
+| `priority` (integer, on `/v1/chat/completions` and `/v1/completions`) | With `--enable-priority-scheduling`, a waiting request with a higher value starts first (`--schedule-low-priority-values-first`: a lower one), and a request without one starts last. With `--radix-eviction-policy priority`, the prefix cache keeps the prefixes of high-priority requests longer. Without either flag the field is refused with 400, since nothing would use it |
+| A full queue | Past `--max-queued-requests` or `--max-queued-tokens` waiting on an engine, a request is answered 503 `{"detail": "The request queue is full."}`, with the header `x-trnrt-queue-full: 1`. The router passes it on and keeps routing to that engine; OpenAI clients retry a 503 |
 | Displaced from a full queue | With priority scheduling, a request better than the worst one waiting takes its place. The displaced request gets 503 `The request is aborted by a higher priority request.` (as an error event if it streams). A request that has already generated tokens is never displaced |
 | Preempted for priority | With priority scheduling, when every seat is taken, a waiting request whose priority beats a running one's by more than `--priority-scheduling-preemption-threshold` (10) takes that one's seat. The preempted request waits and later resumes from its cached prefix; its client sees only a pause |
 
@@ -78,19 +78,19 @@ an output. Like the rest of the router, these endpoints have no authentication.
 
 ## Sampling extras
 
-These fields work on `/v1/chat/completions` and `/v1/completions`, as vLLM and SGLang take them.
+These fields work on `/v1/chat/completions` and `/v1/completions`.
 
 | Field | What it does |
 |---|---|
 | `n` | Up to 128 choices of one prompt, each its own engine request. The prefix cache computes the shared prompt once: the scheduler holds the other choices until they can resume from the first one's prompt checkpoint. Each choice has its `index`, streamed chunks included. `usage` counts the prompt once and every choice's output; `cached_tokens` is the fewest any choice read from the cache. A client that disconnects aborts every choice. |
 | `best_of` | Accepted only equal to `n` (ranking extra candidates needs their logprobs, which no request returns). |
-| `seed` with `n` | Choice i samples with `seed + i`, as vLLM does, so the choices differ and each is reproducible. |
-| `stop_regex` | SGLang's: a pattern or a list of up to 16, matched on the output text. The output ends at the end of the first match, the matched text included (as in SGLang), with `finish_reason` `"stop"`. Each search reaches back about 2048 characters before the text already searched, so a match that starts further back is not found; a match may end anywhere after. With `min_tokens`, a match that ends among the first `min_tokens` output tokens is skipped and the output runs on to the next match, as for stop strings. A pattern whose search can take more than about quadratic time in the text's length (nested or overlapping repeats, such as `(a+)+` or `a*a*`) is refused with 400; repeats that cannot take the same characters, such as `\w+@\w+` (the `@` between them), are served. |
-| `include_stop_str_in_output`, `no_stop_trim` | vLLM's and SGLang's names for one switch: keep the stop string, or the stop token's text, in the output. |
+| `seed` with `n` | Choice i samples with `seed + i`, so the choices differ and each is reproducible. |
+| `stop_regex` | A pattern or a list of up to 16, matched on the output text. The output ends at the end of the first match, the matched text included, with `finish_reason` `"stop"`. Each search reaches back about 2048 characters before the text already searched, so a match that starts further back is not found; a match may end anywhere after. With `min_tokens`, a match that ends among the first `min_tokens` output tokens is skipped and the output runs on to the next match, as for stop strings. A pattern whose search can take more than about quadratic time in the text's length (nested or overlapping repeats, such as `(a+)+` or `a*a*`) is refused with 400; repeats that cannot take the same characters, such as `\w+@\w+` (the `@` between them), are served. |
+| `include_stop_str_in_output`, `no_stop_trim` | Two names for one switch: keep the stop string, or the stop token's text, in the output. |
 | `skip_special_tokens` | `false` keeps special tokens in the output text. |
-| `stop_token_ids` | Tokens that end the request. As in vLLM and SGLang, the stop token (or EOS) is not part of the text. |
+| `stop_token_ids` | Tokens that end the request. The stop token (or EOS) is not part of the text. |
 
-Every finished choice carries SGLang's `matched_stop`: the stop string or `stop_regex` pattern that ended it, the token id
+Every finished choice carries `matched_stop`: the stop string or `stop_regex` pattern that ended it, the token id
 that did (EOS or a stop token), or `null` (a length).
 
 ## Responses API
@@ -104,7 +104,7 @@ prompt, sampling and GLM parsers apply, and its output comes back as Responses i
 | `tools` (function tools), `tool_choice` | chat tools; `"auto"` and `"none"` (`"required"` and a named function are refused, as in chat) |
 | `max_output_tokens`, `temperature`, `top_p`, `stream`, `parallel_tool_calls`, `session_id`, the chat sampling extras | the same chat fields |
 | `reasoning.effort` | `reasoning_effort`: `"low"`, `"high"` or `"max"`, as in chat |
-| `reasoning.summary` | a `summary_text` that mirrors the reasoning (there is no summarizer), as SGLang does |
+| `reasoning.summary` | a `summary_text` that mirrors the reasoning (there is no summarizer) |
 | `include: ["reasoning.encrypted_content"]` | the reasoning text in the reasoning item's `encrypted_content`, not encrypted, so a client can send it back |
 
 | Output | Item |
@@ -155,13 +155,13 @@ failed call; put the error in the result's content), server tools, `mcp_servers`
 
 ## Tokenize and detokenize
 
-`/tokenize` and `/detokenize` (also under `/v1`) answer as SGLang and vLLM do. Neither runs the model, and the router
-sends them to any live engine.
+`/tokenize` and `/detokenize` (also under `/v1`) do not run the model, and the router sends them to any live
+engine.
 
 | Endpoint | Request | Response |
 |---|---|---|
 | `/tokenize` | exactly one of `prompt` (a string, or a list of strings for a batch) or `messages` (with the chat fields `/v1/chat/completions` takes: `tools`, `tool_choice`, `chat_template_kwargs`, `reasoning_effort`); `add_special_tokens` (prompt only, default `true`); `return_token_strs` | `tokens`, `count`, `max_model_len`, and `token_strs` when asked |
-| `/detokenize` | `tokens`: a list of token ids, or a list of such lists for a batch; `skip_special_tokens` (default `true`) | the text as `text` (SGLang's name) and as `prompt` (vLLM's) |
+| `/detokenize` | `tokens`: a list of token ids, or a list of such lists for a batch; `skip_special_tokens` (default `true`) | the text as `text` and as `prompt`, the same text |
 
 A chat request is counted exactly as `/v1/chat/completions` would send it to the engine, rendered by the model's chat
 template, so `count` is the prompt length that request would use against `--max-model-len`. Fields the chat endpoint
@@ -175,15 +175,14 @@ curl -s localhost:8000/tokenize -H 'Content-Type: application/json' \
 
 ## Generate
 
-`/generate` (POST or PUT) is SGLang's native generation endpoint, with SGLang's request and response shapes, so SGLang
-clients work unchanged. It runs through the same engine path as `/v1/completions`: the same checks, stop strings, and a
-client that disconnects aborts its request. The router routes it like a completion, by its prompt or its `session_id`.
+`/generate` (POST or PUT) is the native generation endpoint. It runs through the same engine path as `/v1/completions`: the same checks, stop strings, and a client
+that disconnects aborts its request. The router routes it like a completion, by its prompt or its `session_id`.
 
 | Request field | Meaning |
 |---|---|
 | `text` or `input_ids` | One prompt (a string, or a list of token ids), or a batch (a list of either). Exactly one of the two. |
-| `sampling_params` | SGLang's names: `max_new_tokens` (default 128), `temperature`, `top_p`, `top_k`, `min_p`, `stop`, `stop_token_ids`, `ignore_eos`, `sampling_seed`; with `--structured-outputs`, `json_schema`, `regex`, `ebnf` and `min_new_tokens`; with `--penalties`, `frequency_penalty`, `presence_penalty` and `repetition_penalty`. A batch may send one object per prompt. Defaults come from the checkpoint's `generation_config.json`, as on the OpenAI routes. |
-| `stream` | Server-sent events, then `data: [DONE]`. Each event carries the output so far (SGLang's default): `text`, `output_ids` and `meta_info`. A batch's events also carry their prompt's `index`. |
+| `sampling_params` | `max_new_tokens` (default 128), `temperature`, `top_p`, `top_k`, `min_p`, `stop`, `stop_token_ids`, `ignore_eos`, `sampling_seed`; with `--structured-outputs`, `json_schema`, `regex`, `ebnf` and `min_new_tokens`; with `--penalties`, `frequency_penalty`, `presence_penalty` and `repetition_penalty`. A batch may send one object per prompt. Defaults come from the checkpoint's `generation_config.json`, as on the OpenAI routes. |
+| `stream` | Server-sent events, then `data: [DONE]`. Each event carries the output so far: `text`, `output_ids` and `meta_info`. A batch's events also carry their prompt's `index`. |
 | `return_logprob`, `top_logprobs_num` (0 to 20), `return_text_in_logprobs` | Output-token logprobs in `meta_info`. |
 | `logprob_start_len` | `-1` (or absent) only, when `return_logprob` is set. |
 | `rid` | The request's id, which `/abort_request` names. A batch's ids are `rid_0`, `rid_1`, ..., or a list of one per prompt. A rid already running is refused. |
@@ -214,7 +213,7 @@ Answered with 400, naming the field: prompt logprobs (`logprob_start_len` >= 0 w
 `sampling_params`, `n` > 1, `structural_tag`, `stop_regex`, `no_stop_trim`, `skip_special_tokens` false,
 `spaces_between_special_tokens` false, `logit_bias`, `stream_interval` or `beam_width` other than 1, and
 `custom_params`; and multimodal input, LoRA, hidden states, `priority`, `session_params` and the other
-GenerateReqInput fields this server does not serve. An unknown `sampling_params` key is refused too, as SGLang does.
+request fields this server does not serve. An unknown `sampling_params` key is refused too.
 Each is accepted at its neutral value.
 
 ```bash
@@ -224,12 +223,12 @@ curl -s localhost:8000/generate -H 'Content-Type: application/json' \
 
 ## Info and admin endpoints
 
-SGLang's names (the `get_` forms are SGLang's older ones, served too). The router answers each from one engine or from
+The `get_` forms are served too. The router answers each from one engine or from
 all of them:
 
 | Endpoint | Engine answer | Router |
 |---|---|---|
-| `GET /model_info`, `/get_model_info` | `model_path` (as passed to `--model`), `served_model_name`, `is_generation`, `preferred_sampling_params` (the checkpoint's defaults), `reasoning_parser` and `tool_call_parser` (SGLang's names for the equivalent parsers: `glm45`, `glm47`), `model_type`, `architectures` | The first live engine |
+| `GET /model_info`, `/get_model_info` | `model_path` (as passed to `--model`), `served_model_name`, `is_generation`, `preferred_sampling_params` (the checkpoint's defaults), `reasoning_parser` and `tool_call_parser` (the parsers in use: `glm45`, `glm47`), `model_type`, `architectures` | The first live engine |
 | `GET /server_info`, `/get_server_info` | The engine's configuration (every `EngineConfig` field), `tp_size`, `dp_size`, `context_length`, `preset`, `version`, `startup_seconds`, and `internal_states` (its `/get_load` entry) | The first answer, with `dp_size` the number of engines and `internal_states` one entry per engine |
 | `GET /get_load` | `[{dp_rank, num_reqs, num_running_reqs, num_waiting_reqs, num_tokens, num_pending_tokens, token_usage, ts_tic}]`: `num_tokens` is the KV tokens in use plus the waiting requests' tokens | Every engine's entry, `dp_rank` its index |
 | `GET /health_generate` | 200 once a step ends after a one-token probe is sent (the probe itself on an idle engine); 503 if none ends within 20 s, or once the engine failed. The probe is not counted in `/metrics` | Every engine: 200 `"ok"` or `"degraded"` while any generated, 503 `"down"` when none did, naming the engines down. An engine's 503 counts toward the router's `down_after`, as a stalled `/health` does, rather than marking it down at once |
@@ -245,19 +244,19 @@ Each needs graphs that take inputs from the host. An engine serves them only whe
 
 | Field | Flag | Behaviour |
 |---|---|---|
-| `response_format` `{"type": "json_object"}` | `--structured-outputs` | a JSON object (the schema `{"type": "object"}`, as SGLang) |
+| `response_format` `{"type": "json_object"}` | `--structured-outputs` | a JSON object (the schema `{"type": "object"}`) |
 | `response_format` `{"type": "json_schema", "json_schema": {"schema": ...}}` | `--structured-outputs` | JSON matching the schema |
-| vLLM `guided_json`, `guided_regex`, `guided_choice`, `guided_grammar`; `structured_outputs` `{json, regex, choice, grammar, json_object}` | `--structured-outputs` | a schema, a regular expression, one of the strings, an EBNF grammar |
-| SGLang `json_schema` (a string), `regex`, `ebnf` | `--structured-outputs` | the same |
-| `min_tokens` | `--structured-outputs` | no end-of-sequence or `stop_token_ids` id among the first `min_tokens` tokens; a stop string that ends among them does not end the request (vLLM) |
+| `guided_json`, `guided_regex`, `guided_choice`, `guided_grammar`; `structured_outputs` `{json, regex, choice, grammar, json_object}` | `--structured-outputs` | a schema, a regular expression, one of the strings, an EBNF grammar |
+| `/generate` `sampling_params` `json_schema` (a string), `regex`, `ebnf` | `--structured-outputs` | the same |
+| `min_tokens` | `--structured-outputs` | no end-of-sequence or `stop_token_ids` id among the first `min_tokens` tokens; a stop string that ends among them does not end the request |
 | `thinking_token_budget` | `--structured-outputs` | at most this many reasoning tokens after `<think>`; then `</think>` is forced |
-| `repetition_penalty`, `frequency_penalty`, `presence_penalty` | `--penalties` | vLLM's formulas: repetition over prompt and output tokens, frequency and presence over the output |
+| `repetition_penalty`, `frequency_penalty`, `presence_penalty` | `--penalties` | repetition over prompt and output tokens, frequency and presence over the output |
 
-- One constraint per request. Two (say `response_format` and `regex`) are refused with 400, as SGLang refuses them.
+- One constraint per request. Two (say `response_format` and `regex`) are refused with 400.
 - Guided decoding uses [xgrammar](https://github.com/mlc-ai/xgrammar), an optional dependency:
   `pip install 'trnrt[grammar]'`. Without it, guided requests are answered with 400.
-- GLM-5.3-Flash reasons first. As in vLLM, the constraint applies to the answer after `</think>`, not to the reasoning.
-- Logprobs stay the raw model's, before the mask and the penalties, as vLLM reports them by default.
+- GLM-5.3-Flash reasons first. The constraint applies to the answer after `</think>`, not to the reasoning.
+- Logprobs stay the raw model's, before the mask and the penalties.
 - A request with penalties, a grammar, or a thinking budget near its end waits for its newest token before each step,
   so it gives up the overlap of host and device work; the requests beside it keep it. Under the dynamic `mtp-*` presets
   the engine stops speculating while a request that uses any of these runs.

@@ -36,11 +36,11 @@ it can resume from it.
 Scheduling policies (SchedulerConfig.policy and the fields after it, all host only; the defaults schedule exactly as
 before they existed). The waiting queue is ordered before each admission round: fcfs keeps arrival order; lpm puts the
 longest cached prefix first; lof the longest max_new_tokens first; spf the shortest prompt first. With priority
-scheduling (SGLang --enable-priority-scheduling) a request's `priority` comes first, higher values first unless
+scheduling (--enable-priority-scheduling) a request's `priority` comes first, higher values first unless
 low_priority_first; preemption under KV pressure takes the worst priority first; and a waiting request better than the
-worst running one by more than priority_preemption_threshold takes that one's seat (SGLang preempt_to_schedule). A
+worst running one by more than priority_preemption_threshold takes that one's seat. A
 queue limit (max_queued_requests, max_queued_tokens) refuses a request with QueueFull; under priority scheduling a
-request better than the worst waiting one displaces it instead (SGLang _abort_on_queued_limit).
+request better than the worst waiting one displaces it instead.
 """
 
 from __future__ import annotations
@@ -72,17 +72,16 @@ class NeedSync(Exception):
 
 class QueueFull(Exception):
     """The waiting queue is at its limit (SchedulerConfig.max_queued_requests / max_queued_tokens): the request is
-    refused before it is queued. SGLang answers this with 503 "The request queue is full." (scheduler.py
-    _abort_on_queued_limit)."""
+    refused before it is queued. The API answers it with 503 and the message "The request queue is full.".
+    """
 
 
-# SGLang's --schedule-policy names (managers/schedule_policy.py), the ones served here, plus spf; "priority" is fcfs with
-# priority scheduling on.
+# The --schedule-policy names; "priority" is fcfs with priority scheduling on.
 POLICIES = ("fcfs", "lpm", "lof", "spf", "priority")
-# SGLang turns lpm's prefix matching off above this many waiting requests (SchedulePolicy._determine_active_policy):
-# each match walks the radix tree, once per waiting request per step.
+# lpm's prefix matching is off above this many waiting requests: each match walks the radix tree, once per waiting
+# request per step.
 LPM_MAX_QUEUE = 128
-# Displaced from a full queue by a request of higher priority (SGLang's message).
+# Displaced from a full queue by a request of higher priority.
 DISPLACED = "The request is aborted by a higher priority request."
 
 
@@ -104,10 +103,10 @@ class SchedulerConfig:
     # Scheduling policy (module docstring, POLICIES). Host only; the defaults are the scheduling without them.
     policy: str = "fcfs"
     priority_scheduling: bool = False
-    low_priority_first: bool = False  # SGLang --schedule-low-priority-values-first
-    priority_preemption: bool = True  # SGLang's default; --disable-priority-preemption turns it off
-    priority_preemption_threshold: int = 10  # SGLang --priority-scheduling-preemption-threshold's default
-    max_queued_requests: int | None = None  # SGLang --max-queued-requests
+    low_priority_first: bool = False
+    priority_preemption: bool = True  # --disable-priority-preemption turns it off
+    priority_preemption_threshold: int = 10
+    max_queued_requests: int | None = None
     max_queued_tokens: int | None = None  # prompt tokens waiting, at most
 
     def __post_init__(self) -> None:
@@ -116,7 +115,7 @@ class SchedulerConfig:
         if self.policy == "priority":
             self.policy, self.priority_scheduling = "fcfs", True
         if self.priority_scheduling and self.policy == "lpm":
-            # SGLang's own check (server_args.py): an order by priority and one by cached prefix cannot both lead
+            # an order by priority and one by cached prefix cannot both lead
             raise ValueError("priority scheduling takes schedule policy fcfs, lof or spf, not lpm")
         for name in ("max_queued_requests", "max_queued_tokens"):
             v = getattr(self, name)
@@ -324,8 +323,8 @@ class Scheduler:
         return self.radix.session_close(sid)
 
     def rank(self, req: Request) -> float:
-        """req's priority as a sort key, smaller first: higher priority values first (SGLang's default), lower ones with
-        low_priority_first; a request without one comes last (SGLang gives it the worst value, sys.maxsize). Kept an
+        """req's priority as a sort key, smaller first: higher priority values first, lower ones with
+        low_priority_first; a request without one comes last (it ranks as sys.maxsize). Kept an
         int: the API takes signed 64-bit priorities, which a float would round together above 2**53."""
         p = req.priority
         if p is None:
@@ -354,7 +353,7 @@ class Scheduler:
         return displaced
 
     def _importance(self, req: Request) -> float:
-        """req's priority for the priority eviction, larger kept longer: SGLang's request priority, 0 when it has none
+        """req's priority for the priority eviction, larger kept longer: the request priority, 0 when it has none
         (radix_cache.py _insert_helper), negated with low_priority_first so that eviction keeps what scheduling favours."""
         p = req.priority or 0
         return -p if self.cfg.low_priority_first else p  # an int, exact as rank's
@@ -575,8 +574,8 @@ class Scheduler:
     def _priority_preempt(self) -> None:
         """Priority scheduling: when every seat is taken and the best waiting request (that is not waiting for a prefix
         another request is computing) ranks better than the worst running one by more than
-        priority_preemption_threshold, that one is preempted for its seat (SGLang PrefillAdder.preempt_to_schedule,
-        which also requires the difference to exceed the threshold). Before anything is planned, so the victim is in no
+        priority_preemption_threshold, that one is preempted for its seat (the difference must exceed the
+        threshold). Before anything is planned, so the victim is in no
         entry of this step; with a step in flight, NeedSync first (a preempted request recomputes from real tokens)."""
         c = self.cfg
         if not (c.priority_scheduling and c.priority_preemption) or not self.waiting:

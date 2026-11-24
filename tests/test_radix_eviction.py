@@ -1,4 +1,4 @@
-"""The prefix cache's eviction policies (engine/radix_cache.py EVICTION_POLICIES, SGLang's --radix-eviction-policy).
+"""The prefix cache's eviction policies (engine/radix_cache.py EVICTION_POLICIES, --radix-eviction-policy).
 
 Each test builds prefixes whose recency alone orders them one way and whose policy key orders them the other, so the
 policy is what decides; lru on the same tree is the control."""

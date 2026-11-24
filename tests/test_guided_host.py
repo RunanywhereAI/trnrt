@@ -143,7 +143,7 @@ def stop_check(r: Request, draft=False) -> list[Request]:
 
 
 def test_a_stop_string_among_the_first_min_tokens_never_ends_the_request():
-    """vLLM checks stop strings from min_tokens on, over the newly decoded text only: a stop string that ended among the
+    """Stop strings are checked from min_tokens on, over the newly decoded text only: a stop string that ended among the
     protected tokens stays in the output and is not matched later."""
     r = running([5, 6], SamplingParams(stop=("<7>",), min_tokens=3))
     for t in (7, 8, 9, 20, 21):  # the stop token is the first output token, protected

@@ -3,7 +3,7 @@ committed token changes (a grammar matcher accepts it, a thinking budget counts 
 built per call in engine/host_inputs.py.
 
 Reasoning. GLM-5.3-Flash writes its reasoning between `<think>` and `</think>` (serve/parsers.py THINK_OPEN /
-THINK_CLOSE), and its chat template opens the block in the prompt. As in vLLM:
+THINK_CLOSE), and its chat template opens the block in the prompt:
 - a grammar constrains the output after the reasoning (structured outputs are not enabled in reasoning): under a block
   the prompt opened, the matcher waits for `</think>` and constrains from the token after it;
 - thinking_token_budget counts the reasoning tokens after `<think>` and, at the budget, forces `</think>` (one forced
@@ -89,7 +89,7 @@ class HostSampling:
         return done
 
     def _think(self, r: Request) -> None:
-        """vLLM's thinking budget: count reasoning tokens after the start tag; at the budget queue the close tag, forced
+        """The thinking budget: count reasoning tokens after the start tag; at the budget queue the close tag, forced
         one token a step (host_inputs allows only the next forced token)."""
         out = r.output_ids
         budget = r.params.thinking_token_budget or 0
