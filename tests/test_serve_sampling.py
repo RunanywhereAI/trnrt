@@ -312,6 +312,10 @@ def test_zero_width_stop_regexes_match_and_terminate():
         r"(?:)+",
         "(?:.|.)" * 5 + "x",  # alternations that can start alike, in a row: 32 ways to try
         "(?:a|ab)" * 3 + "(?:a|ab)(?:a|ab)",
+        "".join(f"(?:{c}?|x)" for c in "abcde") + "y",  # branches that can be empty: as many ways as overlapping ones
+        "(?:(?:a{0}|b{0})x)+y",
+        "(?:(?=x)?x)+y",  # an optional empty part, repeated
+        "(?:(?=x))?" * 5 + "y",
     ],
 )
 def test_stop_regex_refuses_patterns_that_backtrack(app, pattern):
@@ -344,6 +348,8 @@ def test_stop_regex_admits_ordinary_patterns():
         r"re\s?ag",
         r"!.*again",
         r"(?:Answer|Ans):\s*(?:yes|y)\b",  # two alternations that start alike: 4 ways
+        r"colou?r",
+        r"https?://\S+",
     ]
     assert {p: _backtracking(p) for p in ordinary} == dict.fromkeys(ordinary)
 

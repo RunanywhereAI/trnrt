@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import socket
@@ -269,6 +270,8 @@ def test_abort_request_ends_a_request_by_rid_with_what_it_generated():
     hanging); abort_all ends every request, an OpenAI one included; a rid in use is refused while it runs."""
     import httpx
 
+    from trnrt.serve import api
+
     eng = ScriptedEngine(PLAIN * 40)
     eng.step_delay = 0.02  # 160 tokens: 3 s on its own
     with _uvicorn(eng) as base, httpx.Client(base_url=base, timeout=30) as c:
@@ -278,6 +281,9 @@ def test_abort_request_ends_a_request_by_rid_with_what_it_generated():
         r = c.post("/generate", json=body)
         assert r.status_code == 400 and "already in use" in r.text
         assert c.post("/abort_request", json={"rid": "nope"}).status_code == 200  # no such rid: nothing happens
+        lp = next(lp for lp in api._LOOPS if lp.engine is eng)
+        lp.abort("r1", asyncio.Queue())  # a refused submission's cleanup: it does not own r1, so r1 runs on
+        time.sleep(0.2)
         assert eng.aborted == []
         assert c.post("/abort_request", json={"rid": "r1"}).status_code == 200
         r = got()

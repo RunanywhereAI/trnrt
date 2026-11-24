@@ -549,7 +549,7 @@ def add_routes(
             )
         except HTTPException:
             for s in subs:
-                loop_.abort(s.rid)
+                loop_.abort(s.rid, s.out)
             raise
         # Admission errors (a prompt that does not fit, a rid in use) arrive before any token: an HTTP status, not a
         # 200 stream, and the batch's other prompts are aborted.
@@ -557,8 +557,8 @@ def add_routes(
         try:
             firsts = [await cast("asyncio.Queue", s.out).get() for s in subs]
         except BaseException:  # cancelled (the client went away) before every prompt was admitted
-            for s in subs:
-                loop_.abort(s.rid)
+            for s in subs:  # each only while it owns its rid: a refused one's rid may be another request's
+                loop_.abort(s.rid, s.out)
             raise
         bad = next((f for f in firsts if f[0] == "error"), None)
         if bad is not None:
