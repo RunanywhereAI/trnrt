@@ -119,7 +119,7 @@ def agent_body(arguments_as) -> dict:
     }
 
 
-def test_template_messages_follows_vllms_rules():
+def test_template_messages_normalizes_tool_call_arguments():
     raw = [
         {"role": "user", "content": "hi"},
         {

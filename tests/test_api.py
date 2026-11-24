@@ -133,7 +133,7 @@ def test_metrics_count_the_served_tokens(client):
     assert "trnrt:generation_tokens_total" in m and "trnrt:time_to_first_token_seconds_count" in m
     gen = next(ln for ln in m.splitlines() if ln.startswith("trnrt:generation_tokens_total "))
     assert int(gen.split()[-1]) >= 4
-    # vllm-neuron's start-up and per-graph metrics (trnrt/metrics.py startup_lines)
+    # start-up and per-graph metrics (trnrt/metrics.py startup_lines)
     assert "trnrt:model_load_time_seconds " in m and "trnrt:model_load_size_bytes " in m
     execs = [ln for ln in m.splitlines() if ln.startswith("trnrt:neff_execution_count{")]
     assert execs and sum(int(ln.split()[-1]) for ln in execs) >= 4

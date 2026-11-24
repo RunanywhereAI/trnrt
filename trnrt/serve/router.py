@@ -34,7 +34,7 @@ a 200K-token context). The session map forgets sessions idle past `session_ttl_s
 recently used past `max_sessions` (100,000), on each poll and each new pin.
 
 A request without a session id (most OpenAI clients send none) is routed by an approximate prefix tree of the request
-text the router sent to each worker, locality first (the cache-aware policy of SGLang's model gateway):
+text the router sent to each worker, locality first:
 1. If its longest match on a live worker covers at least `sticky_chars` characters (32,768, ~8K tokens) PAST its leading
    system messages, to that worker whatever the load: an agent's growing conversation stays where its KV is. The system
    messages do not count: one client's sessions all share them (its instructions, environment and file tree), so
@@ -46,7 +46,7 @@ text the router sent to each worker, locality first (the cache-aware policy of S
 4. Else to the least-loaded worker, the smallest tree (the most room for new prefixes) breaking ties.
 A worker known to be down is never picked while another is up.
 
-The tree is text-level, like SGLang's router, so it needs no tokenizer; it is pruned to `max_tree_chars` per worker by
+The tree is text-level, so it needs no tokenizer; it is pruned to `max_tree_chars` per worker by
 evicting least-recently-used leaves (128M characters: above 32 sessions of a 1M-token context's ~4 MB of text, so long
 sessions' prefixes are not evicted under load).
 

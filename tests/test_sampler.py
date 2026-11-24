@@ -72,7 +72,7 @@ def test_top_p_keeps_the_smallest_set_covering_p():
     assert seen == {0, 1}
 
 
-def test_penalties_match_vllm_semantics():
+def test_repetition_presence_and_frequency_penalties():
     logits = torch.tensor([[2.0, -1.0, 0.5, 3.0, 1.0]])
     hist = torch.tensor([[0, 1, 3, 0]])  # padded by repeating the first id
     counts = torch.tensor([[2.0, 0.0, 1.0, 2.0]])  # token 1 seen in the prompt only

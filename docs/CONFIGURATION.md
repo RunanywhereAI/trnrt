@@ -102,8 +102,8 @@ that were measured:
 | `mtp-batch12` | up to 12 (1,2,4,8,12) | while at most 4 decode | 1024,3072,4096; 1024,4096 | 8 GB |
 | `mtp-batch24` | up to 24, 32 seats (1,2,4,16,24) | while at most 4 decode | 1024,3072,4096; 1024,4096 | 12 GB |
 
-Above its limit a dynamic preset steps every request with the plain decode graph (the idea of vLLM's
-`num_speculative_tokens_per_batch_size`: no drafts above a batch size, here with hysteresis), and its plain steps still write the MTP layer's KV, so a return to
+Above its limit a dynamic preset steps every request with the plain decode graph (no drafts above a batch size, here with
+hysteresis), and its plain steps still write the MTP layer's KV, so a return to
 speculation finds it complete. `--host-cache-gb` is host only: `mtp-batch12 --host-cache-gb 12` is the same graphs with a
 larger prefix-cache tier. The presets' speculation arguments:
 

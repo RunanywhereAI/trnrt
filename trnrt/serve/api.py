@@ -838,8 +838,8 @@ _GEN_DEFAULTS = {"temperature": (0.0, math.inf), "top_p": (0.0, 1.0), "top_k": (
 
 
 def generation_defaults(model_path: str | None) -> dict[str, float]:
-    """The checkpoint's sampling defaults, from its generation_config.json, for a request that sets none: vLLM's
-    `--generation-config auto`, its default. GLM-5.3-Flash's (eb9eb208) sets temperature 1.0 and top_p 0.95, so a
+    """The checkpoint's sampling defaults, from its generation_config.json, for a request that sets none.
+    GLM-5.3-Flash's (eb9eb208) sets temperature 1.0 and top_p 0.95, so a
     request without top_p sampled the whole candidate set at top_p 1.0. A value of the wrong type or out of range is
     left out (the server's own default stands) and logged; no file, no defaults."""
     if not model_path:
@@ -893,13 +893,13 @@ def _params(
     if max_new is None:
         max_new = _int(body, "max_completion_tokens", default_max, 1)
     min_tokens = _int(body, "min_tokens", 0, 0)
-    if min_tokens > max_new:  # vLLM's check
+    if min_tokens > max_new:
         raise _bad(f"min_tokens ({min_tokens}) must be at most max_tokens ({max_new})")
     try:
         grammar = grammar_spec(body)
     except ValueError as e:
         raise _bad(str(e)) from None
-    top_k = _int(body, "top_k", int(d.get("top_k", 0)), -1)  # -1 and 0 both turn it off (vLLM's -1, the engine's 0)
+    top_k = _int(body, "top_k", int(d.get("top_k", 0)), -1)  # -1 and 0 both turn it off
     return SamplingParams(
         max_new_tokens=max_new,
         temperature=_num(body, "temperature", d.get("temperature", 1.0), lo=0.0),
@@ -910,7 +910,7 @@ def _params(
         frequency_penalty=_num(body, "frequency_penalty", 0.0),
         presence_penalty=_num(body, "presence_penalty", 0.0),
         logprobs=logprobs,
-        thinking_token_budget=_int(body, "thinking_token_budget", None, 0),  # vLLM's
+        thinking_token_budget=_int(body, "thinking_token_budget", None, 0),
         grammar=grammar,
         min_tokens=min_tokens,
         stop=tuple(stop),
@@ -1302,7 +1302,7 @@ def template_kwargs(tok, body: dict) -> tuple[dict, bool | None]:
     (the OpenAI field). 400 for a variable the template never reads, which would be ignored, and for a reasoning
     effort GLM-5.3-Flash's template does not honour.
 
-    enable_thinking (vLLM's convention) is the exception: GLM-5.3-Flash's template has none and always opens the
+    enable_thinking is the exception: GLM-5.3-Flash's template has none and always opens the
     reasoning block. On a template without it, it is taken out and returned second, so chat_prompt can check it against
     the rendered prompt: the value the template renders anyway is accepted, the other refused."""
     kw = body.get("chat_template_kwargs")
@@ -1384,8 +1384,7 @@ def chat_prompt(tok, body: dict, cache: PromptCache | None = None) -> tuple[list
             f"this model's chat template has no enable_thinking: thinking is always "
             f'{"on" if tail.endswith(THINK_OPEN) else "off"}. For less reasoning send reasoning_effort "low"'
         )
-    # parallel_tool_calls=False keeps only the first call (vLLM maybe_filter_parallel_tool_calls,
-    # entrypoints/serve/utils/tool_calls_utils.py).
+    # parallel_tool_calls=False keeps only the first call.
     parse = {
         "tools": bool(tools),
         "thinking_open": tail.endswith(THINK_OPEN),
@@ -1407,7 +1406,7 @@ async def _body(http: HTTPRequest) -> dict:
 
 
 async def _disconnected(http: HTTPRequest) -> None:
-    """Returns once the client has gone away (vLLM's listen_for_disconnect). The body is read already, so the next
+    """Returns once the client has gone away. The body is read already, so the next
     ASGI message is the disconnect."""
     while (await http.receive())["type"] != "http.disconnect":
         pass
@@ -1751,7 +1750,7 @@ def build_app(engine: LLMEngine, model_name: str, preset: str | None = None, nam
         ids, parse = await asyncio.get_running_loop().run_in_executor(
             prompt_pool, chat_prompt, prompt_tok, body, prompt_cache
         )
-        # max_tokens defaults to the rest of the context (vLLM's default): reasoning at the template's default effort
+        # max_tokens defaults to the rest of the context: reasoning at the template's default effort
         # (Max) can run long, and a smaller hidden default would cut the answer off
         room = max(engine.cfg.max_model_len - len(ids), 1)
         return await start_run(

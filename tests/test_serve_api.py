@@ -602,7 +602,7 @@ def test_a_client_that_disconnects_aborts_its_request(stream):
 
 def test_the_checkpoints_generation_config_sets_the_sampling_defaults(serve, tmp_path):
     """A request that sets no temperature or top_p samples at the checkpoint's generation_config.json values
-    (GLM-5.3-Flash's: temperature 1.0, top_p 0.95), as vLLM does by default; it sampled at top_p 1.0. A request's own
+    (GLM-5.3-Flash's: temperature 1.0, top_p 0.95); it sampled at top_p 1.0. A request's own
     values win; a value out of range in the file is not used; no file, the server's defaults (1.0, 1.0)."""
     from fastapi.testclient import TestClient
 
