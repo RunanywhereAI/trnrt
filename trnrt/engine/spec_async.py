@@ -5,18 +5,9 @@ next step: the next verify's positions, KV slots, input tokens and recurrent-sta
 positions, tokens and hidden-state row all depend on it. That host round trip sits on the critical path of every
 step.
 
-The reference engines keep that state on the device and schedule the next step blind:
-- vLLM v0.30.0 v1/core/sched/async_scheduler.py:19-49 schedules every decode row with 1 + k tokens as if every
-  draft is accepted; Model Runner V2 (worker/gpu/model_runner.py:1997-2181, worker/gpu/states.py:58-73) keeps
-  num_computed_tokens, the last sampled tokens and the drafts on the GPU, corrects num_computed_tokens on the
-  device after the rejection sampler, and builds the next step's input ids and positions from those buffers.
-- SGLang v0.5.21 speculative/eagle_worker_v2.py:1313-1450 with managers/overlap_utils.py:513-594 publishes the
-  new sequence lengths and bonus tokens into a device FutureMap that the next batch gathers from, reserving
-  slots for both steps in flight (mem_cache/allocation_sizing.py:16-59).
-
-The form used here: one fp32 board row per request slot (exact integers below 2^24) holds what the next speculative
-step needs, and five small graphs around the UNCHANGED verify and MTP graphs (so their compile keys stay the
-synchronous engine's) read and write it:
+Here that state stays on the device and the next step is scheduled blind: one fp32 board row per request slot
+(exact integers below 2^24) holds what the next speculative step needs, and five small graphs around the UNCHANGED
+verify and MTP graphs (so their compile keys stay the synchronous engine's) read and write it:
 
     columns 0 .. Q - 1   T: the tokens after positions base .. base + Q - 1 of the last verify, the first
                          acc + 1 meaningful (accepted drafts, then the replacement or the bonus token);
@@ -140,8 +131,8 @@ def spec_post(board, slot_idx, out, ids, rows_all, valid, Q: int, k: int, synth=
     drafts) for the host.
 
     synth [R, k] fp32 (EngineConfig.spec_synth_al, engine/spec_synth.py): the host's synthetic accept flags stand in for
-    the verify's own, and a rejected position emits the target's sample y there (vLLM's synthetic sampler), not the
-    recovered token r. The verify and MTP graphs are untouched; with synth None this function traces exactly as before."""
+    the verify's own, and a rejected position emits the target's sample y there, not the recovered
+    token r. The verify and MTP graphs are untouched; with synth None this function traces exactly as before."""
     R = ids.shape[0]
     o = out.reshape(R, Q, -1)
     y, accept, rep = o[:, :, 0], o[:, :, 1], o[:, :, 2]

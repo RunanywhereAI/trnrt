@@ -1,11 +1,10 @@
-"""The host cache: a host-memory tier under the radix cache (SGLang HiCache's L2; vLLM's CPU KV offload).
+"""The host cache: a host-memory tier under the radix cache.
 
 When the radix cache evicts a page, its KV (every layer, this rank's heads) is copied to host
 memory instead of being lost; a later request whose prefix continues past the device-resident
 match into pages the host still holds gets them copied back into fresh device pages and
 inserted into the tree, so it skips their prefill. Pages are identified by a chain hash over
-page-aligned token blocks (vLLM prefix caching's block hash: a page's hash covers its own
-tokens and its parent's hash), so a host entry matches only the exact prefix that produced it.
+page-aligned token blocks (a page's hash covers its own tokens and its parent's hash), so a host entry matches only the exact prefix that produced it.
 
 Write-through: a restored page keeps its host copy, so evicting it again costs nothing. The
 host cache is LRU over its own capacity; pages being restored are pinned against it. Under
@@ -16,8 +15,7 @@ State checkpoints (engine/state_pool.py): GLM-5.3-Flash's linear-attention layer
 only where its recurrent state was checkpointed, so the host cache has a second part for them. A
 checkpoint goes to host memory when its node is evicted, and also when only the checkpoint row is
 taken back (RadixCache.evict_checkpoints, including one on a running request's path, and
-free_dominated). It is keyed by the chain hash of the page it ends on (SGLang v0.5.21
-mem_cache/pool_host/mamba.py keeps host copies of mamba states beside the KV the same way), and a
+free_dominated). It is keyed by the chain hash of the page it ends on, and a
 restore brings back the pages up to the deepest host checkpoint the prompt reaches, then that
 checkpoint (Scheduler._restore).
 

@@ -1,17 +1,15 @@
 """Radix tree over token ids that maps shared prefixes to KV cache pages.
 
-The idea is SGLang's RadixAttention (https://arxiv.org/abs/2312.07104), at page
-granularity: every edge key is a whole number of pages, so a node owns exactly
-`len(key) // page_size` pages and only FULL pages are ever shared. A sequence's partial
-last page stays private to it until it fills.
+The tree works at page granularity: every edge key is a whole number of pages, so a node
+owns exactly `len(key) // page_size` pages and only FULL pages are ever shared. A sequence's
+partial last page stays private to it until it fills.
 
 Ownership rules:
 - A page referenced by a node belongs to the tree. It is freed only by eviction.
 - A running request holds a lock on the deepest node of its cached prefix, which pins
   every page on the path from the root to that node.
 - Eviction frees whole unlocked leaves in least-recently-used order.
-- Session references (SGLang v0.5.17 "session-reference-aware radix cache", sgl-project/sglang
-  #29173): a finished request that carries a session_id registers its prefix under that
+- Session references: a finished request that carries a session_id registers its prefix under that
   session; eviction takes unreferenced prefixes first, then fewer-referenced ones, each least
   recently used first. Referenced KV is soft-protected, not pinned, and closing the session
   drops its references without freeing anything. Clients seldom close their sessions, so at most
@@ -19,13 +17,10 @@ Ownership rules:
 - State checkpoints (GLM-5.3-Flash's linear-attention layers, engine/state_pool.py): the model can
   resume a prefix only where the recurrent state after it was saved, so a node may own one
   checkpoint row (`ckpt`), the state after the tokens up to the END of its key. A hit is the
-  deepest node on the matched path that has one (match_checkpoint; SGLang v0.5.21
-  mem_cache/unified_cache/components/mamba.py consumes only best_match_node's state the same way,
-  and vLLM v0.30.0 v1/core/single_type_kv_cache_manager.py MambaManager.find_longest_cache_hit
-  takes the rightmost block with a cached state). A split leaves the checkpoint on the lower
-  node (it ends where the state was taken; SGLang redistribute_on_node_split); evicting a node
+  deepest node on the matched path that has one (match_checkpoint). A split leaves the checkpoint on the lower
+  node (it ends where the state was taken); evicting a node
   frees its checkpoint; checkpoints alone can be evicted under checkpoint-pool pressure
-  (evict_checkpoints) while the KV stays, as SGLang's separate mamba LRU does; and a checkpoint a
+  (evict_checkpoints) while the KV stays; and a checkpoint a
   deeper one dominates is freed when a request releases the path (free_dominated).
 """
 

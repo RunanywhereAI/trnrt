@@ -7,9 +7,7 @@ calls reach the other ranks through a shared-memory channel (ShmChannel below; T
 sends them over gloo instead).
 
 On Neuron each rank sees exactly one NeuronCore (NEURON_RT_VISIBLE_CORES) and all ranks
-share one CCOM bootstrap endpoint (NEURON_RT_ROOT_COMM_ID), the arrangement vllm-neuron's
-worker uses (vllm_neuron/vllm/worker/neuron_worker.py, _init_neuron_distributed_environment
-_and_runtime and rendezvous_ccom_bootstrap). The CCOM port is the gloo port + 1 so the two
+share one CCOM bootstrap endpoint (NEURON_RT_ROOT_COMM_ID). The CCOM port is the gloo port + 1 so the two
 never collide (libtorch_neuronx_lite defaults the CCOM root to MASTER_PORT otherwise).
 """
 

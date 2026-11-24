@@ -7,8 +7,7 @@ shape. Randomness comes in as uniform noise generated on the host per request, s
 request is reproducible and the graph has no RNG state. Rows with temperature <= 0 are greedy
 over the full vocab.
 
-Logprobs follow vLLM's default (`logprobs_mode=raw_logprobs`): log-softmax of the raw
-model logits, before temperature, penalties and filtering.
+Logprobs are the log-softmax of the raw model logits, before temperature, penalties and filtering.
 
 Two forms of the same draw:
 - sample(): from the full logits [B, V];
@@ -94,7 +93,7 @@ def apply_penalties(
     freq: torch.Tensor,
     pres: torch.Tensor,
 ) -> torch.Tensor:
-    """vLLM semantics. hist_ids [B, M]: every distinct token in the prompt or the output
+    """hist_ids [B, M]: every distinct token in the prompt or the output
     (rows padded by repeating their first entry, which makes the scatter idempotent);
     out_counts [B, M]: occurrences in the output only. repetition_penalty divides positive
     and multiplies negative logits of any seen token; frequency and presence penalties
@@ -224,7 +223,7 @@ def verify_sample(
     sampling distribution p (temperature, top-k, top-p, min-p over the K candidates):
     accept with probability p(d) (greedy rows: d == argmax), else the replacement is a
     sample from p with d removed. For a deterministic proposal, such as the MTP head's greedy draft,
-    this is exactly the rejection sampler vLLM uses, so the output distribution is unchanged.
+    this is exact rejection sampling, so the output distribution is unchanged.
 
     Columns: y (sample from p, the bonus token after a fully accepted draft), accept,
     r (replacement), raw logprobs of y, r and d, then top-N ids and logprobs.
