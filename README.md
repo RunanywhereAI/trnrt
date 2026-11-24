@@ -229,6 +229,7 @@ trnrt/
 └── compile/      offline compile: shapes, capture, neuronx-cc, strip
 docker/           the serving and compile image
 tools/            graph-equivalence gate, device checks, doc checks
+benchmarks/       the recipe for every published point: builds, clients, scorers, accuracy
 tests/            CPU test suite (no NeuronCore needed)
 docs/             guides, results, kernel notes
 ```

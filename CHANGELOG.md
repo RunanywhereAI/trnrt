@@ -5,6 +5,17 @@ and versions follow [Semantic Versioning](https://semver.org/). Rebuild the comp
 
 ## [Unreleased]
 
+### Added
+
+- `benchmarks/`: the recipe behind each published trn2 point, one row per point with the build that serves it. It
+  includes a script to compile each build and one to serve a point on one engine of 8 chips. It also has the AgentX
+  client and scorer (InferenceX's definitions, at SemiAnalysis's rate and at AWS's Capacity Block price), the 8K/1K
+  fixed-length client and scorer (InferenceX's fixed_seq recipe), and GSM8K by InferenceX's own eval plus a needle
+  check. Each script has a `--dry-run`.
+- The benchmark mode (`--spec-synth-al`) announces itself. `trnrt serve` and the engines warn in their output and logs,
+  `GET /health` carries a `benchmark_mode` block, and every response of the engine and the router carries the header
+  `x-trnrt-synthetic-acceptance`. The accuracy tools refuse a server in the mode.
+
 ### Fixed
 
 - `stop_regex` refuses a pattern whose search could stall the server: one whose time can grow faster than the square

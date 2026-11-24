@@ -74,13 +74,25 @@ InferenceX's AgentX scoring fixes the acceptance of speculative decoding at a go
 draft head's. `--spec-synth-al 2.518506` (or the environment variable `TRNRT_SPEC_SYNTH_AL`) reproduces that: the accepted
 draft count of every verify step is drawn from a minimum-variance schedule whose mean acceptance length (one plus the
 accepted drafts a step) is the given value. 2.518506 is the golden
-length for 2 draft tokens.
+length for 2 draft tokens. InferenceX's SGLang runs on GPUs set the same thing with `SGLANG_SIMULATE_ACC_LEN`,
+`SGLANG_SIMULATE_ACC_METHOD=match-expected` and `SGLANG_SIMULATE_ACC_TOKEN_MODE=real-draft-token`. That draws one length
+for a whole verify batch, from the two values around the target. This mode draws per request from the same two values,
+so each request sees the same distribution and the same mean.
 
 Drafting and verification still run for real, and the step costs what it costs; only which positions count as accepted is
 drawn. An accepted position takes its draft whether or not the target agrees, so the **text of a benchmark-mode run is not
 the model's**: use it only to compare serving throughput with InferenceX's published runs, never to judge output quality.
 The mode adds one input to one small graph (the draw's flags), so it needs its own capture: pass the same
 `--spec-synth-al` to both `compile capture` and `serve`.
+
+A server in the mode says so wherever a client or an operator looks:
+- a warning from `trnrt serve` before the engines start and again when the router serves, and one in each engine's log;
+- a `benchmark_mode` block in `GET /health`, on the engine at once and on the router from its first poll of the engines;
+- the header `x-trnrt-synthetic-acceptance: <length>` on every response;
+- `gauges.spec.synth_al` in each engine's `GET /v1/stats`.
+
+The accuracy tools of [benchmarks/accuracy](../benchmarks/README.md#accuracy) refuse a server in the mode. The AgentX
+client of [benchmarks/agentx](../benchmarks/README.md#running-a-point) checks that a point's server runs that point's mode.
 
 ## Status
 
@@ -92,6 +104,14 @@ Not yet checked here, and listed in the pull request: that each preset's graphs 
 ran (`tools/graph_equiv.py`), compile from source, a served run, GSM8K accuracy with MTP, and an AgentX point.
 
 ## Run and score a point
+
+[benchmarks/](../benchmarks/README.md) has the whole recipe as scripts:
+- one row per published point;
+- the build that serves it;
+- `serve.sh` and `agentx/client.sh` to run it;
+- `agentx/score.py` to score it.
+
+The rest of this section is what those scripts run.
 
 The load client is SemiAnalysis's AgentX harness, version 1.0.12 (built on AIPerf, Apache-2.0), on a separate CPU
 machine: the harness is CPU-heavy and the requests a minute it reaches depend on its client's cores, so state the
@@ -128,3 +148,5 @@ agentx profile \
   dropped 164 to 222 records as invalid inference results, about 11 warmup requests per unit of concurrency among them.
 - **Dollars per token** use a price per chip-hour you state. The numbers in [RESULTS.md](RESULTS.md#mtp-speculative-decoding-one-engine)
   use SemiAnalysis's $0.58 per trn2 chip-hour.
+- **Without InferenceX's code,** [benchmarks/agentx/score.py](../benchmarks/agentx/score.py) restates the same definitions.
+  It prints the score at SemiAnalysis's rate and at AWS's Capacity Block list price ($2.235 per chip-hour).
