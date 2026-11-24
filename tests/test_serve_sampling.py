@@ -310,6 +310,8 @@ def test_zero_width_stop_regexes_match_and_terminate():
         r"\d+\s*\d+",
         r".*x.*y",
         r"(?:)+",
+        "(?:.|.)" * 5 + "x",  # alternations that can start alike, in a row: 32 ways to try
+        "(?:a|ab)" * 3 + "(?:a|ab)(?:a|ab)",
     ],
 )
 def test_stop_regex_refuses_patterns_that_backtrack(app, pattern):
@@ -341,6 +343,7 @@ def test_stop_regex_admits_ordinary_patterns():
         r"(\w+)\s\1",
         r"re\s?ag",
         r"!.*again",
+        r"(?:Answer|Ans):\s*(?:yes|y)\b",  # two alternations that start alike: 4 ways
     ]
     assert {p: _backtracking(p) for p in ordinary} == dict.fromkeys(ordinary)
 

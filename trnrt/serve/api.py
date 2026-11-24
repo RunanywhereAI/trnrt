@@ -929,6 +929,9 @@ MAX_N = 128
 # text, which a stop pattern's match rarely does.
 MAX_STOP_REGEX = 16
 MAX_STOP_REGEX_CHARS = 1024
+# The ways one pattern may match a text through alternations whose branches can start alike ((a|a), (?:.|x)), in a row
+# or nested: the matcher tries them one by one, so 35 groups of (?:.|.) before a failing literal ran for hours.
+MAX_STOP_REGEX_WAYS = 16
 STOP_REGEX_SPAN = 2048
 
 
@@ -981,6 +984,8 @@ def _backtracking(pattern: str) -> str | None:
       alternation): `(a+)+b`, `(a|a)*b`, `(a{1,3}){1,10}b`, exponential in the text's length;
     - two repeats in a row that can take the same characters (nothing they cannot both match between them): `a*a*b`,
       `\\d+\\s*\\d+`, `.*x.*y`, a power of the length per repeat.
+    Alternations whose branches can start alike also multiply the ways to match outside a repeat: past
+    MAX_STOP_REGEX_WAYS of them, `(?:.|.)(?:.|.)...x`, the pattern is refused too.
     An alternation whose branches start with characters no other branch starts with is one way only, as is a single
     repeat over a fixed part: `\\d+\\.\\d+`, `Answer:\\s*\\d+`, `(?:foo|bar)+`, `\\n\\n+` all pass."""
     try:
@@ -1128,6 +1133,16 @@ def _backtracking(pattern: str) -> str | None:
             elif op is c.ATOMIC_GROUP:
                 scan(av, [])
             elif op is c.BRANCH:
+                firsts = [first(alt) for alt in av[1]]
+                # a branch that is empty, or can start as an earlier one does, is one more way at the same position
+                ways[0] *= 1 + sum(
+                    1 for i, f in enumerate(firsts) if i and any(not f or not g or f & g for g in firsts[:i])
+                )
+                if ways[0] > MAX_STOP_REGEX_WAYS:
+                    raise _Backtracking(
+                        f"it has alternations whose branches can start alike (as (a|a) or (?:.|x) do), more than "
+                        f"{MAX_STOP_REGEX_WAYS} ways to match a text, which Python's backtracking matcher tries one by one"
+                    )
                 out: list[frozenset] = []
                 for alt in av[1]:
                     out += [x for x in scan(alt, list(live)) if x not in out]
@@ -1174,6 +1189,7 @@ def _backtracking(pattern: str) -> str | None:
                 raise _Backtracking(f"it uses {op}, which the backtracking check does not know")
         return live
 
+    ways = [1]  # the product over the alternations scanned so far (MAX_STOP_REGEX_WAYS)
     try:
         scan(tree, [])
     except _Backtracking as e:
