@@ -23,10 +23,14 @@ curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -
   `"low"`, `"high"` or `"max"`, the default. Other values are refused, since the template would answer them at max.
 - `max_tokens` counts reasoning too. Without it, a chat request may generate up to the rest of the context
   (`--max-model-len` minus the prompt); a completion stops at 16 tokens, the OpenAI API's default.
+  A `max_new_tokens` in the checkpoint's `generation_config.json` caps both defaults (`--generation-config none`
+  turns it off with the other defaults): with 32 there, a chat request without `max_tokens` or
+  `max_completion_tokens` generates at most 32 tokens. A request's own limit is not capped.
 - Sampling defaults come from the checkpoint's `generation_config.json`: a request that sets no
   `temperature`, `top_p`, `top_k` or `min_p` gets the checkpoint's value (GLM-5.3-Flash: temperature 1.0, top_p 0.95).
-  Without one, temperature and top_p are 1.0. Sampling draws from the 64 most likely tokens at most
-  (`trnrt/engine/sampler.py`), so top_p 1.0 is top-64.
+  Without one, temperature and top_p are 1.0. `--generation-config none` turns the checkpoint's values off and
+  serves those built-in defaults on every endpoint; `auto` is the default. Sampling draws from the
+  64 most likely tokens at most (`trnrt/engine/sampler.py`), so top_p 1.0 is top-64.
 - A response cut off by `max_tokens` has `finish_reason` `"length"`, even when it ends in a tool call: that call may
   be incomplete.
 - A client that disconnects aborts its request, streamed or not.
@@ -45,8 +49,16 @@ curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -
 - Structured outputs, penalties, `min_tokens` and thinking budgets need an engine started with `--structured-outputs` or
   `--penalties` ([below](#structured-outputs-penalties-and-thinking-budgets)); otherwise they are answered with 400,
   naming the flag.
-- Not supported, answered with 400: `tool_choice` `"required"` or a named tool, prompt logprobs (`prompt_logprobs`,
-  `echo` with `logprobs`), and `min_new_tokens` on the OpenAI endpoints (use `min_tokens`).
+- Not supported, answered with 400: `tool_choice` `"required"` or a named tool, a function tool with `strict: true`
+  (no tool-call grammar is served: send `false` or leave it out, on `/v1/responses` too), prompt logprobs
+  (`prompt_logprobs`, `echo` with `logprobs`), and `min_new_tokens` on the OpenAI endpoints (use `min_tokens`).
+- `tools` must be an array of function tools whose `name` is 1-128 characters of `[A-Za-z0-9_-]`, with an object
+  `parameters` when given; `parallel_tool_calls` is `true`, `false` or null. Null `tools` and null `parameters` are the
+  same as leaving them out. Anything else is a 400 naming the field.
+- On `/v1/chat/completions` and `/v1/completions`, an unknown request field is answered with 400 naming it, never
+  ignored. So is a field of the other endpoint (`prompt` on a chat request, `messages`, `tools` or `top_logprobs` on a
+  completion). `model`, `user`, `safety_identifier`, `metadata` and `prompt_cache_key` are accepted and do not change
+  the output; `store` is accepted only as `false` or null, since nothing is kept for later retrieval.
 - Status codes: 400 for a request that cannot be served as sent (a field of the wrong type or out of range, a prompt
   longer than the context, a chat template variable the template never reads); 500 for an error inside the engine;
   503 once the engine has failed, with the reason on `/health`, and 503 for a full queue
@@ -258,7 +270,7 @@ Each needs graphs that take inputs from the host. An engine serves them only whe
 - GLM-5.3-Flash reasons first. The constraint applies to the answer after `</think>`, not to the reasoning.
 - Logprobs stay the raw model's, before the mask and the penalties.
 - A request with penalties, a grammar, or a thinking budget near its end waits for its newest token before each step,
-  so it gives up the overlap of host and device work; the requests beside it keep it. Under the dynamic `mtp-*` presets
-  the engine stops speculating while a request that uses any of these runs.
+  so it gives up the overlap of host and device work; the requests beside it keep it. A build with dynamic speculation
+  stops speculating while a request that uses any of these runs; the latency build refuses them.
 - If a grammar can continue only with text no token spells, the request ends there with `finish_reason` `"stop"`, and a
   warning is logged.

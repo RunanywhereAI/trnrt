@@ -73,6 +73,7 @@ from .parsers import (
     parse_full,
     template_messages,
     tool_choice_error,
+    tools_error,
 )
 from .prodlog import ProdLog
 from .prompt_cache import PromptCache
@@ -766,6 +767,8 @@ _NEUTRAL: dict[str, tuple[object, ...]] = {
     "function_call": (None, "none", "auto"),
     # One tier of service: "flex" and "priority" would promise a latency or price class this server does not have.
     "service_tier": (None, "auto", "default"),
+    # Nothing is kept for a later retrieval, so a request asking for that is refused, as /v1/responses refuses it.
+    "store": (None, False),
 }
 
 
@@ -775,8 +778,70 @@ def _stream_flags(body: dict) -> tuple[bool, bool]:
     return _flag(body, "stream"), isinstance(opts, dict) and _flag(opts, "include_usage")
 
 
+# Every top-level field /v1/chat/completions and /v1/completions know: read (_params, chat_prompt, _stop_rules,
+# structured.grammar_spec, Run), refused unless neutral (_NEUTRAL), or accepted and ignored because it never changes the
+# output: `model` (one model is served), `user`, `safety_identifier`, `metadata` and `prompt_cache_key` (OpenAI
+# bookkeeping and hints that SDKs and agent harnesses send by default). Any other field is refused with a 400 naming
+# it, never ignored (invariant 7): an unknown one (`prediction`, `modalities`, `audio`, a typo such as `max_token`) used
+# to be answered 200 as if it had been applied. A field read here must be added here, or every request using it is
+# refused (tests/test_serve_api.py sends each).
+_IGNORED = frozenset({"model", "user", "safety_identifier", "metadata", "prompt_cache_key"})
+_READ = frozenset(
+    {
+        "session_id", "stream", "stream_options", "priority",
+        "max_tokens", "max_completion_tokens", "n", "best_of",
+        "temperature", "top_p", "top_k", "min_p", "seed", "ignore_eos", "logprobs",
+        "repetition_penalty", "frequency_penalty", "presence_penalty", "min_tokens", "thinking_token_budget",
+        "stop", "stop_token_ids", "stop_regex", "include_stop_str_in_output", "no_stop_trim", "skip_special_tokens",
+        "response_format", "structured_outputs", "guided_json", "guided_regex", "guided_choice", "guided_grammar",
+        "json_schema", "regex", "ebnf",
+    }
+)  # fmt: skip
+# Read by one endpoint only: the other would ignore them.
+_CHAT_ONLY = frozenset(
+    {
+        "messages",
+        "tools",
+        "tool_choice",
+        "parallel_tool_calls",
+        "chat_template_kwargs",
+        "reasoning_effort",
+        "top_logprobs",
+    }
+)
+_COMPLETION_ONLY = frozenset({"prompt"})
+# The neutral fields (_NEUTRAL) of one endpoint: the other refuses them like any field it does not know.
+_NEUTRAL_CHAT_ONLY = frozenset({"functions", "function_call", "add_generation_prompt", "continue_final_message"})
+_NEUTRAL_COMPLETION_ONLY = frozenset({"echo", "suffix"})
+_KNOWN = {
+    True: _IGNORED | _READ | (_NEUTRAL.keys() - _NEUTRAL_COMPLETION_ONLY) | _CHAT_ONLY,
+    False: _IGNORED | _READ | (_NEUTRAL.keys() - _NEUTRAL_CHAT_ONLY) | _COMPLETION_ONLY,
+}
+
+
+def _refuse_unknown(body: dict, chat: bool) -> None:
+    """400 naming every top-level field this endpoint does not know (_KNOWN), before anything is rendered or queued."""
+    unknown = sorted(k for k in body if k not in _KNOWN[chat])
+    if unknown:
+        raise _bad(
+            f"unknown field{'s' if len(unknown) > 1 else ''} {', '.join(unknown)}: not supported by this endpoint, "
+            "which refuses a field rather than ignore it; send the request without it"
+        )
+
+
+def _neutral(v: object, neutral: tuple[object, ...]) -> bool:
+    """Whether v is one of the neutral values, with a boolean never equal to a number: 0 == False in Python, and
+    `store: 0` is not `store: false`. Numbers still match across int and float (`min_new_tokens: 0.0` is 0), as _int
+    takes an integral float."""
+
+    def num(x: object) -> bool:
+        return isinstance(x, (int, float)) and not isinstance(x, bool)
+
+    return any((type(v) is type(n) or (num(v) and num(n))) and v == n for n in neutral)
+
+
 def _refused(body: dict) -> list[str]:
-    return [k for k, neutral in _NEUTRAL.items() if body.get(k) not in neutral]
+    return [k for k, neutral in _NEUTRAL.items() if not _neutral(body.get(k), neutral)]
 
 
 _INT64_MAX = 2**63 - 1
@@ -842,7 +907,8 @@ def generation_defaults(model_path: str | None) -> dict[str, float]:
     """The checkpoint's sampling defaults, from its generation_config.json, for a request that sets none.
     GLM-5.3-Flash's (eb9eb208) sets temperature 1.0 and top_p 0.95, so a
     request without top_p sampled the whole candidate set at top_p 1.0. A value of the wrong type or out of range is
-    left out (the server's own default stands) and logged; no file, no defaults."""
+    left out (the server's own default stands) and logged; no file, no defaults. Its max_new_tokens, a positive
+    integer, comes back too: the most a request that sets no token limit may generate (_params)."""
     if not model_path:
         return {}
     path = os.path.join(model_path, "generation_config.json")
@@ -863,6 +929,11 @@ def generation_defaults(model_path: str | None) -> dict[str, float]:
             out[k] = v
         else:
             logger.warning("trnrt: %s sets %s to %r, out of range; not used as a default", path, k, v)
+    max_new = gen.get("max_new_tokens") if isinstance(gen, dict) else None
+    if type(max_new) is int and max_new >= 1:
+        out["max_new_tokens"] = max_new
+    elif max_new is not None:
+        logger.warning("trnrt: %s sets max_new_tokens to %r, not a positive integer; not used", path, max_new)
     return out
 
 
@@ -871,7 +942,8 @@ def _params(
 ) -> SamplingParams:
     """A request's sampling. Every field is checked here, before the request is queued: 400 for a value of the wrong
     type or out of range, and the default for a null. default_max is used when the request sets no max_tokens;
-    `defaults` (generation_defaults) replace the server's own temperature, top_p, top_k and min_p defaults."""
+    `defaults` (generation_defaults) replace the server's own temperature, top_p, top_k and min_p defaults, and their
+    max_new_tokens caps default_max. A request's own max_tokens or max_completion_tokens is not capped."""
     d = defaults or {}
     asked = _refused(body)
     if asked:
@@ -892,6 +964,7 @@ def _params(
         logprobs = None if body.get("logprobs") is False else _int(body, "logprobs", None, 0, 20)
     max_new = _int(body, "max_tokens", None, 1)
     if max_new is None:
+        default_max = min(default_max, int(d.get("max_new_tokens", default_max)))
         max_new = _int(body, "max_completion_tokens", default_max, 1)
     min_tokens = _int(body, "min_tokens", 0, 0)
     if min_tokens > max_new:
@@ -1379,8 +1452,10 @@ def chat_prompt(tok, body: dict, cache: PromptCache | None = None) -> tuple[list
     is parsed with. HTTPException 400 on a malformed request. With `cache` (TRNRT_PROMPT_CACHE_MB) the ids come through
     the prompt token cache, the same ids."""
     messages = body.get("messages")
-    if not messages:
+    if messages is None or messages == []:
         raise HTTPException(status_code=400, detail="messages is required")
+    if not isinstance(messages, list):
+        raise _bad("messages must be an array")
     try:
         messages = template_messages(messages, developer_to_system=not template_knows_developer(tok))
     except ValueError as e:
@@ -1390,8 +1465,14 @@ def chat_prompt(tok, body: dict, cache: PromptCache | None = None) -> tuple[list
     error = tool_choice_error(tool_choice)
     if error:
         raise HTTPException(status_code=400, detail=error)
-    tools = body.get("tools") if tool_choice != "none" else None
-    if tools:
+    tools = body.get("tools")
+    error = tools_error(tools)  # with tool_choice "none" too: a malformed field is refused whatever else is sent
+    if error:
+        raise _bad(error)
+    parallel = _flag(body, "parallel_tool_calls", default=True)  # checked before the prompt is rendered
+    if tool_choice == "none":
+        tools = None  # rendered and parsed as if the request sent none, as before
+    elif tools:
         kwargs["tools"] = tools
     if cache is not None and cache.off is None:
         ids = _cached_ids(tok, messages, kwargs, cache, body.get("session_id"))
@@ -1410,7 +1491,7 @@ def chat_prompt(tok, body: dict, cache: PromptCache | None = None) -> tuple[list
         "tools": bool(tools),
         "thinking_open": tail.endswith(THINK_OPEN),
         "tool_defs": tools,
-        "parallel_tool_calls": body.get("parallel_tool_calls") is not False,
+        "parallel_tool_calls": parallel,
     }
     return ids, parse
 
@@ -1678,9 +1759,15 @@ def _tag_id(tok, tag: str) -> int | None:
     return ids[0] if len(ids) == 1 else None
 
 
-def build_app(engine: LLMEngine, model_name: str, preset: str | None = None, name: str = "engine") -> FastAPI:
+def build_app(
+    engine: LLMEngine, model_name: str, preset: str | None = None, name: str = "engine", generation_config: str = "auto"
+) -> FastAPI:
     """The server of one engine. `preset`: the --preset it was started with, for /server_info. `name` names its
-    directory in the production log (TRNRT_PROD_DIR): `serve` gives each engine its own, by port."""
+    directory in the production log (TRNRT_PROD_DIR): `serve` gives each engine its own, by port. `generation_config`
+    is --generation-config: "auto" takes the sampling defaults from the checkpoint's generation_config.json, "none"
+    keeps the server's own."""
+    if generation_config not in ("auto", "none"):
+        raise ValueError(f"generation_config must be 'auto' or 'none', not {generation_config!r}")
     app = FastAPI(title="TrnRT")
     loop_ = EngineLoop(engine, name)
     tok = engine.tokenizer
@@ -1692,7 +1779,7 @@ def build_app(engine: LLMEngine, model_name: str, preset: str | None = None, nam
     # TRNRT_PROMPT_CACHE_MB (serve/prompt_cache.py): a chat prompt's ids from the previous turn's; used on prompt_pool's
     # thread only, by the chat endpoint (/tokenize renders without it)
     prompt_cache = PromptCache.from_env(prompt_tok)
-    gen_defaults = generation_defaults(getattr(engine, "model_path", None))
+    gen_defaults = generation_defaults(getattr(engine, "model_path", None)) if generation_config == "auto" else {}
     if gen_defaults:
         logger.info("trnrt: sampling defaults from the checkpoint's generation_config.json: %s", gen_defaults)
 
@@ -1900,6 +1987,7 @@ def build_app(engine: LLMEngine, model_name: str, preset: str | None = None, nam
     @app.post("/v1/completions")
     async def completions(http: HTTPRequest):
         body = await _body(http)
+        _refuse_unknown(body, chat=False)
         prompt = body.get("prompt", "")
         if isinstance(prompt, list) and prompt and isinstance(prompt[0], int):
             ids = prompt
@@ -1915,6 +2003,7 @@ def build_app(engine: LLMEngine, model_name: str, preset: str | None = None, nam
     @app.post("/v1/chat/completions")
     async def chat(http: HTTPRequest):
         body = await _body(http)
+        _refuse_unknown(body, chat=True)
         _stream_flags(body)  # checked before anything is queued
         return await _generate(http, body, await start_chat(body), chat=True)
 
@@ -1928,7 +2017,7 @@ def build_app(engine: LLMEngine, model_name: str, preset: str | None = None, nam
         if body.get("messages") is not None:
             # The fields chat refuses unless neutral (_NEUTRAL) and that change the rendered prompt.
             for key in ("add_generation_prompt", "continue_final_message"):
-                if body.get(key) not in _NEUTRAL[key]:
+                if not _neutral(body.get(key), _NEUTRAL[key]):
                     raise _bad(f"{key} is not supported; send the request without it")
             ids, _ = chat_prompt(prompt_tok, body)
             seqs, batch = [ids], False

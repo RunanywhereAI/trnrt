@@ -12,7 +12,7 @@
 
 | Path | What it holds |
 |---|---|
-| `trnrt/__main__.py` | The CLI. `serve` runs the router plus N engines, `engine` runs one engine, `compile` runs the offline pipeline. |
+| `trnrt/__main__.py` | The CLI. `serve` runs the router plus N engines, `engine` runs one engine, `compile` runs the offline pipeline. The three builds (`latency`, `balanced`, `throughput`) and `auto`, which picks one from the users per engine. |
 | `trnrt/config.py` | `EngineConfig`: seats, bucket ladders, pool sizes and decode kernel routes. These are graph shapes. |
 | `trnrt/platform.py` | Trainium2 facts, the neuronx-cc argument set and the runtime environment. |
 | `trnrt/metrics.py` | Prometheus text for each engine's `/metrics`. |
@@ -27,15 +27,15 @@
 | `trnrt/engine/engine.py` | `LLMEngine`: model build, the step loop, start and close. |
 | `trnrt/engine/scheduler.py` | Continuous batching, chunked prefill and prefix-cache restores. |
 | `trnrt/engine/model_runner.py` | Pads each step into a compiled bucket and runs its graph. |
-| `trnrt/engine/radix_cache.py`, `kv_pool.py`, `host_cache.py`, `state_pool.py` | The prefix cache: a radix tree over FP8 KV pages, the page pool, the host-memory tier, and linear-attention state rows. |
+| `trnrt/engine/radix_cache.py`, `kv_pool.py`, `host_cache.py`, `host_arena.py`, `state_pool.py` | The prefix cache: a radix tree over FP8 KV pages, the page pool, the host-memory tier (with its moves batched by page run, and, under context-parallel attention, one shared copy of a page per context-parallel index in shared-memory arenas), and linear-attention state rows. |
 | `trnrt/engine/spec_async.py`, `spec_synth.py` | Speculative decoding: the per-request board of device-side state the next step reads (accepted count, newest token, positions, state row, drafts), and the benchmark mode's synthetic acceptance. |
 | `trnrt/engine/tp.py` | Tensor parallelism. Rank 0 drives, the other ranks follow, through shared memory or gloo. |
-| `trnrt/engine/start_checks.py`, `start_lock.py`, `watchdog.py` | Host checks before start, one engine starting at a time, and turning a device hang into a clean exit. |
+| `trnrt/engine/start_checks.py`, `start_lock.py`, `watchdog.py` | Host checks before start (free devices, contiguous host memory, every rank pinnable to its NUMA node), one engine starting at a time, and turning a device hang into a clean exit. |
 | `trnrt/models/` | GLM-5.3-Flash: the decoder, KDA linear attention, DSA sparse attention, mHC, the MoE, and FP8 loading. |
 | `trnrt/kernels/` | NKI kernels: decode megakernels, prefill kernels, in-kernel collectives ([MEGAKERNELS.md](MEGAKERNELS.md)). |
 | `trnrt/compile/` | The offline pipeline: shapes from safetensors headers, capture of every graph, a neuronx-cc farm, NEFF strip. |
 | `docker/` | The image (base pinned by digest) and `check_image.py`, which checks every Neuron piece at build time. |
-| `tools/` | `graph_equiv.py` (this code builds the same graphs as a reference), `check_mixed.py` (on-device output checks), `check_docs.py` (doc links). |
+| `tools/` | `graph_equiv.py` (this code builds the same graphs as a reference), `check_mixed.py` (on-device output checks), `check_docs.py` (doc links), `bench_router_loop_gap.py` (how long the router's event loop stalls under large requests). |
 | `tests/` | The CPU suite ([DEVELOPMENT.md](DEVELOPMENT.md#tests)). |
 
 ## Request path

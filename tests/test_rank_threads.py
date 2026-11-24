@@ -91,12 +91,14 @@ def test_an_affinity_matching_no_rank_falls_back_to_world(affinity):
 
 
 def test_a_failed_listing_counts_all_ranks(monkeypatch, affinity):
-    """neuron-ls failing leaves every rank as launched, so all `world` ranks share the launch set."""
+    """neuron-ls failing under TRNRT_NUMA_PIN_OPTIONAL=1 leaves every rank as launched, so all `world` ranks share the
+    launch set (without it the start fails: tests/test_numa_pin.py)."""
 
     def broken():
         raise FileNotFoundError("neuron-ls")
 
     monkeypatch.setattr(TP, "neuron_devices", broken)
+    monkeypatch.setenv(TP.PIN_OPTIONAL, "1")
     affinity["mask"] = set(HALF_B)
     assert TP.numa_pin(3, 32) is None and TP.rank_threads(32) == 2
 

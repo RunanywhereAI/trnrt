@@ -78,7 +78,12 @@ def decode_args_errors(fhsrc: str, msrc: str) -> list[str]:
     glob = {
         t.id for s in ast.parse(fhsrc).body if isinstance(s, ast.Assign) for t in s.targets if isinstance(t, ast.Name)
     }
-    served = {k: (f"FH.{v}" if v in glob else v) for k, v in served.items()}
+    funcs = {s.name for s in ast.parse(fhsrc).body if isinstance(s, ast.FunctionDef)}
+
+    def qual(v: str) -> str:  # a module global or a call of a module function, as FH.<name>
+        return f"FH.{v}" if v in glob or v.split("(")[0] in funcs else v
+
+    served = {k: qual(v) for k, v in served.items()}
     got = _run_keywords(msrc, "decode_layer_split")
     got.pop("build_only", None)
     return [] if got == served else [f"decode_layer_split's FH.run keywords {got}, the served decode's {served}"]
@@ -98,7 +103,10 @@ def test_hybrid_hands_the_split_layer_its_raw_pend():
         for c in ast.walk(ast.parse(HSRC))
         if isinstance(c, ast.Call) and ast.unparse(c.func) == "MK.decode_layer_split"
     )
-    assert {k.arg: ast.unparse(k.value) for k in c.keywords} == {"pend": "pend"}
+    assert {k.arg: ast.unparse(k.value) for k in c.keywords} == {
+        "pend": "pend",
+        "pages": "None if table is None else table.shape[-1]",
+    }
 
 
 def test_layer_takes_needs_whole_rows_per_program_and_fits_the_glue():
@@ -128,6 +136,6 @@ def test_the_pins_fail_on_planted_sources():
         FBSRC, MSRC.replace("hc, iters, eps, rms_eps, sig, skf,\n", "hc, iters, rms_eps, eps, sig, skf,\n", 1)
     )
     assert split_kernel_errors(FBSRC.replace("fin: int, rev: int):", "fin: int, rev: int, x: int):", 1), MSRC)
-    assert decode_args_errors(FHSRC, MSRC.replace("ring=FH.RING,", "ring=3,", 1))
+    assert decode_args_errors(FHSRC, MSRC.replace("ring=FH.ring_for(pages, T),", "ring=FH.RING,", 1))
     assert decode_args_errors(FHSRC, MSRC.replace("rsp=MH.RSPLIT,", "rsp=0,", 1))
     importlib.import_module("trnrt.kernels.mk_kda_layer")  # still importable (the plants are text only)

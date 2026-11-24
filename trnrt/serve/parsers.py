@@ -29,7 +29,7 @@ import json
 import math
 import re
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 THINK_OPEN, THINK_CLOSE = "<think>", "</think>"
 TOOL_OPEN, TOOL_CLOSE = "<tool_call>", "</tool_call>"
@@ -173,6 +173,14 @@ def _coerce(value: str, types: set[str]):
     return parsed if _finite(parsed) else value
 
 
+def _pair_json(key: str, raw: str, props: dict) -> str:
+    """One completed `key: value` of the arguments JSON, the value typed by the tool's schema (only declared keys are
+    retyped, the rest stay strings, as _args_json does)."""
+    schema = props.get(key)
+    value = _coerce(raw, _schema_types(schema)) if isinstance(schema, dict) else raw
+    return json.dumps(key, ensure_ascii=False) + ": " + json.dumps(value, ensure_ascii=False)
+
+
 def _args_json(items: list[tuple[str, str, bool]], complete: bool, props: dict) -> str:
     """The arguments JSON of a call from its (key, raw value, closed) items, values typed by the tool's schema
     (only declared keys are retyped, the rest stay strings). While the call is open this is
@@ -185,8 +193,7 @@ def _args_json(items: list[tuple[str, str, bool]], complete: bool, props: dict) 
         key = json.dumps(k, ensure_ascii=False) + ": "
         schema = props.get(k)
         if closed or complete:
-            value = _coerce(v, _schema_types(schema)) if isinstance(schema, dict) else v
-            parts.append(key + json.dumps(value, ensure_ascii=False))
+            parts.append(_pair_json(k, v, props))
             continue
         if not isinstance(schema, dict) or _schema_types(schema) == {"string"}:
             parts.append(key + json.dumps(v, ensure_ascii=False)[:-1])
@@ -198,20 +205,15 @@ def _args_json(items: list[tuple[str, str, bool]], complete: bool, props: dict) 
     return "{" + ", ".join(parts) if parts else ""
 
 
+def _esc(s: str) -> str:
+    """A string as it appears between the quotes of a JSON string: json.dumps escaping is per character, so the
+    escaped form of appended raw text is the concatenation of its escaped pieces."""
+    return json.dumps(s, ensure_ascii=False)[1:-1]
+
+
 # ---------------------------------------------------------------------------------------
 # The GLM tool block
 # ---------------------------------------------------------------------------------------
-
-
-def _scan(body: str, done: bool) -> tuple[str | None, str]:
-    """A tool block's (function name, raw argument text) from its text after `<tool_call>` (both the inline layout and
-    GLM-4.5's newline one are read). The name ends at the first `<arg_key>`, newline or the end
-    of the block; None while it may still be being written, "" when there is none."""
-    i = body.find(ARG_KEY_OPEN)
-    head = (body if i < 0 else body[:i]).lstrip()
-    if i < 0 and not done and "\n" not in head:
-        return None, ""
-    return head.split("\n", 1)[0].strip(), body[i:] if i >= 0 else ""
 
 
 def _arguments(args: str, complete: bool, props: dict) -> str:
@@ -291,6 +293,47 @@ def tool_choice_error(tool_choice) -> str | None:
     return f'Invalid value for `tool_choice`: {tool_choice}! Only "none" and "auto" are supported.'
 
 
+def tools_error(tools) -> str | None:
+    """None when `tools` is the OpenAI tools array this server can render, else why not. Both the chat template and
+    the parser index into each entry's `function`, so a malformed entry either raises inside apply_chat_template (a
+    500: _template_ids catches only jinja2.TemplateError) or renders a different prompt without a word; invariant 7
+    refuses it here instead. Absent and null are no tools, and an empty array is allowed, as OpenAI's schema does; an
+    entry's `type` defaults to "function"."""
+    if tools is None:
+        return None
+    if not isinstance(tools, list):
+        return "`tools` must be an array of function definitions"
+    for i, tool in enumerate(tools):
+        if not isinstance(tool, dict):
+            return f"`tools[{i}]` must be an object"
+        if tool.get("type", "function") != "function":
+            return f'`tools[{i}].type` must be "function"'
+        fn = tool.get("function")
+        if not isinstance(fn, dict):
+            return f"`tools[{i}].function` must be an object"
+        name = fn.get("name")
+        # up to 128: the Messages API's limit (its tools come through here too), above OpenAI's 64
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", name):
+            return f"`tools[{i}].function.name` must be 1-128 characters from [A-Za-z0-9_-]"
+        params = fn.get("parameters")
+        if params is not None:
+            if not isinstance(params, dict):
+                return f"`tools[{i}].function.parameters` must be an object"
+            if not isinstance(params.get("properties", {}), dict):
+                return f"`tools[{i}].function.parameters.properties` must be an object"
+        if fn.get("description") is not None and not isinstance(fn["description"], str):
+            return f"`tools[{i}].function.description` must be a string"
+        strict = fn.get("strict")
+        if strict is not None and not isinstance(strict, bool):
+            return f"`tools[{i}].function.strict` must be true or false"
+        if strict is True:
+            return (
+                f"`tools[{i}].function.strict` is not supported: this server does not run the constrained decoding "
+                "it asks for. Send false or omit it."
+            )
+    return None
+
+
 def chat_finish_reason(finish: str | None, called: bool) -> str | None:
     """The finish reason: "tool_calls" once a call was parsed, but only when the model stopped by itself.
     A request cut off by its token limit stays "length" even when it holds a call: that call may be truncated (the
@@ -330,6 +373,59 @@ def _safe_len(text: str, tags, final: bool) -> int:
     return len(text) - hold
 
 
+class _ArgState:
+    """The incremental argument scan and render of one tool block.
+
+    push() hands _block a longer body every time and never a different one (the block's text only grows), so the scan
+    keeps cursors into the `<arg_key>` / `<arg_value>` pairs it has read and the render keeps the JSON it has sent.
+    The shipped whole-text parse stays the definition of the result: a layout the cursor scan does not recognise sets
+    `broken`, and from then on every delta is the whole-text render minus what was sent. The deltas must stay
+    byte-identical to the shipped parser's at every push, because the client already holds the earlier ones and they
+    can only extend.
+
+    Why: the shipped _block re-ran _ARG_RE.finditer, _ARG_RE.sub and json.dumps over the whole argument text on every
+    push, so a call whose value grows (a write_file content) cost O(n^2) over the stream."""
+
+    __slots__ = (
+        "base",  # render of the closed pairs: _args_json's text when no pair is open
+        "base_join",  # `base` plus the separator before another pair: "{" when there are none
+        "base_n",  # len(items) when `base` was rendered
+        "broken",  # the layout is not sequential: render with _arguments over the whole text
+        "close_from",  # where the next search for </arg_value> resumes
+        "esc_from",  # raw characters of the open value already escaped
+        "items",  # completed (key, raw value, closed) pairs, as _arguments reads them
+        "name",  # the call's name, None while it may still be being written
+        "off",  # index of the first <arg_key>, -1 until the body holds one
+        "off_from",  # where the next search for it resumes
+        "opener_from",  # where the next search for a later <arg_key> resumes
+        "pair_at",  # (base_n, value start) of the open pair that `prefix` renders
+        "partial",  # (key, value start) of the open tail pair, None when there is none
+        "prefix",  # render of the open pair up to its opening quote
+        "scan",  # where the next pair scan resumes
+        "sent_len",  # its total length
+        "sent_parts",  # argument text already returned, in pieces
+    )
+
+    def __init__(self) -> None:
+        self.off = -1
+        self.off_from = 0
+        self.name: str | None = None
+        self.items: list[tuple[str, str, bool]] = []
+        self.scan = 0
+        self.close_from = 0
+        self.opener_from = 0
+        self.partial: tuple[str, int] | None = None
+        self.broken = False
+        self.base = ""
+        self.base_join = "{"
+        self.base_n = 0
+        self.pair_at: tuple[int, int] | None = None
+        self.prefix = ""
+        self.esc_from = -1
+        self.sent_parts: list[str] = []
+        self.sent_len = 0
+
+
 @dataclass
 class _Slot:
     """The call of the tool block being parsed."""
@@ -339,7 +435,7 @@ class _Slot:
     muted: bool = False  # parallel_tool_calls=False: calls after the first are dropped
     id: str = ""
     name: str = ""
-    sent: str = ""  # arguments streamed so far
+    args_state: _ArgState = field(default_factory=_ArgState)  # the incremental parse of its arguments
 
 
 class StreamParser:
@@ -366,6 +462,7 @@ class StreamParser:
         self._closed = False  # a reasoning block ended, so a further end tag is a duplicate
         self._skip_nl = False  # drop the newlines that follow the end tag
         self._slot = _Slot()
+        self._close_from = 0  # where the open tool block's search for its end tag resumes
         self._calls = 0
         if thinking_open:
             self._enter_think()
@@ -440,8 +537,11 @@ class StreamParser:
                     self._enter_think()
                 continue
             # otherwise the state is "block"
-            j = self._buf.find(TOOL_CLOSE)
+            j = self._buf.find(TOOL_CLOSE, self._close_from)
+            if j < 0:
+                self._close_from = max(0, len(self._buf) - (len(TOOL_CLOSE) - 1))
             if j >= 0 or final:
+                self._close_from = 0
                 body = self._buf[:j] if j >= 0 else self._buf
                 self._buf = self._buf[j + len(TOOL_CLOSE) :] if j >= 0 else ""
                 out += self._block(body, True, TOOL_CLOSE if j >= 0 else "")
@@ -466,12 +566,170 @@ class StreamParser:
             return True
         return any(isinstance(t, dict) and (t.get("function") or {}).get("name") == name for t in self.tool_defs)
 
+    def _arg_name_and_off(self, body: str, done: bool, st: _ArgState) -> tuple[str | None, int]:
+        """A tool block's (function name, argument text offset) from an appended body (both the inline layout and
+        GLM-4.5's newline one are read). The name ends at the first `<arg_key>`, newline or the end
+        of the block: None while it may still be being written, "" when there is none. Both searches are resumed."""
+        if st.off < 0:
+            i = body.find(ARG_KEY_OPEN, max(0, st.off_from))
+            if i >= 0:
+                st.off = i
+            else:
+                st.off_from = max(0, len(body) - (len(ARG_KEY_OPEN) - 1))
+        if st.off >= 0:
+            if st.name is None:
+                st.name = body[: st.off].lstrip().split("\n", 1)[0].strip()
+        elif st.name is None:
+            head = body.lstrip()
+            if done or "\n" in head:
+                st.name = head.split("\n", 1)[0].strip()
+        return st.name, st.off
+
+    @staticmethod
+    def _arg_later_opener(body: str, k: int, st: _ArgState) -> bool:
+        """Whether another <arg_key> follows the one at k, so the pair at k is malformed and the shipped whole-text
+        parse must decide what it means. A non-sequential layout is the only reason to give up the cursor scan."""
+        start = max(k + len(ARG_KEY_OPEN), st.opener_from)
+        if body.find(ARG_KEY_OPEN, start) >= 0:
+            return True
+        st.opener_from = max(start, len(body) - (len(ARG_KEY_OPEN) - 1))
+        return False
+
+    def _arg_scan(self, body: str, off: int, st: _ArgState) -> None:
+        """Advance over the completed pairs in body[off:] and its open tail pair, as _ARG_RE reads them."""
+        if st.broken:
+            return
+        pos = max(st.scan, off)
+        while True:
+            k = pos
+            while k < len(body) and body[k].isspace():
+                k += 1
+            if not body.startswith(ARG_KEY_OPEN, k):
+                if ARG_KEY_OPEN.startswith(body[k:]):  # nothing yet, or an opener still being written
+                    st.scan, st.partial = k, None
+                else:  # other text between pairs: _ARG_RE.sub splices around it, so the whole-text parse decides
+                    st.broken = True
+                return
+            ke = body.find(ARG_KEY_CLOSE, k + len(ARG_KEY_OPEN))
+            if ke < 0:
+                if self._arg_later_opener(body, k, st):
+                    st.broken = True
+                else:
+                    st.scan, st.partial = k, None  # the key may still be being written
+                return
+            v = ke + len(ARG_KEY_CLOSE)
+            while v < len(body) and body[v].isspace():
+                v += 1
+            if not body.startswith(ARG_VALUE_OPEN, v):
+                tail = body[v:]
+                if len(tail) < len(ARG_VALUE_OPEN) and ARG_VALUE_OPEN.startswith(tail):
+                    if self._arg_later_opener(body, k, st):  # a value opener split by a push: wait
+                        st.broken = True
+                    else:
+                        st.scan, st.partial = k, None
+                else:
+                    st.broken = True
+                return
+            vs = v + len(ARG_VALUE_OPEN)
+            ve = body.find(ARG_VALUE_CLOSE, max(vs, st.close_from))
+            if ve < 0:
+                if self._arg_later_opener(body, k, st):
+                    st.broken = True
+                    return
+                key = body[k + len(ARG_KEY_OPEN) : ke].strip()
+                st.partial = (key, vs) if key else None
+                st.scan, st.close_from = k, max(vs, len(body) - (len(ARG_VALUE_CLOSE) - 1))
+                return
+            st.items.append((body[k + len(ARG_KEY_OPEN) : ke].strip(), body[vs:ve], True))
+            pos = ve + len(ARG_VALUE_CLOSE)
+            st.scan, st.close_from, st.opener_from, st.partial = pos, pos, pos, None
+
+    @staticmethod
+    def _arg_closed_parts(props: dict, st: _ArgState) -> None:
+        """Render the closed pairs once each into base / base_join, the text an open pair is appended to."""
+        if st.base_n == len(st.items):
+            return
+        parts = [_pair_json(k, v, props) for k, v, _closed in st.items[st.base_n :]]
+        if st.base_n:
+            st.base += ", " + ", ".join(parts)
+            st.base_join += ", ".join(parts) + ", "
+        else:
+            st.base = "{" + ", ".join(parts)
+            st.base_join = "{" + ", ".join(parts) + ", "
+        st.base_n = len(st.items)
+
+    def _arg_text(self, body: str, off: int, st: _ArgState, complete: bool, props: dict) -> str:
+        """The argument-text delta to emit now, after _arg_scan has read body.
+
+        With the call complete, or a body that is not the sequential layout, _arguments over the whole text is the
+        result (as shipped) and the delta is its part not sent yet. Otherwise the closed pairs are rendered once each
+        and the open string value is escaped as it arrives, so a push costs its own text, not all of it so far (the first
+        push of a new pair also compares the text already sent)."""
+        if st.broken or complete:
+            text = _arguments(body[off:] if off >= 0 else "", complete, props)
+            sent = "".join(st.sent_parts)
+            diff = text[len(sent) :] if text.startswith(sent) else ""
+            if diff:
+                st.sent_parts.append(diff)
+                st.sent_len += len(diff)
+            return diff
+
+        self._arg_closed_parts(props, st)
+        if st.partial is None:
+            diff = st.base[st.sent_len :] if len(st.base) >= st.sent_len else ""
+            if diff:
+                st.sent_parts.append(diff)
+                st.sent_len += len(diff)
+            return diff
+
+        key, vs = st.partial
+        if st.pair_at != (st.base_n, vs):
+            # A new open pair: its prefix is rendered once, not on every push of a value that keeps growing
+            st.pair_at, st.esc_from = (st.base_n, vs), -1
+            st.prefix = st.base_join + json.dumps(key, ensure_ascii=False) + ": "
+        prefix = st.prefix
+        schema = props.get(key)
+        string_kind = not isinstance(schema, dict) or _schema_types(schema) == {"string"}
+        if not string_kind:
+            # A non-string value is only known once its closing tag arrives; the key streams alone.
+            if st.sent_len < len(prefix):
+                diff = prefix[st.sent_len :]
+                st.sent_parts.append(diff)
+                st.sent_len = len(prefix)
+                return diff
+            return ""
+
+        value_len = len(body) - vs
+        if st.esc_from < 0:
+            # The pair's first push: what the previous one emitted is complete, and this value is escaped from its start.
+            e = _esc(body[vs : vs + value_len])
+            st.esc_from = value_len
+            full = prefix + '"' + e
+            sent = "".join(st.sent_parts)
+            diff = full[len(sent) :] if full.startswith(sent) else ""
+            if diff:
+                st.sent_parts.append(diff)
+                st.sent_len += len(diff)
+            return diff
+        if value_len < st.esc_from:
+            return ""  # a body never shrinks between pushes; defensive, and nothing already sent can be retracted
+        e = _esc(body[vs + st.esc_from : vs + value_len])
+        if e:
+            st.sent_parts.append(e)
+            st.sent_len += len(e)
+        st.esc_from = value_len
+        return e
+
     def _block(self, body: str, done: bool, closer: str) -> list[dict]:
         """The deltas of the current tool block so far. body: its text after `<tool_call>`; done: the block ended
-        (closer: its `</tool_call>`, or "" when the output ended inside it)."""
+        (closer: its `</tool_call>`, or "" when the output ended inside it).
+
+        body only grows between the pushes of one block, so the name, the pair scan and the rendered JSON resume
+        where the previous call stopped (_ArgState); the result is the shipped whole-text one at every push."""
         slot = self._slot
+        st = slot.args_state
         out: list[dict] = []
-        name, args = _scan(body, done)
+        name, off = self._arg_name_and_off(body, done, st)
         announce = False
         if not slot.skip and slot.index is None and name is not None:
             if name and self._offered(name):
@@ -482,10 +740,9 @@ class StreamParser:
             else:
                 slot.skip = True
         if slot.index is not None:
-            text = _arguments(args, done, self._props(slot.name))
-            diff = ""
-            if text.startswith(slot.sent):  # never retract what was streamed
-                diff, slot.sent = text[len(slot.sent) :], text
+            if off >= 0 and not done:  # done renders with _arguments over the whole text, so a scan would duplicate it
+                self._arg_scan(body, off, st)
+            diff = self._arg_text(body, off, st, done, self._props(slot.name))
             if not slot.muted and (announce or diff):
                 call: dict[str, object] = {"index": slot.index, "function": {"arguments": diff}}
                 if announce:

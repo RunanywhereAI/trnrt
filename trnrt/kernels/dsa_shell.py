@@ -511,10 +511,89 @@ if nki is not None:  # D3b's kernel: its own block and revision (REVA)
     from .dsa_slots import KTR as _SL_KTR
     from .dsa_slots_n_s2 import _row_nat as _sn_row
 
-    def _select_st(SS, PS, nt: int, W: int, G, keep: int, nbits: int, rbits: int):
-        """_select_ts (tskip 0, g 128, piece offsets 0) over the program's nt rows at once, as sel2's _select2s: SS
-        [128, nt, W] row i's merge candidates' scores at [:, i, :], PS [128, nt, W] their context pools (the tie order,
-        each row its own). Each op runs once over every row where _select_ts issues it per row tile; the per-row scalars
+    # The stacked merge selection's tie search runs as a device loop of 0 or 1 trips: only when some row has more scores
+    # tied at a visible threshold than room. Without the search LIM = 2^nbits - 1 takes every tied score (pools < 2^nbits
+    # <= BIG_T) and no untied one, which is the search's answer whenever the tied fit the room; a row whose threshold is
+    # invisible keeps only visible scores either way. So the same set for every input. Measured on trn2 at 24 decode rows:
+    # the search was 0.64 ms of a 1.87 ms merge per step.
+
+    def _tie_need_st(tied, th, room, Gc, CD, n: int, nt: int):
+        """The tie search's trip count [1, 1] int32: 1 when some row has more scores tied at its threshold th than room
+        AND th is visible (> VISIBLE_T), else 0. A row whose threshold is invisible has only invisible tied scores, which
+        the selection's visible mask drops whatever LIM is, so it needs no search. tied [n, nt, W] 0 / 1, th and room
+        [n, nt]; the tied counts summed over the partitions by the all-ones Gc (each <= W a partition: exact in CD)."""
+        tp = _sb((n, nt), CD)
+        nisa.tensor_reduce(dst=tp, op=nl.add, data=tied, axis=2)
+        ttot = nl.ndarray((n, nt), dtype=F32, buffer=nl.psum)
+        nisa.nc_matmul(dst=ttot, stationary=Gc, moving=tp)
+        ov = _sb((n, nt))
+        nisa.tensor_tensor(dst=ov, data1=ttot, data2=room, op=nl.greater, engine=VE)
+        vt = _sb((n, nt))
+        nisa.tensor_scalar(dst=vt, data=th, op0=nl.greater, operand0=VISIBLE_T, engine=VE)
+        nisa.tensor_tensor(dst=ov, data1=ov, data2=vt, op=nl.multiply, engine=VE)
+        need = _sb((n, 1))
+        nisa.tensor_reduce(dst=need, op=nl.maximum, data=ov, axis=1)
+        needi = _sb((1, 1), I32)
+        nisa.tensor_copy(dst=needi, src=need[0:1, 0:1], engine=VE)
+        return needi
+
+    def _tie_rounds_st(X):
+        """_select_st's tie search (LIM's rounds) from lim 0: the body of its 0 / 1-trip loop, at module level (the
+        device tracer takes an inner function only as a device loop's body)."""
+        n, nt, W, J, CD, TC, Gc = X["n"], X["nt"], X["W"], X["J"], X["CD"], X["TC"], X["Gc"]
+        tj, room, lim, nbits, rbits = X["tj"], X["room"], X["lim"], X["nbits"], X["rbits"]
+        nisa.memset(dst=lim, value=0.0)
+        for r in range((nbits - 1 + rbits) // rbits):
+            lo = _topk_rlo(nbits - 1, rbits, r)
+            Jw = (1 << _topk_rwidth(nbits - 1, rbits, r)) - 1
+            thr = _sb((n, nt, Jw))
+            nisa.tensor_tensor(dst=thr, data1=lim.ap(pattern=[[nt, n], [1, nt], [0, Jw]], offset=0),
+                               data2=TC[r].ap(pattern=[[J, n], [0, nt], [1, Jw]], offset=0), op=nl.add, engine=VE)
+            lt = _sb((n, nt, Jw, W))
+            nisa.tensor_tensor(dst=lt, data1=tj.ap(pattern=[[nt * W, n], [W, nt], [0, Jw], [1, W]], offset=0),
+                               data2=thr.ap(pattern=[[nt * Jw, n], [Jw, nt], [1, Jw], [0, W]], offset=0), op=nl.less,
+                               engine=VE)
+            cpj = _sb((n, nt, Jw), CD)
+            nisa.tensor_reduce(dst=cpj, op=nl.add, data=lt, axis=3)
+            totj = nl.ndarray((n, nt * Jw), dtype=F32, buffer=nl.psum)
+            nisa.nc_matmul(dst=totj, stationary=Gc, moving=cpj.reshape((n, nt * Jw)))
+            okj = _sb((n, nt, Jw))
+            nisa.tensor_tensor(dst=okj.reshape((n, nt * Jw)), data1=totj,
+                               data2=room.ap(pattern=[[nt, n], [1, nt], [0, Jw]], offset=0), op=nl.less, engine=VE)
+            dg = _sb((n, nt))
+            nisa.tensor_reduce(dst=dg, op=nl.add, data=okj, axis=2)
+            nisa.scalar_tensor_tensor(dst=lim, data=dg, op0=nl.multiply, operand0=float(1 << lo), op1=nl.add,
+                                      operand1=lim)
+
+    def _tie_agree(needi, xs):
+        """The tie search's trip count both LNC programs load: the max of their own flags. Each program writes its flag
+        into the first sbias cell of its own first row (a kernel output, so one buffer in both programs), core_barrier,
+        reads both programs' cells (rows 0 and (T + 1) // 2: dsa_sa._attend's split), takes the max, and a second
+        core_barrier after the reads, so neither program's later write of its final sbias rows (which overwrites its own
+        cell) can land before the other has read it. A count each program took alone hung the fused layer's collectives
+        on the device: a device loop's trip count must agree between the programs."""
+        sbias, T, nskp, b0 = xs["sbias"], xs["T"], xs["nskp"], xs["b0"]
+        h = (T + 1) // 2
+        nf = _sb((1, 1))
+        nisa.tensor_copy(dst=nf, src=needi, engine=VE)
+        dma_static(dst=sbias.ap(pattern=[[nskp, 1], [1, 1]], offset=b0 * nskp), src=nf)
+        nisa.core_barrier(data=sbias, cores=(0, 1))
+        both = _sb((1, 2))
+        dma_static(dst=both[0:1, 0:1], src=sbias.ap(pattern=[[nskp, 1], [1, 1]], offset=0))
+        dma_static(dst=both[0:1, 1:2], src=sbias.ap(pattern=[[nskp, 1], [1, 1]], offset=h * nskp))
+        m = _sb((1, 1))
+        nisa.tensor_reduce(dst=m, op=nl.maximum, data=both, axis=1)
+        nisa.core_barrier(data=sbias, cores=(0, 1))
+        out = _sb((1, 1), I32)
+        nisa.tensor_copy(dst=out, src=m, engine=VE)
+        return out
+
+    def _select_st(SS, PS, nt: int, W: int, G, keep: int, nbits: int, rbits: int, xs):
+        """_select_ts (tskip 0, g 128, piece offsets 0) over the program's nt rows at once, as sel2's _select2s, with
+        its tie search a 0 / 1-trip loop whose count both LNC programs agree on (xs: _tie_agree's context; None at grid
+        1 or one row, where one program holds every row). SS [128, nt, W] row i's merge candidates' scores at [:, i, :],
+        PS [128, nt, W] their context pools (the tie order, each row its own). Each op runs once over every row where
+        _select_ts issues it per row tile; the per-row scalars
         become [128, nt] tiles read through zero-stride access patterns. The element arithmetic is _select_ts's (integer
         counts, bit-pattern thresholds, x * +-1), so the selection is its bit for bit. The counts (each <= W a
         partition) go to the PE in bf16 when W <= 256, where every count is exact (their fp32 PSUM sums <= 128 W).
@@ -572,7 +651,7 @@ if nki is not None:  # D3b's kernel: its own block and revision (REVA)
             inc = _sb((n, nt), I32)
             nisa.tensor_scalar(dst=inc, data=dg, op0=nl.multiply, operand0=float(1 << lo), engine=VE)
             nisa.tensor_tensor(dst=pre, data1=pre, data2=inc, op=nl.bitwise_or, engine=VE)
-        # 3. above, room, ties (the tie search always runs: _select_ts at tskip 0)
+        # 3. above, room, ties
         th = _sb((n, nt))
         nisa.tensor_tensor(dst=th, data1=pre.view(F32), data2=sg, op=nl.multiply, engine=VE)
         thw = th.ap(pattern=[[nt, n], [1, nt], [0, W]], offset=0)
@@ -591,28 +670,20 @@ if nki is not None:  # D3b's kernel: its own block and revision (REVA)
         nisa.scalar_tensor_tensor(dst=tj, data=tied, op0=nl.multiply, operand0=-BIG_T, op1=nl.add, operand1=PS)
         nisa.tensor_scalar(dst=tj, data=tj, op0=nl.add, operand0=BIG_T, engine=VE)
         lim = _sb((n, nt))
-        nisa.memset(dst=lim, value=0.0)
-        for r in range((nbits - 1 + rbits) // rbits):
-            lo = _topk_rlo(nbits - 1, rbits, r)
-            Jw = (1 << _topk_rwidth(nbits - 1, rbits, r)) - 1
-            thr = _sb((n, nt, Jw))
-            nisa.tensor_tensor(dst=thr, data1=lim.ap(pattern=[[nt, n], [1, nt], [0, Jw]], offset=0),
-                               data2=TC[r].ap(pattern=[[J, n], [0, nt], [1, Jw]], offset=0), op=nl.add, engine=VE)
-            lt = _sb((n, nt, Jw, W))
-            nisa.tensor_tensor(dst=lt, data1=tj.ap(pattern=[[nt * W, n], [W, nt], [0, Jw], [1, W]], offset=0),
-                               data2=thr.ap(pattern=[[nt * Jw, n], [Jw, nt], [1, Jw], [0, W]], offset=0), op=nl.less,
-                               engine=VE)
-            cpj = _sb((n, nt, Jw), CD)
-            nisa.tensor_reduce(dst=cpj, op=nl.add, data=lt, axis=3)
-            totj = nl.ndarray((n, nt * Jw), dtype=F32, buffer=nl.psum)
-            nisa.nc_matmul(dst=totj, stationary=Gc, moving=cpj.reshape((n, nt * Jw)))
-            okj = _sb((n, nt, Jw))
-            nisa.tensor_tensor(dst=okj.reshape((n, nt * Jw)), data1=totj,
-                               data2=room.ap(pattern=[[nt, n], [1, nt], [0, Jw]], offset=0), op=nl.less, engine=VE)
-            dg = _sb((n, nt))
-            nisa.tensor_reduce(dst=dg, op=nl.add, data=okj, axis=2)
-            nisa.scalar_tensor_tensor(dst=lim, data=dg, op0=nl.multiply, operand0=float(1 << lo), op1=nl.add,
-                                      operand1=lim)
+        assert (1 << nbits) <= BIG_T, "the tie skip: LIM 2^nbits - 1 must stay below every untied BIG_T + pool"
+        needi = _tie_need_st(tied, th, room, Gc, CD, n, nt)
+        if xs is not None:  # the trip count both programs load: the max of their flags
+            needi = _tie_agree(needi, xs)
+        nisa.memset(dst=lim, value=float((1 << nbits) - 1))  # every tied pool (< 2^nbits), no untied (>= BIG_T)
+        XT = {"n": n, "nt": nt, "W": W, "J": J, "CD": CD, "TC": TC, "Gc": Gc, "tj": tj, "room": room, "lim": lim,
+              "nbits": nbits, "rbits": rbits}
+
+        def body(it):
+            _tie_rounds_st(XT)
+
+        rt = nisa.register_alloc()
+        nisa.register_load(rt, needi)
+        nl.fori_loop(0, rt, body)  # 0 trips unless some row's tied scores at a visible threshold exceed its room
         # 4. sel (piece offsets 0: lp = lim)
         sel = _sb((n, nt, W))
         nisa.tensor_tensor(dst=sel, data1=tj, data2=lim.ap(pattern=[[nt, n], [1, nt], [0, W]], offset=0),
@@ -762,7 +833,12 @@ if nki is not None:  # D3b's kernel: its own block and revision (REVA)
                            src=ev.ap(pattern=[[W, PR], [K, nt], [1, W]], offset=(a * T + b0) * K))
                 dma_static(dst=PS[a * PR:(a + 1) * PR, :, :],
                            src=ec.ap(pattern=[[W, PR], [K, nt], [1, W]], offset=(a * T + b0) * K))
-        sel = _select_st(SS, PS, nt, W, G, keep, nbits, rbits)
+        # both LNC programs agree on the tie search's trip count through sbias (an output)
+        xs = None
+        npg_ = nl.num_programs(axes=0) if nl.program_ndim() != 0 else 1
+        if npg_ == 2 and T >= 2:  # dsa_sa._attend's split: each program its own rows, so the counts can differ
+            xs = {"sbias": sbias, "T": T, "nskp": ns * kp, "b0": b0}
+        sel = _select_st(SS, PS, nt, W, G, keep, nbits, rbits, xs)
         # this rank's selection bits, slots k = p W + c, and their bias on every token: every row in one matmul
         pm = nl.ndarray((PR, nt * W), dtype=F32, buffer=nl.psum)
         nisa.nc_matmul(dst=pm, stationary=X["ohr"], moving=sel.reshape((128, nt * W)), accumulate=False)

@@ -26,6 +26,8 @@ from tests import test_glm5_next as T
 from trnrt.engine.request import SamplingParams
 from trnrt.models import decoder, mla
 
+pytestmark = pytest.mark.usefixtures("decode_routes")  # set_decode_routes's writes are undone
+
 MTP_SEED = 52
 
 
