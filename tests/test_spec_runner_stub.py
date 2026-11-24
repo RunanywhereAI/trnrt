@@ -5,9 +5,10 @@ only), so what runs for real is the runner: its bucket families and page ladders
 speculative board and the small graphs around the verify (engine/spec_async.py, executed on the CPU here, so their
 argument lists and shapes must agree with what the runner passes them), the MTP passes and the order of it all.
 
-For each shipped speculative preset the warmup must request exactly the graphs its families name: the plain decode only at
-the plain buckets and the page ladder, the verify family only at the speculative buckets and the speculative ladder, and
-nothing at a page rung outside the ladder (the 3072-page rung exists for plain decode only)."""
+Every build's warmup must request exactly the graphs its families name. The speculative build: the verify family only at
+the speculative buckets and the speculative ladder, and no plain decode graph at all (its speculation never turns off).
+The builds without speculation: the plain decode at their buckets and page ladder, and none of the speculative
+machinery. Each warms its prefill chunks at their page buckets."""
 
 from __future__ import annotations
 
@@ -201,14 +202,17 @@ def keys_of(runner):
 
 
 def expected(c):
-    """The graph keys a speculative engine's warmup builds, from its configuration alone."""
+    """The graph keys an engine's warmup builds, from its configuration alone: the plain decode at the plain buckets and
+    the page ladder (a build without speculation, or one whose speculation turns off), the verify family at the
+    speculative buckets and ladder, the prefill chunks, and the MTP passes over them when the build speculates."""
+    spec = c.spec_method == "mtp"
     Q, k = 1 + c.spec_k, c.spec_k
     dec, pb = c.resolved_decode_batch_buckets(), c.resolved_page_buckets()
     sp = tuple(sorted(c.spec_page_buckets or pb))
     plain_b = [b for b in dec if not c.plain_bucket_min or b >= c.plain_bucket_min]
-    spec_b = [b for b in dec if not c.spec_bucket_max or b <= c.spec_bucket_max]
+    spec_b = [b for b in dec if not c.spec_bucket_max or b <= c.spec_bucket_max] if spec else []
     out = set()
-    if c.spec_max_batch:
+    if not spec or (c.spec_max_batch and c.plain_decode):
         out |= {("decode", B, P) for B in plain_b for P in pb}
     for B in spec_b:
         for P in sp:
@@ -224,6 +228,8 @@ def expected(c):
     for C in c.resolved_prefill_token_buckets():
         for P in prefill_pages(c.resolved_prefill_page_buckets(), c.prefill_page_min_rows, C):
             out.add(("prefill", C, P))
+            if not spec:
+                continue
             Pm = P if not c.spec_page_buckets else min(x for x in sp if x >= P)
             q = C if not fill or fill >= C else fill
             out |= {("mtp", 1, q, Pm, C, k), ("mtp_prefill_ids", 1, q), ("mtp_post", 1, Q), ("spec_init", 1)}
@@ -233,14 +239,12 @@ def expected(c):
     return out
 
 
-PRESETS = ["mtp-always", "mtp-batch8", "mtp-batch12", "mtp-batch24"]
-
-
-@pytest.mark.parametrize("preset", PRESETS)
-def test_the_warmup_requests_exactly_the_graphs_the_families_name(preset, monkeypatch):
-    runner, ecfg, _ = build(preset, monkeypatch)
+@pytest.mark.parametrize("build_name", sorted(cli.PRESETS))
+def test_the_warmup_requests_exactly_the_graphs_the_families_name(monkeypatch, build_name):
+    runner, ecfg, _ = build(build_name, monkeypatch)
     runner.warmup()
     got, want = keys_of(runner), expected(ecfg)
+    assert {k[0] for k in want} >= {"prefill", "verify" if ecfg.spec_method else "decode"}  # not an empty comparison
     copies = {k for k in got if k[0] == "copy"}
     got -= copies
     want = {k for k in want if k[0] != "copy"}
@@ -249,52 +253,36 @@ def test_the_warmup_requests_exactly_the_graphs_the_families_name(preset, monkey
     assert copies, "the checkpoint copies are warmed"
 
 
-def test_mtp_batch8_builds_the_families_it_names(monkeypatch):
-    """Literal counts, from the preset's own numbers: decode buckets 1 2 4 6 8, plain from 4, verify up to 4, pages 1024 3072
-    4096 and the speculative ladder 1024 4096."""
-    runner, _, _ = build("mtp-batch8", monkeypatch)
+def test_the_latency_build_warms_every_decode_bucket_as_a_verify_and_no_plain_decode(monkeypatch):
+    """Literal counts, from the build's own numbers: decode buckets 1 2 4 6 8, every one a verify (spec_bucket_max 8), pages
+    1024 2048 4096 for every family, and no plain decode graph (plain_decode False)."""
+    runner, _, _ = build("latency", monkeypatch)
+    assert runner.plain_buckets == () and runner.spec_buckets == (1, 2, 4, 6, 8)
     runner.warmup()
     keys = keys_of(runner)
-    assert {k[1:] for k in keys if k[0] == "decode"} == {(B, P) for B in (4, 6, 8) for P in (1024, 3072, 4096)}
-    assert {k[1:] for k in keys if k[0] == "verify"} == {(B, 3, P) for B in (1, 2, 4) for P in (1024, 4096)}
-    assert not [k for k in keys if k[0] in ("verify", "spec_prep", "mtp_board") and 3072 in k], (
-        "a speculative graph at the 3072 rung"
-    )
-    assert {k for k in keys if k[0] == "spec_post"} == {("spec_post", B, 3) for B in (1, 2, 4)}
+    assert not [k for k in keys if k[0] == "decode"], "a plain decode graph in a build that has none"
+    assert {k[1:] for k in keys if k[0] == "verify"} == {(B, 3, P) for B in (1, 2, 4, 6, 8) for P in (1024, 2048, 4096)}
+    assert {k for k in keys if k[0] == "spec_post"} == {("spec_post", B, 3) for B in (1, 2, 4, 6, 8)}
+    with pytest.raises(RuntimeError, match="no plain decode buckets"):
+        mr.pick_family(1, runner.plain_buckets, "plain decode")
 
 
-def test_mtp_always_is_static_speculation_with_no_plain_decode_graph(monkeypatch):
-    runner, _, _ = build("mtp-always", monkeypatch)
-    runner.warmup()
-    keys = keys_of(runner)
-    assert not [k for k in keys if k[0] == "decode"], "a static speculative engine never launches a plain decode"
-    assert {k[1:] for k in keys if k[0] == "verify"} == {(B, 3, P) for B in (1, 2, 4, 6, 8) for P in (1024, 4096)}
-    assert not [k for k in keys if k[0] == "mtp_kv"], "mtp-always has no KV-only windows"
+def test_the_state_pool_has_the_rows_of_the_build(monkeypatch):
+    runner, ecfg, _ = build("latency", monkeypatch)
+    assert runner.state.rows == mr.state_pool_rows(ecfg) == 34 and not runner.state.mixed_seats
 
 
-def test_mtp_batch24_has_two_disjoint_families(monkeypatch):
-    runner, _, _ = build("mtp-batch24", monkeypatch)
-    runner.warmup()
-    keys = keys_of(runner)
-    assert {k[1] for k in keys if k[0] == "decode"} == {16, 24}
-    assert {k[1] for k in keys if k[0] == "verify"} == {1, 2, 4}
-    with pytest.raises(RuntimeError, match="exceeds its warmed buckets"):
-        mr.pick_family(5, runner.spec_buckets, "verify")
-    assert runner.state.rows == 58 and runner.state.spec_seats == 4 and runner.state.mixed_seats
-
-
-@pytest.mark.parametrize("preset", PRESETS)
-def test_the_state_pool_has_the_rows_of_the_preset(preset, monkeypatch):
-    runner, ecfg, _ = build(preset, monkeypatch)
-    assert runner.state.rows == mr.state_pool_rows(ecfg) == {"mtp-batch24": 58}.get(preset, 34)
-
-
-def test_a_speculative_engine_without_speculation_builds_none_of_it(monkeypatch):
-    runner, ecfg, _ = build("batch12", monkeypatch)
+@pytest.mark.parametrize(("build_name", "buckets"), [("balanced", (8, 16, 24)), ("throughput", (16, 24))])
+def test_a_build_without_speculation_builds_none_of_it(monkeypatch, build_name, buckets):
+    runner, ecfg, _ = build(build_name, monkeypatch)
     assert not runner.spec_async and runner._spec_fns == {} and runner._mtp is None and runner.async_ckpt_t == 0
-    assert runner.plain_buckets == runner.spec_buckets == runner.decode_buckets
+    assert runner.plain_buckets == runner.spec_buckets == runner.decode_buckets == buckets
     assert runner.spec_page_buckets == tuple(sorted(runner.page_buckets)) and not runner.spec_page_set
-    assert runner.mtp_q_buckets == () and runner.state.rows == mr.state_pool_rows(ecfg)
+    assert runner.mtp_q_buckets == () and runner.state.rows == mr.state_pool_rows(ecfg) == 50
+    runner.warmup()
+    keys = keys_of(runner)
+    assert {k[1:] for k in keys if k[0] == "decode"} == {(B, P) for B in buckets for P in (1024, 3072, 4096)}
+    assert not [k for k in keys if k[0] in ("verify", "mtp", "mtp_board", "spec_prep")]
 
 
 class MtpRecordingModel(StubModel):
@@ -350,9 +338,7 @@ def test_a_blind_step_runs_the_real_board_graphs_with_the_arguments_the_device_s
         return out
 
     model = MtpRecordingModel()
-    runner, ecfg, _ = build(
-        "mtp-batch8", monkeypatch, hooks={"prefill": prefill_hook, "verify": verify_hook}, model=model
-    )
+    runner, ecfg, _ = build("latency", monkeypatch, hooks={"prefill": prefill_hook, "verify": verify_hook}, model=model)
     ps, Q, k = ecfg.page_size, 3, 2
     req = Request("r", list(range(100, 110)), SamplingParams(max_new_tokens=8))
     req.pages = [3]
@@ -413,9 +399,7 @@ def test_a_blind_verify_of_three_requests_one_of_them_cold(monkeypatch):
         return torch.zeros(B * Q, VERIFY_COLS)
 
     model = MtpRecordingModel()
-    runner, ecfg, _ = build(
-        "mtp-batch8", monkeypatch, hooks={"prefill": prefill_hook, "verify": verify_hook}, model=model
-    )
+    runner, ecfg, _ = build("latency", monkeypatch, hooks={"prefill": prefill_hook, "verify": verify_hook}, model=model)
     ps, Q, k = ecfg.page_size, 3, 2
     reqs = []
     for i, (n, page) in enumerate(((10, 3), (6, 4), (5, 5))):
@@ -464,7 +448,7 @@ def test_a_long_chunk_fills_the_mtp_layers_kv_in_windows_and_only_the_last_carri
         a[10].index_put_((a[11],), torch.tensor([77.0]))
 
     model = MtpRecordingModel()
-    runner, ecfg, _ = build("mtp-batch8", monkeypatch, hooks={"prefill": prefill_hook}, model=model)
+    runner, ecfg, _ = build("latency", monkeypatch, hooks={"prefill": prefill_hook}, model=model)
     assert runner.after_prefill_rows == 1024 and runner._mtp_kv is not None
     n = 2500
     req = Request("r", [(7 * i) % 997 + 10 for i in range(n)], SamplingParams(max_new_tokens=4))

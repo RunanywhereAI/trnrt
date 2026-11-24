@@ -11,32 +11,31 @@
 - **MTP speculative decoding** with GLM-5.3-Flash's own MTP layer: 2 draft tokens per step, verified by the target model
   in the next step. The accepted count, the newest token, the positions, the state row and the drafts stay on the device,
   so the next step is scheduled before the previous one is read back (`trnrt/engine/spec_async.py`).
-- **MTP only while few users decode.** MTP runs while at most 4 requests decode in a step and plain decode runs above that,
-  because past that point a verify step costs more per token than it saves. Once plain, MTP returns when 3 or fewer
-  decode (`--spec-hysteresis 1`), so a batch hovering at the limit doesn't flip every step. Plain steps still write the MTP layer's KV
-  cache, so a return to MTP finds it complete.
-- **Larger decode batches** for higher concurrency (12 and 24 requests per engine), with a state checkpoint row per
-  decoding seat. Only the seats that speculate hold the 3 state rows a verify writes.
-- **Host DRAM prompt cache sizes** of 8 and 12 GB per NeuronCore for concurrency 12 to 32.
+- **Speculation in the latency build only.** The latency build (1 to 8 users per engine) speculates at every step: its
+  running cap of 8 is its speculation limit, so it has no plain decode graph, and every state seat holds the 3 state rows
+  a verify writes. The balanced and throughput builds decode without drafts.
+- **Larger decode batches** without speculation for higher concurrency: buckets 8, 16 and 24 in the balanced build, 16
+  and 24 in the throughput build, each with 24 state checkpoints.
+- **Host DRAM prompt cache** of 4 GiB per rank in the latency build, and 16 GiB per rank in the balanced and throughput
+  builds, where the ranks of one context-parallel index keep one shared copy of each page (`--host-cache-save-once`).
 - **A benchmark mode** that reproduces InferenceX's synthetic acceptance. It is off by default;
   see [Benchmark mode](#benchmark-mode).
 
 ## Configurations
 
 One engine is 8 trn2 chips (tensor parallel 32 at logical NeuronCore 2); `trnrt serve` runs two behind the router.
-Each row is a preset ([CONFIGURATION.md](CONFIGURATION.md#speculative-decoding-the-mtp--presets)) and the
-`trnrt serve` arguments that select it:
+Each concurrency is served by the build for its users per engine ([CONFIGURATION.md](CONFIGURATION.md)):
 
-| Concurrency | Arguments | Speculation | Decode batch |
+| Concurrency (users per engine) | Arguments | Speculation | Decode batch |
 |---|---|---|---|
-| 1, 4, 8 | `--preset mtp-batch8` | while at most 4 users decode | up to 8 |
-| 2 | `--preset mtp-always` | always | up to 8 |
-| 12, 16 | `--preset mtp-batch12` | while at most 4 users decode | up to 12, 8 GB host cache per core |
-| 24, 32 | `--preset mtp-batch24` | while at most 4 users decode | up to 24, 12 GB host cache per core |
+| 1 to 8 | `--preset latency` | at every step | up to 8 |
+| 9 to 16 | `--preset balanced` | none | 8, 16, 24 |
+| 17 and up | `--preset throughput` | none | 16, 24 |
 
-A preset names its decode batch; `mtp-always` is the one with speculation at every batch size. The host cache size is host
-only: it changes no graph, so `mtp-batch12 --host-cache-gb 12` is a larger tier on the same compile cache, though none of
-the measured points uses it. Every preset has its own graphs and its own capture.
+`--preset auto --users N` picks the same build from N users per engine. Every build has its own graphs and its own
+capture. The points in [RESULTS.md](RESULTS.md#mtp-speculative-decoding-one-engine) were measured with the presets of release 0.1.0
+(`mtp-batch8`, `mtp-always`, `mtp-batch12`, `mtp-batch24`, all speculative); those names now run the builds above
+([Earlier preset names](CONFIGURATION.md#earlier-preset-names)), so reproducing those points needs release 0.1.0.
 
 ## Build the compile cache
 
@@ -44,27 +43,28 @@ Follow [DEPLOY.md](DEPLOY.md) for the image, the model and the shape directory; 
 preset you serve, capture, compile and strip with the arguments you will serve with:
 
 ```bash
-PRESET=mtp-batch8      # or mtp-always, mtp-batch12, mtp-batch24
+PRESET=latency      # or balanced, throughput
 trnrt compile capture --out $OUT -- --model $OUT/shapes --preset $PRESET
 trnrt compile compile --out $OUT --work-root $OUT/work
 trnrt compile strip --out $OUT
 ```
 
-A speculative preset adds graphs to the plain engine's: the verify call, the MTP passes, and a handful of small graphs
-around them that read and write the board. The cache for one preset is therefore not the batch-12 cache plus a few
-entries; capture and compile each preset you serve.
+The latency build's graphs are the verify calls, the MTP passes and a handful of small graphs around them that read and
+write the board; it has no plain decode graph. The three builds share no decode graph, so capture and compile each build
+you serve.
 
 ## Serve
 
 ```bash
-docker run ... trnrt serve --model /model --port 8000 --preset mtp-batch8 --engines 1   # the mounts and variables of DEPLOY.md, step 4
+docker run ... trnrt serve --model /model --port 8000 --preset latency --engines 1   # the mounts and variables of DEPLOY.md, step 4
 ```
 
 `--engines 1` is the measured layout: one engine of 8 chips, the unit of [RESULTS.md](RESULTS.md) and of the per-chip
 scoring below. It changes no graph. With the default two engines the box serves on 16 chips, so divide by 16 instead.
 
 Each engine's `GET /v1/stats` carries a `spec` block (drafts proposed and accepted, the mean acceptance length, the
-per-position counts, and in a dynamic preset the mode flips), and its `GET /metrics` the same counters as
+per-position counts, and the speculation mode's step and flip counts; the latency build never decodes plain, so its
+flips stay at 0), and its `GET /metrics` the same counters as
 `trnrt:spec_decode_*`. Both are on the engine's own port, `--port` + 1 (8001 here) on
 127.0.0.1, not on the router's.
 

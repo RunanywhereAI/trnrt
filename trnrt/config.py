@@ -160,6 +160,109 @@ class EngineConfig:
     structured_outputs: bool = False
     penalties: bool = False
     penalty_buckets: tuple[int, ...] = (1024, 16384)
+    # -- KDA, mHC and FFN-half routes (engine.set_decode_routes copies each into the module that reads it at trace) --
+    # - kda_shell (models/hybrid.py KDA_SHELL): a KDA layer's decode attention block may run as the KDA shell's kernel
+    #   (kernels/kda_shell.py; its packed blobs exist only then), up to kda_shell_max_rows rows and for verifies. Off,
+    #   every KDA decode step runs linear_attn's decode form (kernels/kda_decode.py): the shell's per-row recurrence
+    #   (~8.5-10.5 us a row per layer) costs more than the decode kernel at 8 rows a step and up.
+    kda_shell: bool = True
+    # - mhc_seam (models/hybrid.py MHC_SEAM): a decode layer that takes the FFN half without the KDA shell and without
+    #   the fused DSA layer runs the previous layer's FFN mix and its own attention pre as one kernel call
+    #   (kernels/mhc_seam.py, rows split over the LNC pair), its fn re-laid at load as a decode-only copy.
+    mhc_seam: bool = False
+    # - shell_mix_row_split (kernels/shell.py MIX_ROW_SPLIT): the stream mix inside the decode kernels (the FFN half's,
+    #   the dense half's and the KDA shell's mix_in) with its rows split over the LNC pair, each program mixing its half
+    #   and reading the other's back from the kernel's output; exact.
+    shell_mix_row_split: bool = False
+    # - state_ckpt_mid_export (models/linear_attn.py MID_EXPORT): a prefill chunk with an in-chunk state checkpoint takes
+    #   the checkpoint's state from the main delta-rule scan (its chunk-end states, and one 128-row call when the
+    #   checkpoint is not on a 128-row boundary) instead of a second, masked scan over the whole chunk; bitwise on trn2.
+    state_ckpt_mid_export: bool = False
+    # -- host area: the decode families, the host cache's moves and the page pool's order -------------------------------
+    # plain_decode False: no plain decode bucket at all, so no plain decode graph is warmed or compiled. Only where no plain
+    # decode can launch (model_runner.plain_none_refusal): MTP speculation always on, spec_max_batch covering the largest
+    # decode bucket and the running cap, and no state_spec_seats. Graph set: a change needs a new capture.
+    plain_decode: bool = True
+    # The share of host_cache_gb given to recurrent-state checkpoints; the rest holds KV pages. Host only.
+    host_cache_ckpt_frac: float = 0.5
+    # A restore's pages and an eviction's pages in one broadcast each, every cache copied once per run of consecutive
+    # device pages (engine/host_cache.py), instead of one broadcast and one copy per cache per page. Host only.
+    host_cache_batch: bool = False
+    # The ranks that hold identical bytes under context-parallel DSA (one CP index in each row group) keep one shared copy
+    # of a page in host memory instead of one each (engine/host_arena.py): the same host_cache_gb holds as many times
+    # the pages as there are row groups. Needs host_cache_batch; without row groups the host cache stays write-through.
+    # Host only.
+    host_cache_save_once: bool = False
+    # Every page pool hands out the lowest free page ids in ascending order, so a request's pages, and the pages an
+    # eviction frees, form few runs for the batched host-cache copies. Host only (page ids are values, not shapes).
+    pool_ascending: bool = False
+    # -- the DSA layers' routes (the dsa area's block; engine.set_decode_routes copies each into the module that reads it
+    # when a graph is traced, so each is graph structure: a change needs a new capture) --
+    # - dsa_topk_rowsplit_big (kernels/dsa_topk.py ROWSPLIT_BIG): a prefill chunk's one-tile selections of at least 64
+    #   rows split over the two LNC programs, as the decode calls' are.
+    dsa_topk_rowsplit_big: bool = False
+    # - dsa_cp_fail_trip (models/mla.py CP_FAIL_TRIP): a prefill chunk's failed-row merge (the rows whose local top-K
+    #   certificate failed) runs its selections only when some row failed (kernels/dsa_topk_t.py).
+    dsa_cp_fail_trip: bool = False
+    # - dsa_cp_fail_attn_trip (models/mla.py CP_FAIL_ATTN_TRIP): its failed rows' attention runs the live (failed)
+    #   entries only, so it runs no row when none failed.
+    dsa_cp_fail_attn_trip: bool = False
+    # - dsa_slots_pipe_rows (kernels/dsa_slots_n_p.py PIPE_ROWS): a prefill chunk's main rows' slot attention with its
+    #   rows software-pipelined, this many rows a device-loop iteration (0: the split kernel's call).
+    dsa_slots_pipe_rows: int = 0
+    # - sp_gather_direct (kernels/sp_gather.py DIRECT, with sp_gather "nki"): the sequence-parallel gather written straight
+    #   into the kernel's output, no copy-out.
+    sp_gather_direct: bool = False
+    # - dsa_drop_unread_o_dec (models/mla.py ODEC_DROP): the main DSA layers keep no model-dtype o_proj copy beside the
+    #   fused layer calls' pre-tiled one (no graph reads it when every decode step runs the fused call): HBM only.
+    dsa_drop_unread_o_dec: bool = False
+    # - dsa_row_classes (kernels/dsa_sel2gc.py LAYOUTS): static row classes, "B:NxG+NxG..,B:.." (e.g.
+    #   "24:6x24+6x8+12x4"): a plain decode batch of B rows at the page bucket of its widest class (128 G pages) scores
+    #   each slot over its own class's first 128 G pages only. The runner orders the batch into the slots, longest rows
+    #   first, and sends a batch that does not fit to the next page bucket. "": no classes.
+    # - dsa_row_classes_cw (kernels/dsa_sel2gc.py CW): the classed selection builds each row's candidate bias from nloc
+    #   in the kernel instead of reading an XLA-built [B, P] mask.
+    # - dsa_rowsplit_layout (kernels/dsa_satwfcga.py W_LAYOUTS): form W, "B:naxqa+nbxqb[,B:..]" a row group's two runs
+    #   of slots: a classed call's selection over this rank's row group's rows only, its lists gathered over the world.
+    #   Every classed batch size needs one.
+    dsa_row_classes: str = ""
+    dsa_row_classes_cw: bool = False
+    dsa_rowsplit_layout: str = ""
+
+    def _check_dsa_routes(self) -> None:
+        """The DSA block's checks (__post_init__ runs them last)."""
+        if self.dsa_slots_pipe_rows < 0 or self.dsa_slots_pipe_rows % 2:
+            raise ValueError(f"dsa_slots_pipe_rows={self.dsa_slots_pipe_rows}: 0 (off) or an even row count (each "
+                             f"LNC program a half)")
+        if self.sp_gather_direct and self.sp_gather != "nki":
+            raise ValueError("sp_gather_direct needs sp_gather 'nki' (the kernel's gather)")
+        if not self.dsa_row_classes:
+            if self.dsa_row_classes_cw or self.dsa_rowsplit_layout:
+                raise ValueError("dsa_row_classes_cw and dsa_rowsplit_layout need dsa_row_classes")
+            return
+        from .kernels import dsa_satwfcga, dsa_sel2gc  # (at construction: no import cycle with this module)
+
+        lay = dsa_sel2gc.parse(self.dsa_row_classes)
+        if not lay:  # e.g. "," or " ": set_layouts would install no classes, so the route would be off without a word
+            raise ValueError(f"dsa_row_classes {self.dsa_row_classes!r} holds no layout (\"\" turns the classes off)")
+        dsa_sel2gc._rc_ints(lay)  # the kernel's form: at most 2 batch sizes of at most 4 runs
+        w = dsa_satwfcga.parse_w(self.dsa_rowsplit_layout)
+        if set(w) != set(lay):
+            raise ValueError(f"dsa_rowsplit_layout {self.dsa_rowsplit_layout!r} must cover every classed batch size "
+                             f"{sorted(lay)} (the classed selection is served in form W only)")
+        dsa_satwfcga.check_layouts(w, lay)
+        if self.spec_method is not None:
+            raise ValueError("dsa_row_classes: speculative decoding's verify and MTP calls would skip the runner's slot "
+                             "order; the latency build (--preset latency) is the speculative one")
+        buckets, pages = self.resolved_decode_batch_buckets(), self.resolved_page_buckets()
+        for B, ngs in sorted(lay.items()):
+            P = 128 * max(ngs)
+            if B not in buckets:
+                raise ValueError(f"dsa_row_classes: B {B} is not a decode bucket {buckets}")
+            if P not in pages or P == max(pages):
+                raise ValueError(f"dsa_row_classes: B {B}'s page bucket {P} must be a page bucket below the largest "
+                                 f"{pages} (the runner's fallback for a batch that does not fit)")
+    # -- end of the DSA block
 
     def __post_init__(self):
         if self.max_running is not None and self.max_running < 1:
@@ -183,6 +286,8 @@ class EngineConfig:
                          "dyn_mtp_kv"):
                 if getattr(self, name):
                     raise ValueError(f"{name} needs spec_method 'mtp'")
+            if not self.plain_decode:
+                raise ValueError("plain_decode False (no plain decode graphs) needs spec_method 'mtp'")
         else:
             if self.spec_k < 1:
                 raise ValueError(f"spec_k={self.spec_k}: at least 1")
@@ -210,6 +315,10 @@ class EngineConfig:
                     f"a running request must hold its state rows")
             if self.state_seats > self.max_num_seqs:
                 raise ValueError(f"state_seats={self.state_seats} above max_num_seqs={self.max_num_seqs}")
+        if not 0.0 < self.host_cache_ckpt_frac < 1.0:
+            raise ValueError(f"host_cache_ckpt_frac={self.host_cache_ckpt_frac}: in (0, 1)")
+        if self.host_cache_save_once and not self.host_cache_batch:
+            raise ValueError("host_cache_save_once needs host_cache_batch (the shared arenas move pages in batches)")
         if self.state_spec_seats is not None and not self.spec_max_batch <= self.state_spec_seats <= (
                 self.state_seats or self.max_num_seqs):
             raise ValueError(
@@ -221,6 +330,10 @@ class EngineConfig:
                 "(spec_method without spec_max_batch) has none: its verify graph takes no token mask or penalties")
         if any(m < 1 for m in self.penalty_buckets):
             raise ValueError(f"penalty_buckets={self.penalty_buckets}: positive distinct-token counts")
+        if (self.structured_outputs or self.penalties) and not self.plain_decode:
+            raise ValueError("structured_outputs and penalties need plain decode steps, and plain_decode False (the latency "
+                             "build) has no plain decode graph: a request with a mask or penalties is stepped plain")
+        self._check_dsa_routes()  # the DSA block's checks
 
     def resolved_moe_kernel(self) -> str:
         return self.moe_kernel or ("nki" if self.device in ("neuron", "meta") else "xla")

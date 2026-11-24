@@ -15,7 +15,7 @@ from ..config import EngineConfig, ModelConfig
 from ..models.loader import load_model, resolve_model_path
 from . import watchdog
 from .kv_pool import PagePool
-from .model_runner import ModelRunner
+from .model_runner import ModelRunner, rowclass_order
 from .radix_cache import RadixCache
 from .request import Request, SamplingParams, Status, unsupported
 from .sampler import NUM_TOP_LOGPROBS, unpack
@@ -41,6 +41,59 @@ _OPEN: weakref.WeakSet = weakref.WeakSet()
 def _close_open() -> None:
     for eng in list(_OPEN):
         eng.close()
+
+
+# How long close() waits for the workers to take rank 0's stop (seconds; 0: no bound). Over gloo the stop is a broadcast
+# bounded only by the process group's timeout (hours); over the shared-memory channel, an acknowledgement wait bounded by
+# nothing. A rank that never answers (one still inside a collective, or a graph rank 0 never joined) held the process
+# until an outer timeout killed it, 3,600 s twice in a row on trn2. Past the bound, close() logs the ranks that never
+# acknowledged and terminates the workers. A healthy stop is unchanged: the same call, joined well inside the bound.
+TP_STOP_WAIT_S = 120.0
+
+
+def _bounded_stop(send, timeout: float | None = None) -> bool:
+    """send(None), rank 0's stop, on a daemon thread joined for at most `timeout` (TP_STOP_WAIT_S) seconds. True when the
+    stop went out and every worker took it; False, after logging who did not, when it raised or did not return in time."""
+    t = TP_STOP_WAIT_S if timeout is None else timeout
+    if t <= 0:
+        send(None)
+        return True
+    import threading
+
+    err: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            send(None)
+        except BaseException as e:  # noqa: BLE001  reported below, on the closing thread
+            err.append(e)
+
+    th = threading.Thread(target=run, name="tp-stop", daemon=True)
+    th.start()
+    th.join(t)
+    if th.is_alive() or err:
+        from . import tp
+
+        why = f"raised {err[0]!r}" if err else f"no answer in {t:g} s"
+        try:
+            ranks: Any = tp.unacked_ranks()
+        except Exception as e:  # noqa: BLE001  a diagnostic, never a reason not to stop the workers
+            ranks = f"unknown ({e!r})"
+        logger.warning(
+            "engine close: the tensor-parallel stop %s; ranks not acknowledged: %s; terminating the workers", why, ranks
+        )
+        return False
+    return True
+
+
+def host_tier_split(budget: float, row_bytes: int, page_bytes: int, frac: float = 0.5) -> tuple[int, int]:
+    """Per-rank host cache capacities (checkpoint slots, KV pages) from a byte budget: `frac` of it for state checkpoints
+    (at least one slot), the remainder for pages. frac 0.5 is the even split."""
+    if not 0.0 < frac < 1.0:
+        raise ValueError(f"the checkpoints' share of the host cache must be in (0, 1), not {frac}")
+    ckpts = max(1, int(budget * frac // row_bytes)) if row_bytes else 0
+    rest = budget - ckpts * row_bytes
+    return ckpts, (int(rest // page_bytes) if page_bytes else 0)
 
 
 @dataclass
@@ -121,6 +174,27 @@ def set_decode_routes(cfg: EngineConfig) -> None:
     dense_half.SKIP_T = frozenset(cfg.dense_half_skip_rows)
     decoder.MTP_CHUNK_Q = int(cfg.mtp_chunk_q)
     decoder.DYN_MTP_KV = "1" if cfg.dyn_mtp_kv else "0"
+    # -- KDA, mHC and FFN-half routes
+    hybrid.KDA_SHELL = bool(cfg.kda_shell)
+    hybrid.MHC_SEAM = bool(cfg.mhc_seam)
+    from ..kernels import shell
+
+    shell.MIX_ROW_SPLIT = bool(cfg.shell_mix_row_split)
+    from ..models import linear_attn
+
+    linear_attn.MID_EXPORT = bool(cfg.state_ckpt_mid_export)
+    # -- the DSA layers' routes (the dsa area's block: one line a field) --
+    from ..kernels import dsa_satwfcga, dsa_sel2gc, dsa_slots_n_p, dsa_topk
+
+    dsa_topk.ROWSPLIT_BIG = bool(cfg.dsa_topk_rowsplit_big)
+    mla.CP_FAIL_TRIP = bool(cfg.dsa_cp_fail_trip)
+    mla.CP_FAIL_ATTN_TRIP = bool(cfg.dsa_cp_fail_attn_trip)
+    dsa_slots_n_p.PIPE_ROWS = int(cfg.dsa_slots_pipe_rows)
+    sp_gather.DIRECT = bool(cfg.sp_gather_direct)
+    mla.ODEC_DROP = bool(cfg.dsa_drop_unread_o_dec)
+    dsa_sel2gc.set_layouts(cfg.dsa_row_classes)
+    dsa_sel2gc.CW = bool(cfg.dsa_row_classes_cw)
+    dsa_satwfcga.set_layouts(cfg.dsa_rowsplit_layout)  # (after dsa_sel2gc's: checked against them)
 
 
 def local_k_counts(model) -> list[float] | None:
@@ -255,7 +329,7 @@ class LLMEngine:
                 for w in self._workers:
                     w.start()
                 if cfg.device == "neuron":
-                    tp.neuron_env(0, port, cfg.tp_core_base)
+                    tp.neuron_env(0, port, cfg.tp_core_base, world=cfg.tp)
                 tp.init_rank(0, cfg.tp, port)
             except BaseException:
                 self._stop_tp()
@@ -267,6 +341,21 @@ class LLMEngine:
         except BaseException:
             self._stop_tp()
             raise
+        try:
+            self._finish_init(cfg, path, num_pages)
+        except BaseException:
+            # The workers run and the process group is up, and the caller gets no engine to close: stop the workers
+            # without another word to them (close_failed), then close() destroys the group, restores this process and
+            # closes a save-once arena rank 0 has made (a /dev/shm refusal lands here).
+            try:
+                self.close_failed()
+                self.close()
+            except Exception:  # the start's own error, re-raised below, is the one to report
+                logger.exception("engine start failed, and so did the teardown after it")
+            raise
+
+    def _finish_init(self, cfg: EngineConfig, path: str, num_pages: int) -> None:
+        """The engine past its shards: the tokenizer, the pool, the radix cache, the scheduler and the host cache."""
         # The tokenizer (and so transformers) loads only AFTER tensor-parallel workers are spawned: a process that
         # imported transformers and then spawned a child traces torch.topk differently from every other process, which
         # gave rank 0 its own compile cache keys and doubled every compile. And only after build_shard, so rank 0 imports
@@ -289,7 +378,7 @@ class LLMEngine:
 
             self.runner.tp_send = tp.send
             _OPEN.add(self)
-        self.pool = PagePool(num_pages)
+        self.pool = PagePool(num_pages, ascending=cfg.pool_ascending)
         sch = self.scheduling
         self.radix = RadixCache(self.pool, cfg.page_size, sch.eviction_policy, sch.eviction_config)
         scfg = SchedulerConfig(
@@ -311,19 +400,32 @@ class LLMEngine:
         self.scheduler.states = self.runner.state  # checkpoint rows of the state pool back the radix nodes
         self.scheduler.on_preempt = self.runner.release_slot
         self.radix.free_ckpt = self.runner.state.free_ckpt
-        # Host memory under the radix cache (engine/host_cache.py), per rank: half for state checkpoints, the rest for
-        # KV pages. Evicted pages and checkpoints go there (a checkpoint on a running request's path too, when no row is
-        # free), and a later hit copies them back.
+        # Host memory under the radix cache (engine/host_cache.py), per rank: host_cache_ckpt_frac of it for state
+        # checkpoints, the rest for KV pages. Evicted pages and checkpoints go there (a checkpoint on a running request's
+        # path too, when no row is free), and a later hit copies them back.
         self.host_tier: HostTier | None = None
         if cfg.host_cache_gb > 0:
             from .host_cache import HostTier
 
-            budget = cfg.host_cache_gb * 2**30
-            ckpts = max(1, int(budget / 2 // self.runner.state.bytes_per_row()))
-            budget -= ckpts * self.runner.state.bytes_per_row()
             page_bytes = self.runner.kv_page_bytes()
-            pages = int(budget // page_bytes) if page_bytes else cfg.max_num_seqs * cfg.max_pages_per_seq
-            self.host_tier = HostTier(self.runner, cfg.page_size, max(1, pages), ckpts)
+            ckpts, pages = host_tier_split(
+                cfg.host_cache_gb * 2**30, self.runner.state.bytes_per_row(), page_bytes, cfg.host_cache_ckpt_frac
+            )
+            if not page_bytes:
+                pages = cfg.max_num_seqs * cfg.max_pages_per_seq
+            if cfg.host_cache_save_once and page_bytes and pages:
+                if self.runner.so_possible():
+                    # The ranks of one CP index pool their budgets: each page is kept once, not once per row group.
+                    R = self.model.cp_rows
+                    tag = f"c{cfg.tp_core_base}" if cfg.device == "neuron" else f"p{os.getpid() % 100000}"
+                    pages *= R
+                    gone = self.runner.kv_arena_init(tag, pages)
+                    if gone:
+                        logger.info("removed %d stale host-arena segments of tag %s", len(gone), tag)
+                    logger.info("save-once host cache: %d pages over %d row groups (tag %s)", pages, R, tag)
+                else:
+                    logger.info("save-once host cache off: no context-parallel row groups; every rank keeps its copy")
+            self.host_tier = HostTier(self.runner, cfg.page_size, max(1, pages), ckpts, batch=cfg.host_cache_batch)
             self.radix.offload, self.radix.offload_ckpt = self.host_tier.offload, self.host_tier.offload_ckpt
             self.radix.offload_ckpt_hash = self.host_tier.offload_ckpt_hash
             self.scheduler.host = self.host_tier
@@ -427,10 +529,13 @@ class LLMEngine:
         if self._workers and runner is not None and runner.tp_send is not None:
             if self.dead_ranks():  # a broadcast to a dead peer raises or never returns: stop the rest instead
                 wait = 0.0
-            else:
-                runner.tp_send(None)
+            elif not _bounded_stop(runner.tp_send):
+                wait = 0.0  # a rank never took the stop: terminate them all now (_stop_workers)
             runner.tp_send = None
         self._stop_tp(wait)
+        arena_close = getattr(runner, "kv_arena_close", None)
+        if arena_close is not None:
+            arena_close()  # the save-once arenas: rank 0's own and the board, after the workers have gone
 
     def _stop_tp(self, wait: float = 30.0) -> None:
         """Workers that did not exit within `wait` seconds (and every worker of an engine whose
@@ -594,7 +699,8 @@ class LLMEngine:
             self.dyn_spec_steps += bool(spec)
         self._restore_states(plan)
         for i in range(0, len(plain), max_b):
-            chunk = plain[i : i + max_b]
+            # in the DSA selection's class-slot order when its row classes are on (model_runner.rowclass_order)
+            chunk = rowclass_order(self.runner, plain[i : i + max_b])
             launches.append((chunk, self.runner.decode(chunk), "decode"))
             self._save_states(chunk)
         Q = 1 + self.cfg.spec_k

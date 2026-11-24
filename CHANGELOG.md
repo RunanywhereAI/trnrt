@@ -47,15 +47,63 @@ and versions follow [Semantic Versioning](https://semver.org/). Rebuild the comp
 - Repetition, frequency and presence penalties, with `--penalties` and `--penalty-buckets`, which add graphs that take
   penalty inputs ([docs/CONFIGURATION.md](docs/CONFIGURATION.md#structured-outputs-penalties-and-thinking-budgets)).
   Tested on CPU; not yet run on Trainium2.
+- Host cache: batched moves (`--host-cache-batch`: a restore's and an eviction's pages in one call, every cache copied
+  once per run of consecutive pages), save-once (`--host-cache-save-once`: the ranks of one context-parallel index keep
+  one shared copy of a page in /dev/shm instead of one each), ascending page allocation (`--pool-ascending`) and the
+  checkpoints' share of the host cache (`--host-cache-ckpt-frac`). Host only; on in the balanced and throughput builds.
+  An engine with save-once refuses to start when /dev/shm cannot hold its arenas beside those of engines already running.
+- `--no-plain-decode`: no plain decode graph, for a build whose speculation never turns off.
+- The runner's side of the DSA selection's row classes: a plain decode batch in class-slot order, and a batch whose rows
+  do not fit their classes sent to the next page bucket.
+- Closing an engine bounds the tensor-parallel stop (120 s): a rank that never answers is named in the log and the
+  workers are terminated, instead of holding the process.
+- `--generation-config auto|none` for `serve` and `engine`: `none` serves the built-in sampling defaults (temperature
+  and top_p 1.0) even when the checkpoint has a `generation_config.json`, on every endpoint (`/generate`, the
+  Responses and Messages APIs, and `/model_info`'s `preferred_sampling_params` too). `auto`, the default, takes the
+  checkpoint's values as before.
 
 ### Changed
 
+- A request without `max_tokens` or `max_completion_tokens` generates at most the `max_new_tokens` in the checkpoint's
+  `generation_config.json`, when it sets one (and `--generation-config` is `auto`). Such a chat request could run to
+  the end of the context. A request's own limit is unchanged.
+- The router parses a request's JSON in a worker thread and forwards the client's own bytes, and its prefix trees
+  compare text by slices instead of one character at a time, so a large request stalls the streams it relays for less
+  time (the JSON parser still holds the interpreter lock while it runs).
 - The stop token that ends a request (EOS or a `stop_token_ids` entry) is no longer part of its text when the tokenizer
   does not mark it special.
 - `min_new_tokens` on the OpenAI endpoints and `spaces_between_special_tokens: false` are refused with 400;
   they were ignored.
 - `service_tier` other than `"auto"` or `"default"` is refused with 400 on `/v1/chat/completions`, `/v1/completions`
   and `/v1/responses`.
+- Three builds replace the presets, one per band of expected users per engine: `--preset latency` (1-8 users, MTP
+  speculative decoding at every step, no plain decode graph), `--preset balanced` (9-16, decode batches of 8, 16 and 24;
+  the default) and `--preset throughput` (17 and up, decode batches of 16 and 24). `--preset auto --users N` (or
+  `--users N` alone) picks the build for N users per engine ([docs/CONFIGURATION.md](docs/CONFIGURATION.md)). The
+  earlier names still work and run the nearest build, with a deprecation warning: `batch8`, `mtp-batch8` and
+  `mtp-always` run `latency`, `batch12` and `mtp-batch12` run `balanced`, `mtp-batch24` runs `throughput`. Every build
+  has its own graphs: rebuild the compile cache.
+- `TRNRT_DMA_HW=1` under every build.
+- An engine whose device listing fails, or whose launch CPU set cannot pin every rank to its NeuronCore's NUMA node,
+  refuses to start; `TRNRT_NUMA_PIN_OPTIONAL=1` starts it anyway, with a warning. Rank 0 logs how many ranks pinned.
+- Every engine warms every slot of its IO pool, so no slot's buffers are built on a serving call.
+
+### Fixed
+
+- An unknown field on `/v1/chat/completions` or `/v1/completions`, or a field of the other endpoint, is refused with
+  400 naming it, as AGENTS.md invariant 7 requires. It was ignored, and the request answered 200 as if it had been
+  applied (`prediction`, `modalities`, `audio`, a misspelled field).
+- A malformed `tools` array, or a `parallel_tool_calls` that is not a boolean, is refused with a 400 that names the
+  field. Before, a non-array `tools` reached the chat template and raised there (a 500), and a malformed entry or
+  `"false"` was accepted silently: a different prompt, and parallel calls kept. A function tool with `strict: true` is
+  refused too (no tool-call grammar is served), on `/v1/chat/completions` and `/v1/responses`.
+- The streaming tool-call parser no longer re-scans and re-renders the whole argument text on every push. A call
+  whose value grows (a `write_file` content) cost O(n²) over the stream. Host CPU only (Apple M2, CPython 3.13.5;
+  no Neuron SDK, model or precision involved): a GLM `write_file` call with tools enabled and 64 KB of content,
+  pushed in 12-character chunks (about 3–4 tokens per engine step), 5,349 pushes, took 5–6 s of parser CPU time
+  against `development` @ `ef581f5`, now 0.1 s. Streamed deltas and the non-streaming result are byte-identical to
+  that baseline at every split of the parser test corpus and in 133,000 randomized differential runs; a layout the
+  cursor scan does not recognise falls back to it.
 
 ## [0.1.0] - 2026-11-08
 

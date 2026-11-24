@@ -331,11 +331,18 @@ TIE_BITS = 21  # context pools < 2^21 (1M tokens are 2^18 pools)
 
 
 def cp_merge(vals: torch.Tensor, cpool: torch.Tensor, keep: int, rows: int | None = None,
-             cpools: int | None = None, two_k: bool = False) -> torch.Tensor:
+             cpools: int | None = None, two_k: bool = False, trip: torch.Tensor | None = None) -> torch.Tensor:
     """cp_merge_rows in pieces of at most `rows` rows (one piece, the same graph, when rows is None or N <= rows).
     cpools: the context pools the indices lie below (the bucket's, A x the local pools); the tie search covers all
-    TIE_BITS whatever it is. two_k: cp_merge_rows_2k's form (the same result)."""
+    TIE_BITS whatever it is. two_k: cp_merge_rows_2k's form (the same result). trip (with two_k): an int tensor of one
+    element, 0 or 1; both selections run only when it is 1 (kernels/dsa_topk_t.py; the caller masks the trip-0
+    result)."""
     N = vals.shape[0]
+    if trip is not None:
+        if not (two_k and (rows is None or N <= rows) and dsa_topk_ok(N, vals.shape[1] * vals.shape[2])):
+            raise NotImplementedError(f"cp_merge with a run-time trip needs the two-selection form in one piece of "
+                                      f"<= 4096 scores a partition: N {N}, A K {vals.shape[1] * vals.shape[2]}")
+        return cp_merge_rows_2k(vals, cpool, keep, trip=trip)
     if two_k and (rows is None or N <= rows) and dsa_topk_ok(N, vals.shape[1] * vals.shape[2]):
         return cp_merge_rows_2k(vals, cpool, keep)
     if rows is None or N <= rows:
@@ -383,14 +390,16 @@ def dsa_topk_ok(rows: int, n: int) -> bool:
     return dsa_topk.supported(rows, n)
 
 
-def cp_merge_rows_2k(vals: torch.Tensor, cpool: torch.Tensor, keep: int) -> torch.Tensor:
+def cp_merge_rows_2k(vals: torch.Tensor, cpool: torch.Tensor, keep: int, trip: torch.Tensor | None = None) -> torch.Tensor:
     """cp_merge_rows' mask from two selections and a handful of elementwise ops, no tie search (models/mla.py
     attention_cp's decode merge from 2 rows up; on trn1 the search's ~130 ops cost ~0.8 ms per call from 2 rows up,
     against ~0.07 at 1 row). The threshold t as there (the keep-th largest); then
     the keep largest of key = 1 above t, -cpool for the candidates tied at t, NEG_INF for the rest: every candidate
     above t (there are keep - room of them, all keyed 1, above any -cpool <= 0) and the room tied ones of the smallest
     context pool (distinct integers, exact in fp32, so the second selection has no ties at its own threshold), which
-    is cp_merge_rows' rule; with fewer than keep valid candidates every one is visible and selected, as there."""
+    is cp_merge_rows' rule; with fewer than keep valid candidates every one is visible and selected, as there.
+    trip: both selections through kernels/dsa_topk_t.py, run only when trip is 1 (the same selection bit for bit;
+    unwritten memory at 0, which the caller masks)."""
     from ..kernels import dsa_topk
 
     N, A, K = vals.shape
@@ -399,12 +408,31 @@ def cp_merge_rows_2k(vals: torch.Tensor, cpool: torch.Tensor, keep: int) -> torc
     valid = s > torch.full_like(s, VISIBLE)  # a tensor, not a float literal (f64, NCC_ESPP004)
     if A * K <= keep:
         return valid.view(N, A, K)
+    if trip is not None:  # a separate copy of the lines below, so the trip-less trace is unchanged
+        return _cp_merge_rows_2k_trip(s, c, valid, keep, trip).view(N, A, K)
     sel0 = dsa_topk.select(s, keep, vis_only=True) == 0
     t = torch.where(sel0, s, torch.full_like(s, 3.0e38)).amin(-1, keepdim=True)
     above = s > t
     tied = (s == t) & valid
     key = torch.where(above, torch.ones_like(s), torch.where(tied, -c, torch.full_like(s, NEG_INF)))
     return (dsa_topk.select(key, keep, vis_only=True) == 0).view(N, A, K)
+
+
+def _cp_merge_rows_2k_trip(s: torch.Tensor, c: torch.Tensor, valid: torch.Tensor, keep: int,
+                           trip: torch.Tensor) -> torch.Tensor:
+    """cp_merge_rows_2k's two selections and elementwise ops, line for line, with the selections run under trip
+    (kernels/dsa_topk_t.py). Each selection's mask is ANDed with (trip > 0): at trip 0 the kernels write nothing and their
+    output is whatever the buffer held, so the AND makes every value downstream deterministic (no selection), whatever
+    the caller's mask does after; at trip 1 the AND is with True, the same mask bit for bit."""
+    from ..kernels import dsa_topk_t
+
+    on = (trip.reshape(1, 1) > 0)
+    sel0 = (dsa_topk_t.select(s, keep, trip, vis_only=True) == 0) & on
+    t = torch.where(sel0, s, torch.full_like(s, 3.0e38)).amin(-1, keepdim=True)
+    above = s > t
+    tied = (s == t) & valid
+    key = torch.where(above, torch.ones_like(s), torch.where(tied, -c, torch.full_like(s, NEG_INF)))
+    return (dsa_topk_t.select(key, keep, trip, vis_only=True) == 0) & on
 
 
 def _keep_th_two_level(s: torch.Tensor, keep: int) -> torch.Tensor:

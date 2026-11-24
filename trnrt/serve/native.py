@@ -425,7 +425,8 @@ def add_routes(
             "tokenizer_path": engine.cfg.model_path,
             "served_model_name": model_name,
             "is_generation": True,
-            "preferred_sampling_params": gen_defaults or None,
+            # sampling defaults only: max_new_tokens caps an unset limit, and a client sending it back would set one
+            "preferred_sampling_params": {k: v for k, v in gen_defaults.items() if k != "max_new_tokens"} or None,
             "reasoning_parser": REASONING_PARSER,
             "tool_call_parser": TOOL_CALL_PARSER,
             "has_image_understanding": False,

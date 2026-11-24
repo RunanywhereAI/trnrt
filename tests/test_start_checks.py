@@ -6,6 +6,8 @@
 - the engine's own Neuron devices (neuron-ls's records at LNC 2: four logical cores a device on a trn2.48xlarge) must
   have no runtime user; processes on the other engine's devices, and processes without a runtime (neuron-ls itself, a
   monitor) do not count; a failing neuron-ls refuses, a missing one only warns;
+- every rank can be pinned to its NeuronCore's NUMA node: a failed device listing, or a launch CPU set that holds no CPU
+  of some device's node, refuses the start; TRNRT_NUMA_PIN_OPTIONAL=1 starts anyway with a warning;
 - nothing is checked on CPU or off Linux, and each check has its own skip switch.
 - a start that passes logs one line naming what each check found, or why it did not run; a refusal logs none.
 """
@@ -19,6 +21,7 @@ import sys
 import pytest
 
 from trnrt.engine import start_checks as S
+from trnrt.engine import tp as TP
 
 # A host's /proc/buddyinfo at a refused start: node 0's Normal zone had no free order-10 block while the total over
 # every zone passed the all-zone floor.
@@ -124,15 +127,65 @@ def test_neuron_ls_refuses_an_empty_listing(monkeypatch):
         S.neuron_ls()
 
 
+# neuron-ls --json-output's records with each device's CPUs (tp.numa_cpus): devices 0-3 and 12-15 on node 1, 4-11 on node 0.
+NODE0, NODE1 = "0-47,96-143", "48-95,144-191"
+PIN_LS = [
+    {**d, "cpu_affinity": NODE1 if d["neuron_device"] < 4 or d["neuron_device"] >= 12 else NODE0} for d in _trn2()
+]
+
+
+def test_numa_check_passes_when_every_rank_pins():
+    assert S.numa_check(0, 32, 2, PIN_LS, set(range(192))) == (None, "NUMA pin on, 32/32 ranks")
+    assert S.numa_check(32, 32, 2, PIN_LS, TP.parse_cpulist(NODE0) | {50}) == (None, "NUMA pin on, 32/32 ranks")
+
+
+def test_numa_check_refuses_a_launch_set_of_one_node(monkeypatch, caplog):
+    monkeypatch.delenv(TP.PIN_OPTIONAL, raising=False)
+    why, _ = S.numa_check(0, 32, 2, PIN_LS, TP.parse_cpulist(NODE0))  # engine 0's devices 0-3 sit on node 1
+    assert (
+        why is not None and "only 16 of 32 ranks" in why and "0-47,96-143" in why and "TRNRT_NUMA_PIN_OPTIONAL=1" in why
+    )
+    monkeypatch.setenv(TP.PIN_OPTIONAL, "1")
+    with caplog.at_level(logging.WARNING, logger="trnrt"):
+        assert S.numa_check(0, 32, 2, PIN_LS, TP.parse_cpulist(NODE0)) == (
+            None,
+            "NUMA pin not complete (TRNRT_NUMA_PIN_OPTIONAL=1)",
+        )
+    assert "starting anyway" in caplog.text
+
+
+@pytest.mark.parametrize("bad", [{"nc_count": None}, {"nc_count": 0}, {"cpu_affinity": None}, {"neuron_device": "x"}])
+def test_numa_check_refuses_a_device_record_it_cannot_read(monkeypatch, bad):
+    monkeypatch.delenv(TP.PIN_OPTIONAL, raising=False)
+    devs = [{**PIN_LS[0], **bad}, *PIN_LS[1:]]
+    why, _ = S.numa_check(0, 32, 2, devs, set(range(192)))
+    assert why is not None and "the device listing failed (ValueError: neuron-ls device record" in why
+    monkeypatch.setenv(TP.PIN_OPTIONAL, "1")
+    assert S.numa_check(0, 32, 2, devs, set(range(192))) == (None, "NUMA pin not complete (TRNRT_NUMA_PIN_OPTIONAL=1)")
+
+
+def test_numa_check_refuses_a_failed_listing(monkeypatch):
+    monkeypatch.delenv(TP.PIN_OPTIONAL, raising=False)
+
+    def broken():
+        raise FileNotFoundError("neuron-ls")
+
+    monkeypatch.setattr(TP, "neuron_devices", broken)
+    why, _ = S.numa_check(0, 32, 2, None, set(range(192)))
+    assert why is not None and "the device listing failed (FileNotFoundError" in why
+
+
 @pytest.fixture
 def linux_host(monkeypatch, tmp_path):
-    """A Linux host with every device busy and the memory short, so each check refuses unless skipped."""
+    """A Linux host with every device busy and the memory short, so each check refuses unless skipped; every rank can pin."""
     monkeypatch.setattr(sys, "platform", "linux")
     monkeypatch.setattr(S, "neuron_ls", lambda: _trn2({d: [_rt(1000 + d)] for d in range(16)}))
+    monkeypatch.setattr(TP, "neuron_devices", lambda: PIN_LS)
+    monkeypatch.setattr(S.os, "sched_getaffinity", lambda pid: set(range(192)), raising=False)
     p = tmp_path / "buddyinfo"
     p.write_text(SHORT_NODE)
     monkeypatch.setattr(S, "BUDDYINFO", str(p))
-    for k in (S.SKIP_DEVICE, S.SKIP_HOST_MEM):
+    for k in (S.SKIP_DEVICE, S.SKIP_HOST_MEM, TP.PIN_OPTIONAL):
         monkeypatch.delenv(k, raising=False)
     return monkeypatch
 
@@ -142,6 +195,10 @@ def test_refusal_checks_devices_then_memory_each_skippable(linux_host):
     linux_host.setenv(S.SKIP_DEVICE, "1")
     assert "contiguous free host memory" in S.refusal("neuron", 0, 32)
     linux_host.setenv(S.SKIP_HOST_MEM, "1")
+    assert S.refusal("neuron", 0, 32) is None
+    linux_host.setattr(S.os, "sched_getaffinity", lambda pid: TP.parse_cpulist(NODE0), raising=False)
+    assert "only 16 of 32 ranks" in S.refusal("neuron", 0, 32)  # engine 0's node-1 devices, launched on node 0
+    linux_host.setenv(TP.PIN_OPTIONAL, "1")
     assert S.refusal("neuron", 0, 32) is None
 
 
@@ -169,7 +226,7 @@ def test_a_pass_prints_one_line_of_what_each_check_found(linux_host, tmp_path, c
     assert logged() == [
         (
             "trnrt: start checks passed: devices 8, 9, 10, 11, 12, 13, 14, 15 of cores 32-63 free; host memory ok (16000 "
-            "free order-10 blocks; Normal zones: node 0 9000, node 1 7000)"
+            "free order-10 blocks; Normal zones: node 0 9000, node 1 7000); NUMA pin on, 32/32 ranks"
         )
     ]
     linux_host.setattr(S, "neuron_ls", lambda: None)
@@ -183,7 +240,7 @@ def test_a_pass_prints_one_line_of_what_each_check_found(linux_host, tmp_path, c
     assert logged() == [
         (
             "trnrt: start checks passed: devices not checked (TRNRT_SKIP_DEVICE_CHECK=1); host memory not checked "
-            "(TRNRT_SKIP_HOST_MEM_CHECK=1)"
+            "(TRNRT_SKIP_HOST_MEM_CHECK=1); NUMA pin on, 32/32 ranks"
         )
     ]
     assert S.refusal("cpu", 32, 32) is None

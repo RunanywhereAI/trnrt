@@ -13,6 +13,7 @@ from tests import test_serve_cli as base
 from trnrt.engine.scheduler import Scheduling
 
 host, engine, stand_in = base.host, base.engine, base.stand_in  # its fixtures: fake engine processes, no device
+_kernel_env_already_set = base._kernel_env_already_set  # autouse there: TRNRT_DMA_HW as this session bound the kernels
 
 BASE = ["--model", "m", "--device", "cpu"]
 

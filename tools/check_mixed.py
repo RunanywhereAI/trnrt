@@ -245,7 +245,7 @@ def main() -> None:
         q = float(sys.argv[sys.argv.index("--logit-ulp") + 1]) if "--logit-ulp" in sys.argv else None
         sys.exit(compare(sys.argv[2], sys.argv[3], q))
     from trnrt import log
-    from trnrt.__main__ import add_engine_args, engine_config
+    from trnrt.__main__ import add_engine_args, apply_preset_env, engine_config
 
     log.configure()
 
@@ -279,6 +279,9 @@ def main() -> None:
     args = ap.parse_args()
     if args.permute and args.turns:
         raise SystemExit("--permute with --turns: not built (the turns key on the submission position)")
+    # the build's environment (TRNRT_DMA_HW) before anything imports trnrt.kernels, as `trnrt engine` sets it, so this
+    # process and its ranks trace the graphs the build's compile cache holds
+    apply_preset_env(sys.argv[1:])
     from trnrt.engine.engine import LLMEngine
     from trnrt.engine.request import Request, SamplingParams
 

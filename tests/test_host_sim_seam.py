@@ -166,6 +166,7 @@ def test_mhc_mix_follows_it(monkeypatch, fake_launch):
     from trnrt.kernels import shell as SH
 
     monkeypatch.setattr(mhc_mix, "mhc_mix_kernel", "the mhc_mix kernel")
+    monkeypatch.setattr(mhc_mix, "mhc_mix_lnc_kernel", "the row-split mhc_mix kernel")
     T, hc, H = 2, 4, 256
     g = torch.Generator().manual_seed(0)
     post, comb = torch.rand(T, hc, generator=g), torch.rand(T, hc, hc, generator=g)
@@ -174,8 +175,12 @@ def test_mhc_mix_follows_it(monkeypatch, fake_launch):
     assert torch.equal(mhc_mix.mix(post, comb, y, S), mhc_mix.emulate(post, comb, y, S)) and fake_launch == []
     monkeypatch.setattr(SH, "HOST_SIM", True)
     assert mhc_mix.takes(S.device, H, T)
-    mhc_mix.mix(post, comb, y, S)
-    assert [(k, g, kw["rev"]) for k, g, kw in fake_launch] == [("the mhc_mix kernel", 2, mhc_mix.REV)], fake_launch
+    mhc_mix.mix(post, comb, y, S)  # an even T at grid 2: the rows split over the LNC pair
+    mhc_mix.mix(post[:1], comb[:1], y[:1], S[:1])  # one row: the unsplit kernel
+    assert [(k, g, kw["rev"]) for k, g, kw in fake_launch] == [
+        ("the row-split mhc_mix kernel", 2, mhc_mix.REV ^ mhc_mix.LNC_REV),
+        ("the mhc_mix kernel", 2, mhc_mix.REV),
+    ], fake_launch
 
 
 def test_mhc_pre_follows_it(monkeypatch, fake_launch):
@@ -227,6 +232,9 @@ SITES = {
     ("trnrt/kernels/dsa_shell.py", "attend"): ["flip"],
     ("trnrt/kernels/dsa_shell.py", "select2"): ["flip"],  # sel2 is the served decode selection
     ("trnrt/kernels/dsa_sel2g.py", "select2g"): ["flip"],  # sel2's generated copy: the P3072 decode selection
+    ("trnrt/kernels/dsa_sel2gc.py", "select2gc"): ["flip"],  # the classed decode selection (row classes)
+    ("trnrt/kernels/dsa_topk_t.py", "select"): ["flip"],  # dsa_topk's selection under a run-time trip count
+    ("trnrt/models/mla.py", "_cp_slots_attend"): ["flip"],  # a prefill chunk's slot attention, pipelined or split
     ("trnrt/kernels/dsa_slots_c.py", "attend"): ["off"],
     ("trnrt/kernels/dsa_slots_n.py", "attend"): ["flip"],
     ("trnrt/kernels/dsa_topk.py", "select"): ["flip"],

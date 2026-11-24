@@ -22,6 +22,18 @@ MISS = (
 )
 
 
+@pytest.fixture(autouse=True)
+def _kernel_env_already_set(monkeypatch):
+    """Every build puts TRNRT_DMA_HW=1 into the environment before the kernels are imported, and refuses in a process
+    that imported them without it (tests/test_preset_env.py), as this test session may have. The kernels read it once,
+    at import, so an engine in this process cannot run a build's real environment: the value set here is the form this
+    session's kernels are bound in (the caller's value, else "0", which is what its absence means). "1" would bind every
+    kernel the stand-in engines import first in the hardware-DGE form for the rest of the session, after the variable is
+    restored (tests/test_dsa_fused_layer.py's REV check then fails). Each build's own value and its effect on the
+    kernels are tested in fresh interpreters (tests/test_preset_env.py)."""
+    monkeypatch.setenv("TRNRT_DMA_HW", os.environ.get("TRNRT_DMA_HW", "0"))
+
+
 def _last(cmd: list[str], flag: str) -> str:
     """The value argparse takes for `flag` in `cmd`: the last (an engine's command repeats serve's --port, --host)."""
     return cmd[len(cmd) - cmd[::-1].index(flag)]
@@ -280,6 +292,35 @@ def test_engine_passes_other_failures_through_and_allow_compile_turns_the_assert
     assert engine.seen_env == ["1", "1", "0"]
 
 
+def test_generation_config_reaches_each_engine_and_its_app(host, engine, monkeypatch, capsys):
+    """--generation-config is the engine's to apply: serve hands it on, the engine gives it to build_app (auto without
+    the flag), and a value other than auto or none is refused by both."""
+    import trnrt.serve.api as api
+
+    assert cli.cmd_serve(["--model", "m", "--generation-config", "none"]) == 0
+    assert [_last(e.cmd, "--generation-config") for e in host.engines] == ["none", "none"]
+    got = []
+    monkeypatch.setattr(api, "build_app", lambda eng, model, **kw: got.append(kw))
+    assert cli.cmd_engine(ENGINE_ARGV) == 0
+    assert cli.cmd_engine([*ENGINE_ARGV, "--generation-config", "none"]) == 0
+    assert [kw["generation_config"] for kw in got] == ["auto", "none"]
+    for cmd in (cli.cmd_serve, cli.cmd_engine):
+        with pytest.raises(SystemExit):
+            cmd([*ENGINE_ARGV, "--generation-config", "vllm"])
+        assert "invalid choice" in capsys.readouterr().err
+
+
+def test_the_engine_reports_the_build_that_runs(engine, monkeypatch):
+    """/server_info's preset is the build the engine runs (auto, --users and an earlier name resolved), not the argument."""
+    import trnrt.serve.api as api
+
+    seen = []
+    monkeypatch.setattr(api, "build_app", lambda *a, **k: seen.append(k["preset"]))
+    for argv in ([], ["--users", "4"], ["--preset", "mtp-batch24"]):
+        assert cli.cmd_engine([*ENGINE_ARGV, *argv]) == 0
+    assert seen == ["balanced", "latency", "throughput"]
+
+
 def test_an_engine_its_host_refuses_builds_nothing(engine, monkeypatch, capsys):
     """cmd_engine asks the host checks about its own cores before anything starts: a refusal is printed and ends it
     with START_REFUSED_STATUS, no engine built and no environment set for one."""
@@ -336,7 +377,7 @@ def test_serve_hands_each_engine_an_argv_it_parses(stand_in):
     """The argv serve builds for each engine through cmd_engine's parser and engine_config: the `--host 127.0.0.1` serve
     appends is the engine's listen address, not an abbreviation of --host-cache-gb."""
     assert cli.cmd_serve(["--model", "m", "--device", "cpu", "--port", "9000"]) == 0
-    assert [(c.host_cache_gb, c.tp_core_base) for c in stand_in.cfgs] == [(4.0, 0), (4.0, 32)]
+    assert [(c.host_cache_gb, c.tp_core_base) for c in stand_in.cfgs] == [(16.0, 0), (16.0, 32)]
     stand_in.cfgs.clear()
     assert cli.cmd_serve(["--model", "m", "--device", "cpu", "--host-cache-gb", "2", "--host", "0.0.0.0"]) == 0  # noqa: S104  an argv; the stand-in binds nothing
     assert [c.host_cache_gb for c in stand_in.cfgs] == [2.0, 2.0]  # a full name still reaches the engines
@@ -355,7 +396,7 @@ def test_with_abbreviations_allowed_the_engines_fail_to_start(stand_in, monkeypa
     with pytest.raises(SystemExit) as e:
         cli.cmd_serve(["--model", "m", "--device", "cpu"])
     assert "engine 0 exited during start-up (status 2)" in str(e.value.code), e.value.code
-    assert "--host-cache-gb: invalid float value: '127.0.0.1'" in capsys.readouterr().err
+    assert "--host could match --host-cache-gb" in capsys.readouterr().err  # serve's --host read as an engine argument
 
 
 def test_serve_refuses_an_abbreviated_argument(host):

@@ -303,7 +303,8 @@ def run(S, pend_a, fn, base, scale, post_norm, bb, *, Ir: int, limit: float, hc:
                 Yp=Y_a.to(BF16), fnb=fn.to(BF16).contiguous(), base=base.float().contiguous(),
                 scale=scale.float().contiguous(), pnorm=post_norm.to(BF16).contiguous(), bb=bb, hc=int(hc),
                 iters=int(iters), eps=float(hc_eps), rms_eps=float(rms_eps), sig=MP.SIGMOID, skf=MP.SK, Ir=int(Ir),
-                limit=float(limit), fin=int(fin), dbg=int(dbg), rev=REV, **offsets(H, Ir, grid))
+                limit=float(limit), fin=int(fin), dbg=int(dbg), rev=REV ^ SH.mix_rev_term(),
+                **offsets(H, Ir, grid))
     k = dense_half_kernel
     if simulate:
         import ml_dtypes

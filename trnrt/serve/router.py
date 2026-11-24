@@ -29,7 +29,7 @@ tools:
   least-loaded live worker; the pin and key stay.
 A client that sends no tools keeps its pin through compactions. One case stays open for such a client: if its first
 request is a side request (another system block), its main turns are taken as side requests and go by load.
-Session-routed requests skip the prefix tree: no match, no insert (both walk the request text in Python, ~1 MB of it for
+Session-routed requests skip the prefix tree: no match, no insert (both walk the request text, ~1 MB of it for
 a 200K-token context). The session map forgets sessions idle past `session_ttl_s` (4 x session_idle_s), and the least
 recently used past `max_sessions` (100,000), on each poll and each new pin.
 
@@ -124,6 +124,8 @@ STATELESS_ROUTES = ("/tokenize", "/v1/tokenize", "/detokenize", "/v1/detokenize"
 # so the answer goes to the client as it is (503 "The request queue is full.") and the engine stays up. Another
 # engine is not tried: a session belongs on its own, and one without a session was routed where its prefix is cached.
 QUEUE_FULL_HEADER = "x-trnrt-queue-full"
+# The header httpx sets for `json=body`, which it does not set for the client's own bytes (`content=`).
+_JSON_HEADERS = {"content-type": "application/json"}
 
 
 class _Node:
@@ -134,6 +136,24 @@ class _Node:
         self.text = text
         self.last = 0.0
         self.parent = parent
+
+
+def _common_prefix(a: str, s: str, i: int) -> int:
+    """The length of the common prefix of `a` and `s[i:]`, comparing slices (C speed) instead of one character at a
+    time: the walk cost ~300 ms of held GIL per 1 MB of request text in PrefixTree.match and insert, and it runs in a
+    worker thread whose lock the event loop then waits on in switch-interval slices (#30). Binary search: prefix
+    equality is monotone, so ~log2(n) slice comparisons find the exact same length as the character loop."""
+    n = min(len(a), len(s) - i)
+    if a[:n] == s[i : i + n]:
+        return n
+    lo, hi = 0, n  # a[:lo] == s[i:i+lo], and a[:hi] != s[i:i+hi] while hi <= n
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if a[lo:mid] == s[i + lo : i + mid]:  # a[:lo] already matches: compare only past it
+            lo = mid
+        else:
+            hi = mid
+    return lo
 
 
 class PrefixTree:
@@ -151,9 +171,7 @@ class PrefixTree:
             child = node.children.get(s[i])
             if child is None:
                 break
-            n = 0
-            while n < len(child.text) and i + n < len(s) and child.text[n] == s[i + n]:
-                n += 1
+            n = _common_prefix(child.text, s, i)
             child.last = now
             i += n
             if n < len(child.text):
@@ -172,9 +190,7 @@ class PrefixTree:
                 node.children[s[i]] = leaf
                 self.size += len(leaf.text)
                 break
-            n = 0
-            while n < len(child.text) and i + n < len(s) and child.text[n] == s[i + n]:
-                n += 1
+            n = _common_prefix(child.text, s, i)
             if n < len(child.text):  # split
                 upper = _Node(child.text[:n], node)
                 upper.last = now
@@ -421,11 +437,12 @@ class Router:
     async def pick_off_loop(
         self, text: str, session: str | None = None, head: int = 0, key: tuple | None = None, tools: bool = False
     ) -> int:
-        """pick, with the prefix trees' match and insert in a worker thread: both walk the request text character by
-        character in Python, 35 ms at 0.14 MB of text and ~300 ms at 1.1 MB (~250K tokens), which on the event loop
-        stalled every stream the router relays. The decision itself stays on the event loop, with the rest of the
-        router's state. One request at a time, in arrival order (_pick_lock), from its match to its insert: the routing
-        is pick's, request for request. A session request touches no tree and is picked at once."""
+        """pick, with the prefix trees' match and insert in a worker thread: both walk the request text and hold the GIL
+        while they do (a slice-compared walk is ~0.3 ms at 1 MB since #30; the character-by-character one it replaced
+        was ~300 ms at 1.1 MB, ~250K tokens, which on the event loop stalled every stream the router relays). The
+        decision itself stays on the event loop, with the rest of the router's state. One request at a time, in arrival
+        order (_pick_lock), from its match to its insert: the routing is pick's, request for request. A session request
+        touches no tree and is picked at once."""
         if session is not None:
             return self.pick_keyed(session, key, tools)
         loop = asyncio.get_running_loop()
@@ -605,16 +622,20 @@ def _request_text_head(path: str, body: dict) -> tuple[str, int]:
     return _request_text(path, body), _request_head(path, body)
 
 
-async def _json_object(http: Request) -> dict:
-    """The request's JSON object; 400 for anything else, as each engine answers (serve/api.py, _body). Without this, a
-    malformed body or a JSON array raised inside the proxy and the router answered 500."""
+async def _json_object(http: Request) -> tuple[bytes, dict]:
+    """The request's bytes and its JSON object; 400 for anything else, as each engine answers (serve/api.py, _body).
+    Without this, a malformed body or a JSON array raised inside the proxy and the router answered 500. Parsed in a
+    worker thread: a 1 MB body is ~6 ms of json.loads, and the loop would spend it stalled for every relayed stream. The
+    router never changes a request, so the client's bytes are what it forwards: no second serialisation, which holds the
+    GIL in C even in a worker thread."""
+    raw = await http.body()
     try:
-        body = await http.json()
+        body = await asyncio.to_thread(json.loads, raw)
     except ValueError:  # json.JSONDecodeError and UnicodeDecodeError
         raise HTTPException(status_code=400, detail="the request body must be a JSON object") from None
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="the request body must be a JSON object")
-    return body
+    return raw, body
 
 
 async def _disconnected(http: Request) -> None:
@@ -802,8 +823,8 @@ def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: floa
     async def abort_request(http: Request):
         """Sent to every engine: only the one holding the rid has it (abort_all: every engine aborts all). 200 once
         any engine took it; else the first engine's refusal (a malformed body), or 503 if none answered."""
-        body = await _json_object(http)
-        rs = await each("POST", "/abort_request", health_timeout_s, json=body)
+        raw, _ = await _json_object(http)
+        rs = await each("POST", "/abort_request", health_timeout_s, content=raw, headers=_JSON_HEADERS)
         if any(r is not None and r.status_code == 200 for r in rs):
             return Response(status_code=200)
         r = next((r for r in rs if r is not None), None)
@@ -884,7 +905,7 @@ def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: floa
         return HTMLResponse(DASHBOARD_PAGE)
 
     async def proxy(path: str, http: Request):
-        body = await _json_object(http)
+        raw, body = await _json_object(http)
         sid = router.session_of(body)
         key = _session_key(path, body) if sid is not None else None
         tools = bool(body.get("tools"))
@@ -902,7 +923,9 @@ def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: floa
             router.load[w] += 1
             try:
                 if body.get("stream"):
-                    resp = await client.send(client.build_request("POST", url, json=body), stream=True)
+                    resp = await client.send(
+                        client.build_request("POST", url, content=raw, headers=_JSON_HEADERS), stream=True
+                    )
                     if resp.status_code == 503:
                         try:
                             await resp.aread()
@@ -910,7 +933,7 @@ def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: floa
                             await resp.aclose()
                         r = resp
                 else:
-                    r = await _unless_disconnected(http, client.post(url, json=body))
+                    r = await _unless_disconnected(http, client.post(url, content=raw, headers=_JSON_HEADERS))
                     if r is None:  # the client went away: the upstream request is cancelled and its connection closed
                         router.load[w] -= 1
                         return Response(status_code=499)  # nginx's "client closed request"; nobody reads it
@@ -973,10 +996,10 @@ def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: floa
     async def stateless(path: str, http: Request):
         """STATELESS_ROUTES: the first live worker that answers, least loaded first. A refused connection or a 503 (a
         failed engine) marks the worker down, as in a request, and the next one is asked."""
-        body = await _json_object(http)
+        raw, _ = await _json_object(http)
         for w in sorted(router._live(), key=lambda i: (router.load[i], i)):
             try:
-                r = await client.post(router.workers[w] + path, json=body)
+                r = await client.post(router.workers[w] + path, content=raw, headers=_JSON_HEADERS)
             except httpx.ConnectError:
                 router.note_failure(w, hard=True)
                 continue

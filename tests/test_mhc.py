@@ -122,6 +122,75 @@ def test_mix_parser_takes_the_kernel(T):
     )
 
 
+def test_mix_splits_an_even_row_count_over_the_lnc_pair():
+    assert [mm.lnc_takes(T, 2) for T in (1, 2, 3, 8, 16, 24)] == [False, True, False, True, True, True]
+    assert not any(mm.lnc_takes(T, 1) for T in (2, 8, 24))
+
+
+def test_mix_routes_to_the_split_kernel_at_grid_2(monkeypatch):
+    """mix() on the device: the split kernel at grid 2 for an even T, rev REV ^ LNC_REV; the unsplit one otherwise,
+    with the same arguments."""
+    import sys
+
+    from trnrt import platform
+
+    seen = []
+
+    class Wrapped:
+        def __init__(self, k):
+            self.k = k
+
+        def __getitem__(self, grid):
+            def call(**a):
+                seen.append((self.k, grid, a["rev"], sorted(a)))
+                return a["S"]
+
+            return call
+
+    hop = types.ModuleType("libtorch_neuronx_lite.nki.nki_hop")
+    hop.wrap_nki = Wrapped
+    for name in ("libtorch_neuronx_lite", "libtorch_neuronx_lite.nki"):
+        monkeypatch.setitem(sys.modules, name, sys.modules.get(name) or types.ModuleType(name))
+    monkeypatch.setitem(sys.modules, "libtorch_neuronx_lite.nki.nki_hop", hop)
+    split, whole = object(), object()
+    monkeypatch.setattr(mm, "mhc_mix_lnc_kernel", split)
+    monkeypatch.setattr(mm, "mhc_mix_kernel", whole)
+    monkeypatch.setattr(mm.SH, "HOST_SIM", True)
+    keys = ["S", "comb", "hc", "post", "rev", "y"]
+    for grid, T, want in (
+        (2, 8, (split, 2, mm.REV ^ mm.LNC_REV)),
+        (2, 3, (whole, 2, mm.REV)),
+        (1, 8, (whole, 1, mm.REV)),
+    ):
+        monkeypatch.setattr(platform, "nki_grid", lambda g=grid: g)
+        seen.clear()
+        mm.mix(*mix_case(T, 256))
+        assert seen == [(*want, keys)]
+    assert mm.LNC_REV not in (0, mm.REV)
+
+
+@needs_nki
+@pytest.mark.parametrize(("T", "H"), [(2, 256), (8, 4096), (24, 4096)])
+def test_the_split_mix_in_the_simulator_equals_emulation(T, H, monkeypatch):
+    import nki
+
+    monkeypatch.setenv("NEURON_PLATFORM_TARGET_OVERRIDE", "trn2")
+    post, comb, y, S = mix_case(T, H, seed=T + H + 1)
+    got = np.asarray(
+        nki.simulate(mm.mhc_mix_lnc_kernel[2])(
+            post=post.numpy().astype(np.float32),
+            comb=comb.reshape(T, HC * HC).numpy().astype(np.float32),
+            y=_bf(y),
+            S=_bf(S.reshape(T, HC * H)),
+            hc=HC,
+            rev=mm.REV ^ mm.LNC_REV,
+        )
+    )
+    got = torch.from_numpy(got.astype(np.float32))
+    want = mm.emulate(post, comb, y, S).float()
+    assert torch.equal(got, want), (got - want).abs().max()
+
+
 # -- mhc_pre: the hyper-connection before a block ------------------------------------------------------------------
 
 
