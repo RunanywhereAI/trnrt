@@ -1,16 +1,15 @@
-"""A request's output constraint (engine/grammar.py GrammarSpec) from the fields the OpenAI API, vLLM and SGLang use:
+"""A request's output constraint (engine/grammar.py GrammarSpec) from the request's fields:
 
-| Field | From | Constraint |
-|---|---|---|
-| `response_format` `{"type": "json_object"}` | OpenAI | a JSON object (SGLang's schema `{"type": "object"}`) |
-| `response_format` `{"type": "json_schema", "json_schema": {"schema": ...}}` | OpenAI | the schema |
-| `guided_json`, `guided_regex`, `guided_choice`, `guided_grammar` | vLLM (older) | schema, regex, one of the strings, EBNF |
-| `structured_outputs` `{json, regex, choice, grammar, json_object}` | vLLM | the same |
-| `json_schema` (a string), `regex`, `ebnf` | SGLang | schema, regex, EBNF |
+| Field | Constraint |
+|---|---|
+| `response_format` `{"type": "json_object"}` | a JSON object (the schema `{"type": "object"}`) |
+| `response_format` `{"type": "json_schema", "json_schema": {"schema": ...}}` | the schema |
+| `guided_json`, `guided_regex`, `guided_choice`, `guided_grammar` | schema, regex, one of the strings, EBNF |
+| `structured_outputs` `{json, regex, choice, grammar, json_object}` | the same |
+| `json_schema` (a string), `regex`, `ebnf` | schema, regex, EBNF |
 
-At most one constraint per request, as SGLang requires ("Only one of json_schema, regex, ebnf, or structural_tag can be
-set"). A malformed field is a ValueError, which the server answers with 400; a constraint xgrammar cannot compile is
-refused by the engine when the request is added (also a 400).
+At most one constraint per request. A malformed field is a ValueError, which the server answers with 400; a constraint
+xgrammar cannot compile is refused by the engine when the request is added (also a 400).
 """
 
 from __future__ import annotations
@@ -20,10 +19,10 @@ import json
 from ..engine.grammar import GrammarSpec
 
 OBJECT = '{"type": "object"}'
-_VLLM_KEYS = ("json", "regex", "choice", "grammar", "json_object")
-# vLLM's other StructuredOutputsParams fields (vllm/sampling_params.py), accepted only at their defaults: a client that
-# sends the whole dataclass sends them. Any other key is refused whatever its value.
-_VLLM_NEUTRAL: dict[str, tuple[object, ...]] = {
+_STRUCTURED_OUTPUTS_KEYS = ("json", "regex", "choice", "grammar", "json_object")
+# The other fields of structured_outputs, accepted only at their defaults: a client that sends the whole parameter set
+# sends them. Any other key is refused whatever its value.
+_STRUCTURED_OUTPUTS_NEUTRAL: dict[str, tuple[object, ...]] = {
     "disable_any_whitespace": (None, False),
     "disable_additional_properties": (None, False),
     "whitespace_pattern": (None,),
@@ -67,7 +66,7 @@ def _response_format(rf) -> GrammarSpec | None:
         return GrammarSpec("json_schema", OBJECT)
     if kind == "json_schema":
         js = rf.get("json_schema")
-        if js is None and "schema" in rf:  # SGLang also takes the schema at the top of response_format
+        if js is None and "schema" in rf:  # the schema is also taken at the top of response_format
             js = {"schema": rf["schema"]}
         if not isinstance(js, dict) or js.get("schema") is None:
             raise ValueError('response_format json_schema needs "json_schema": {"name": ..., "schema": {...}}')
@@ -75,14 +74,18 @@ def _response_format(rf) -> GrammarSpec | None:
     raise ValueError(f"response_format type {kind!r} is not supported: text, json_object or json_schema")
 
 
-def _vllm(so) -> list[GrammarSpec]:
+def _structured_outputs(so) -> list[GrammarSpec]:
     if so is None:
         return []
     if not isinstance(so, dict):
         raise ValueError("structured_outputs must be an object")
-    unknown = sorted(k for k, v in so.items() if k not in _VLLM_KEYS and v not in _VLLM_NEUTRAL.get(k, ()))
+    unknown = sorted(
+        k
+        for k, v in so.items()
+        if k not in _STRUCTURED_OUTPUTS_KEYS and v not in _STRUCTURED_OUTPUTS_NEUTRAL.get(k, ())
+    )
     if unknown:
-        raise ValueError(f"structured_outputs.{unknown[0]} is not supported: {', '.join(_VLLM_KEYS)}")
+        raise ValueError(f"structured_outputs.{unknown[0]} is not supported: {', '.join(_STRUCTURED_OUTPUTS_KEYS)}")
     out = []
     if so.get("json") is not None:
         out.append(GrammarSpec("json_schema", _schema_text(so["json"], "structured_outputs.json")))
@@ -106,7 +109,7 @@ def grammar_spec(body: dict) -> GrammarSpec | None:
     rf = _response_format(body.get("response_format"))
     if rf is not None:
         specs.append(("response_format", rf))
-    specs += [("structured_outputs", s) for s in _vllm(body.get("structured_outputs"))]
+    specs += [("structured_outputs", s) for s in _structured_outputs(body.get("structured_outputs"))]
     fields = (
         ("guided_json", lambda v, k: GrammarSpec("json_schema", _schema_text(v, k))),
         ("guided_regex", lambda v, k: GrammarSpec("regex", _text(v, k))),

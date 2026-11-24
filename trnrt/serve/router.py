@@ -60,7 +60,7 @@ The router's own endpoints:
   body names the workers down ("down": their URLs) and carries the routing counters. Up and down are the router's view
   (above): the /health polls and the requests' refused connections and 503s;
 - GET /v1/models: the answer of the first live worker that gives one (least loaded first), 503 if none does;
-- SGLang's native API (serve/native.py). POST /generate is a request like /v1/completions: routed by its prompt (`text`
+- The native API (serve/native.py). POST /generate is a request like /v1/completions: routed by its prompt (`text`
   or `input_ids`, a batch as one request) or its session. The rest go to every worker or to one:
 
   | Route | Workers | Answer |
@@ -121,7 +121,7 @@ ROUTES = ("/v1/completions", "/v1/chat/completions", "/generate", "/v1/responses
 # no prefix tree and no session: a /tokenize of an agent's context must not steer where its next turn is routed.
 STATELESS_ROUTES = ("/tokenize", "/v1/tokenize", "/detokenize", "/v1/detokenize", "/v1/messages/count_tokens")
 # An engine's 503 for a full waiting queue carries this header (serve/api.py QUEUE_FULL_HEADER): the engine is serving,
-# so the answer goes to the client as it is (SGLang's 503 "The request queue is full.") and the engine stays up. Another
+# so the answer goes to the client as it is (503 "The request queue is full.") and the engine stays up. Another
 # engine is not tried: a session belongs on its own, and one without a session was routed where its prefix is cached.
 QUEUE_FULL_HEADER = "x-trnrt-queue-full"
 
@@ -530,7 +530,7 @@ def _request_head(path: str, body: dict) -> int:
 
 
 def _prompt(path: str, body: dict):
-    """A prompt request's prompt: /v1/completions' `prompt`, SGLang /generate's `text` or else `input_ids` (a string, a
+    """A prompt request's prompt: /v1/completions' `prompt`, /generate's `text` or else `input_ids` (a string, a
     list of ids, or a batch's list of either)."""
     if path == "/generate":
         text = body.get("text")
@@ -758,7 +758,7 @@ def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: floa
 
     @app.get("/get_load")
     async def get_load():
-        """Every engine's SGLang load entry, dp_rank its worker index (an engine is the data-parallel rank here)."""
+        """Every engine's load entry, dp_rank its worker index (an engine is the data-parallel rank here)."""
         out = []
         for w, r in enumerate(await each("GET", "/get_load", health_timeout_s)):
             got = json_of(r)
@@ -771,8 +771,8 @@ def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: floa
     @app.get("/server_info")
     @app.get("/get_server_info")
     async def server_info():
-        """The first engine's configuration (the engines share it), as SGLang's data-parallel /server_info: dp_size
-        the number of engines, internal_states each answering engine's load."""
+        """The first engine's configuration (the engines share it), with dp_size the
+        number of engines and internal_states each answering engine's load."""
         answers = [(w, json_of(r)) for w, r in enumerate(await each("GET", "/server_info", health_timeout_s))]
         answers = [(w, a) for w, a in answers if isinstance(a, dict)]
         if not answers:

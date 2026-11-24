@@ -1,4 +1,4 @@
-"""The sampling extras of /v1/chat/completions and /v1/completions (trnrt/serve/api.py): `n` choices, SGLang's
+"""The sampling extras of /v1/chat/completions and /v1/completions (trnrt/serve/api.py): `n` choices,
 stop_regex, keeping the stop text (include_stop_str_in_output / no_stop_trim), skip_special_tokens, the stop token left
 out of the text, and the refusal of a minimum length. Over the scripted engine of tests/test_serve_api.py."""
 
@@ -43,7 +43,7 @@ def app():
 
 def test_n_choices_share_the_prompt_and_count_it_once(app):
     """n engine requests for one HTTP request, one prompt; each choice its index; usage counts the prompt once and
-    every choice's output. A seed gives choice i seed + i (vLLM), so seeded choices differ and reproduce."""
+    every choice's output. A seed gives choice i seed + i, so seeded choices differ and reproduce."""
     client, eng = app(TOOL_TURN)
     r = client.post("/v1/chat/completions", json={**MSG, "tools": TOOLS, "n": 3, "seed": 7})
     assert r.status_code == 200, r.text
@@ -211,11 +211,11 @@ def test_a_client_that_disconnects_aborts_every_choice():
 
 @pytest.mark.parametrize("stream", [False, True])
 def test_stop_regex_ends_the_output_after_its_match_and_aborts_the_request(app, stream):
-    """SGLang's stop_regex: the output ends at the end of the first match, the matched text kept (SGLang's trim looks
-    for the pattern itself), finish "stop", matched_stop the pattern. The engine knows nothing of it, so the request is
-    aborted there. The match spans two tokens (" there", " again"), so it is only found by searching back into text
-    already pushed: a bounded pattern's search starts its longest match before the new text. The engine takes 10 ms a
-    token, so the abort reaches it before it ends the request on its own."""
+    """stop_regex: the output ends at the end of the first match, the matched text kept, finish "stop", matched_stop the
+    pattern. The engine knows nothing of it, so the request is aborted there. The match spans two tokens (" there",
+    " again"), so it is only found by searching back into text already pushed: a bounded pattern's search starts
+    its longest match before the new text. The engine takes 10 ms a token, so the abort reaches it before it ends the
+    request on its own."""
     client, eng = app(PLAIN * 10, setup=lambda e: setattr(e, "step_delay", 0.01))
     body = {"prompt": [1], "max_tokens": 40, "stop_regex": [r"x{3}", r"re\s?ag"]}
     if stream:
@@ -254,7 +254,7 @@ def test_stop_regex_unbounded_and_anchored(app):
 )
 def test_a_stop_among_the_min_tokens_does_not_end_the_output(app, monkeypatch, stream, stops, text, matched):
     """min_tokens 2: "Hello" ends in the first output token, so it stays in the text and the output runs on to the next
-    stop, as the engine checks stop strings (engine._stop_in, after vLLM). The scripted engine stands in for one started
+    stop, as the engine checks stop strings (engine._stop_in). The scripted engine stands in for one started
     with --structured-outputs, which serves min_tokens."""
     import tests.test_serve_api as scripted
 
@@ -382,7 +382,7 @@ def test_the_stop_text_is_kept_when_asked(app, key):
 
 def test_the_stop_token_is_not_in_the_text(app):
     """The EOS (or a stop_token_ids entry) that ends a request is left out of its text even when the tokenizer does not
-    mark it special, as vLLM and SGLang leave it out; matched_stop names it. Kept with no_stop_trim."""
+    mark it special; matched_stop names it. Kept with no_stop_trim."""
 
     def eos(eng):
         eng.mcfg.eos_token_ids = (ID["!"],)

@@ -1,5 +1,5 @@
-"""SGLang's native API on one engine (trnrt/serve/native.py), over the scripted engine of tests/test_serve_api.py:
-/generate in SGLang's request and response shapes, the info and load endpoints, /health_generate, /abort_request and
+"""The native API on one engine (trnrt/serve/native.py), over the scripted engine of tests/test_serve_api.py:
+/generate with its request and response shapes, the info and load endpoints, /health_generate, /abort_request and
 /flush_cache. The real engine behind the same routes: tests/test_api_native.py."""
 
 from __future__ import annotations
@@ -92,7 +92,7 @@ def _wait_for(cond, s: float = 10.0) -> None:
 
 
 @pytest.mark.parametrize("method", ["POST", "PUT"])
-def test_generate_answers_in_sglangs_shape(serve, method):
+def test_generate_answers_with_text_output_ids_and_meta_info(serve, method):
     client, eng = serve(PLAIN)
     r = client.request(method, "/generate", json={"text": "Hello", "rid": "a1"})
     assert r.status_code == 200, r.text
@@ -102,7 +102,7 @@ def test_generate_answers_in_sglangs_shape(serve, method):
     assert meta["id"] == "a1" and meta["finish_reason"] == {"type": "stop", "matched": PLAIN[-1]}
     assert (meta["prompt_tokens"], meta["completion_tokens"], meta["cached_tokens"]) == (1, 4, 2)
     assert meta["e2e_latency"] >= 0 and "output_token_logprobs" not in meta and "prompt_token_ids" not in out
-    assert eng.added[-1].params.max_new_tokens == 128  # SGLang's default
+    assert eng.added[-1].params.max_new_tokens == 128  # the default
     assert eng.added[-1].prompt_ids == [ID["Hello"]]
 
     r = client.post("/generate", json={"input_ids": [1, 2], "sampling_params": {"max_new_tokens": 2}})
@@ -117,13 +117,13 @@ def test_generate_answers_in_sglangs_shape(serve, method):
     assert p.stop == (" again", "!")
 
 
-def test_generate_maps_sglangs_sampling_params(serve):
+def test_generate_maps_sampling_params_to_the_engine_params(serve):
     client, eng = serve(PLAIN)
     sp = {
         "max_new_tokens": 3,
         "temperature": 0.5,
         "top_p": 0.9,
-        "top_k": 1 << 30,  # SGLang's "all"
+        "top_k": 1 << 30,  # "all"
         "min_p": 0.05,
         "stop_token_ids": [ID["!"]],
         "ignore_eos": True,
@@ -156,7 +156,7 @@ def test_generate_batch_rids_and_prompt_ids(serve):
     )
     assert r.status_code == 200, r.text
     a, b = r.json()
-    assert (a["meta_info"]["id"], b["meta_info"]["id"]) == ("b_0", "b_1")  # SGLang's batch rids
+    assert (a["meta_info"]["id"], b["meta_info"]["id"]) == ("b_0", "b_1")  # a batch's rids
     assert (a["text"], b["text"]) == ("Hello", "Hello there")
     assert (a["prompt_token_ids"], b["prompt_token_ids"]) == ([1], [2, 3])
     r = client.post("/generate", json={"text": ["Hello", "Hello !"], "rid": ["x", "y"]})
@@ -164,7 +164,7 @@ def test_generate_batch_rids_and_prompt_ids(serve):
     assert [o["meta_info"]["prompt_tokens"] for o in r.json()] == [1, 2]
 
 
-def test_generate_output_logprobs_in_sglangs_tuples(serve):
+def test_generate_output_logprobs_as_tuples(serve):
     client, _ = serve(PLAIN)
     body = {"input_ids": [1], "return_logprob": True, "top_logprobs_num": 1, "sampling_params": {"max_new_tokens": 2}}
     meta = client.post("/generate", json=body).json()["meta_info"]
@@ -279,7 +279,7 @@ def test_abort_request_ends_a_request_by_rid_with_what_it_generated():
 
 
 def test_flush_cache_flushes_only_an_idle_engine():
-    """Idle: flushed at once. Busy with timeout 0 (SGLang's default): refused with the reason, nothing flushed. Busy
+    """Idle: flushed at once. Busy with timeout 0 (the default): refused with the reason, nothing flushed. Busy
     with a timeout: flushed once the running request finishes, never while it runs; a second flush meanwhile is
     refused."""
     import httpx
@@ -384,7 +384,7 @@ def test_a_full_queue_503_from_generate_keeps_the_queue_full_header(stream):
 
 
 def test_no_logs_keeps_a_request_out_of_the_production_log(serve, monkeypatch, tmp_path):
-    """SGLang's no_logs: true writes nothing of the request to disk (TRNRT_PROD_DIR); /v1/stats still counts it, as
+    """no_logs: true writes nothing of the request to disk (TRNRT_PROD_DIR); /v1/stats still counts it, as
     /metrics does (log_metrics is the field for those)."""
     from trnrt.serve import api
     from trnrt.serve import prodlog as PL

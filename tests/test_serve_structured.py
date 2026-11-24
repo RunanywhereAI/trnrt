@@ -74,7 +74,7 @@ SCHEMA = {"type": "object", "properties": {"a": {"type": "integer"}}}
         ({"guided_choice": ["yes", "no"]}, GrammarSpec("regex", "(yes|no)")),
         ({"regex": "[0-9]+"}, GrammarSpec("regex", "[0-9]+")),
         ({"ebnf": 'root ::= "a"'}, GrammarSpec("ebnf", 'root ::= "a"')),
-        (  # vLLM's whole StructuredOutputsParams, its other fields at their defaults
+        (  # the whole structured_outputs parameter set, its other fields at their defaults
             {
                 "structured_outputs": {
                     "json": SCHEMA,
@@ -128,7 +128,7 @@ def test_min_tokens_penalties_and_a_thinking_budget_reach_the_engine(client):
         {"structured_outputs": {"json_object": 1}},
         {"structured_outputs": {"bogus": None}},  # an unknown key, whatever its value
         {"structured_outputs": {"bogus": False}},
-        {"structured_outputs": {"disable_any_whitespace": True}},  # vLLM's option, not at its default
+        {"structured_outputs": {"disable_any_whitespace": True}},  # an option not at its default
         {"min_tokens": 9},  # above max_tokens
         {"prompt_logprobs": 1},  # still not served (docs/API.md)
     ],

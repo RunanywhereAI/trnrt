@@ -1,22 +1,19 @@
-"""SGLang's native HTTP API on one engine, beside the OpenAI API of serve/api.py (whose build_app adds these routes).
+"""The server's native generation API on one engine, beside the OpenAI API of serve/api.py (whose build_app adds these
+routes).
 
 | Route | What it does |
 |---|---|
-| POST, PUT /generate | SGLang's GenerateReqInput: `text` or `input_ids`, one prompt or a batch, SGLang's `sampling_params`, `stream`, output logprobs; SGLang's response (`text`, `output_ids`, `meta_info`) |
+| POST, PUT /generate | `text` or `input_ids`, one prompt or a batch, `sampling_params`, `stream`, output logprobs; the response is `text`, `output_ids`, `meta_info` |
 | GET /model_info, /get_model_info | the model: its path as the operator passed it, served name, parsers, sampling defaults |
 | GET /server_info, /get_server_info | the engine's configuration, its version and preset, and its load |
-| GET /get_load | requests running and waiting, KV tokens in use (SGLang's legacy /get_load shape) |
-| GET /health_generate | a one-token generation through the engine (SGLang's semantics: any step ending meanwhile counts) |
+| GET /get_load | requests running and waiting, KV tokens in use |
+| GET /health_generate | a one-token generation through the engine (any step ending meanwhile counts) |
 | POST /abort_request | abort a request by its `rid`, or every request (`abort_all`) |
 | GET, POST /flush_cache | drop the prefix cache, only while the engine is idle (`?timeout=` seconds to wait for that) |
 
-Shapes follow SGLang's main branch as of September 2026 (after v0.5.18): python/sglang/srt/managers/io_struct.py
-(GenerateReqInput, AbortReq), python/sglang/srt/entrypoints/http_server.py, python/sglang/srt/managers/
-tokenizer_manager.py (meta_info and its logprob tuples), python/sglang/srt/managers/schedule_batch.py (finish reasons) and
-python/sglang/srt/sampling/sampling_params.py. Every route reaches the engine through EngineLoop's inbox (AGENTS.md:
-the engine thread owns engine state). Guided decoding and min_new_tokens go to the engine, which serves them when started
-with --structured-outputs, and penalties, which it serves when started with --penalties; it refuses each without its
-flag. What the served graphs cannot compute
+Every route reaches the engine through EngineLoop's inbox (AGENTS.md: the engine thread owns engine state). Guided
+decoding and min_new_tokens go to the engine, which serves them when started with --structured-outputs, and penalties,
+which it serves when started with --penalties; it refuses each without its flag. What the served graphs cannot compute
 (prompt logprobs, several samples per prompt, multimodal input, LoRA) is refused with a 400 that names the field, as on
 the OpenAI routes.
 """
@@ -50,20 +47,20 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# SGLang's SamplingParams.max_new_tokens default.
+# The default max_new_tokens of a /generate request.
 GENERATE_MAX_NEW_TOKENS = 128
-# SGLang's HEALTH_CHECK_TIMEOUT default (http_server.py): how long /health_generate waits for a step to end.
+# How long /health_generate waits for a step to end.
 HEALTH_GENERATE_TIMEOUT_S = 20.0
-# SGLang's names for parsers equivalent to serve/parsers.py's (function_call_parser.py, reasoning_parser.py).
+# The names of the reasoning and tool-call parsers that serve/parsers.py implements.
 REASONING_PARSER, TOOL_CALL_PARSER = "glm45", "glm47"
-# SGLang's /flush_cache answer on success (http_server.py).
+# The /flush_cache answer on success.
 FLUSHED = (
     "Cache flushed.\nPlease check backend logs for more details. (When there are running or waiting requests, the "
     "operation will not be performed.)\n"
 )
 
-# SGLang sampling_params -> the field api._params reads it from. The mapped fields _NEUTRAL lists are refused unless
-# neutral, named here by their SGLang names.
+# sampling_params key -> the field api._params reads it from. The mapped fields _NEUTRAL lists are refused unless
+# neutral, named here by their sampling_params keys.
 _SAMPLING: dict[str, str] = {
     "max_new_tokens": "max_tokens",
     "stop": "stop",
@@ -83,7 +80,7 @@ _SAMPLING: dict[str, str] = {
     "regex": "guided_regex",
     "ebnf": "guided_grammar",
 }
-# SGLang sampling parameters with no counterpart here, or not served on /generate (n choices, kept stop text and special
+# The sampling_params keys with no counterpart here, or not served on /generate (n choices, kept stop text and special
 # tokens in the text are the OpenAI endpoints' Run path), accepted only at these values.
 _SAMPLING_NEUTRAL: dict[str, tuple[object, ...]] = {
     "n": (None, 1),
@@ -165,8 +162,8 @@ class _Item:
 
 
 def _sampling(sp: Any, logprobs: int | None, vocab: int, defaults: dict[str, float]) -> SamplingParams:
-    """SGLang sampling_params as SamplingParams, checked by api._params under SGLang's names. 400 for an unknown key
-    (SGLang's SamplingParams(**sp) raises on one), and for a parameter not served at a value that is not neutral."""
+    """sampling_params as SamplingParams, checked by api._params under the sampling_params keys. 400 for an unknown key,
+    and for a parameter not served at a value that is not neutral."""
     if sp is None:
         sp = {}
     if not isinstance(sp, dict):
@@ -182,7 +179,7 @@ def _sampling(sp: Any, logprobs: int | None, vocab: int, defaults: dict[str, flo
     body["logprobs"] = logprobs
     try:
         return _params(body, GENERATE_MAX_NEW_TOKENS, chat=False, vocab=vocab, defaults=defaults)
-    except HTTPException as e:  # its message names the field as _params reads it: name SGLang's
+    except HTTPException as e:  # its message names the field as _params reads it: name the sampling_params key
         detail = str(e.detail)
         for sg, ours in _SAMPLING.items():
             if sg != ours and detail.startswith(ours + " "):
@@ -202,7 +199,7 @@ def _per_prompt(body: dict, key: str, n: int, single: bool) -> list:
 
 
 def _prompts(body: dict, tok) -> tuple[list[list[int]], bool]:
-    """The request's prompts as token ids, and whether it is one prompt (SGLang's is_single)."""
+    """The request's prompts as token ids, and whether it is one prompt."""
     text, ids = body.get("text"), body.get("input_ids")
     if (text is None) == (ids is None):
         raise _bad("exactly one of text or input_ids is required")
@@ -220,7 +217,7 @@ def _prompts(body: dict, tok) -> tuple[list[list[int]], bool]:
 
 
 def parse_generate(body: dict, tok, vocab: int, defaults: dict[str, float]) -> tuple[list[_Item], bool]:
-    """A /generate request (SGLang's GenerateReqInput) as its prompts, and whether it is one prompt. 400 for anything
+    """A /generate request as its prompts, and whether it is one prompt. 400 for anything
     malformed or not served (_GENERATE_REFUSED, _sampling, prompt logprobs). Tokenizes `text`: run it off the event
     loop."""
     refused = [k for k in _GENERATE_REFUSED if body.get(k) not in _UNSET]
@@ -232,7 +229,7 @@ def parse_generate(body: dict, tok, vocab: int, defaults: dict[str, float]) -> t
     if rid is None:
         rids: list[str | None] = [None] * n
     elif isinstance(rid, str) and rid:
-        rids = [rid] if single else [f"{rid}_{i}" for i in range(n)]  # SGLang's batch rids (_normalize_rid)
+        rids = [rid] if single else [f"{rid}_{i}" for i in range(n)]  # a batch's rids
     elif not single and isinstance(rid, list) and len(rid) == n and all(isinstance(r, str) and r for r in rid):
         rids = rid
     else:
@@ -269,14 +266,14 @@ def parse_generate(body: dict, tok, vocab: int, defaults: dict[str, float]) -> t
 
 
 class _Run:
-    """One prompt of a /generate request in the engine: its output as it arrives, and SGLang's view of it."""
+    """One prompt of a /generate request in the engine: its output as it arrives, in /generate's shape."""
 
     def __init__(self, item: _Item, sub: _Submit, tok, text_in_logprobs: bool, prompt_ids: bool, t0: float):
         self.item, self.sub, self.tok = item, sub, tok
         self.detok = _Detok(tok, item.params.stop, incremental=True, rid=sub.rid, protect=item.params.min_tokens)
         self.text_in, self.prompt_ids, self.t0 = text_in_logprobs, prompt_ids, t0
         self.ids: list[int] = []
-        # SGLang's logprob entries of the output so far, built once per token (a stream's events repeat them all)
+        # The logprob entries of the output so far, built once per token (a stream's events repeat them all)
         self.token_lps: list[list] = []
         self.top_lps: list[list[list]] = []
         self.text = ""
@@ -308,8 +305,8 @@ class _Run:
             self.push(*rest)
 
     def _finish_reason(self) -> dict | None:
-        """SGLang's finish reason (schedule_batch.py FINISH_*.to_json): a stop names what matched, the stop string or the
-        token id (EOS or a stop_token_ids entry); a length, the tokens generated."""
+        """The finish reason: a stop names what matched, the stop string or the token
+        id (EOS or a stop_token_ids entry); a length, the tokens generated."""
         f = self.finish
         if f is None:
             return None
@@ -328,8 +325,7 @@ class _Run:
         return [lp, t, self.tok.decode([t]) if self.text_in else None]
 
     def result(self) -> dict:
-        """SGLang's output so far (tokenizer_manager.py _handle_batch_output; a stream's events are cumulative, as with
-        SGLang's default incremental_streaming_output off)."""
+        """The output so far (a stream's events are cumulative)."""
         req = self.req
         meta: dict = {
             "id": self.rid,
@@ -342,7 +338,7 @@ class _Run:
         if self.finish is not None:
             meta["e2e_latency"] = time.perf_counter() - self.t0
         if self.item.logprob:
-            meta["input_token_logprobs"] = []  # output logprobs only: SGLang's logprob_start_len -1
+            meta["input_token_logprobs"] = []  # output logprobs only
             meta["output_token_logprobs"] = list(self.token_lps)
             if self.item.top:
                 meta["input_top_logprobs"] = []
@@ -385,15 +381,15 @@ def add_routes(
     prompt_tok,
     gen_defaults: dict[str, float],
 ) -> None:
-    """SGLang's native routes on the app of one engine (serve/api.py build_app)."""
+    """The native routes on the app of one engine (serve/api.py build_app)."""
     engine = loop_.engine
     tok = engine.tokenizer
     model_type, architectures = _checkpoint_ids(getattr(engine, "model_path", None))
 
     def load() -> dict:
-        """SGLang's legacy /get_load entry for this engine (http_server.py get_load: num_tokens is the KV tokens in use
-        plus the waiting requests' tokens, num_pending_tokens the latter). Read off the engine thread, as /v1/stats
-        is: list() copies each queue whole while holding the GIL, so the engine thread's changes cannot interleave."""
+        """The /get_load entry for this engine (num_tokens is the KV tokens in use plus the waiting requests' tokens,
+        num_pending_tokens the latter). Read off the engine thread, as /v1/stats is:
+        list() copies each queue whole while holding the GIL, so the engine thread's changes cannot interleave."""
         sched = engine.scheduler
         running, waiting = list(sched.running), list(sched.waiting)
         used, total = kv_pages(engine)
@@ -416,8 +412,8 @@ def add_routes(
     @app.get("/model_info")
     @app.get("/get_model_info")
     async def model_info():
-        """SGLang's /model_info. model_path is the checkpoint as the operator passed it (a directory or a Hugging Face
-        repo id), never the download cache it resolved to."""
+        """The model's information. model_path is the checkpoint as the operator passed it (a directory or a Hugging
+        Face repo id), never the download cache it resolved to."""
         return {
             "model_path": engine.cfg.model_path,
             "tokenizer_path": engine.cfg.model_path,
@@ -435,9 +431,9 @@ def add_routes(
     @app.get("/server_info")
     @app.get("/get_server_info")
     async def server_info():
-        """SGLang's /server_info: the engine's configuration (EngineConfig: shapes, pools and routes, all from the
-        command line; it holds no credential), SGLang's names for the ones its clients read, the version and preset,
-        and the load (internal_states)."""
+        """The engine's configuration (EngineConfig: shapes, pools and routes, all from the command line; it holds no
+        credential), served_model_name, tp_size, dp_size and context_length, the version and preset, and the load
+        (internal_states)."""
         cfg = engine.cfg
         fields = (
             {f.name: getattr(cfg, f.name) for f in dataclasses.fields(cfg)}
@@ -458,9 +454,9 @@ def add_routes(
 
     @app.get("/health_generate")
     async def health_generate():
-        """SGLang's /health_generate: one token generated from prompt [0] (greedy, not counted in /metrics). A step that
-        ends after the probe is sent shows the engine serving, so a busy engine answers as soon as its current step ends
-        (and the probe is aborted); 503 if no step ends within HEALTH_GENERATE_TIMEOUT_S, or once the engine failed."""
+        """One token generated from prompt [0] (greedy, not counted in /metrics). A step that ends after the probe is
+        sent shows the engine serving, so a busy engine answers as soon as its current step ends (and the probe is
+        aborted); 503 if no step ends within HEALTH_GENERATE_TIMEOUT_S, or once the engine failed."""
         tic = time.monotonic()
         err = loop_.health_error()
         if err is None:
@@ -498,9 +494,8 @@ def add_routes(
 
     @app.post("/abort_request")
     async def abort_request(http: HTTPRequest):
-        """SGLang's AbortReq: `rid` (exact: a batch's rids are rid_0, rid_1, ...) or `abort_all`. An aborted request
-        answers with what it generated and finish_reason {"type": "abort"}. 200 whether or not the rid is running, as
-        SGLang."""
+        """Abort by `rid` (exact: a batch's rids are rid_0, rid_1, ...) or `abort_all`. An aborted request answers with
+        what it generated and finish_reason {"type": "abort"}. 200 whether or not the rid is running."""
         body = await _body(http)
         for key in ("finished_reason", "abort_message"):
             if body.get(key) is not None:
@@ -516,9 +511,9 @@ def add_routes(
 
     @app.api_route("/flush_cache", methods=["GET", "POST"])
     async def flush_cache(http: HTTPRequest):
-        """SGLang's /flush_cache: the prefix cache (device pages, state checkpoints and the host tier) dropped, only
-        while no request runs or waits; `timeout` (seconds, default 0) waits that long for the engine to be idle. 200
-        with SGLang's text when flushed, 400 with the reason when not."""
+        """Drop the prefix cache (device pages, state checkpoints and the host tier), only while no request runs or
+        waits; `timeout` (seconds, default 0) waits that long for the engine to be idle. 200 with the text of FLUSHED
+        when flushed, 400 with the reason when not."""
         raw = http.query_params.get("timeout", "0")
         try:
             timeout = float(raw)
@@ -587,9 +582,9 @@ def add_routes(
 
 
 async def _events(runs: list[_Run], single: bool, abort_unfinished):
-    """A /generate stream: SGLang's server-sent events, one per prompt that has new output after a step (cumulative
+    """A /generate stream: server-sent events, one per prompt that has new output after a step (cumulative
     text, output_ids and meta_info; a batch's carry its prompt's `index`), then `data: [DONE]`. An engine error ends the
-    stream with SGLang's error event; a client that goes away closes this generator, which aborts what is left."""
+    stream with an error event; a client that goes away closes this generator, which aborts what is left."""
     merged: asyncio.Queue = asyncio.Queue()
 
     async def pump(i: int, r: _Run) -> None:

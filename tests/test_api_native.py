@@ -1,4 +1,4 @@
-"""SGLang's native API (trnrt/serve/native.py) on a GLM-5.3-Flash engine on CPU (a tiny random model,
+"""The native API (trnrt/serve/native.py) on a GLM-5.3-Flash engine on CPU (a tiny random model,
 tests/test_glm5_next.py), with the host-memory tier on: /generate gives the tokens and logprobs /v1/completions gives,
 /flush_cache empties the prefix cache of both tiers so the next turn is cold and the one after it hits again, and
 /health_generate runs its token through the engine.

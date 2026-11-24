@@ -681,7 +681,7 @@ def test_tokenize_refuses_what_it_cannot_answer_with_a_400(serve, body):
 
 
 @pytest.mark.parametrize("prefix", ["", "/v1"])
-def test_detokenize_answers_sglang_and_vllm_clients(prefix):
+def test_detokenize_answers_text_and_prompt(prefix):
     from fastapi.testclient import TestClient
 
     from trnrt.serve import api

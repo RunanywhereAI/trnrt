@@ -141,7 +141,7 @@ def test_length_is_incomplete(client):
 
 
 def test_a_reasoning_summary_and_encrypted_content_mirror_the_reasoning(client):
-    """reasoning.summary mirrors the reasoning into a summary part (as SGLang does: there is no summarizer), streamed
+    """reasoning.summary mirrors the reasoning into a summary part (there is no summarizer), streamed
     as reasoning_summary events; include reasoning.encrypted_content returns the reasoning text there, for a stateless
     client to send back."""
     c, _ = client(TOOL_TURN)

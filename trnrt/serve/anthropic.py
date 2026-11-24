@@ -23,9 +23,8 @@ not the request set `thinking`, with an empty `signature` (nothing here signs it
 guided decoding and are refused, as the chat path refuses `required` and a named tool. Usage follows Anthropic's split:
 `input_tokens` are the prompt tokens not read from the prefix cache, `cache_read_input_tokens` those that were.
 
-Errors use Anthropic's shape, `{"type": "error", "error": {"type": ..., "message": ...}}`. The translation follows
-SGLang's Anthropic adapter (python/sglang/srt/entrypoints/anthropic/serving.py), except that SGLang accepts and ignores a
-thinking budget, which this server enforces (with `--structured-outputs`) or refuses, never ignores (AGENTS.md).
+Errors use Anthropic's shape, `{"type": "error", "error": {"type": ..., "message": ...}}`. A thinking budget is
+enforced (with `--structured-outputs`) or refused, never ignored (AGENTS.md).
 """
 
 from __future__ import annotations
@@ -140,8 +139,8 @@ def messages(body: dict) -> list[dict]:
                     }
                 )
             elif kind == "tool_result" and role == "user":
-                # GLM's template has no slot for a failed call, so the model would read the error as a result (SGLang's
-                # adapter drops the flag that way); the client can say so in the content instead
+                # GLM's template has no slot for a failed call, so the model would read the error as a result, so
+                # the flag is refused; the client can say so in the content instead
                 if b.get("is_error") not in (None, False):
                     raise _bad(f"{at}: tool_result is_error is not supported; send the error in its content")
                 if text:  # the user's text before the result stays before it

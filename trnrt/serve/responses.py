@@ -6,7 +6,7 @@ parsed by the same GLM parsers as a chat response, is translated back into Respo
 
 | Chat output | Responses item |
 |---|---|
-| `reasoning_content` | a `reasoning` item, its text as `reasoning_text` content (and as a `summary_text` when `reasoning.summary` is set, as SGLang mirrors it) |
+| `reasoning_content` | a `reasoning` item, its text as `reasoning_text` content (and as a `summary_text` when `reasoning.summary` is set) |
 | `content` | a `message` item with one `output_text` part |
 | each of `tool_calls` | a `function_call` item; its `call_id` is the chat call's id |
 
@@ -17,8 +17,7 @@ extras, `session_id`, `chat_template_kwargs`). A streamed response sends the Res
 
 Nothing is stored: `store` true, `previous_response_id` and `background` are refused with a 400, and so are the fields
 whose meaning needs what no served graph computes (structured output in `text.format`, `top_logprobs`) or a server-side
-tool. The fields that matter follow SGLang's /v1/responses (python/sglang/srt/entrypoints/openai/serving_responses.py and
-protocol.py ResponsesRequest), and the event shapes the OpenAI API's.
+tool. The fields and the event shapes are the OpenAI API's.
 """
 
 from __future__ import annotations

@@ -1,4 +1,4 @@
-"""The router's SGLang native routes (trnrt/serve/router.py): /generate routed like a completion by its prompt or
+"""The router's native routes (trnrt/serve/router.py): /generate routed like a completion by its prompt or
 session, and the info, load, health, abort and flush routes sent to one worker or to all and their answers combined."""
 
 import asyncio
@@ -26,7 +26,7 @@ def test_generate_prompts_are_the_routing_text():
 
 
 def _native_worker(i: int, flush_status: int = 200, health_status: int = 200, flush_s: float = 0.0):
-    """A worker with SGLang's native routes: it answers each with its index, and records what it was sent. (No
+    """A worker with the native routes: it answers each with its index, and records what it was sent. (No
     `from __future__ import annotations` in this module: FastAPI resolves a handler's `req: Request` in the module's
     globals, where this local import is not, and would take `req` for a query parameter.)"""
     from fastapi import FastAPI, Request

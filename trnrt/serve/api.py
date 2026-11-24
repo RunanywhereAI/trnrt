@@ -13,7 +13,7 @@
   state, and request rates and latency percentiles over recent windows (serve/stats.py);
 - GET /dashboard: a page drawing /v1/stats (serve/dashboard.py);
 - GET /metrics: Prometheus counters and histograms (trnrt/metrics.py);
-- SGLang's native API (serve/native.py): POST /generate, the info endpoints /model_info and /server_info, /get_load,
+- The native API (serve/native.py): POST /generate, the info endpoints /model_info and /server_info, /get_load,
   /health_generate, /abort_request and /flush_cache.
 
 A request may ask for `n` choices: each is its own engine request (Run), sharing the prompt through the prefix cache.
@@ -95,7 +95,7 @@ class _Stream:
     sent: int = 0
     metrics: bool = True  # counted in /metrics when it finishes (a /health_generate probe is not)
     stream: bool = False  # the HTTP response streams (GET /v1/stats's records)
-    logs: bool = True  # its record goes to the production log (SGLang's no_logs turns it off)
+    logs: bool = True  # its record goes to the production log (no_logs turns it off)
     at_arrival: tuple[int, int] | None = None  # (running, waiting) when the engine took it
 
 
@@ -265,11 +265,11 @@ class EngineLoop:
         stream: bool = False,
         logs: bool = True,
     ) -> _Submit:
-        """Queue a request for the engine thread. `rid`: the client's request id (SGLang's), which /abort_request
+        """Queue a request for the engine thread. `rid`: the client's request id, which /abort_request
         names; a new one when None. `metrics`: whether /metrics and /v1/stats count it. `out`: a choice's view of a
-        shared queue (`n` > 1), instead of its own. `priority`: SGLang's per-request priority. `stream`: whether the HTTP
-        response streams (GET /v1/stats's records). `logs`: whether its record goes to the production log (SGLang's
-        no_logs: false)."""
+        shared queue (`n` > 1), instead of its own. `priority`: the per-request priority. `stream`: whether the HTTP
+        response streams (GET /v1/stats's records). `logs`: whether its record goes to the production log (no_logs
+        false turns it off)."""
         # Checked here, before the engine sees the request: an id outside the vocabulary fails the step, and at tp > 1
         # one failed step fails the engine for every request (_fail).
         if not prompt_ids or not all(type(t) is int and 0 <= t < self.vocab for t in prompt_ids):
@@ -305,7 +305,7 @@ class EngineLoop:
 
     def flush(self, timeout_s: float) -> _Flush:
         """Ask the engine thread to drop its prefix cache (LLMEngine.flush_cache) once it is idle, waiting up to
-        `timeout_s` for that (SGLang's /flush_cache: 0 flushes only an engine idle when the request arrives)."""
+        `timeout_s` for that (0 flushes only an engine idle when the request arrives)."""
         loop = asyncio.get_running_loop()
         f = _Flush(time.monotonic() + timeout_s, loop, loop.create_future())
         self._put("flush", f)
@@ -376,7 +376,7 @@ class EngineLoop:
 
     def _add(self, sub: _Submit) -> None:
         post = sub.loop.call_soon_threadsafe
-        if sub.rid in self.streams:  # a client's rid (SGLang's /generate) names one request at a time
+        if sub.rid in self.streams:  # a client's rid (on /generate) names one request at a time
             post(sub.out.put_nowait, ("error", f"rid {sub.rid!r} is already in use", 400))
             return
         # priority only when sent: an engine without priority scheduling refuses any value (LLMEngine.add_request)
@@ -416,8 +416,7 @@ class EngineLoop:
 
     def _start_flush(self, f: _Flush) -> None:
         """A /flush_cache, in inbox order: done now if the engine is idle, refused if another is waiting or the request
-        set no time to wait, else kept until the engine is idle or its deadline passes (_check_flush; SGLang's
-        scheduler_components/flush_wrapper.py)."""
+        set no time to wait, else kept until the engine is idle or its deadline passes (_check_flush)."""
         if self._flush is not None:
             f.loop.call_soon_threadsafe(_resolve, f.fut, (False, "Another flush_cache is already in progress."))
             return
@@ -590,18 +589,16 @@ class _Detok:
     Never emits half of a multi-byte character, and with stop strings it holds back the
     last `max(len(stop)) - 1` characters until they cannot start a stop string, so a stop
     sequence is never partially streamed. Output is cut before the first stop string, as
-    the OpenAI API specifies, or after it with `keep` (vLLM's include_stop_str_in_output,
-    SGLang's no_stop_trim).
+    the OpenAI API specifies, or after it with `keep` (include_stop_str_in_output, no_stop_trim).
 
-    `regexes` are SGLang's stop_regex patterns, as (compiled, the longest text a match can span or None): the output
-    ends at the end of the first match, the matched text included, as SGLang's does (its trim looks for the pattern
-    itself in the text, which a pattern rarely is). A match starts at most STOP_REGEX_SPAN characters before the text
-    already searched. A match never takes back text already streamed. `matched`: the stop string or pattern that ended
-    the output, None until one does.
+    `regexes` are the stop_regex patterns, as (compiled, the longest text a match can span or None): the output
+    ends at the end of the first match, the matched text included. A match starts at most STOP_REGEX_SPAN characters
+    before the text already searched. A match never takes back text already streamed. `matched`: the stop string or
+    pattern that ended the output, None until one does.
 
     `protect` is the request's min_tokens: a stop string or pattern counts only once the output has more tokens than that,
-    and only if it ends past the text of the first `protect` tokens, as the engine checks it (engine._stop_in, after
-    vLLM; SGLang's min_new_tokens holds back every stop check). One that ends among them stays in the text.
+    and only if it ends past the text of the first `protect` tokens, as the engine checks it (engine._stop_in). One
+    that ends among them stays in the text.
     """
 
     def __init__(
@@ -720,7 +717,7 @@ class _Detok:
 
     def push(self, ids: list[int], final: bool, drop_last: bool = False) -> str:
         """The text these ids add. drop_last: the last id is the stop token that ended the request (EOS or a
-        stop_token_ids entry), which is not part of the text (vLLM and SGLang leave it out)."""
+        stop_token_ids entry), which is not part of the text (it is left out)."""
         if self.stopped:
             return ""
         self.ids.extend(ids)
@@ -747,7 +744,7 @@ class _Detok:
 
 
 # Request fields that would change the output in a way no served graph computes (prompt logprobs, logit biases, an
-# echoed or suffixed prompt, SGLang's min_new_tokens on the OpenAI endpoints): refused with a 400, never ignored. Each is
+# echoed or suffixed prompt, min_new_tokens on the OpenAI endpoints): refused with a 400, never ignored. Each is
 # accepted at its neutral values, absent or listed here, which OpenAI SDKs and agent harnesses send by default. Guided
 # decoding (serve/structured.py), min_tokens, penalties and a thinking budget go to the engine, which refuses them unless
 # it was started with the graphs that serve them (engine/request.py unsupported).
@@ -928,8 +925,8 @@ MAX_N = 128
 # before it runs: _backtracking refuses the shapes whose search time grows faster than the square of the text's length,
 # and the span bounds the text. The worst admitted shape, one repeat over a broad class (`\w+@\w+\.\w+` over a run of
 # letters), measured 13 ms per search at 2048 characters and 51 ms at 4096 (CPython 3.14, one Apple M3 Max core). The
-# matches are SGLang's (its tail search reads the whole output for an unbounded pattern) but for one that starts more
-# than the span before the newest text, which a stop pattern's match rarely does.
+# matches are those of a search over the whole output but for one that starts more than the span before the newest
+# text, which a stop pattern's match rarely does.
 MAX_STOP_REGEX = 16
 MAX_STOP_REGEX_CHARS = 1024
 STOP_REGEX_SPAN = 2048
@@ -937,9 +934,9 @@ STOP_REGEX_SPAN = 2048
 
 @dataclass(frozen=True)
 class StopRules:
-    """A request's host-side stop rules (the engine matches stop strings and stop tokens itself): SGLang's stop_regex
-    as (compiled, the longest text a match spans or None); keep: the stop text stays in the output (vLLM's
-    include_stop_str_in_output, SGLang's no_stop_trim); skip_special: skip_special_tokens."""
+    """A request's host-side stop rules (the engine matches stop strings and stop tokens itself): stop_regex as
+    (compiled, the longest text a match spans or None); keep: the stop text stays in the output
+    (include_stop_str_in_output, no_stop_trim); skip_special: skip_special_tokens."""
 
     regexes: tuple[tuple[re.Pattern, int | None], ...] = ()
     keep: bool = False
@@ -948,7 +945,7 @@ class StopRules:
 
 def _match_width(pattern: str) -> int | None:
     """The longest text a match of `pattern` can span, None if unbounded (or unknown): the window a new match can start
-    in. Read from the regex parser's own width (SGLang computes the same bound, sampling_params.get_max_seq_length)."""
+    in. Read from the regex parser's own width."""
     try:
         parser = importlib.import_module("re._parser")
         hi = parser.parse(pattern).getwidth()[1]
@@ -1211,9 +1208,8 @@ def _stop_rules(body: dict) -> StopRules:
 
 def _fanout(body: dict, params: SamplingParams) -> list[SamplingParams]:
     """One SamplingParams per choice (`n`, default 1). best_of is accepted only when it asks for no more than n (it would
-    rank extra candidates by their logprob, which no request here returns). A seed gives choice i the seed + i, as vLLM
-    does (v1/engine/parallel_sampling.py), so the choices differ and each is reproducible; without one each choice draws
-    its own noise, keyed by its own request id."""
+    rank extra candidates by their logprob, which no request here returns). A seed gives choice i the seed + i, so the
+    choices differ and each is reproducible; without one each choice draws its own noise, keyed by its own request id."""
     n = _int(body, "n", 1, 1, MAX_N)
     best_of = _int(body, "best_of", n, 1)
     if best_of != n:
@@ -1608,7 +1604,7 @@ class Run:
         return msg, chat_finish_reason(self.finish[i], bool(msg.get("tool_calls")))
 
     def matched_stop(self, i: int) -> str | int | None:
-        """SGLang's matched_stop for a finished choice: the stop string or stop_regex pattern that ended it, else the
+        """The matched_stop of a finished choice: the stop string or stop_regex pattern that ended it, else the
         token id (EOS or a stop id) that did, else None (a length or an abort)."""
         d = self.detoks[i] if i < len(self.detoks) else None
         if d is not None and d.matched is not None:
@@ -1736,7 +1732,7 @@ def build_app(engine: LLMEngine, model_name: str, preset: str | None = None, nam
         (chat_prompt), None for a completion. Every request field is checked before anything is queued."""
         rules = _stop_rules(body)
         choices = _fanout(body, params)
-        # SGLang's per-request priority (engine/scheduler.py); an engine without priority scheduling refuses it (400)
+        # The per-request priority (engine/scheduler.py); an engine without priority scheduling refuses it (400)
         priority = _int(body, "priority", None, -_INT64_MAX - 1)
         run = Run(
             loop_, tok, prompt_ids, choices, body.get("session_id"), rules, eos, parse, priority, _flag(body, "stream")
@@ -1793,7 +1789,7 @@ def build_app(engine: LLMEngine, model_name: str, preset: str | None = None, nam
             if lps is not None:
                 choice["logprobs"] = lp_block(lps)
             if finish is not None:
-                choice["matched_stop"] = run.matched_stop(i)  # SGLang's field
+                choice["matched_stop"] = run.matched_stop(i)
             return {
                 "id": oid,
                 "object": obj + (".chunk" if chat else ""),
@@ -1897,7 +1893,7 @@ def build_app(engine: LLMEngine, model_name: str, preset: str | None = None, nam
         _stream_flags(body)  # checked before anything is queued
         return await _generate(http, body, await start_chat(body), chat=True)
 
-    # SGLang's and vLLM's /tokenize and /detokenize (also under /v1). A chat request is rendered exactly as
+    # /tokenize and /detokenize (also under /v1). A chat request is rendered exactly as
     # /v1/chat/completions renders it (chat_prompt), so `count` is what the engine would be sent; a prompt is encoded as
     # /v1/completions encodes it. Both run on the prompt thread with its tokenizer, as a chat prompt does: never on the
     # event loop, and never in a second thread inside one tokenizer.
@@ -1924,7 +1920,7 @@ def build_app(engine: LLMEngine, model_name: str, preset: str | None = None, nam
             "count": [len(s) for s in seqs] if batch else len(seqs[0]),
             "max_model_len": engine.cfg.max_model_len,
         }
-        if _flag(body, "return_token_strs"):  # vLLM's
+        if _flag(body, "return_token_strs"):
             strs = [prompt_tok.convert_ids_to_tokens(s) for s in seqs]
             out["token_strs"] = strs if batch else strs[0]
         return out
@@ -1935,10 +1931,10 @@ def build_app(engine: LLMEngine, model_name: str, preset: str | None = None, nam
         seqs: list = cast("list", tokens) if batch else [tokens]
         if not all(isinstance(s, list) and all(type(t) is int and 0 <= t < loop_.vocab for t in s) for s in seqs):
             raise _bad(f"tokens must be a list of token ids in [0, {loop_.vocab}), or a list of such lists")
-        skip = _flag(body, "skip_special_tokens", True)  # SGLang's default
+        skip = _flag(body, "skip_special_tokens", True)
         texts = [prompt_tok.decode(s, skip_special_tokens=skip) for s in seqs]
         text = texts if batch else texts[0]
-        return {"text": text, "prompt": text}  # SGLang answers `text`, vLLM `prompt`
+        return {"text": text, "prompt": text}  # the same text under both names
 
     @app.post("/tokenize")
     @app.post("/v1/tokenize")
