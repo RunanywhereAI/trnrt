@@ -72,7 +72,7 @@ class NeedSync(Exception):
 
 class QueueFull(Exception):
     """The waiting queue is at its limit (SchedulerConfig.max_queued_requests / max_queued_tokens): the request is
-    refused before it is queued. The API answers it with 503 and the message "The request queue is full.".
+    refused before it is queued. The API answers it with 503 and a message beginning "The request queue is full".
     """
 
 

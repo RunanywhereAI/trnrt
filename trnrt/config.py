@@ -128,9 +128,9 @@ class EngineConfig:
     # published acceptance length, not for quality. The command line reads TRNRT_SPEC_SYNTH_AL when --spec-synth-al is absent.
     spec_synth_al: float | None = None
     # Dynamic speculation: no drafts above a batch size, with hysteresis, so a batch hovering at the threshold does not flip
-    # every step. While at most this many requests decode, they speculate, above it every decode step is the plain graph
-    # (0: always speculate). Once plain, speculation returns when at most spec_max_batch - spec_hysteresis requests decode.
-    # A flip drains the step in flight.
+    # every step. At most this many decoding requests speculate unless one needs host inputs (a mask or penalties); above
+    # it, every decode step is the plain graph (0: always speculate). Once plain, speculation returns when at most
+    # spec_max_batch - spec_hysteresis requests decode. A flip drains the step in flight.
     spec_max_batch: int = 0
     spec_hysteresis: int = 1
     # With dynamic speculation, the decode buckets each step family is warmed and picked at: the verify family (verify,
