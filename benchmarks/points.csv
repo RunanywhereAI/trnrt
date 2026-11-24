@@ -20,3 +20,7 @@ fixed-on-c1,fixed_seq,1,latency
 fixed-on-c2,fixed_seq,2,latency
 fixed-on-c4,fixed_seq,4,latency
 fixed-on-c8,fixed_seq,8,latency
+fixed-golden-c1,fixed_seq,1,latency-golden
+fixed-golden-c2,fixed_seq,2,latency-golden
+fixed-golden-c4,fixed_seq,4,latency-golden
+fixed-golden-c8,fixed_seq,8,latency-golden

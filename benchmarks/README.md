@@ -7,7 +7,7 @@ build from [builds.csv](builds.csv), and each build's engine arguments are the s
 | Benchmark | Load | Scored with | Points |
 |---|---|---|---|
 | AgentX | SemiAnalysis's AgentX harness 1.0.12, its public coding-agent traces, one hour per point | [agentx/score.py](agentx/score.py): InferenceX's AgentX definitions | `agentx-c*` |
-| 8K/1K fixed length | InferenceX's fixed_seq recipe at commit 47cdc9d0: 8,192 input / 1,024 output tokens, random prompts | [fixed_seq/score.py](fixed_seq/score.py) | `fixed-off-c*` (no speculation), `fixed-on-c*` (speculation, real acceptance) |
+| 8K/1K fixed length | InferenceX's fixed_seq recipe at commit 47cdc9d0: 8,192 input / 1,024 output tokens, random prompts | [fixed_seq/score.py](fixed_seq/score.py) | `fixed-off-c*` (no speculation), `fixed-on-c*` (speculation, real acceptance), `fixed-golden-c*` (speculation at the golden length, as InferenceX's GPU runs with MTP on) |
 | GSM8K | InferenceX's own GSM8K task and lm-eval hooks | lm-eval | per build |
 | Needle | Three facts at depths 0.1, 0.5 and 0.9 of a long document, asked cold and after other documents have gone through the cache | [accuracy/needle.py](accuracy/needle.py) | per build |
 

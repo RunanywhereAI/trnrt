@@ -61,11 +61,13 @@ def test_the_agentx_points_follow_the_builds_bands():
         assert (p["build"] == "latency-golden") == (c <= 8), name
 
 
-def test_fixed_length_points_never_run_the_benchmark_mode():
+def test_fixed_length_points_run_the_benchmark_mode_only_where_named():
+    """fixed-off-* decode without drafts, fixed-on-* with real acceptance, fixed-golden-* at the golden length."""
     for name, p in points.points().items():
         if p["benchmark"] == "fixed_seq":
-            assert p["build"] != "latency-golden", name
+            assert (p["build"] == "latency-golden") == name.startswith("fixed-golden-"), name
             assert (p["build"] == "latency") == name.startswith("fixed-on-"), name
+            assert (p["build"] in ("balanced", "throughput")) == name.startswith("fixed-off-"), name
 
 
 def _rec(start_s, end_s, isl, osl, ttft_ms, e2e_ms, itl_ms, phase="profiling", error=None):
@@ -235,6 +237,14 @@ def test_client_dry_runs_take_the_points_concurrency():
         env={"TOKENIZER": "/t", "INFX": "/i"},
     )
     assert "--use-chat-template" not in out
+    out = _dry(
+        "fixed_seq/client.sh",
+        "fixed-golden-c4",
+        "http://h:8000",
+        "/nonexistent/out",
+        env={"TOKENIZER": "/t", "INFX": "/i"},
+    )
+    assert "on build latency-golden" in out and out.rstrip().endswith("--use-chat-template)")
 
 
 @needs_bash

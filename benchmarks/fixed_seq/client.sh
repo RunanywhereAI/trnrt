@@ -4,7 +4,8 @@
 # 8,192 input / 1,024 output tokens with --random-range-ratio 0.8 (inputs uniform in [6,553, 8,192], outputs in [819,
 # 1,024]), 10 x C prompts at concurrency C, 2 x C warmups, request rate unlimited, EOS ignored, /v1/completions; the
 # chat template only on a speculative build, as InferenceX does for speculative runs. No prefix cache reuse: the prompts
-# are random.
+# are random. The fixed-golden-* points run the latency build at InferenceX's golden acceptance length (the benchmark mode),
+# the form of InferenceX's GPU runs with MTP on; their server must report that mode, every other point's must not.
 #
 #   INFX=/src/InferenceX TOKENIZER=/models/GLM-5.3-Flash benchmarks/fixed_seq/client.sh [--dry-run] POINT URL OUT_DIR
 #
@@ -34,7 +35,8 @@ if [ "$dry" = 0 ]; then
   [ ! -e "$out" ] || { echo "$out exists: give each run a new directory" >&2; exit 2; }
   got=$(git -C "$INFX" rev-parse HEAD 2>/dev/null || echo none)
   [ "$got" = "$WANT_COMMIT" ] || { echo "InferenceX at $got; the published points used $WANT_COMMIT" >&2; exit 2; }
-  python3 -I "$here/../accuracy/acceptance_mode.py" --expect real --url "$url" || exit 2
+  python3 -I "$here/../accuracy/acceptance_mode.py" --expect "$([ "$build" = latency-golden ] && echo golden || echo real)" \
+    --url "$url" || exit 2
   mkdir -p "$out"
   out=$(cd "$out" && pwd)  # absolute: the client runs from the InferenceX checkout
 fi
