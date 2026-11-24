@@ -5,7 +5,17 @@ and versions follow [Semantic Versioning](https://semver.org/). Rebuild the comp
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-24
+
+Serving APIs for agent clients, and three builds chosen by users per engine in place of release 0.1.0's presets. Rebuild
+the compile cache: every build has its own graphs. Each build's graphs are proven equal to the device-measured reference
+builds with `tools/graph_equiv.py` on CPU; the device check of this release's own commit (`docker/check_image.py
+--device`, and each build compiled and served on all 32 ranks) has not been run yet.
+
 ### Added
+
+- Results against H100 and H200 on InferenceX AgentX and the 8K/1K recipe, per 8 accelerators at AWS Capacity Block
+  prices ([docs/RESULTS.md](docs/RESULTS.md#against-h100-and-h200-inferencex-agentx-and-8k1k)).
 
 - `/tokenize` and `/detokenize` (also under `/v1`). A chat request is counted exactly as
   `/v1/chat/completions` would send it to the engine. The router sends them to any live engine without touching its
