@@ -7,7 +7,8 @@
 #
 # Environment: CACHE, NKI (the compile output of benchmarks/compile.sh, copied here); MODEL (the checkpoint at revision
 # eb9eb208eb0d988989d07a6a12d0fdeb5f52574a, docs/DEPLOY.md step 4); IMAGE (default trnrt); PORT (default 8000: the
-# router; the engine is on PORT + 1, on 127.0.0.1). The other arguments are docs/DEPLOY.md step 4's. The box layout of
+# router; the engine is on PORT + 1, on 127.0.0.1); DOCKER_ARGS (optional, extra `docker run` arguments). The other
+# arguments are docs/DEPLOY.md step 4's. The box layout of
 # two engines (the default of `trnrt serve`) is the deployment form; the published points are per 8 chips.
 set -euo pipefail
 
@@ -21,8 +22,10 @@ args=$(python3 -I "$here/points.py" get "$point" engine_args) || exit 2
 IMAGE=${IMAGE:-trnrt}
 PORT=${PORT:-8000}
 
-# shellcheck disable=SC2206  # the engine arguments are words by design
-cmd=(docker run --rm --privileged --network host --ipc=host
+# shellcheck disable=SC2206  # the engine arguments and DOCKER_ARGS are words by design
+extra=(${DOCKER_ARGS:-})
+# shellcheck disable=SC2206
+cmd=(docker run --rm --privileged --network host --ipc=host ${extra[@]+"${extra[@]}"}
   -v "$CACHE:/cache" -v "$NKI:/var/tmp/nki-intermediate-cache" -v "$MODEL:/model"
   -e NEURON_LIBTORCH_CACHE_ROOT=/cache
   "$IMAGE" serve --model /model --port "$PORT" --engines 1 $args)

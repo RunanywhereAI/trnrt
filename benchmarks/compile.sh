@@ -7,7 +7,8 @@
 #
 # Environment: OUT (required: the compile output, then copied to the serving host); IMAGE (default trnrt, the image of
 # docs/DEPLOY.md step 2); REV (default the checkpoint revision the published numbers were measured on); HF_TOKEN
-# (optional, passed into the containers). --dry-run prints the commands without running them.
+# (optional, passed into the containers); DOCKER_ARGS (optional, extra `docker run` arguments, e.g. --cpuset-cpus=0-95
+# to keep CPUs for other work). --dry-run prints the commands without running them.
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -18,8 +19,10 @@ if [ "${1:-}" = "--dry-run" ]; then dry=1; shift; fi
 IMAGE=${IMAGE:-trnrt}
 REV=${REV:-eb9eb208eb0d988989d07a6a12d0fdeb5f52574a}
 
+# shellcheck disable=SC2206  # DOCKER_ARGS is words by design
+extra=(${DOCKER_ARGS:-})
 run() {  # one step: `python -m trnrt` in a new container, $OUT at the same path, $OUT/nki at the kernels' cache path
-  local cmd=(docker run --rm -e HF_TOKEN -v "$OUT:$OUT" -v "$OUT/nki:/var/tmp/nki-intermediate-cache" "$IMAGE" "$@")
+  local cmd=(docker run --rm ${extra[@]+"${extra[@]}"} -e HF_TOKEN -v "$OUT:$OUT" -v "$OUT/nki:/var/tmp/nki-intermediate-cache" "$IMAGE" "$@")
   echo "+ ${cmd[*]}"
   [ "$dry" = 1 ] || "${cmd[@]}"
 }

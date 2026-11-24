@@ -201,6 +201,17 @@ def test_compile_dry_run_captures_each_build_then_compiles_once():
 
 
 @needs_bash
+def test_docker_args_reach_every_container():
+    out = _dry("compile.sh", "balanced", env={"OUT": "/o", "DOCKER_ARGS": "--cpuset-cpus=0-95"})
+    runs = [ln for ln in out.splitlines() if ln.startswith("+ docker run")]
+    assert runs and all(ln.startswith("+ docker run --rm --cpuset-cpus=0-95 ") for ln in runs)
+    out = _dry(
+        "serve.sh", "agentx-c16", env={"CACHE": "/c", "NKI": "/n", "MODEL": "/m", "DOCKER_ARGS": "--cpuset-cpus=0-95"}
+    )
+    assert "--ipc=host --cpuset-cpus=0-95 -v /c:/cache" in out
+
+
+@needs_bash
 def test_client_dry_runs_take_the_points_concurrency():
     out = _dry("agentx/client.sh", "agentx-c24", "http://h:8000", "/nonexistent/out", env={"TOKENIZER": "/t"})
     assert (
