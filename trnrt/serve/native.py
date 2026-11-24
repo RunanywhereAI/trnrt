@@ -36,7 +36,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse, Response, Streami
 from .. import __version__
 from ..engine.request import SamplingParams
 from ..metrics import kv_pages
-from .api import _NEUTRAL, _bad, _body, _Detok, _error, _flag, _int, _params, _unless_disconnected
+from .api import _NEUTRAL, MAX_N, _bad, _body, _Detok, _error, _flag, _int, _params, _unless_disconnected
 
 if TYPE_CHECKING:
     from concurrent.futures import ThreadPoolExecutor
@@ -49,6 +49,8 @@ logger = logging.getLogger(__name__)
 
 # The default max_new_tokens of a /generate request.
 GENERATE_MAX_NEW_TOKENS = 128
+# A client rid is kept in /v1/stats' records and the production log: bounded, as a batch is (MAX_N prompts, as `n`).
+MAX_RID_CHARS = 256
 # How long /health_generate waits for a step to end.
 HEALTH_GENERATE_TIMEOUT_S = 20.0
 # The names of the reasoning and tool-call parsers that serve/parsers.py implements.
@@ -225,6 +227,8 @@ def parse_generate(body: dict, tok, vocab: int, defaults: dict[str, float]) -> t
         raise _bad(f"not supported: {', '.join(refused)}")
     seqs, single = _prompts(body, tok)
     n = len(seqs)
+    if n > MAX_N:
+        raise _bad(f"a batch takes at most {MAX_N} prompts, not {n}")
     rid = body.get("rid")
     if rid is None:
         rids: list[str | None] = [None] * n
@@ -236,6 +240,8 @@ def parse_generate(body: dict, tok, vocab: int, defaults: dict[str, float]) -> t
         raise _bad("rid must be a non-empty string, or for a batch a list of one per prompt")
     if len({r for r in rids if r is not None}) < sum(r is not None for r in rids):
         raise _bad("the rids of a batch must differ")
+    if any(r is not None and len(r) > MAX_RID_CHARS for r in rids):
+        raise _bad(f"a rid takes at most {MAX_RID_CHARS} characters")
     for key in ("stream", "return_text_in_logprobs", "return_prompt_token_ids", "log_metrics", "no_logs"):
         _flag(body, key)
     if body.get("session_id") is not None and not isinstance(body.get("session_id"), str):
@@ -314,11 +320,9 @@ class _Run:
             return {"type": "length", "length": len(self.ids)}
         if f == "abort":
             return {"type": "abort", "message": "Aborted"}
-        if f == "stop" and self.detok.stopped:
-            full = self.tok.decode(self.ids, skip_special_tokens=True)
-            hits = [(full.find(x), x) for x in self.item.params.stop if x in full]
-            if hits:
-                return {"type": "stop", "matched": min(hits)[1]}
+        if f == "stop" and self.detok.stopped and self.detok.matched is not None:
+            # what the detokenizer stopped on, past min_tokens' protected text (not the first stop anywhere in it)
+            return {"type": "stop", "matched": self.detok.matched}
         return {"type": f, "matched": self.ids[-1] if self.ids else None}
 
     def _entry(self, lp: float, t: int) -> list:
@@ -548,7 +552,12 @@ def add_routes(
         # Admission errors (a prompt that does not fit, a rid in use) arrive before any token: an HTTP status, not a
         # 200 stream, and the batch's other prompts are aborted.
         # /generate's requests own their queues (api._Submit.out is a _Tagged view only for `n` > 1 choices)
-        firsts = [await cast("asyncio.Queue", s.out).get() for s in subs]
+        try:
+            firsts = [await cast("asyncio.Queue", s.out).get() for s in subs]
+        except BaseException:  # cancelled (the client went away) before every prompt was admitted
+            for s in subs:
+                loop_.abort(s.rid)
+            raise
         bad = next((f for f in firsts if f[0] == "error"), None)
         if bad is not None:
             for s, f in zip(subs, firsts):

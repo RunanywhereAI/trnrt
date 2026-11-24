@@ -117,6 +117,22 @@ def test_generate_answers_with_text_output_ids_and_meta_info(serve, method):
     assert p.stop == (" again", "!")
 
 
+def test_a_stop_after_min_new_tokens_is_the_one_its_finish_reason_names(serve, monkeypatch):
+    """A stop string inside min_new_tokens' protected text does not end the request, so finish_reason names the stop that
+    did, not the first one anywhere in the output."""
+    import tests.test_serve_api as S
+
+    monkeypatch.setattr(S, "unsupported", lambda params: None)  # as an engine started with --structured-outputs
+    client, _ = serve(PLAIN)
+    sp = {"min_new_tokens": 2, "stop": ["Hello", "again"]}
+    r = client.post("/generate", json={"input_ids": [1], "sampling_params": sp})
+    assert r.status_code == 200, r.text
+    assert (r.json()["text"], r.json()["meta_info"]["finish_reason"]) == (
+        "Hello there ",
+        {"type": "stop", "matched": "again"},
+    )
+
+
 def test_generate_maps_sampling_params_to_the_engine_params(serve):
     client, eng = serve(PLAIN)
     sp = {
@@ -201,6 +217,8 @@ def test_generate_output_logprobs_as_tuples(serve):
         ({"input_ids": [1], "rid": ["a"]}, "rid"),
         ({"input_ids": [[1], [2]], "rid": ["a"]}, "rid"),
         ({"input_ids": [[1], [2]], "rid": ["a", "a"]}, "must differ"),
+        ({"input_ids": [[1]] * 129}, "at most 128 prompts"),
+        ({"input_ids": [1], "rid": "r" * 257}, "at most 256 characters"),
         ({"input_ids": [[1], [2]], "sampling_params": [{}]}, "sampling_params"),
         ({"text": "Hello", "input_ids": [1]}, "exactly one of text or input_ids"),
         ({}, "exactly one of text or input_ids"),
