@@ -493,7 +493,7 @@ def add_routes(
         finally:
             if not done.done():
                 done.cancel()
-                loop_.abort(sub.rid)
+                loop_.abort(sub.rid, sub.out)
         err = loop_.health_error() or err
         if err is not None:
             return JSONResponse(status_code=503, content={"status": "failed", "error": err})
@@ -550,7 +550,7 @@ def add_routes(
             )
         except HTTPException:
             for s in subs:
-                loop_.abort(s.rid)
+                loop_.abort(s.rid, s.out)
             raise
         # Admission errors (a prompt that does not fit, a rid in use) arrive before any token: an HTTP status, not a
         # 200 stream, and the batch's other prompts are aborted.
@@ -558,14 +558,14 @@ def add_routes(
         try:
             firsts = [await cast("asyncio.Queue", s.out).get() for s in subs]
         except BaseException:  # cancelled (the client went away) before every prompt was admitted
-            for s in subs:
-                loop_.abort(s.rid)
+            for s in subs:  # each only while it owns its rid: a refused one's rid may be another request's
+                loop_.abort(s.rid, s.out)
             raise
         bad = next((f for f in firsts if f[0] == "error"), None)
         if bad is not None:
             for s, f in zip(subs, firsts):
                 if f[0] == "accepted":
-                    loop_.abort(s.rid)
+                    loop_.abort(s.rid, s.out)
             raise _error(*bad[1:])  # a full queue's 503 keeps QUEUE_FULL_HEADER: the router keeps the engine up
         text_in, prompt_ids = _flag(body, "return_text_in_logprobs"), _flag(body, "return_prompt_token_ids")
         runs = [_Run(it, s, tok, text_in, prompt_ids, t0) for it, s in zip(items, subs)]
@@ -575,7 +575,7 @@ def add_routes(
         def abort_unfinished() -> None:
             for r in runs:
                 if r.finish is None:
-                    loop_.abort(r.rid)
+                    loop_.abort(r.rid, r.sub.out)
 
         if _flag(body, "stream"):
             return StreamingResponse(_events(runs, single, abort_unfinished), media_type="text/event-stream")

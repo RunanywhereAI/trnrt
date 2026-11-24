@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import socket
@@ -269,6 +270,8 @@ def test_abort_request_ends_a_request_by_rid_with_what_it_generated():
     hanging); abort_all ends every request, an OpenAI one included; a rid in use is refused while it runs."""
     import httpx
 
+    from trnrt.serve import api
+
     eng = ScriptedEngine(PLAIN * 40)
     eng.step_delay = 0.02  # 160 tokens: 3 s on its own
     with _uvicorn(eng) as base, httpx.Client(base_url=base, timeout=30) as c:
@@ -278,7 +281,31 @@ def test_abort_request_ends_a_request_by_rid_with_what_it_generated():
         r = c.post("/generate", json=body)
         assert r.status_code == 400 and "already in use" in r.text
         assert c.post("/abort_request", json={"rid": "nope"}).status_code == 200  # no such rid: nothing happens
+        lp = next(lp for lp in api._LOOPS if lp.engine is eng)
+
+        def r1_tokens() -> int:
+            return next((len(q.output_ids) for q in eng.scheduler.running if q.rid == "r1"), -1)
+
+        n0 = r1_tokens()
+        lp.abort("r1", asyncio.Queue())  # a refused submission's cleanup: it does not own r1, so r1 runs on
+        _wait_for(lambda: r1_tokens() >= n0 + 3)  # steps past the abort in the inbox: it was read and passed over
         assert eng.aborted == []
+        calls: list = []
+        abort = lp.abort
+
+        def recording(rid, out=None):
+            calls.append((rid, out))
+            abort(rid, out)
+
+        lp.abort = recording
+        try:  # a batch whose first rid is r1's: refused, and the prompt it did queue is aborted by its own queue
+            r = c.post("/generate", json={**body, "input_ids": [[1], [1]], "rid": ["r1", "r2b"]})
+        finally:
+            lp.abort = abort
+        assert r.status_code == 400 and calls and all(out is not None for _, out in calls), (r.text, calls)
+        _wait_for(lambda: "r2b" in eng.aborted)  # the batch's own queued prompt, by its own queue
+        assert "r1" not in eng.aborted
+        eng.aborted.clear()
         assert c.post("/abort_request", json={"rid": "r1"}).status_code == 200
         r = got()
         assert r.status_code == 200, r.text

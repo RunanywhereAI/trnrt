@@ -297,8 +297,10 @@ class EngineLoop:
         self._put("add", sub)
         return sub
 
-    def abort(self, rid: str) -> None:
-        self.inbox.put(("abort", rid))
+    def abort(self, rid: str, out: asyncio.Queue | _Tagged | None = None) -> None:
+        """Abort the request `rid`; with `out`, only while that submission still owns the rid (a refused submission
+        with a rid already in use must not end the request that holds it)."""
+        self.inbox.put(("abort", (rid, out)))
 
     def abort_all(self) -> None:
         """Abort every request the engine holds, and those queued for it before this call."""
@@ -358,8 +360,10 @@ class EngineLoop:
             if kind == "add":
                 self._add(payload)
             elif kind == "abort":
-                st = self.streams.pop(payload, None)
-                if st is not None:
+                rid, out = payload
+                st = self.streams.get(rid)
+                if st is not None and (out is None or st.out is out):
+                    del self.streams[rid]
                     self._abort(st)
                     self._finished(st, "abort")
             elif kind == "abort_all":
@@ -1157,11 +1161,11 @@ def _backtracking(pattern: str) -> str | None:
                 return False
             if op in (c.GROUPREF, c.GROUPREF_EXISTS):
                 return False
-            if op in (c.MAX_REPEAT, c.MIN_REPEAT, c.POSSESSIVE_REPEAT) and not one_way(av[2]):
-                return False
+            if op in (c.MAX_REPEAT, c.MIN_REPEAT, c.POSSESSIVE_REPEAT) and (av[0] != av[1] or not one_way(av[2])):
+                return False  # a variable count matches its text more than one way even when its width is fixed
             if op is c.BRANCH:
                 firsts = [first(alt) for alt in av[1]]
-                if any(not f for f in firsts) or any(
+                if any(not f or alt.getwidth()[0] == 0 for f, alt in zip(firsts, av[1], strict=True)) or any(
                     firsts[i] & firsts[j] for i in range(len(firsts)) for j in range(i)
                 ):
                     return False
@@ -1207,9 +1211,12 @@ def _backtracking(pattern: str) -> str | None:
                 scan(av, [])
             elif op is c.BRANCH:
                 firsts = [first(alt) for alt in av[1]]
-                # a branch that is empty, or can start as an earlier one does, is one more way at the same position
+                null = [alt.getwidth()[0] == 0 for alt in av[1]]  # can match the empty text, whatever it starts with
+                # a branch that can be empty, or can start as an earlier one does, is one more way at the same position
                 ways[0] *= 1 + sum(
-                    1 for i, f in enumerate(firsts) if i and any(not f or not g or f & g for g in firsts[:i])
+                    1
+                    for i, f in enumerate(firsts)
+                    if i and any(null[i] or null[j] or not f or not firsts[j] or f & firsts[j] for j in range(i))
                 )
                 if ways[0] > MAX_STOP_REGEX_WAYS:
                     raise _Backtracking(
@@ -1231,7 +1238,9 @@ def _backtracking(pattern: str) -> str | None:
                 if lo == hi == 1:
                     live = scan(body, live)
                     continue
-                if hi > 1 and body.getwidth()[1] == 0:
+                # `?` too (an optional empty part is a second way), and an exact count: re runs every mandatory
+                # iteration of an empty body, so (?:){1000000000}X spends seconds and memory on any text
+                if (hi > 1 or lo != hi) and body.getwidth()[1] == 0:
                     raise _Backtracking("it repeats a part that matches only the empty text")
                 if hi > 1 and not one_way(body):
                     raise _Backtracking(
