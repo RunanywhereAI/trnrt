@@ -293,6 +293,47 @@ def tool_choice_error(tool_choice) -> str | None:
     return f'Invalid value for `tool_choice`: {tool_choice}! Only "none" and "auto" are supported.'
 
 
+def tools_error(tools) -> str | None:
+    """None when `tools` is the OpenAI tools array this server can render, else why not. Both the chat template and
+    the parser index into each entry's `function`, so a malformed entry either raises inside apply_chat_template (a
+    500: _template_ids catches only jinja2.TemplateError) or renders a different prompt without a word; invariant 7
+    refuses it here instead. Absent and null are no tools, and an empty array is allowed, as OpenAI's schema does; an
+    entry's `type` defaults to "function"."""
+    if tools is None:
+        return None
+    if not isinstance(tools, list):
+        return "`tools` must be an array of function definitions"
+    for i, tool in enumerate(tools):
+        if not isinstance(tool, dict):
+            return f"`tools[{i}]` must be an object"
+        if tool.get("type", "function") != "function":
+            return f'`tools[{i}].type` must be "function"'
+        fn = tool.get("function")
+        if not isinstance(fn, dict):
+            return f"`tools[{i}].function` must be an object"
+        name = fn.get("name")
+        # up to 128: the Messages API's limit (its tools come through here too), above OpenAI's 64
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", name):
+            return f"`tools[{i}].function.name` must be 1-128 characters from [A-Za-z0-9_-]"
+        params = fn.get("parameters")
+        if params is not None:
+            if not isinstance(params, dict):
+                return f"`tools[{i}].function.parameters` must be an object"
+            if not isinstance(params.get("properties", {}), dict):
+                return f"`tools[{i}].function.parameters.properties` must be an object"
+        if fn.get("description") is not None and not isinstance(fn["description"], str):
+            return f"`tools[{i}].function.description` must be a string"
+        strict = fn.get("strict")
+        if strict is not None and not isinstance(strict, bool):
+            return f"`tools[{i}].function.strict` must be true or false"
+        if strict is True:
+            return (
+                f"`tools[{i}].function.strict` is not supported: this server does not run the constrained decoding "
+                "it asks for. Send false or omit it."
+            )
+    return None
+
+
 def chat_finish_reason(finish: str | None, called: bool) -> str | None:
     """The finish reason: "tool_calls" once a call was parsed, but only when the model stopped by itself.
     A request cut off by its token limit stays "length" even when it holds a call: that call may be truncated (the

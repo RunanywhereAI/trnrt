@@ -23,6 +23,9 @@ curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -
   `"low"`, `"high"` or `"max"`, the default. Other values are refused, since the template would answer them at max.
 - `max_tokens` counts reasoning too. Without it, a chat request may generate up to the rest of the context
   (`--max-model-len` minus the prompt); a completion stops at 16 tokens, the OpenAI API's default.
+  A `max_new_tokens` in the checkpoint's `generation_config.json` caps both defaults (`--generation-config none`
+  turns it off with the other defaults): with 32 there, a chat request without `max_tokens` or
+  `max_completion_tokens` generates at most 32 tokens. A request's own limit is not capped.
 - Sampling defaults come from the checkpoint's `generation_config.json`: a request that sets no
   `temperature`, `top_p`, `top_k` or `min_p` gets the checkpoint's value (GLM-5.3-Flash: temperature 1.0, top_p 0.95).
   Without one, temperature and top_p are 1.0. `--generation-config none` turns the checkpoint's values off and
@@ -46,8 +49,12 @@ curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -
 - Structured outputs, penalties, `min_tokens` and thinking budgets need an engine started with `--structured-outputs` or
   `--penalties` ([below](#structured-outputs-penalties-and-thinking-budgets)); otherwise they are answered with 400,
   naming the flag.
-- Not supported, answered with 400: `tool_choice` `"required"` or a named tool, prompt logprobs (`prompt_logprobs`,
-  `echo` with `logprobs`), and `min_new_tokens` on the OpenAI endpoints (use `min_tokens`).
+- Not supported, answered with 400: `tool_choice` `"required"` or a named tool, a function tool with `strict: true`
+  (no tool-call grammar is served: send `false` or leave it out, on `/v1/responses` too), prompt logprobs
+  (`prompt_logprobs`, `echo` with `logprobs`), and `min_new_tokens` on the OpenAI endpoints (use `min_tokens`).
+- `tools` must be an array of function tools whose `name` is 1-128 characters of `[A-Za-z0-9_-]`, with an object
+  `parameters` when given; `parallel_tool_calls` is `true`, `false` or null. Null `tools` and null `parameters` are the
+  same as leaving them out. Anything else is a 400 naming the field.
 - An unknown request field is answered with 400 naming it, never ignored. So is a field of the other endpoint
   (`prompt` on a chat request, `messages`, `tools` or `top_logprobs` on a completion). `model`, `user`,
   `safety_identifier`, `metadata`, `store` and `prompt_cache_key` are accepted and do not change the output.

@@ -211,6 +211,67 @@ def test_chat_returns_reasoning_content_and_a_tool_call(serve):
     }
 
 
+def test_malformed_tools_and_parallel_tool_calls_are_400(serve):
+    """A tools entry the template or parser cannot read, and a non-boolean parallel_tool_calls, are refused before
+    the engine. The first was a template 500 (or, where the template ignores tools, a silently different prompt);
+    the second silently kept parallel calls (AGENTS.md invariant 7)."""
+    client, eng = serve(PLAIN)
+    body = {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 8}
+    for tools in (
+        "notalist",
+        [1],
+        [{"type": "function"}],
+        [{"type": "function", "function": {}}],
+        [{"type": "function", "function": {"name": ""}}],
+        [{"type": "function", "function": {"name": "bad name"}}],
+        [{"type": "function", "function": {"name": "f", "parameters": "x"}}],
+        [{"type": "function", "function": {"name": "f", "parameters": {"properties": ["x"]}}}],
+        [{"type": "function", "function": {"name": "f", "description": 1}}],
+        [{"type": "function", "function": {"name": "f", "strict": True}}],
+        [{"type": "function", "function": {"name": "f", "strict": "true"}}],
+        [{"type": "function", "function": {"name": "f", "strict": 1}}],
+        [{"type": "function", "function": {"name": "f", "strict": {}}}],
+        [{"type": "nope", "function": {"name": "f"}}],
+    ):
+        r = client.post("/v1/chat/completions", json={**body, "tools": tools})
+        assert r.status_code == 400, (tools, r.status_code, r.text)
+        assert "tools" in r.json()["detail"], (tools, r.json())
+    for value in ("false", 0, 1, {}):
+        r = client.post("/v1/chat/completions", json={**body, "parallel_tool_calls": value})
+        assert r.status_code == 400, (value, r.status_code, r.text)
+        assert "parallel_tool_calls" in r.json()["detail"], (value, r.json())
+    r = client.post("/v1/chat/completions", json={**body, "tools": "notalist", "tool_choice": "none"})
+    assert r.status_code == 400 and "tools" in r.json()["detail"], r.text  # malformed, whatever tool_choice says
+    r = client.post("/v1/chat/completions", json={**body, "messages": {"role": "user", "content": "hi"}})
+    assert r.status_code == 400 and "messages must be an array" in r.json()["detail"], r.text  # was a 500
+    for messages in ("", 0):  # falsy, but sent: still the wrong type
+        r = client.post("/v1/chat/completions", json={**body, "messages": messages})
+        assert r.status_code == 400 and "messages must be an array" in r.json()["detail"], (messages, r.text)
+    r = client.post(
+        "/v1/chat/completions", json={**body, "tools": [{"type": "function", "function": {"name": "f" * 129}}]}
+    )
+    assert r.status_code == 400 and "1-128" in r.json()["detail"], r.text
+    assert eng.added == []  # none reached the engine
+    r = client.post("/v1/chat/completions", json={**body, "tools": TOOLS, "tool_choice": "none"})
+    assert r.status_code == 200, r.text  # well-formed tools are discarded with tool_choice "none"
+    for value in (False, None):  # null is unset, as every other field: parallel calls stay on
+        r = client.post("/v1/chat/completions", json={**body, "tools": TOOLS, "parallel_tool_calls": value})
+        assert r.status_code == 200, (value, r.text)
+    for tools in (  # what OpenAI's schema allows: an empty array, null, no type, no parameters
+        [],
+        None,
+        [{"function": {"name": "f"}}],
+        [{"type": "function", "function": {"name": "f", "parameters": None}}],
+        [{"type": "function", "function": {"name": "f" * 128}}],  # the Messages API's longest name
+    ):
+        r = client.post("/v1/chat/completions", json={**body, "tools": tools})
+        assert r.status_code == 200, (tools, r.text)
+    for neutral_strict in (False, None):
+        neutral = [{"type": "function", "function": {"name": "f", "strict": neutral_strict}}]
+        r = client.post("/v1/chat/completions", json={**body, "tools": neutral})
+        assert r.status_code == 200, (neutral_strict, r.text)  # false and null are neutral, not unsupported
+
+
 def test_streamed_chat_gives_the_same_message_and_a_usage_chunk_when_asked(serve):
     client, _ = serve(TOOL_TURN)
     body = {
@@ -634,6 +695,62 @@ def test_the_checkpoints_generation_config_sets_the_sampling_defaults(serve, tmp
     assert params_with({"temperature": 0.6, "top_k": 20, "min_p": 0.05}, msgs) == (0.6, 1.0, 20, 0.05)
     assert params_with({"top_p": 0, "temperature": -1, "top_k": "x"}, msgs) == (1.0, 1.0, 0, 0.0)
     assert params_with(None, msgs) == (1.0, 1.0, 0, 0.0)
+
+
+def test_the_checkpoints_max_new_tokens_caps_a_request_without_a_token_limit(serve, tmp_path):
+    """A request that sets neither max_tokens nor max_completion_tokens generates at most the checkpoint's
+    generation_config.json max_new_tokens; a chat request ran to the end of the context. A request's own
+    limit wins, larger or smaller; a value that is not a positive integer is not used; a completion keeps its default
+    of 16 under a larger value."""
+    from fastapi.testclient import TestClient
+
+    from trnrt.serve import api
+
+    chat = {"messages": [{"role": "user", "content": "hi"}]}
+    text = {"prompt": [1]}
+
+    def max_new(gen: dict | None, body: dict, path: str = "/v1/chat/completions") -> int:
+        d = tmp_path / str(len(list(tmp_path.iterdir())))
+        d.mkdir()
+        if gen is not None:
+            (d / "generation_config.json").write_text(json.dumps(gen))
+        eng = ScriptedEngine(PLAIN)
+        eng.model_path = str(d)
+        with TestClient(api.build_app(eng, "glm")) as c:
+            r = c.post(path, json=body)
+            assert r.status_code == 200, r.text
+        for lp in [lp for lp in api._LOOPS if lp.engine is eng]:
+            lp.stop()
+        return eng.added[-1].params.max_new_tokens
+
+    room = max_new(None, chat)  # no file: the rest of the context
+    assert room > 6
+    assert max_new({"max_new_tokens": 4}, chat) == 4
+    assert max_new({"max_new_tokens": 4}, {**chat, "max_tokens": None}) == 4  # null: unset
+    assert max_new({"max_new_tokens": 4}, {**chat, "max_tokens": 6}) == 6
+    assert max_new({"max_new_tokens": 4}, {**chat, "max_completion_tokens": 2}) == 2
+    assert max_new({"max_new_tokens": 4}, {**chat, "max_completion_tokens": 6}) == 6  # larger: still the request's
+    assert max_new({"max_new_tokens": 4}, {**chat, "max_completion_tokens": None}) == 4
+    assert max_new({"max_new_tokens": room + 1000}, chat) == room  # never past the context
+    for bad in (0, -5, 4.0, "4", True):
+        assert max_new({"max_new_tokens": bad}, chat) == room
+    assert max_new({"max_new_tokens": 8}, text, "/v1/completions") == 8
+    assert max_new({"max_new_tokens": 32}, text, "/v1/completions") == 16  # the completions default is the smaller
+    assert max_new({"max_new_tokens": 8}, {**text, "max_tokens": 20}, "/v1/completions") == 20
+
+    d = tmp_path / "info"
+    d.mkdir()
+    (d / "generation_config.json").write_text(json.dumps({"max_new_tokens": 4, "temperature": 0.6}))
+    for kw, want_max, want_info in (({}, 4, {"temperature": 0.6}), ({"generation_config": "none"}, room, None)):
+        eng = ScriptedEngine(PLAIN)
+        eng.model_path = str(d)
+        with TestClient(api.build_app(eng, "glm", **kw)) as c:
+            assert c.post("/v1/chat/completions", json=chat).status_code == 200
+            # /model_info gives sampling defaults only: a client sending max_new_tokens back would set a limit
+            assert c.get("/model_info").json()["preferred_sampling_params"] == want_info
+        for lp in [lp for lp in api._LOOPS if lp.engine is eng]:
+            lp.stop()
+        assert eng.added[-1].params.max_new_tokens == want_max  # none drops the cap with the other defaults
 
 
 def test_generation_config_none_keeps_the_servers_sampling_defaults(tmp_path):

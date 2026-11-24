@@ -73,6 +73,7 @@ from .parsers import (
     parse_full,
     template_messages,
     tool_choice_error,
+    tools_error,
 )
 from .prodlog import ProdLog
 from .prompt_cache import PromptCache
@@ -889,7 +890,8 @@ def generation_defaults(model_path: str | None) -> dict[str, float]:
     """The checkpoint's sampling defaults, from its generation_config.json, for a request that sets none.
     GLM-5.3-Flash's (eb9eb208) sets temperature 1.0 and top_p 0.95, so a
     request without top_p sampled the whole candidate set at top_p 1.0. A value of the wrong type or out of range is
-    left out (the server's own default stands) and logged; no file, no defaults."""
+    left out (the server's own default stands) and logged; no file, no defaults. Its max_new_tokens, a positive
+    integer, comes back too: the most a request that sets no token limit may generate (_params)."""
     if not model_path:
         return {}
     path = os.path.join(model_path, "generation_config.json")
@@ -910,6 +912,11 @@ def generation_defaults(model_path: str | None) -> dict[str, float]:
             out[k] = v
         else:
             logger.warning("trnrt: %s sets %s to %r, out of range; not used as a default", path, k, v)
+    max_new = gen.get("max_new_tokens") if isinstance(gen, dict) else None
+    if type(max_new) is int and max_new >= 1:
+        out["max_new_tokens"] = max_new
+    elif max_new is not None:
+        logger.warning("trnrt: %s sets max_new_tokens to %r, not a positive integer; not used", path, max_new)
     return out
 
 
@@ -918,7 +925,8 @@ def _params(
 ) -> SamplingParams:
     """A request's sampling. Every field is checked here, before the request is queued: 400 for a value of the wrong
     type or out of range, and the default for a null. default_max is used when the request sets no max_tokens;
-    `defaults` (generation_defaults) replace the server's own temperature, top_p, top_k and min_p defaults."""
+    `defaults` (generation_defaults) replace the server's own temperature, top_p, top_k and min_p defaults, and their
+    max_new_tokens caps default_max. A request's own max_tokens or max_completion_tokens is not capped."""
     d = defaults or {}
     asked = _refused(body)
     if asked:
@@ -939,6 +947,7 @@ def _params(
         logprobs = None if body.get("logprobs") is False else _int(body, "logprobs", None, 0, 20)
     max_new = _int(body, "max_tokens", None, 1)
     if max_new is None:
+        default_max = min(default_max, int(d.get("max_new_tokens", default_max)))
         max_new = _int(body, "max_completion_tokens", default_max, 1)
     min_tokens = _int(body, "min_tokens", 0, 0)
     if min_tokens > max_new:
@@ -1421,8 +1430,10 @@ def chat_prompt(tok, body: dict, cache: PromptCache | None = None) -> tuple[list
     is parsed with. HTTPException 400 on a malformed request. With `cache` (TRNRT_PROMPT_CACHE_MB) the ids come through
     the prompt token cache, the same ids."""
     messages = body.get("messages")
-    if not messages:
+    if messages is None or messages == []:
         raise HTTPException(status_code=400, detail="messages is required")
+    if not isinstance(messages, list):
+        raise _bad("messages must be an array")
     try:
         messages = template_messages(messages, developer_to_system=not template_knows_developer(tok))
     except ValueError as e:
@@ -1432,8 +1443,14 @@ def chat_prompt(tok, body: dict, cache: PromptCache | None = None) -> tuple[list
     error = tool_choice_error(tool_choice)
     if error:
         raise HTTPException(status_code=400, detail=error)
-    tools = body.get("tools") if tool_choice != "none" else None
-    if tools:
+    tools = body.get("tools")
+    error = tools_error(tools)  # with tool_choice "none" too: a malformed field is refused whatever else is sent
+    if error:
+        raise _bad(error)
+    parallel = _flag(body, "parallel_tool_calls", default=True)  # checked before the prompt is rendered
+    if tool_choice == "none":
+        tools = None  # rendered and parsed as if the request sent none, as before
+    elif tools:
         kwargs["tools"] = tools
     if cache is not None and cache.off is None:
         ids = _cached_ids(tok, messages, kwargs, cache, body.get("session_id"))
@@ -1452,7 +1469,7 @@ def chat_prompt(tok, body: dict, cache: PromptCache | None = None) -> tuple[list
         "tools": bool(tools),
         "thinking_open": tail.endswith(THINK_OPEN),
         "tool_defs": tools,
-        "parallel_tool_calls": body.get("parallel_tool_calls") is not False,
+        "parallel_tool_calls": parallel,
     }
     return ids, parse
 
