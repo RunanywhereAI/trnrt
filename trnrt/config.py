@@ -42,7 +42,7 @@ class EngineConfig:
     model_revision: str | None = None
     device: str = "cpu"  # "cpu" or "neuron"
     dtype: torch.dtype = torch.bfloat16
-    # "auto" stores KV in the model dtype; "fp8" in float8 e4m3 (vLLM / SGLang --kv-cache-dtype fp8), halving the KV
+    # "auto" stores KV in the model dtype; "fp8" in float8 e4m3 (--kv-cache-dtype fp8), 1 byte/value, halving the KV
     # bytes every decode step reads.
     kv_cache_dtype: str = "auto"
     page_size: int = 32
@@ -127,8 +127,8 @@ class EngineConfig:
     # own. Verification stays real; accepted positions still take their drafts. For comparing serving throughput at a
     # published acceptance length, not for quality. The command line reads TRNRT_SPEC_SYNTH_AL when --spec-synth-al is absent.
     spec_synth_al: float | None = None
-    # Dynamic speculation (the idea of vLLM's num_speculative_tokens_per_batch_size: no drafts above a batch size, here with
-    # hysteresis): while at most this many requests decode they speculate, above it every decode step is the plain graph
+    # Dynamic speculation: no drafts above a batch size, with hysteresis, so a batch hovering at the threshold does not flip
+    # every step. While at most this many requests decode, they speculate, above it every decode step is the plain graph
     # (0: always speculate). Once plain, speculation returns when at most spec_max_batch - spec_hysteresis requests decode.
     # A flip drains the step in flight.
     spec_max_batch: int = 0

@@ -76,7 +76,7 @@ def neuronx_cc_args(kv_dtype: torch.dtype, fp8_weights: bool = False) -> list[st
     trn2 FP8 is e4m3 with inf (max 240) and torch has no such dtype, so an fp8 KV cache or FP8 weights are
     float8_e4m3fn in the graph, which neuronx-cc rejects there: "[NCC_EVRF051] Data type F8E4M3FN is not supported
     on TRN1/TRN2 ... use the --experimental-unsafe-fp8e4m3fn-as-fp8e4m3 flag" (SDK 2.32). The values are clamped to
-    240 on write, so the cast is exact. trnrt/platform.py adds --logical-nc-config and vllm-neuron's argument set."""
+    240 on write, so the cast is exact. trnrt/platform.py adds --logical-nc-config and its own fixed argument set."""
     from .. import platform
 
     args = platform.neuronx_cc_args(platform.runtime_target(), fp8=kv_dtype == torch.float8_e4m3fn or fp8_weights)
@@ -413,7 +413,7 @@ def alloc_kv(shapes, slots: int, dtype, device):
 
 def state_checkpoint_rows(ecfg: EngineConfig) -> int:
     """Rows of a recurrent model's state pool kept for prefix-cache checkpoints: the configured
-    count, else twice max_num_seqs (SGLang v0.5.21 int8_mamba_ckpt_size's default: 2x the active
+    count, else twice max_num_seqs (2x the active
     mamba pool)."""
     return ecfg.state_checkpoints if ecfg.state_checkpoints is not None else 2 * ecfg.max_num_seqs
 
@@ -499,7 +499,7 @@ class ModelRunner:
         self._free_slots = list(range(n_slots - 2, -1, -1))
         self._slot: dict[str, int] = {}
         self.compile_seconds: dict[tuple, float] = {}
-        self.exec_counts: dict[tuple, int] = {}  # graph executions by key (vllm-neuron's neff_execution_count)
+        self.exec_counts: dict[tuple, int] = {}  # graph executions by key (the neff execution count per graph)
         self.calls: dict[tuple, int] = defaultdict(int)
         # meta: trnrt/compile/capture.py traces the device run's graphs on a host without NeuronCores, through
         # a backend that writes each graph's HLO into the compile cache instead of compiling it.

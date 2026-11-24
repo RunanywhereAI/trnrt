@@ -48,8 +48,8 @@ def quantize_fp8_rows(w: torch.Tensor, bk: int = 128):
 def fit_e4m3_max(w: torch.Tensor, scale: torch.Tensor, max_finite: float = 240.0, row_group: int | None = None):
     """Checkpoint FP8 is e4m3fn (max 448); trn2 FP8 is e4m3 with inf (max 240), which
     neuronx-cc only accepts e4m3fn graphs as under --experimental-unsafe-fp8e4m3fn-as-fp8e4m3
-    ("unsafe" because the larger fn values do not fit; AWS's vllm-neuron clamps to 240 before
-    it for that reason). Halve the values of any (row, block) whose max exceeds max_finite and
+    ("unsafe" because the larger fn values do not fit, so values must be brought within 240 before
+    it). Halve the values of any (row, block) whose max exceeds max_finite and
     double its scale: exact for every normal e4m3 value (448 / 2 = 224).
 
     row_group g: decide the halving per (g consecutive rows, block) instead, where the scales are

@@ -4,17 +4,17 @@ the prefill path of GLM-5.3-Flash's KDA layers (models/linear_attn.py).
 What it computes is linear_attn.chunk_scan's: for every v head, from its state S [Dk, Dv],
     S_t = diag(exp(g_t)) S_{t-1} + k_t (beta_t (v_t - (diag(exp(g_t)) S_{t-1})^T k_t))^T,  o_t = S_t^T q_t
 with per-channel log decays g [T, H, Dk] (KDA) or one per head g [T, H] (GDN), returning o and the
-final S. Every per-chunk quantity is the chunked form of flash-linear-attention (fla, MIT,
-https://github.com/fla-org/flash-linear-attention at 3e52d5a): fla/ops/kda/chunk_fwd.py chunk_kda_fwd
-(intra-chunk A = beta k k^T and Aqk = q k^T under the decay, chunk_kda_fwd_intra in
-fla/ops/kda/chunk_intra.py; the UT transform T = (I + A)^-1 and w = T (beta k exp(G)), u = T (beta v),
-fla/ops/kda/wy_fast.py recompute_w_u_fwd and fla/ops/utils/solve_tril.py; the state recurrence
-fla/ops/common/chunk_delta_h.py chunk_gated_delta_rule_fwd_h; the output fla/ops/gla/chunk.py
-chunk_gla_fwd_o_gk), which vLLM v0.30.0 (vllm/third_party/flash_linear_attention/ops/kda.py,
-vllm/models/glm5next/nvidia/kda.py: chunk_kda_with_fused_gate(..., safe_gate=True)) and SGLang
-v0.5.21 (python/sglang/kernels/ops/attention/fla/kda.py, chunk_intra.py, chunk_delta_h.py,
-wy_fast.py; GDN: fla/chunk.py) carry as Triton kernels. What differs here is how each piece is laid
-onto a 128 x 128 systolic array, vector and scalar engines:
+final S. Every per-chunk quantity is the chunked form of
+flash-linear-attention (fla, MIT,
+https://github.com/fla-org/flash-linear-attention at 3e52d5a):
+fla/ops/kda/chunk_fwd.py chunk_kda_fwd (intra-chunk A = beta k k^T and Aqk = q
+k^T under the decay, chunk_kda_fwd_intra in fla/ops/kda/chunk_intra.py; the UT
+transform T = (I + A)^-1 and w = T (beta k exp(G)), u = T (beta v),
+fla/ops/kda/wy_fast.py recompute_w_u_fwd and fla/ops/utils/solve_tril.py; the
+state recurrence fla/ops/common/chunk_delta_h.py chunk_gated_delta_rule_fwd_h;
+the output fla/ops/gla/chunk.py chunk_gla_fwd_o_gk),, which exist there as
+Triton kernels. What differs here is how each piece is laid onto a 128 x 128
+systolic array, vector and scalar engines:
 
 - Chunks of L = 128 tokens (fla uses 64): every chunk matrix is one [128, 128] tile. All matmuls
   are float32 (measured exact to 1.6e-7 relative on trn1), a transpose is

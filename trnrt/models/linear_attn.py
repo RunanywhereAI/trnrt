@@ -179,8 +179,8 @@ def _unit_lower_inverse(N: torch.Tensor, eye: torch.Tensor) -> torch.Tensor:
 
     Blocks of up to INVERSE_BASE rows are inverted as I + N + ... + N^(b-1) = (I + N)(I + N^2)
     (I + N^4)...; larger ones by merging halves, [[A, 0], [C, D]]^-1 = [[A^-1, 0], [-D^-1 C A^-1,
-    D^-1]] (fla's solve_tril: 16 x 16 diagonal blocks merged into 32 and 64, vLLM v0.30.0
-    third_party/flash_linear_attention/ops/solve_tril.py). Repeated squaring over a whole sub-chunk
+    D^-1]] (fla's solve_tril: 16 x 16 diagonal blocks merged into 32 and 64).
+    Repeated squaring over a whole sub-chunk
     is exact algebra but not exact arithmetic: the powers of N grow like binomial coefficients
     before they cancel, and with real weights (63 tokens, fp32) one sub-chunk of 64 came out wrong
     by 9.5e7 (32: 0.21, 16: 1.8e-6) against the token-by-token recurrence; the blocked form is
@@ -300,9 +300,9 @@ def verify_scan(q, k, v, g, beta, S):
     """B sequences x Q tokens each, from their own state (speculative verify): q, k [B, Q, H, Dk] (q scaled),
     v [B, Q, H, Dv], g [B, Q, H, Dk], beta [B, Q, H], S [B, H, Dk, Dv]; fp32. recurrent_step once per position, the
     decode step's own arithmetic. Returns o [B, Q, H, Dv] and the state after EVERY position, [B, Q, H, Dk, Dv]: a
-    rejected draft is rolled back by continuing from the state after the last accepted position (vLLM v0.30.0
-    v1/attention/backends/gdn_attn.py spec_state_indices_tensor: num_spec + 1 state slots per request, the next step
-    reading the one at num_accepted_tokens - 1; SGLang v0.5.21 mem_cache/memory_pool.py intermediate_ssm_state_cache,
+    rejected draft is rolled back by continuing from the state after the last accepted position
+    (num_spec + 1 state slots per request, the next step
+    reading the one at num_accepted_tokens - 1;
     one state per draft token)."""
     outs, states = [], []
     for t in range(k.shape[1]):

@@ -128,8 +128,8 @@ def final(model, h: torch.Tensor) -> torch.Tensor:
     return rms_norm(streams.view(T, hy.hc, H).mean(dim=1), model.norm, cfg.rms_norm_eps)
 
 
-# How the hyper-connection stream arithmetic is written: vLLM v0.30.0's numerics
-# (vllm/model_executor/kernels/mhc/torch.py, mhc_pre_torch / mhc_post_torch) with no [T, hc * H] fp32 temporary and no
+# How the hyper-connection stream arithmetic is written: pre (collapse) and post
+# (stream update) steps are plain torch ops on separate [T, H] rows in fp32, with no [T, hc * H] fp32 temporary and no
 # per-token batched matmul. The RMS scale multiplies the [T, 2 hc + hc^2] logits after the fp32 projection (one scalar
 # per token, (x r) W^T = (x W^T) r), the collapse is hc per-token multiply-adds of [T, H] rows in fp32, and each output
 # stream post_n y + sum_m comb[m, n] S_m is accumulated in fp32 from [T, H] rows. The collapse and the streams are

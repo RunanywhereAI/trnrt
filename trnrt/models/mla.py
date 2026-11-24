@@ -14,8 +14,8 @@ its pool gate logits). Decode attends over the latent directly by weight absorpt
 W_UK^T q_nope; out = W_UV (p @ c)), so the per-head keys and values are never formed; a prefill
 chunk on the host decompresses its context.
 
-Tensor parallelism is SGLang v0.5.21's and vLLM v0.30.0's layout (srt/models/deepseek_v2.py
-DeepseekV2AttentionMLA; vllm/model_executor/models/deepseek_v2.py DeepseekV2MLAAttention):
+Tensor parallelism splits only the heads of the
+DeepSeek-V2-style MLA layer:
 q_a_proj and kv_a_proj_with_mqa are ReplicatedLinear, q_b_proj and kv_b_proj are
 ColumnParallelLinear over heads, o_proj is RowParallelLinear; so every rank computes the same
 latent, and only the heads are split, over the attention TP.
@@ -193,7 +193,7 @@ def init_layer(layer, cfg: ModelConfig, spec: AttnSpec, p, lin, tp: int) -> None
     H, nh = cfg.hidden_size, spec.num_heads // tp
     dn, dr, dv, r = m.qk_nope_head_dim, m.qk_rope_head_dim, m.v_head_dim, m.kv_lora_rank
     layer.nh, layer.nkv, layer.kv_offset = nh, 1, 0
-    # q_a_proj and kv_a_proj_with_mqa read the same input and are replicated: one matmul (vLLM's
+    # q_a_proj and kv_a_proj_with_mqa read the same input and are replicated: one matmul (called
     # fused_qkv_a_proj).
     lin("w_a", "self_attn.q_a_proj", m.q_lora_rank + r + dr, H)
     layer.q_a_norm = p(m.q_lora_rank)
