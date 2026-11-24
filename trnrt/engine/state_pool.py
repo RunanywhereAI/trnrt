@@ -21,9 +21,7 @@ otherwise it is one row past the pool, which the KDA kernels' hardware-DMA reads
 
 Speculative decoding: a request in a speculative seat holds `rows_per_req` = 1 + k consecutive rows. The verify graph
 reads its CURRENT row and writes the state after each of its 1 + k positions into its rows in order, and the row after the
-last accepted position becomes current (`set_current`), so a rejected draft costs no copy. vLLM keeps the same layout for its
-gated-delta-net layers (`vllm/v1/attention/backends/gdn_attn.py`: num_spec + 1 state slots per request; see
-THIRD_PARTY_NOTICES.md, "Designs followed").
+last accepted position becomes current (`set_current`), so a rejected draft costs no copy.
 
 Seats: under dynamic speculation (`EngineConfig.spec_max_batch`) at most that many requests speculate at once, so only
 `spec_seats` seats need 1 + k rows and the others are plain seats of one row. A request takes the kind the engine prefers
@@ -34,8 +32,7 @@ flip, right after it drains the step in flight, moves every running request out 
 
 State checkpoints (the prefix cache of these models): the checkpoint rows hold the state of
 all linear layers after a page-aligned prefix, one per radix node that has one
-(engine/radix_cache.py RadixNode.ckpt; SGLang v0.5.21 mem_cache/unified_cache/components/
-mamba.py keeps one state per node the same way). They are written and read by copying whole
+(engine/radix_cache.py RadixNode.ckpt). They are written and read by copying whole
 rows on the device (ModelRunner.copy_state).
 """
 

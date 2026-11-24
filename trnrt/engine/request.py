@@ -26,7 +26,7 @@ class SamplingParams:
     stop_token_ids: tuple[int, ...] = ()
     ignore_eos: bool = False
     seed: int | None = None
-    # vLLM's thinking_token_budget. Not served: unsupported() refuses any value but None.
+    # thinking_token_budget is not served: unsupported() refuses any value but None.
     thinking_token_budget: int | None = None
 
 
@@ -55,8 +55,8 @@ class Request:
     prompt_ids: list[int]
     params: SamplingParams
     arrival_time: float = field(default_factory=time.monotonic)
-    # SGLang's top-level session_id: a finished request's prefix stays referenced by its
-    # session (soft eviction protection) until the session is closed.
+    # A finished request's prefix stays referenced by its session (soft eviction protection) until the session
+    # is closed.
     session_id: str | None = None
     session_gen: int = -1
 

@@ -2,8 +2,7 @@
 
 Every step runs all decoding sequences (one query token each) and, within a token budget,
 chunks of prefill. Decodes never pause for a prefill, which bounds inter-token latency by
-the chunk size; the managed Neuron scheduler instead runs one prefill per step and pauses
-decodes during it (vllm-neuron docs, "neuron-scheduler").
+the chunk size.
 
 Admission reserves KV for what the running requests will need (SchedulerConfig.admission_decode_tokens),
 so a KV-short pool runs fewer requests instead of admitting prompts it must later preempt. When the
@@ -13,11 +12,10 @@ radix cache, so the recompute resumes from its last state checkpoint.
 State checkpoints. GLM-5.3-Flash's linear-attention (KDA) layers resume a prefix only from a state
 checkpoint (engine/state_pool.py, RadixNode.ckpt), so a prefill leaves one at:
 - the radix junction past the last checkpoint of a request's matched path (another request shares
-  those tokens: SGLang v0.5.21 unified_cache/components/mamba.py mamba_branching_seqlen, vLLM v0.30.0
-  Scheduler._mamba_block_aligned_split's shared-prefix junction);
-- the prompt's last page boundary (vLLM's "replay boundary"): the prompt-end checkpoint, from which a
+  those tokens);
+- the prompt's last page boundary: the prompt-end checkpoint, from which a
   session's next turn resumes when its replay of this turn's reply differs from the cached tokens;
-and decode leaves one at every page boundary it crosses (SGLang mamba_track_interval at the page size),
+and decode leaves one at every page boundary it crosses,
 the newest superseding the older, so a finished turn leaves the state after its last full page for the
 next turn to resume from.
 
@@ -73,8 +71,7 @@ class SchedulerConfig:
     # prompt and up to admission_decode_tokens of its decode, on top of what the running requests still
     # need: the rest of their prompts plus up to admission_decode_tokens of decode each (_still_needs).
     # A KV-short pool then runs fewer requests instead of admitting prompts it must later preempt, and
-    # every preemption recomputes from the request's last state checkpoint. (vLLM's v1 scheduler admits
-    # whenever the first chunk fits.)
+    # every preemption recomputes from the request's last state checkpoint.
     admission_decode_tokens: int = 256
     # EngineConfig.max_running: running requests at most (None: max_num_seqs). Admission only, never the graphs' seats.
     max_running: int | None = None
