@@ -74,6 +74,7 @@ builds with `tools/graph_equiv.py` on CPU; the device check of this release's ow
   one shared copy of a page in /dev/shm instead of one each), ascending page allocation (`--pool-ascending`) and the
   checkpoints' share of the host cache (`--host-cache-ckpt-frac`). Host only; on in the balanced and throughput builds.
   An engine with save-once refuses to start when /dev/shm cannot hold its arenas beside those of engines already running.
+  Rank 0's arena and board close with its engine, after its step thread has stopped, not first among the exit hooks.
 - `--no-plain-decode`: no plain decode graph, for a build whose speculation never turns off.
 - The runner's side of the DSA selection's row classes: a plain decode batch in class-slot order, and a batch whose rows
   do not fit their classes sent to the next page bucket.
