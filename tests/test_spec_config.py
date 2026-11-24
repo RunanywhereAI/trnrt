@@ -106,6 +106,18 @@ def test_the_latency_build_has_no_plain_launch_path():
         mr.pick_family(9, (4, 8), "plain decode")
 
 
+@pytest.mark.parametrize("flag", ["structured_outputs", "penalties"])
+def test_host_input_graphs_are_a_plain_launch_path(flag):
+    """A request with a mask or penalties steps plain, so no plain decode graph is refused with either flag on (EngineConfig
+    refuses the pair first; this covers a configuration built past it)."""
+    import copy
+
+    c = copy.copy(_cfg("--preset", "latency"))
+    setattr(c, flag, True)
+    why = mr.plain_none_refusal(c)
+    assert why is not None and "structured_outputs or penalties" in why, why
+
+
 def test_dynamic_plain_mode_cannot_start_under_the_running_cap():
     """LLMEngine._dyn_want_plain is False at every decoding count the latency build admits (at most its running cap,
     8), and True one above it (the detector can trip)."""

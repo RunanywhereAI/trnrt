@@ -258,7 +258,7 @@ Each needs graphs that take inputs from the host. An engine serves them only whe
 - GLM-5.3-Flash reasons first. The constraint applies to the answer after `</think>`, not to the reasoning.
 - Logprobs stay the raw model's, before the mask and the penalties.
 - A request with penalties, a grammar, or a thinking budget near its end waits for its newest token before each step,
-  so it gives up the overlap of host and device work; the requests beside it keep it. Under the dynamic `mtp-*` presets
-  the engine stops speculating while a request that uses any of these runs.
+  so it gives up the overlap of host and device work; the requests beside it keep it. A build with dynamic speculation
+  stops speculating while a request that uses any of these runs; the latency build refuses them.
 - If a grammar can continue only with text no token spells, the request ends there with `finish_reason` `"stop"`, and a
   warning is logged.

@@ -1610,6 +1610,10 @@ def plain_none_refusal(ecfg: EngineConfig) -> str | None:
         (m >= buckets[-1], f"spec_max_batch {m} < the largest decode bucket {buckets[-1]}"),
         (cap <= m, f"the running cap {cap} > spec_max_batch {m} (dynamic speculation steps plain above it)"),
         (ecfg.state_spec_seats is None, "state_spec_seats is set (a request in a plain seat steps plain)"),
+        (
+            not (getattr(ecfg, "structured_outputs", False) or getattr(ecfg, "penalties", False)),
+            "structured_outputs or penalties is set (a request with a mask or penalties steps plain)",
+        ),
     )
     bad = [why for ok, why in checks if not ok]
     return "; ".join(bad) if bad else None

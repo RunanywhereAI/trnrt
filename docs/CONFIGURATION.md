@@ -157,9 +157,8 @@ docker run ... trnrt serve --model /model --port 8000 --preset latency --max-run
 These need graphs that take inputs from the host, so an engine serves them only when started with the flag. Each flag adds
 graphs to warmup and to the capture: capture with the flags you serve with. With both off, the graphs are meant to be
 the ones an engine without the flags compiles; the graph-equivalence check of that, and a Trainium2 run of the variants,
-are pending (they are tested on CPU). They are refused with speculation at every batch size (`mtp-always`): its verify graph
-takes no mask or penalties. Under the other `mtp-*` presets the engine steps every request plain while one that uses
-them runs.
+are pending (they are tested on CPU). The latency build refuses them: it has no plain decode graph, and its verify graph
+takes no mask or penalties. The balanced and throughput builds serve them on their plain decode graphs.
 
 | Argument | Default | |
 |---|---|---|
@@ -172,10 +171,9 @@ step only, one per prefill bucket):
 
 | Configuration | `--structured-outputs` | `--penalties` (3 rungs) | both |
 |---|---|---|---|
-| default (batch 12) | 18 decode, 4 prefill | 54 decode, 12 prefill | 72 decode, 16 prefill |
-| `--preset batch8` | 15 decode, 4 prefill | 45 decode, 12 prefill | 60 decode, 16 prefill |
-| `mtp-batch8`, `mtp-batch12` | 9 decode, 4 prefill | 27 decode, 12 prefill | 36 decode, 16 prefill |
-| `mtp-batch24` | 6 decode, 4 prefill | 18 decode, 12 prefill | 24 decode, 16 prefill |
+| `balanced` (the default) | 9 decode, 4 prefill | 27 decode, 12 prefill | 36 decode, 16 prefill |
+| `throughput` | 6 decode, 4 prefill | 18 decode, 12 prefill | 24 decode, 16 prefill |
+| `latency` | refused | refused | refused |
 
 These counts follow from the bucket ladders; the variants' device cost (compile time, HBM, step time) is not measured yet.
 

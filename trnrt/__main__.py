@@ -638,7 +638,8 @@ def add_host_sampling_args(ap: argparse.ArgumentParser) -> None:
         "host-input sampling",
         "graph variants that take inputs from the host (docs/API.md#structured-outputs-penalties-and-thinking-budgets). "
         "Graph structure: they add graphs, so a capture must run with the same flags. Not with speculation at every "
-        "batch size (--spec-method without --spec-max-batch)",
+        "batch size (--spec-method without --spec-max-batch) or without plain decode graphs (--preset latency, "
+        "--no-plain-decode)",
     )
     h.add_argument(
         "--structured-outputs",
