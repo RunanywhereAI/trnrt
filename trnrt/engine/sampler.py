@@ -7,7 +7,8 @@ shape. Randomness comes in as uniform noise generated on the host per request, s
 request is reproducible and the graph has no RNG state. Rows with temperature <= 0 are greedy
 over the full vocab.
 
-Logprobs are the log-softmax of the raw model logits, before temperature, penalties and filtering.
+Logprobs are the log-softmax of the raw model logits, before temperature, penalties and
+filtering.
 
 Two forms of the same draw:
 - sample(): from the full logits [B, V];
