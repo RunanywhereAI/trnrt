@@ -209,8 +209,8 @@ that disconnects aborts its request. The router routes it like a completion, by 
 | `rid` | The request's id, which `/abort_request` names. A batch's ids are `rid_0`, `rid_1`, ..., or a list of one per prompt. A rid already running is refused. |
 | `session_id` | As on the OpenAI routes: the router pins the session to one engine. |
 | `return_prompt_token_ids` | Adds `prompt_token_ids` to the response. |
-| `log_metrics` | `false` leaves the request out of `/metrics`. |
-| `no_logs` | `true` keeps the request's record out of the production log (`TRNRT_PROD_DIR`); it is still counted in `/v1/stats`. |
+| `log_metrics` | `false` leaves the request out of `/metrics`, `/v1/stats` and the production log (`TRNRT_PROD_DIR`), as the `/health_generate` probe is. |
+| `no_logs` | `true` keeps the request's record out of the production log alone; it is still counted in `/metrics` and `/v1/stats`. |
 
 The response is one object for one prompt and a list for a batch:
 

@@ -39,7 +39,8 @@ builds with `tools/graph_equiv.py` on CPU; the device check of this release's ow
   characters before the text already searched, so a match must start there or later. Over 2048 characters
   (CPython 3.13, one Apple M3 Max core) the slowest admitted pattern found takes 0.21 s a search, a request 0.4 s
   at every streamed piece; a lookaround over the rest of the text, admitted before, took a second or more.
-- `no_logs` on `/generate`: the request's record stays out of the production log.
+- `no_logs` on `/generate`: the request's record stays out of the production log. `log_metrics: false` leaves it out
+  of `/metrics`, `/v1/stats` and the production log; docs/API.md named only `/metrics`.
 - The OpenAI Responses API, `POST /v1/responses`, stateless: reasoning, message and function-call items, and the
   Responses stream events ([docs/API.md](docs/API.md#responses-api)). A field it does not know is ignored, not
   refused as on `/v1/chat/completions`; its documentation said otherwise.

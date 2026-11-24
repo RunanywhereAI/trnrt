@@ -534,6 +534,26 @@ def test_no_logs_keeps_a_request_out_of_the_production_log(serve, monkeypatch, t
     assert client.post("/generate", json={"input_ids": [1], "no_logs": "yes"}).status_code == 400
 
 
+def test_log_metrics_false_leaves_a_request_out_of_metrics_stats_and_the_log(serve, monkeypatch, tmp_path):
+    """docs/API.md: log_metrics false leaves the request out of /metrics, /v1/stats and the production log alike (the
+    server records it as it records a /health_generate probe: not at all); no_logs only out of the log."""
+    from trnrt.serve import api
+    from trnrt.serve import prodlog as PL
+
+    monkeypatch.setenv(PL.ENV, str(tmp_path))
+    client, eng = serve(PLAIN)
+    r = client.post("/generate", json={"input_ids": [1], "rid": "unseen", "log_metrics": False})
+    assert r.status_code == 200, r.text
+    assert client.post("/generate", json={"input_ids": [1], "rid": "seen"}).status_code == 200
+    (lp,) = [lp for lp in api._LOOPS if lp.engine is eng]
+    _wait_for(lambda: lp.stats.counts["ok"] == 1 and lp.prodlog.written["requests"] == 1)
+    assert lp.stats.counts == {"ok": 1, "aborted": 0, "failed": 0} and lp.stats.records[-1]["rid"] == "seen"
+    assert 'trnrt:request_success_total{finished_reason="stop"} 1' in client.get("/metrics").text
+    lp.stop()
+    (path,) = tmp_path.rglob("requests.jsonl")
+    assert [rec["rid"] for rec in PL.read_jsonl(str(path))] == ["seen"]
+
+
 def test_load_and_info_endpoints(serve):
     client, eng = serve(PLAIN, preset="batch12")
     eng.scheduler.waiting.append(Request("w", [1, 2, 3], SamplingParams()))
