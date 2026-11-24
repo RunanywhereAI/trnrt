@@ -276,9 +276,21 @@ def parse_generate(body: dict, tok, vocab: int, defaults: dict[str, float]) -> t
 class _Run:
     """One prompt of a /generate request in the engine: its output as it arrives, in /generate's shape."""
 
-    def __init__(self, item: _Item, sub: _Submit, tok, text_in_logprobs: bool, prompt_ids: bool, t0: float):
+    def __init__(
+        self,
+        item: _Item,
+        sub: _Submit,
+        tok,
+        text_in_logprobs: bool,
+        prompt_ids: bool,
+        t0: float,
+        eos: tuple[int, ...] = (),
+    ):
         self.item, self.sub, self.tok = item, sub, tok
         self.detok = _Detok(tok, item.params.stop, incremental=True, rid=sub.rid, protect=item.params.min_tokens)
+        # The ids whose token ends the request without being part of its text: EOS and the request's stop ids, as on the
+        # OpenAI routes (api.Run), since no_stop_trim false is the only value /generate serves.
+        self.stop_ids = frozenset(eos) | frozenset(item.params.stop_token_ids)
         self.text_in, self.prompt_ids, self.t0 = text_in_logprobs, prompt_ids, t0
         self.ids: list[int] = []
         # The logprob entries of the output so far, built once per token (a stream's events repeat them all)
@@ -299,7 +311,8 @@ class _Run:
             if self.item.top:
                 self.top_lps += [[self._entry(v, i) for i, v in zip(ti, tl)] for _, ti, tl in lps]
         self.ids += ids
-        delta = self.detok.push(ids, finish is not None)
+        drop = finish == "stop" and bool(ids) and ids[-1] in self.stop_ids
+        delta = self.detok.push(ids, finish is not None, drop_last=drop)
         self.text += delta
         self.finish = finish
         return bool(ids or delta or finish)
@@ -390,6 +403,7 @@ def add_routes(
     """The native routes on the app of one engine (serve/api.py build_app)."""
     engine = loop_.engine
     tok = engine.tokenizer
+    eos = tuple(getattr(engine.mcfg, "eos_token_ids", ()) or ())
     model_type, architectures = _checkpoint_ids(getattr(engine, "model_path", None))
 
     def load() -> dict:
@@ -579,7 +593,7 @@ def add_routes(
                     loop_.abort(s.rid, s.out)
             raise _error(*bad[1:])  # a full queue's 503 keeps QUEUE_FULL_HEADER: the router keeps the engine up
         text_in, prompt_ids = _flag(body, "return_text_in_logprobs"), _flag(body, "return_prompt_token_ids")
-        runs = [_Run(it, s, tok, text_in, prompt_ids, t0) for it, s in zip(items, subs)]
+        runs = [_Run(it, s, tok, text_in, prompt_ids, t0, eos) for it, s in zip(items, subs)]
         for r, f in zip(runs, firsts):
             r.req = f[1]
 

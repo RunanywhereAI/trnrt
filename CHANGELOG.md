@@ -90,7 +90,7 @@ builds with `tools/graph_equiv.py` on CPU; the device check of this release's ow
   compare text by slices instead of one character at a time, so a large request stalls the streams it relays for less
   time (the JSON parser still holds the interpreter lock while it runs).
 - The stop token that ends a request (EOS or a `stop_token_ids` entry) is no longer part of its text when the tokenizer
-  does not mark it special.
+  does not mark it special, on the OpenAI endpoints and on `/generate`.
 - `min_new_tokens` on the OpenAI endpoints and `spaces_between_special_tokens: false` are refused with 400;
   they were ignored.
 - `service_tier` other than `"auto"` or `"default"` is refused with 400 on `/v1/chat/completions`, `/v1/completions`

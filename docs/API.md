@@ -214,7 +214,7 @@ The response is one object for one prompt and a list for a batch:
 
 | Field | Value |
 |---|---|
-| `text` | The output, cut before a stop string. |
+| `text` | The output, cut before a stop string. The stop token that ends the request (EOS or a `stop_token_ids` entry) is not part of it, as on `/v1/completions`. |
 | `output_ids` | The output token ids. |
 | `meta_info.id` | The rid. |
 | `meta_info.finish_reason` | `{"type": "stop", "matched": <stop string or token id>}`, `{"type": "length", "length": n}`, `{"type": "abort", "message": "Aborted"}`, or `null` while a stream runs. |

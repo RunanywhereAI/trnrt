@@ -118,6 +118,39 @@ def test_generate_answers_with_text_output_ids_and_meta_info(serve, method):
     assert p.stop == (" again", "!")
 
 
+@pytest.mark.parametrize("stream", [False, True])
+def test_generate_leaves_the_stop_token_out_of_the_text(serve, stream):
+    """A stop_token_ids entry (or EOS) that ends the request is not part of `text`, as on /v1/completions, even when the
+    tokenizer does not mark it special; output_ids keep it, and finish_reason names it."""
+
+    def text_of(client, body):
+        if not stream:
+            return client.post("/generate", json=body).json()
+        with client.stream("POST", "/generate", json={**body, "stream": True}) as r:
+            events = [json.loads(ln[6:]) for ln in r.iter_lines() if ln.startswith("data: {")]
+        return events[-1]
+
+    client, _ = serve(PLAIN)
+    out = text_of(client, {"input_ids": [1], "sampling_params": {"stop_token_ids": [ID["!"]]}})
+    assert out["text"] == "Hello there again" and out["output_ids"] == PLAIN
+    assert out["meta_info"]["finish_reason"] == {"type": "stop", "matched": ID["!"]}
+    assert text_of(client, {"input_ids": [1]})["text"] == "Hello there again!"  # "!" is no stop token here
+
+    from fastapi.testclient import TestClient
+
+    from trnrt.serve import api
+
+    eos = ScriptedEngine(PLAIN)
+    eos.mcfg.eos_token_ids = (ID["!"],)  # an engine whose EOS is "!", an ordinary token to its tokenizer
+    try:
+        with TestClient(api.build_app(eos, "glm")) as c:
+            out = text_of(c, {"input_ids": [1]})
+            assert out["text"] == "Hello there again" and out["meta_info"]["finish_reason"]["matched"] == ID["!"]
+    finally:
+        for lp in [lp for lp in api._LOOPS if lp.engine is eos]:
+            lp.stop()
+
+
 def test_a_stop_after_min_new_tokens_is_the_one_its_finish_reason_names(serve, monkeypatch):
     """A stop string inside min_new_tokens' protected text does not end the request, so finish_reason names the stop that
     did, not the first one anywhere in the output."""
