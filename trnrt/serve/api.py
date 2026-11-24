@@ -803,9 +803,12 @@ _CHAT_ONLY = frozenset(
     }
 )
 _COMPLETION_ONLY = frozenset({"prompt"})
+# The neutral fields (_NEUTRAL) of one endpoint: the other refuses them like any field it does not know.
+_NEUTRAL_CHAT_ONLY = frozenset({"functions", "function_call", "add_generation_prompt", "continue_final_message"})
+_NEUTRAL_COMPLETION_ONLY = frozenset({"echo", "suffix"})
 _KNOWN = {
-    True: _IGNORED | _READ | _NEUTRAL.keys() | _CHAT_ONLY,
-    False: _IGNORED | _READ | _NEUTRAL.keys() | _COMPLETION_ONLY,
+    True: _IGNORED | _READ | (_NEUTRAL.keys() - _NEUTRAL_COMPLETION_ONLY) | _CHAT_ONLY,
+    False: _IGNORED | _READ | (_NEUTRAL.keys() - _NEUTRAL_CHAT_ONLY) | _COMPLETION_ONLY,
 }
 
 

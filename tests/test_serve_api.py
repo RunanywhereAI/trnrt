@@ -791,9 +791,18 @@ def test_a_field_of_the_other_endpoint_is_refused(serve):
     """`prompt` on a chat request, `messages` or `tools` on a completion: the endpoint would ignore them."""
     client, eng = serve(PLAIN)
     msgs = [{"role": "user", "content": "hi"}]
-    r = client.post("/v1/chat/completions", json={"messages": msgs, "prompt": "x"})
-    assert r.status_code == 400 and "prompt" in r.json()["detail"], r.text
-    for extra in ({"messages": msgs}, {"tools": TOOLS}, {"reasoning_effort": "low"}, {"top_logprobs": 2}):
+    for extra in ({"prompt": "x"}, {"echo": False}, {"suffix": None}):  # a completion's fields, neutral there or not
+        r = client.post("/v1/chat/completions", json={"messages": msgs, **extra})
+        assert r.status_code == 400 and next(iter(extra)) in r.json()["detail"], r.text
+    r = client.post("/v1/chat/completions", json={"prompt": "x"})  # named before "messages is required"
+    assert r.status_code == 400 and "unknown field prompt" in r.json()["detail"], r.text
+    for extra in (
+        {"messages": msgs},
+        {"tools": TOOLS},
+        {"reasoning_effort": "low"},
+        {"top_logprobs": 2},
+        {"functions": []},
+    ):
         r = client.post("/v1/completions", json={"prompt": [1], **extra})
         assert r.status_code == 400 and next(iter(extra)) in r.json()["detail"], r.text
     assert eng.added == []
