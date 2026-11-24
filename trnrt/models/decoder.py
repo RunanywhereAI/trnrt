@@ -277,7 +277,7 @@ class DecoderForCausalLM(nn.Module):
     """Tensor parallelism is Megatron-style over `tp` ranks: the token mixers' and the MLP's input
     projections (each expert's, for MoE layers) are split on their output dim (heads, intermediate), the
     output projections on their input dim followed by an all-reduce. The final norm is replicated. With
-    vocab_parallel (vLLM VocabParallelEmbedding / ParallelLMHead) each rank holds 1 / tp of the
+    vocab_parallel each rank holds 1 / tp of the
     vocabulary rows of the embedding and lm_head: a lookup is a masked local lookup plus an all-reduce,
     and the logits are the local shard gathered, which equals the replicated matmul column for column.
     Every rank samples the same tokens from the same noise and only rank 0's output is read.
@@ -482,7 +482,7 @@ class DecoderForCausalLM(nn.Module):
 
     def _store(self, cache: torch.Tensor, slots: torch.Tensor, x: torch.Tensor) -> None:
         if self.fp8_max is not None:
-            # KV scale 1.0 (vLLM's default without calibration); clamp first, because a
+            # KV scale 1.0 (the default absent any calibration); clamp first, because a
             # finite value past the format's max would become inf / NaN on the cast.
             x = x.float().clamp(-self.fp8_max, self.fp8_max).to(cache.dtype)
         cache.index_put_((slots,), x)
@@ -798,8 +798,8 @@ class DecoderForCausalLM(nn.Module):
 
     # -- piecewise execution: one compiled graph per KIND of layer ---------------------
     #
-    # vLLM compiles its model piecewise (split at attention) and SGLang captures per batch
-    # size; here the unit is a run of whole layers. layer_fn(i) is a pure function of tensors, so
+    # The unit of compilation is a run of whole layers, not a whole model or a batch size.
+    # One layer is traced by itself, not the model: layer_fn(i) is a pure function of tensors, so
     # every layer of one kind (same static attributes, same tensor shapes) traces to the
     # same graph and shares one NEFF.
 
@@ -987,7 +987,7 @@ class DecoderForCausalLM(nn.Module):
 
     def forward_mtp(self, input_ids, positions, block_table, slot_mapping, hsrc, hidx, last_index, src_norm,
                     swa_table=None, swa_first=None):
-        """One MTP pass over B rows x Q positions, in the target's positions (vLLM's EAGLE / MTP convention): row b
+        """One MTP pass over B rows x Q positions, in the target's positions: row b
         position j takes input_ids[b, j], the token AFTER that position, and hsrc[hidx[b, j]], the hidden state of the
         model (or of the previous MTP pass) AT that position; its KV goes to slot_mapping[b, j]. Returns [B, 1] fp32
         greedy drafts from position last_index[b] and the MTP hidden there [B, H], which seeds the next pass."""
@@ -996,7 +996,7 @@ class DecoderForCausalLM(nn.Module):
 
     def _mtp_pass(self, input_ids, positions, block_table, slot_mapping, hsrc, hidx, last_index, src_norm,
                   swa_table=None, swa_first=None, target=False, sp_onehot=None, later=False):
-        """forward_mtp. GLM-5.3-Flash's MTP layer (vLLM v0.30.0 deepseek_mtp.py, SGLang v0.5.21 deepseek_nextn.py):
+        """forward_mtp. GLM-5.3-Flash's MTP layer:
         x = eh_proj(cat(enorm(embed(token after p)), hnorm(h_p))), y = the plain decoder layer (pooled-DSA MLA, MoE +
         shared expert) on x, draft = argmax(lm_head(shared_head.norm(y))), with the target's embedding and lm_head
         (the checkpoint's MTP layer stores neither). h_p is the target's last hidden state after its final norm (target:
@@ -1005,7 +1005,7 @@ class DecoderForCausalLM(nn.Module):
         (kv_layers), written for every position the pass computes, which is how the later passes and the next step see
         them. Its later passes run their own indexer, as in the builds behind the published numbers: the checkpoint's
         index_share_for_mtp_iteration is not used (glm5_next leaves it unparsed, and under context-parallel DSA every
-        bucket takes the long path, which has no shared-selection form), so drafts can differ from vLLM's there (never the
+        bucket takes the long path, which has no shared-selection form), so drafts can differ there (never the
         tokens: verification keeps the target's). sp_onehot: hsrc holds only this
         rank's rows of a sequence-parallel prefill chunk, and hidx indexes the chunk's rows in full. later: whether the
         graph has later passes (forward_mtp_k); unused here, but forward_mtp_k computes it as this call's argument so that
