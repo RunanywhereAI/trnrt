@@ -65,7 +65,7 @@ scoring below. It changes no graph. With the default two engines the box serves 
 Each engine's `GET /v1/stats` carries a `spec` block (drafts proposed and accepted, the mean acceptance length, the
 per-position counts, and the speculation mode's step and flip counts; the latency build never decodes plain, so its
 flips stay at 0), and its `GET /metrics` the same counters as
-`trnrt:spec_decode_*`, under vLLM's metric names. Both are on the engine's own port, `--port` + 1 (8001 here) on
+`trnrt:spec_decode_*`. Both are on the engine's own port, `--port` + 1 (8001 here) on
 127.0.0.1, not on the router's.
 
 ## Benchmark mode
@@ -73,7 +73,7 @@ flips stay at 0), and its `GET /metrics` the same counters as
 InferenceX's AgentX scoring fixes the acceptance of speculative decoding at a golden length instead of measuring the
 draft head's. `--spec-synth-al 2.518506` (or the environment variable `TRNRT_SPEC_SYNTH_AL`) reproduces that: the accepted
 draft count of every verify step is drawn from a minimum-variance schedule whose mean acceptance length (one plus the
-accepted drafts a step) is the given value, after the design of vLLM's synthetic rejection sampler. 2.518506 is the golden
+accepted drafts a step) is the given value. 2.518506 is the golden
 length for 2 draft tokens.
 
 Drafting and verification still run for real, and the step costs what it costs; only which positions count as accepted is

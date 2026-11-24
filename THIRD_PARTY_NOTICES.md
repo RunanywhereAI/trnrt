@@ -25,13 +25,6 @@ for credit, not because their licenses require it.
 | Component | Reference | License of the reference |
 |---|---|---|
 | KDA chunked prefill (the per-chunk quantities of the delta-rule recurrence) | flash-linear-attention, `fla/ops/kda/chunk_fwd.py` (`chunk_kda_fwd`), https://github.com/fla-org/flash-linear-attention | MIT |
-| Radix prefix cache | SGLang's RadixAttention, https://github.com/sgl-project/sglang | Apache-2.0 |
-| Synthetic acceptance (`trnrt/engine/spec_synth.py`): the minimum-variance schedule of accepted draft counts and the conditional-rate rejection walk | vLLM's synthetic rejection sampler, pull request 40662, https://github.com/vllm-project/vllm | Apache-2.0 |
-| One state slot per speculative position of a linear-attention layer, the next step reading the slot of the last accepted token (`trnrt/engine/state_pool.py`) | vLLM v0.30.0, `vllm/v1/attention/backends/gdn_attn.py`, https://github.com/vllm-project/vllm | Apache-2.0 |
-| Speculative steps scheduled before the previous one is read back, with the accepted count, the newest token and the positions kept on the device (`trnrt/engine/spec_async.py`, `trnrt/engine/scheduler.py`) | vLLM v0.30.0, `vllm/v1/core/sched/async_scheduler.py` and the Model Runner V2 state in `vllm/v1/worker/gpu/`, https://github.com/vllm-project/vllm | Apache-2.0 |
-| The same, publishing the new lengths and bonus tokens into a device buffer the next batch gathers from (`trnrt/engine/spec_async.py`) | SGLang v0.5.21, `python/sglang/srt/speculative/eagle_worker_v2.py` and `python/sglang/srt/managers/overlap_utils.py`, https://github.com/sgl-project/sglang | Apache-2.0 |
-| Dynamic speculation: no drafts above a batch size (`EngineConfig.spec_max_batch`, `trnrt/engine/engine.py`) | vLLM v0.30.0, `SpeculativeConfig.num_speculative_tokens_per_batch_size` in `vllm/config/speculative.py`, https://github.com/vllm-project/vllm | Apache-2.0 |
-| GLM tool-call and reasoning parsing behaviour (cross-checked against vLLM's, above) | SGLang v0.5.21 (commit e00930c5489053f26d86b179cee0d087f846acbb): `python/sglang/srt/function_call/glm4_moe_detector.py`, `python/sglang/srt/parser/reasoning_parser.py` | Apache-2.0 |
 
 ## Models and services this code works with
 

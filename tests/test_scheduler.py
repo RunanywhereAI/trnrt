@@ -390,7 +390,7 @@ def test_a_finished_turn_leaves_a_checkpoint_at_its_last_full_page():
 
 def test_session_turns_survive_pressure_that_evicts_other_prefixes():
     """An agent session's previous turn stays cached while one-off traffic churns the pool;
-    the same workload without the session id loses it (SGLang #29173's motivating case)."""
+    the same workload without the session id loses it."""
 
     def workload(session):
         sched = make(num_pages=40, max_seqs=2, budget=64)

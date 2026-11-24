@@ -11,19 +11,16 @@ a tag, so a tag is never streamed as content or reasoning. A tool call is announ
 complete, and its arguments then stream as JSON deltas that only ever extend what was sent. The non-streaming parse
 runs the same machine over the whole text, so both paths return the same calls.
 
-Behaviour follows vLLM v0.30.0 (commit ced6857afa0ea7b2e3f0846a62e1394e90f15607: vllm/parser/glm47_moe.py,
-vllm/parser/engine/parser_engine.py, vllm/tool_parsers/utils.py) where vLLM and SGLang v0.5.21 (commit
-e00930c5489053f26d86b179cee0d087f846acbb: python/sglang/srt/function_call/glm4_moe_detector.py,
-parser/reasoning_parser.py) agree or SGLang has no equivalent. Portions adapted from vLLM,
+Portions adapted from vLLM v0.30.0 (commit ced6857afa0ea7b2e3f0846a62e1394e90f15607: vllm/parser/glm47_moe.py,
+vllm/parser/engine/parser_engine.py, vllm/tool_parsers/utils.py),
 Copyright contributors to the vLLM project, Apache License 2.0; see THIRD_PARTY_NOTICES.md.
-Deliberate differences, each with its reason:
+Details, each with its reason:
 - Whether the output starts inside a reasoning block is read from the rendered prompt, not from an `enable_thinking`
-  default (vLLM assumes thinking on). The two agree whenever the model follows its chat template, and this way a
-  request that turns thinking off through chat_template_kwargs needs no special case.
+  default. The two agree whenever the model follows its chat template, and this way a request that turns thinking off
+  through chat_template_kwargs needs no special case.
 - A tool block that yields no call (no function name, or a name the request did not offer) is returned verbatim as
-  content instead of being dropped (vLLM and SGLang drop it), so the client sees what the model wrote.
-- A call cut off by max_tokens keeps its partial last argument in both paths (vLLM's streaming and non-streaming
-  disagree there).
+  content instead of being dropped, so the client sees what the model wrote.
+- A call cut off by max_tokens keeps its partial last argument in both paths.
 """
 
 from __future__ import annotations
@@ -42,28 +39,26 @@ TOOL_OPEN, TOOL_CLOSE = "<tool_call>", "</tool_call>"
 # https://huggingface.co/zai-org/GLM-5/blob/c183ef8c61faee82855eca1ed9bb3a9a7ce3b0b2/chat_template.jinja). GLM-4.5 and
 # GLM-4.6 put a newline after the name and after each pair
 # (https://huggingface.co/zai-org/GLM-4.5/blob/cbb2c7cfb52fa128a9660cb1a7a78e017899e115/chat_template.jinja), which the
-# parser accepts too, as vLLM's does. Strings are written raw, other values with `tojson`. `<think>`, `<tool_call>` and
+# parser accepts too. Strings are written raw, other values with `tojson`. `<think>`, `<tool_call>` and
 # the four arg tags are added tokens with special=false (tokenizer_config.json), so the server's skip_special_tokens
-# decode keeps them (tests/test_glm53_chat.py checks this on GLM-5.3-Flash's tokenizer). Regexes: vLLM
-# https://github.com/vllm-project/vllm/blob/v0.30.0/vllm/parser/glm47_moe.py, SGLang
-# https://github.com/sgl-project/sglang/blob/v0.5.21/python/sglang/srt/function_call/glm4_moe_detector.py.
+# decode keeps them (tests/test_glm53_chat.py checks this on GLM-5.3-Flash's tokenizer).
 ARG_KEY_OPEN, ARG_KEY_CLOSE = "<arg_key>", "</arg_key>"
 ARG_VALUE_OPEN, ARG_VALUE_CLOSE = "<arg_value>", "</arg_value>"
 _ARG_RE = re.compile(r"<arg_key>(?P<key>.*?)</arg_key>\s*<arg_value>(?P<value>.*?)</arg_value>", re.DOTALL)
 _PARTIAL_ARG_RE = re.compile(r"<arg_key>(?P<key>.*?)</arg_key>\s*<arg_value>(?P<value>.*)$", re.DOTALL)
 
-# Inside reasoning: the end tag ends it; a repeated start tag is absorbed (vLLM glm47 (REASONING, THINK_START)); a tool
-# call opener also ends it, without the end tag (vLLM's (REASONING, TOOL_START) transition, SGLang's tool_start_token).
+# Inside reasoning: the end tag ends it; a repeated start tag is absorbed; a tool call opener also ends it, without the
+# end tag.
 _THINK_TAGS = (THINK_CLOSE, THINK_OPEN, TOOL_OPEN)
 # Every tag that can appear inside a tool block, held back when the text so far ends with part of one.
 _BLOCK_TAGS = (TOOL_CLOSE, ARG_KEY_OPEN, ARG_KEY_CLOSE, ARG_VALUE_OPEN, ARG_VALUE_CLOSE)
 
 
 # ---------------------------------------------------------------------------------------
-# Argument typing (vLLM ParserEngine._fix_arg_types over vllm/tool_parsers/utils.py)
+# Argument typing
 # ---------------------------------------------------------------------------------------
 
-# utils.py _TYPE_ALIASES
+# Schema type names and the type each is read as
 _TYPE_ALIASES = {
     "str": "string",
     "text": "string",
@@ -179,13 +174,12 @@ def _coerce(value: str, types: set[str]):
 
 
 def _args_json(items: list[tuple[str, str, bool]], complete: bool, props: dict) -> str:
-    """The arguments JSON of a call from its (key, raw value, closed) items, values typed by the tool's schema (vLLM
-    ParserEngine._fix_arg_types: only declared keys are retyped, the rest stay strings). While the call is open this is
-    the prefix that cannot change (vLLM _safe_arg_prefix): closed values are final; the value still being written
+    """The arguments JSON of a call from its (key, raw value, closed) items, values typed by the tool's schema
+    (only declared keys are retyped, the rest stay strings). While the call is open this is
+    the prefix that cannot change: closed values are final; the value still being written
     streams only when it will stay a string, otherwise its key waits with it; the closing brace waits for the call to
     end. Same separators as json.dumps, so the complete text is json.dumps of the arguments. A repeated key is written
-    again rather than overwritten, so the stream stays a prefix of the final text (a JSON reader keeps the last one, as
-    vLLM's dict does)."""
+    again rather than overwritten, so the stream stays a prefix of the final text (a JSON reader keeps the last one)."""
     parts = []
     for k, v, closed in items:
         key = json.dumps(k, ensure_ascii=False) + ": "
@@ -210,8 +204,8 @@ def _args_json(items: list[tuple[str, str, bool]], complete: bool, props: dict) 
 
 
 def _scan(body: str, done: bool) -> tuple[str | None, str]:
-    """A tool block's (function name, raw argument text) from its text after `<tool_call>` (vLLM glm47_moe.py, which
-    reads both the inline layout and GLM-4.5's newline one). The name ends at the first `<arg_key>`, newline or the end
+    """A tool block's (function name, raw argument text) from its text after `<tool_call>` (both the inline layout and
+    GLM-4.5's newline one are read). The name ends at the first `<arg_key>`, newline or the end
     of the block; None while it may still be being written, "" when there is none."""
     i = body.find(ARG_KEY_OPEN)
     head = (body if i < 0 else body[:i]).lstrip()
@@ -237,13 +231,11 @@ def _arguments(args: str, complete: bool, props: dict) -> str:
 def template_messages(messages: list, developer_to_system: bool = False) -> list:
     """The request's messages as the chat template takes them: an assistant turn's tool_calls arguments as an object (a
     dict), not the JSON string the OpenAI API carries. GLM's templates write a call key by key from
-    `tc.arguments.items()`, and an agent replays its earlier calls, string arguments and all, on every turn. vLLM's
-    rules (chat_utils.py _postprocess_messages, vllm-project/vllm 36fa72d2d0): None or "" is {}; a dict is kept; a
-    string is parsed, and one that is not JSON, or is JSON but not an object, becomes {} so that one malformed call in
+    `tc.arguments.items()`, and an agent replays its earlier calls, string arguments and all, on every turn. None or
+    "" is {}; a dict is kept; a string is parsed, and one that is not JSON, or is JSON but not an object, becomes {} so that one malformed call in
     the history does not fail every later turn; an empty tool_calls list is dropped; an entry that is not a function
-    call is refused (ValueError). SGLang (serving_chat.py normalize_assistant_tool_call_arguments) parses the same way
-    but refuses the malformed string; this follows vLLM, since an agent session cannot recover from an error on its own
-    history. New dicts; the request's are left as they were.
+    call is refused (ValueError). A malformed string is not refused, since an agent session cannot recover from an error on
+    its own history. New dicts; the request's are left as they were.
 
     developer_to_system: role "developer" (the OpenAI API's successor to "system" for instructions) becomes "system",
     for a chat template that has no branch for it. GLM-5.3-Flash's renders only user / assistant / tool / system, so a
@@ -287,9 +279,8 @@ def template_messages(messages: list, developer_to_system: bool = False) -> list
 
 def tool_choice_error(tool_choice) -> str | None:
     """None for the tool_choice values this server honours, "none" and "auto" (or absent), else why not. "required" and
-    a named function are what vLLM enforces with guided decoding, which no served graph runs: accepting them would
-    answer 200 with whatever the model chose, so they are refused. vLLM's check (chat_completion/protocol.py
-    check_tool_usage, v0.30.0) without its refusal of "auto" when no tools are sent."""
+    a named function need guided decoding, which no served graph runs: accepting them would
+    answer 200 with whatever the model chose, so they are refused."""
     if tool_choice is None or tool_choice in ("none", "auto"):
         return None
     if tool_choice == "required" or isinstance(tool_choice, dict):
@@ -301,10 +292,10 @@ def tool_choice_error(tool_choice) -> str | None:
 
 
 def chat_finish_reason(finish: str | None, called: bool) -> str | None:
-    """vLLM chat_completion/serving.py: "tool_calls" once a call was parsed, but only when the model stopped by itself.
+    """The finish reason: "tool_calls" once a call was parsed, but only when the model stopped by itself.
     A request cut off by its token limit stays "length" even when it holds a call: that call may be truncated (the
-    parser closes its partial last argument), and an agent must not run it as complete. (vLLM kept the engine's reason
-    for a named tool_choice; this server refuses one: tool_choice_error.)"""
+    parser closes its partial last argument), and an agent must not run it as complete. (A named tool_choice is
+    refused: tool_choice_error.)"""
     if finish == "stop" and called:
         return "tool_calls"
     return finish
@@ -425,13 +416,11 @@ class StreamParser:
                     if not self._buf and not final:
                         return _coalesce(out)
                     self._skip_nl = False
-                tags = [
-                    THINK_OPEN
-                ]  # a later start tag opens another reasoning block (vLLM glm47 (CONTENT, THINK_START))
+                tags = [THINK_OPEN]  # a later start tag opens another reasoning block
                 if self.tools:
                     tags.append(TOOL_OPEN)
                 if self._closed:
-                    tags.append(THINK_CLOSE)  # vLLM drops a duplicate end tag ((CONTENT, THINK_END))
+                    tags.append(THINK_CLOSE)  # a duplicate end tag is dropped
                 i, tag = _find(self._buf, tags)
                 if tag is None:
                     n = _safe_len(self._buf, tags, final)
@@ -472,8 +461,7 @@ class StreamParser:
         return {}
 
     def _offered(self, name: str) -> bool:
-        """vLLM glm47_moe validate_tool_names=True, SGLang parse_base_json: a name the request did not offer is no
-        call."""
+        """A name the request did not offer is no call."""
         if self.tool_defs is None:
             return True
         return any(isinstance(t, dict) and (t.get("function") or {}).get("name") == name for t in self.tool_defs)
@@ -562,7 +550,7 @@ def parse_full(
             by_index[c["index"]]["function"]["arguments"] += c["function"]["arguments"]
     calls = [by_index[i] for i in sorted(by_index)]
     if calls:
-        content = content.strip()  # vLLM strips content when calls were made
+        content = content.strip()  # content is stripped when calls were made
     elif "reasoning_content" in msg:
         content = content.strip("\n")
     msg["content"] = content or None
