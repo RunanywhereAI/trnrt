@@ -21,7 +21,9 @@ builds with `tools/graph_equiv.py` on CPU; the device check of this release's ow
   routing state ([docs/API.md](docs/API.md)).
 - The native `/generate` (also PUT): `text` or `input_ids`, one prompt or a batch, `sampling_params`,
   streaming, output logprobs and request ids. The router routes it by its prompt or session
-  ([docs/API.md](docs/API.md#generate)).
+  ([docs/API.md](docs/API.md#generate)). A `/generate` that is cancelled (its client goes away) or refused (a rid
+  already in use, a full queue) aborts only its own requests, never another live request that holds the same rid,
+  as one from a client that reuses rids could.
 - `/model_info`, `/server_info`, `/get_load`, `/health_generate`, `/abort_request` and `/flush_cache` (and
   their `get_` names), on each engine and on the router, which asks one engine or all of them
   ([docs/API.md](docs/API.md#info-and-admin-endpoints)). An engine whose full waiting queue refuses the
