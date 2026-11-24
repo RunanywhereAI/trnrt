@@ -218,6 +218,7 @@ def test_generate_output_logprobs_as_tuples(serve):
         ({"input_ids": [[1], [2]], "rid": ["a"]}, "rid"),
         ({"input_ids": [[1], [2]], "rid": ["a", "a"]}, "must differ"),
         ({"input_ids": [[1]] * 129}, "at most 128 prompts"),
+        ({"text": ["Hello"] * 129}, "at most 128 prompts"),
         ({"input_ids": [1], "rid": "r" * 257}, "at most 256 characters"),
         ({"input_ids": [[1], [2]], "sampling_params": [{}]}, "sampling_params"),
         ({"text": "Hello", "input_ids": [1]}, "exactly one of text or input_ids"),

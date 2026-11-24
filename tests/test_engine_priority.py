@@ -128,7 +128,7 @@ def test_requests_preempted_into_the_queue_give_back_their_board_slots(tmp_path)
     path = str(tmp_path)
     T.build(path, seed=4)
     prompts_ = [[5 + w, 6 + j, 7, 8] for w in range(7) for j in range(2)]
-    sp = SamplingParams(max_new_tokens=40)
+    sp = SamplingParams(max_new_tokens=40, ignore_eos=True)  # every request lives through all seven waves
     ref = T.engine(path, max_num_seqs=2)
     try:
         want = [r.output_ids for r in ref.generate(prompts_, sp)]

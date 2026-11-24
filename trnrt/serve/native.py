@@ -201,10 +201,14 @@ def _per_prompt(body: dict, key: str, n: int, single: bool) -> list:
 
 
 def _prompts(body: dict, tok) -> tuple[list[list[int]], bool]:
-    """The request's prompts as token ids, and whether it is one prompt."""
+    """The request's prompts as token ids, and whether it is one prompt. A batch past MAX_N is refused before any of it
+    is tokenized."""
     text, ids = body.get("text"), body.get("input_ids")
     if (text is None) == (ids is None):
         raise _bad("exactly one of text or input_ids is required")
+    batch = text if text is not None else ids
+    if isinstance(batch, list) and batch and not isinstance(batch[0], int) and len(batch) > MAX_N:
+        raise _bad(f"a batch takes at most {MAX_N} prompts, not {len(batch)}")
     if text is not None:
         if isinstance(text, str):
             return [list(tok(text)["input_ids"])], True
@@ -227,8 +231,6 @@ def parse_generate(body: dict, tok, vocab: int, defaults: dict[str, float]) -> t
         raise _bad(f"not supported: {', '.join(refused)}")
     seqs, single = _prompts(body, tok)
     n = len(seqs)
-    if n > MAX_N:
-        raise _bad(f"a batch takes at most {MAX_N} prompts, not {n}")
     rid = body.get("rid")
     if rid is None:
         rids: list[str | None] = [None] * n
