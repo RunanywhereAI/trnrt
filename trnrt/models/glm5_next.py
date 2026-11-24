@@ -110,12 +110,12 @@ def config_from_hf(cls, c: dict, eos_ids: tuple[int, ...]) -> ModelConfig:
         specs.append(AttnSpec(t["num_attention_heads"], 1, kw, vw, 0, 10000.0, mla=m))
     experts = t.get("n_routed_experts") or 0
     # The MTP layer (num_nextn_predict_layers, model.language_model.layers.<n> in zai-org/GLM-5.3-Flash's
-    # model.safetensors.index.json) is a pooled-DSA MLA layer with the MoE and NO hyper-connections (vLLM v0.30.0
-    # models/glm5next/nvidia/model.py Glm5NextDecoderLayer is_mtp_layer: "MTP layers use the non-mHC path";
-    # nvidia/mtp.py Glm5NextMultiTokenPredictorLayer: enorm, hnorm, eh_proj, shared_head). Its later passes run their own
+    # model.safetensors.index.json) is a pooled-DSA MLA layer with a MoE and NO hyper-connections; it adds enorm,
+    # hnorm (norms of the token embedding and the hidden state), eh_proj (their merge) and the shared_head.
+    # Draft: argmax(lm_head(shared_head.norm(y))) with the target's lm_head and embedding. Its later passes run their own
     # indexer, as in the builds behind the published numbers: index_share_for_mtp_iteration (reusing the first pass's
     # pooled selection) is left unparsed, and under context-parallel DSA every bucket takes the long path, which has no
-    # shared-selection form. So drafts can differ from vLLM's there (never the tokens: verification keeps the target's).
+    # shared-selection form. So drafts can differ there on occasion (never the tokens: verification keeps the target's).
     mtp = {}
     if int(t.get("num_nextn_predict_layers") or 0):
         mtp_dsa = DSASpec(t["index_n_heads"], t["index_head_dim"], t["index_topk"], kpool=kpool,
