@@ -825,8 +825,14 @@ def _refuse_unknown(body: dict, chat: bool) -> None:
         )
 
 
+def _neutral(v: object, neutral: tuple[object, ...]) -> bool:
+    """Whether v is one of the neutral values, by type as well as value: 0 == False in Python, and `store: 0` is not
+    `store: false`."""
+    return any(type(v) is type(n) and v == n for n in neutral)
+
+
 def _refused(body: dict) -> list[str]:
-    return [k for k, neutral in _NEUTRAL.items() if body.get(k) not in neutral]
+    return [k for k, neutral in _NEUTRAL.items() if not _neutral(body.get(k), neutral)]
 
 
 _INT64_MAX = 2**63 - 1
@@ -1997,7 +2003,7 @@ def build_app(
         if body.get("messages") is not None:
             # The fields chat refuses unless neutral (_NEUTRAL) and that change the rendered prompt.
             for key in ("add_generation_prompt", "continue_final_message"):
-                if body.get(key) not in _NEUTRAL[key]:
+                if not _neutral(body.get(key), _NEUTRAL[key]):
                     raise _bad(f"{key} is not supported; send the request without it")
             ids, _ = chat_prompt(prompt_tok, body)
             seqs, batch = [ids], False

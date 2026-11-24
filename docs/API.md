@@ -58,7 +58,7 @@ curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -
 - On `/v1/chat/completions` and `/v1/completions`, an unknown request field is answered with 400 naming it, never
   ignored. So is a field of the other endpoint (`prompt` on a chat request, `messages`, `tools` or `top_logprobs` on a
   completion). `model`, `user`, `safety_identifier`, `metadata` and `prompt_cache_key` are accepted and do not change
-  the output; `store` is accepted only as `false`, since nothing is kept for later retrieval.
+  the output; `store` is accepted only as `false` or null, since nothing is kept for later retrieval.
 - Status codes: 400 for a request that cannot be served as sent (a field of the wrong type or out of range, a prompt
   longer than the context, a chat template variable the template never reads); 500 for an error inside the engine;
   503 once the engine has failed, with the reason on `/health`, and 503 for a full queue

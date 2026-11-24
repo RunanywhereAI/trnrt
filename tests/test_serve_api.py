@@ -931,8 +931,11 @@ def test_a_field_of_the_other_endpoint_is_refused(serve):
         {"store": False},
     ):
         assert client.post("/v1/chat/completions", json={"messages": msgs, "max_tokens": 2, **extra}).status_code == 200
-    r = client.post("/v1/chat/completions", json={"messages": msgs, "store": True})
-    assert r.status_code == 400 and "store" in r.json()["detail"], r.text  # nothing is kept to retrieve later
+    for path, base in (("/v1/chat/completions", {"messages": msgs}), ("/v1/completions", {"prompt": [1]})):
+        for store in (True, 0, "false"):  # only false or null: nothing is kept to retrieve later, and 0 is not false
+            r = client.post(path, json={**base, "store": store})
+            assert r.status_code == 400 and "store" in r.json()["detail"], (path, store, r.text)
+        assert client.post(path, json={**base, "max_tokens": 2, "store": None}).status_code == 200
 
 
 def test_every_field_the_openai_endpoints_read_is_known():
