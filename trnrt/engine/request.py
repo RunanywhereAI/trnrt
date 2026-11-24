@@ -27,7 +27,7 @@ class SamplingParams:
     stop_token_ids: tuple[int, ...] = ()
     ignore_eos: bool = False
     seed: int | None = None
-    # vLLM's thinking_token_budget: reasoning tokens before the engine forces the reasoning's end (engine/engine.py).
+    # Reasoning tokens before the engine forces the reasoning's end (engine/engine.py).
     thinking_token_budget: int | None = None
     # Guided decoding (engine/grammar.py), and vLLM's min_tokens (SGLang min_new_tokens): no end-of-sequence or stop id
     # among the first min_tokens output tokens.
@@ -77,8 +77,8 @@ class Request:
     prompt_ids: list[int]
     params: SamplingParams
     arrival_time: float = field(default_factory=time.monotonic)
-    # SGLang's top-level session_id: a finished request's prefix stays referenced by its
-    # session (soft eviction protection) until the session is closed.
+    # A finished request's prefix stays referenced by its session (soft eviction protection) until the session
+    # is closed.
     session_id: str | None = None
     session_gen: int = -1
     # SGLang's per-request priority (engine/scheduler.py: priority scheduling, the priority eviction); None: none given.

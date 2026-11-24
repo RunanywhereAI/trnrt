@@ -2,9 +2,8 @@
 
 InferenceX fixes the acceptance length (AL) of every submission at a committed "golden" value per model and draft length,
 and engines force it with synthetic acceptance: the draft runs, verification is real, and the number of accepted drafts a
-step is drawn from a schedule whose mean is the golden AL. This module is that schedule, the same one vLLM merged for
-this (vllm-project/vllm pull 40662; see THIRD_PARTY_NOTICES.md, "Designs followed"). GLM-5.3-Flash with 2 draft tokens has
-a golden AL of 2.518506.
+step is drawn from a schedule whose mean is the golden AL. This module is that schedule. GLM-5.3-Flash with 2 draft tokens has a golden AL of
+2.518506.
 
 Set it with `TRNRT_SPEC_SYNTH_AL` (or `EngineConfig.spec_synth_al`). Use it only to compare with a published InferenceX
 number: with it on, an accepted position emits the DRAFT token whether or not the target agrees, so the text a request
@@ -20,8 +19,8 @@ The semantics:
   if nothing is rejected the bonus token is the target's sample after the last draft (engine/spec_async.py `spec_post` and
   `Engine._accept` apply this rule).
 
-Differences from vLLM, on purpose: vLLM's uniform at a position is a pure function of (request seed, absolute token
-position); here it is a per-request stream, k draws a verify step (drafts or not), seeded as the sampler's noise is
+The uniform at a position is not a function of (request seed, absolute token position): it comes from a per-request
+stream, k draws a verify step (drafts or not), seeded as the sampler's noise is
 (`SamplingParams.seed`, else (`EngineConfig.seed`, crc32(rid))), with a salt so the two streams differ. The distribution
 of the accepted count is the same, and a run is reproducible given the request seeds and the same sequence of steps.
 """

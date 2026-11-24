@@ -159,14 +159,13 @@ def build_shard(cfg: EngineConfig, path: str, num_pages: int, rank: int = 0):
     if cfg.num_layers is not None:
         mcfg = mcfg.truncated(cfg.num_layers)
     if cfg.device == "neuron":
-        # Runtime knobs vllm-neuron sets for serving (neuron_worker.py,
-        # _init_neuron_distributed_environment_and_runtime). Piecewise execution launches several graphs per step:
-        # take the runtime's maximum queue depth (libnrt clamps larger values to 63, with a warning).
+        # Runtime knobs for serving. Piecewise execution launches several graphs per step: take the runtime's
+        # maximum queue depth (libnrt clamps larger values to 63, with a warning).
         os.environ.setdefault("NEURON_RT_XU_COMPUTE_MAX_QUEUED_REQUESTS", "63")
         os.environ.setdefault("NEURON_RT_IO_RING_CACHE_SIZE", "32")
-        # NOT NEURON_RT_DISABLE_EXECUTION_BARRIER=1, the third knob vllm-neuron sets there (neuron_worker.py): without
-        # the runtime's per-execution barrier a collective mismatch returns silently wrong numbers, and ranks
-        # alternating world and attention-group collectives under host jitter deadlock.
+        # NOT NEURON_RT_DISABLE_EXECUTION_BARRIER=1: without the runtime's per-execution barrier a collective
+        # mismatch returns silently wrong numbers, and ranks alternating world and attention-group collectives under
+        # host jitter deadlock.
         from .. import platform
 
         platform.configure_runtime_env()  # NEURON_LOGICAL_NC_CONFIG, before the runtime
@@ -381,7 +380,7 @@ class LLMEngine:
         self.radix.offload = offload
 
     def close_session(self, session_id: str) -> bool:
-        """SGLang /close_session: drop the session's prefix references (nothing is freed)."""
+        """/close_session: drop the session's prefix references (nothing is freed)."""
         return self.scheduler.close_session(session_id)
 
     def abort(self, req: Request) -> None:

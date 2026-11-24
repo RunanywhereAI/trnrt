@@ -1,8 +1,6 @@
 """Prometheus text exposition for the server's GET /metrics, no client library needed.
 
-Names follow vLLM's metric set (docs/design/metrics.md) under a `trnrt:` prefix, so an existing vLLM dashboard maps
-by replacing the prefix. Start-up and per-graph metrics follow vllm-neuron's ("Neuron-specific metrics" in its
-features guide), with the engine's graph keys as the bucket label.
+Every metric name carries a `trnrt:` prefix. Per-graph metrics use the engine's graph keys as the bucket label.
 """
 
 from __future__ import annotations
@@ -127,7 +125,7 @@ class Metrics:
 
 
 def spec_lines(engine) -> list[str]:
-    """Speculative decoding's counters over the engine's run, under vLLM's spec_decode names, when the engine speculates:
+    """Speculative decoding's counters over the engine's run, under spec_decode names, when the engine speculates:
     verify steps (one per sequence), draft tokens proposed, draft tokens accepted, and the accepted ones by draft position
     (position j counted over the verifies that reached it). Dynamic speculation adds its mode flips and the steps launched in
     each mode. With these, the mean acceptance length is 1 + accepted / drafts."""
@@ -206,7 +204,7 @@ def local_k_lines(counts: list[float] | None) -> list[str]:
 
 
 def _bucket(key) -> str:
-    """A graph key as vllm-neuron's bucket_name label (e.g. prefill_s1024): the key's parts joined by "_"."""
+    """A graph key as a bucket_name label (e.g. prefill_s1024): the key's parts joined by "_"."""
     return "_".join(str(k) for k in (key if isinstance(key, tuple) else (key,)))
 
 
