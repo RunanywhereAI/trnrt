@@ -316,6 +316,11 @@ class EngineLoop:
         self._put("flush", f)
         return f
 
+    def unflush(self, f: _Flush) -> None:
+        """Withdraw flush `f` if the engine thread still waits to run it (its client went away): nobody asks for that
+        flush any more, and while it waits every other /flush_cache is refused."""
+        self.inbox.put(("unflush", f))
+
     def _hook(self, fn, *args) -> None:
         """Run a statistics or recording hook on the engine thread: an exception is counted and logged (at most once a
         minute), never raised, so recording cannot stop serving (GET /v1/stats shows the count as stats_errors)."""
@@ -377,6 +382,9 @@ class EngineLoop:
                     self._finished(st, "abort")
             elif kind == "flush":
                 self._start_flush(payload)
+            elif kind == "unflush" and self._flush is payload:  # not run yet: one done or refused is gone from here
+                self._flush = None
+                logger.info("trnrt: a pending flush_cache was withdrawn: its client went away")
             # "wake": nothing to do, the loop re-checks whether it is stopping
             try:
                 item = self.inbox.get_nowait()

@@ -387,6 +387,34 @@ def test_flush_cache_flushes_only_an_idle_engine():
             assert c.post(f"/flush_cache?timeout={t}").status_code == 400, t
 
 
+def test_a_flush_whose_client_went_away_is_withdrawn():
+    """A /flush_cache?timeout=T on a busy engine whose client gives up is withdrawn at once. Before, it held the engine's
+    one pending flush, so every other /flush_cache was refused until T passed, and it still dropped the whole prefix
+    cache once the engine was idle, which nobody asked for any more."""
+    import httpx
+
+    from trnrt.serve import api
+
+    eng = ScriptedEngine(PLAIN * 40)
+    eng.step_delay = 0.05
+    with _uvicorn(eng) as base, httpx.Client(base_url=base, timeout=30) as c:
+        busy = _background(lambda: c.post("/v1/completions", json={"prompt": [1], "max_tokens": 100}))  # 5 s
+        _wait_for(lambda: eng.scheduler.running)
+        (lp,) = [lp for lp in api._LOOPS if lp.engine is eng]
+        gone = socket.create_connection(("127.0.0.1", int(base.rsplit(":", 1)[1])))
+        gone.sendall(b"GET /flush_cache?timeout=3600 HTTP/1.1\r\nHost: x\r\n\r\n")
+        _wait_for(lambda: lp._flush is not None)  # the engine thread holds it, waiting for the engine to be idle
+        gone.close()
+        _wait_for(lambda: lp._flush is None, 3)
+        assert eng.scheduler.running  # withdrawn while the engine is still busy, not run
+        r = c.get("/flush_cache")
+        assert r.status_code == 400 and "requests are running or waiting" in r.text, r.text  # not "Another flush"
+        assert busy().status_code == 200
+        time.sleep(0.2)
+        assert eng.flushes == []  # nothing flushed once the engine went idle
+        assert c.get("/flush_cache").status_code == 200 and eng.flushes == [0]
+
+
 def test_health_generate_runs_a_token_through_the_engine(monkeypatch):
     """Idle: the probe (prompt [0], one greedy token) runs, and /metrics does not count it. Stuck in a step past the
     timeout: 503, and the probe is aborted. /v1/stats counts neither probe."""

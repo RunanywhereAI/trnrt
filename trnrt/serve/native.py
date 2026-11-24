@@ -545,7 +545,9 @@ def add_routes(
     async def flush_cache(http: HTTPRequest):
         """Drop the prefix cache (device pages, state checkpoints and the host tier), only while no request runs or
         waits; `timeout` (seconds, default 0) waits that long for the engine to be idle. 200 with the text of FLUSHED
-        when flushed, 400 with the reason when not."""
+        when flushed, 400 with the reason when not. A client that goes away first withdraws its flush: it would
+        otherwise still drop the cache once the engine is idle, which nobody asks for any more, and refuse every other
+        /flush_cache until then."""
         raw = http.query_params.get("timeout", "0")
         try:
             timeout = float(raw)
@@ -554,7 +556,11 @@ def add_routes(
         if not (math.isfinite(timeout) and timeout >= 0):
             raise _bad("timeout must be a number of seconds >= 0")
         f = loop_.flush(timeout)
-        flushed, message = await f.fut
+        got = await _unless_disconnected(http, f.fut)
+        if got is None:
+            loop_.unflush(f)
+            return Response(status_code=499)  # nginx's "client closed request"; nobody reads it
+        flushed, message = got
         if flushed:
             return PlainTextResponse(FLUSHED)
         return PlainTextResponse(message + "\n", status_code=400)

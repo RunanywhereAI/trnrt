@@ -81,6 +81,11 @@ def _native_worker(
         hold = getattr(app.state, "hold", None)  # an asyncio.Event a test sets: a flush stuck until then
         if hold is not None:
             await hold.wait()
+        if getattr(app.state, "until_gone", False):  # a flush waiting for an idle engine until its client goes away
+            while not await req.is_disconnected():
+                await asyncio.sleep(0.02)
+            app.state.seen.append(("flush withdrawn",))
+            return Response(status_code=499)
         if flush_status != 200:
             return PlainTextResponse("Cache not flushed: 2 requests are running or waiting.\n", status_code=400)
         return PlainTextResponse("Cache flushed.\n")
@@ -263,3 +268,30 @@ def test_flush_cache_bounds_its_wait_by_the_timeout_it_passes_on():
             await _stop(servers, tasks)
 
     asyncio.run(main())
+
+
+def test_a_flush_whose_client_went_away_closes_the_engines_flushes():
+    """A client that gives up on a /flush_cache still waiting at the engines: the router closes its requests to them,
+    so each engine sees its client gone and withdraws the flush (serve/native.py) instead of holding it, and refusing
+    every other flush, until its `timeout` passes."""
+    worker = _native_worker(0)
+    worker.state.until_gone = True
+
+    async def check(c, router) -> None:
+        port = int(str(c.base_url).rstrip("/").rsplit(":", 1)[1])
+        _, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(b"GET /flush_cache?timeout=3600 HTTP/1.1\r\nHost: x\r\n\r\n")
+        await writer.drain()
+        for _ in range(500):
+            if any(x[0] == "flush" for x in worker.state.seen):
+                break
+            await asyncio.sleep(0.01)
+        writer.close()
+        for _ in range(500):
+            if ("flush withdrawn",) in worker.state.seen:
+                break
+            await asyncio.sleep(0.01)
+        assert ("flush withdrawn",) in worker.state.seen, worker.state.seen
+        assert router.up == [True]
+
+    _run([worker], check)
