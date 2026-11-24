@@ -323,6 +323,14 @@ def test_engine_config_refuses_out_of_range_values(kw, message):
         EngineConfig(model_path="m", **kw)
 
 
+@pytest.mark.parametrize("flag", ["--structured-outputs", "--penalties"])
+def test_only_a_build_with_plain_decode_graphs_takes_host_input_graphs(flag):
+    """A request with a mask or penalties is stepped on the plain decode graph, and the latency build has none."""
+    with pytest.raises(ValueError, match="plain_decode False"):
+        _cfg("--preset", "latency", flag)
+    assert _cfg("--preset", "balanced", flag).plain_decode
+
+
 def test_engine_config_defaults_are_the_modules_own_row_caps():
     """A fresh import (another process: a test may have set the routes in this one) has the model modules' own caps,
     which EngineConfig's defaults restate; a build raises them (set_decode_routes)."""

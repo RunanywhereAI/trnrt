@@ -835,7 +835,7 @@ def cmd_engine(argv: list[str]) -> int:
     # The router keeps its connections to the engines alive and drops idle ones after 30 s: uvicorn closing them first
     # (its default keep-alive is 5 s) raced a request onto a closing connection.
     # name: the engine's own directory in the production log (TRNRT_PROD_DIR), by its port, stable across restarts
-    app = build_app(eng, a.served_model_name, preset=a.preset, name=f"engine-{a.port}")
+    app = build_app(eng, a.served_model_name, preset=parse_engine_args(argv).preset, name=f"engine-{a.port}")
     serve(app, host=a.host, port=a.port, log_level="warning", timeout_keep_alive=600)
     return 0
 

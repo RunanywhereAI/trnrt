@@ -358,7 +358,7 @@ def test_a_start_that_fails_after_its_workers_started_stops_them_and_gives_rank_
     def refuse(tag, pages):
         raise ValueError("planted: the save-once host arenas need more of /dev/shm than is free")
 
-    mcfg = types.SimpleNamespace(eos_token_ids=(0,))
+    mcfg = types.SimpleNamespace(eos_token_ids=(0,), vocab_size=8)
     runner = types.SimpleNamespace(
         device=torch.device("cpu"),
         tp_send=None,
@@ -368,6 +368,7 @@ def test_a_start_that_fails_after_its_workers_started_stops_them_and_gives_rank_
         so_possible=lambda: True,
         kv_arena_init=refuse,
         kv_arena_close=lambda: events.append("arena closed"),
+        release_slot=lambda req: None,
     )
     monkeypatch.setattr(multiprocessing, "get_context", lambda kind: types.SimpleNamespace(Process=proc))
     monkeypatch.setattr(TP, "free_port", lambda core_base=None: 0)

@@ -292,6 +292,17 @@ def test_engine_passes_other_failures_through_and_allow_compile_turns_the_assert
     assert engine.seen_env == ["1", "1", "0"]
 
 
+def test_the_engine_reports_the_build_that_runs(engine, monkeypatch):
+    """/server_info's preset is the build the engine runs (auto, --users and an earlier name resolved), not the argument."""
+    import trnrt.serve.api as api
+
+    seen = []
+    monkeypatch.setattr(api, "build_app", lambda *a, **k: seen.append(k["preset"]))
+    for argv in ([], ["--users", "4"], ["--preset", "mtp-batch24"]):
+        assert cli.cmd_engine([*ENGINE_ARGV, *argv]) == 0
+    assert seen == ["balanced", "latency", "throughput"]
+
+
 def test_an_engine_its_host_refuses_builds_nothing(engine, monkeypatch, capsys):
     """cmd_engine asks the host checks about its own cores before anything starts: a refusal is printed and ends it
     with START_REFUSED_STATUS, no engine built and no environment set for one."""

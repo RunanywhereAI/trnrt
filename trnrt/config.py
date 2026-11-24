@@ -330,6 +330,9 @@ class EngineConfig:
                 "(spec_method without spec_max_batch) has none: its verify graph takes no token mask or penalties")
         if any(m < 1 for m in self.penalty_buckets):
             raise ValueError(f"penalty_buckets={self.penalty_buckets}: positive distinct-token counts")
+        if (self.structured_outputs or self.penalties) and not self.plain_decode:
+            raise ValueError("structured_outputs and penalties need plain decode steps, and plain_decode False (the latency "
+                             "build) has no plain decode graph: a request with a mask or penalties is stepped plain")
         self._check_dsa_routes()  # the DSA block's checks
 
     def resolved_moe_kernel(self) -> str:

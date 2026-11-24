@@ -115,7 +115,7 @@ def test_dynamic_plain_mode_cannot_start_under_the_running_cap():
     cfg = _cfg("--preset", "latency")
 
     def stub(n):
-        reqs = [SimpleNamespace(status=Status.RUNNING, is_decoding=True) for _ in range(n)]
+        reqs = [SimpleNamespace(status=Status.RUNNING, is_decoding=True, needs_host_inputs=False) for _ in range(n)]
         return SimpleNamespace(
             scheduler=SimpleNamespace(running=reqs),
             cfg=cfg,

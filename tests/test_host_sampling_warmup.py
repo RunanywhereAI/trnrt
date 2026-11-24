@@ -1,4 +1,4 @@
-"""The graphs --structured-outputs and --penalties add to warmup (and so to a capture), per shipped preset, on
+"""The graphs --structured-outputs and --penalties add to warmup (and so to a capture), per build, on
 tests/test_spec_runner_stub.py's recording stub model: the variants exactly at the plain decode family's buckets and page
 rungs and at every prefill bucket and rung, none beside a verify, and nothing at all without the flags."""
 
@@ -15,7 +15,9 @@ from trnrt.config import prefill_pages
 from trnrt.engine import model_runner as mr
 
 VOCAB = 154_880  # GLM-5.3-Flash's
-PRESETS = ["batch12", "batch8", "mtp-batch8", "mtp-batch12", "mtp-batch24"]
+PRESETS = ["latency", "balanced", "throughput"]
+# The builds with plain decode graphs: the latency build refuses the flags (tests/test_builds.py).
+FLAG_PRESETS = ["balanced", "throughput"]
 
 
 def build(preset, monkeypatch, *extra):
@@ -48,7 +50,7 @@ def test_without_the_flags_warmup_adds_nothing(preset, monkeypatch):
     assert tagged(runner) == set()
 
 
-@pytest.mark.parametrize("preset", PRESETS)
+@pytest.mark.parametrize("preset", FLAG_PRESETS)
 @pytest.mark.parametrize(
     ("flags", "tags"),
     [
@@ -68,13 +70,13 @@ def test_the_flags_warm_exactly_their_variants(preset, flags, tags, monkeypatch)
     assert not [k for k in got if k[0] == "verify"]
 
 
-def test_batch12_counts(monkeypatch):
-    """Literal counts for the served preset with --structured-outputs: decode buckets 1 2 4 6 8 12 x pages 512 1024 4096,
+def test_balanced_counts(monkeypatch):
+    """Literal counts for the default build with --structured-outputs: decode buckets 8 16 24 x pages 1024 3072 4096,
     and prefill 512 1024 (the 4096-page rung only, below 2048 rows) and 2048 4096 (both rungs)."""
-    runner, _ = build("batch12", monkeypatch, "--structured-outputs")
+    runner, _ = build("balanced", monkeypatch, "--structured-outputs")
     runner.warmup()
     keys = tagged(runner)
-    assert len([k for k in keys if k[0] == "decode"]) == 18
+    assert len([k for k in keys if k[0] == "decode"]) == 9
     assert sorted(k[1:3] for k in keys if k[0] == "prefill") == [
         (512, 4096),
         (1024, 4096),
