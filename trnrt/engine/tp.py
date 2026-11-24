@@ -19,6 +19,7 @@ import errno
 import logging
 import os
 import socket
+import sys
 import threading
 from typing import Any
 
@@ -615,9 +616,28 @@ def wait_joining(workers, ready) -> None:
         ready[pending[0] - 1].wait(JOIN_POLL_S)
 
 
+def _dies_with_rank0() -> None:
+    """Linux: this worker is killed (SIGKILL) when rank 0 exits (PR_SET_PDEATHSIG), so it never outlives its engine
+    holding its NeuronCore. LLMEngine.close stops the workers itself; this covers a rank 0 that dies first (killed past
+    `serve`'s grace, or by the OOM killer), whose workers otherwise ran on until their own watchdog or the gloo timeout
+    ended them, and a restart was refused because their cores were taken. The signal comes when the thread that started
+    the worker exits: LLMEngine starts its workers on the thread that builds it, which the engine's life is bound to."""
+    if not sys.platform.startswith("linux"):
+        return
+    import ctypes
+    import multiprocessing
+    import signal
+
+    ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGKILL)  # PR_SET_PDEATHSIG
+    parent = multiprocessing.parent_process()
+    if parent is not None and os.getppid() != parent.pid:  # rank 0 exited before the prctl took effect
+        raise SystemExit("tensor-parallel rank 0 exited before this rank started")
+
+
 def worker_main(rank: int, cfg, path: str, num_pages: int, port: int, ready=None) -> None:
     """A tensor-parallel worker (rank > 0). `ready` (a multiprocessing Event): set once its own start (the device
     environment and NUMA pin) is done, just before it joins the process group, which rank 0 waits for (wait_joining)."""
+    _dies_with_rank0()
     configure_logging()  # a spawned process starts with no logging configuration
     if cfg.device == "neuron":
         neuron_env(rank, port, cfg.tp_core_base)

@@ -474,3 +474,63 @@ def test_wait_joining_with_real_workers():
         for w in ws:
             w.kill()
             w.join(10)
+
+
+def test_serve_waits_out_an_engines_whole_close():
+    """`serve` kills an engine ENGINE_STOP_S after its SIGTERM: longer than the engine's own close can take, its step
+    thread's stop and then the bounded tensor-parallel stop and the workers' terminate and kill joins (10 s each)."""
+    from trnrt import __main__ as cli
+    from trnrt.serve import api
+
+    assert cli.ENGINE_STOP_S > api.LOOP_STOP_WAIT_S + E.TP_STOP_WAIT_S + 2 * 10
+
+
+DEATH = textwrap.dedent(
+    """
+    import multiprocessing as mp, os, sys, time
+    sys.path.insert(0, {root!r})
+
+    def worker(path):
+        from trnrt.engine import tp
+        tp._dies_with_rank0()
+        open(path, "w").write(str(os.getpid()))
+        while True:
+            time.sleep(1)
+
+    if __name__ == "__main__":
+        w = mp.get_context("spawn").Process(target=worker, args=(sys.argv[1],))  # not a daemon: only the signal ends it
+        w.start()
+        for _ in range(1200):
+            if os.path.exists(sys.argv[1]):
+                break
+            time.sleep(0.05)
+        os._exit(0)  # rank 0 dies without closing anything, as a kill past serve's grace would end it
+    """
+).format(root=ROOT)
+
+
+def _running(pid: int) -> bool:
+    """Whether pid is a live process (a zombie waiting for its new parent to reap it is not)."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().rsplit(")", 1)[1].split()[0] != "Z"
+    except FileNotFoundError:
+        return False
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="PR_SET_PDEATHSIG is Linux's")
+def test_process_a_worker_dies_with_its_rank_0(tmp_path):
+    """A worker is killed when its rank 0 exits (tp._dies_with_rank0), so a rank 0 that dies before its close stopped
+    the workers leaves none holding a NeuronCore."""
+    script, pid_file = tmp_path / "death.py", tmp_path / "worker.pid"
+    script.write_text(DEATH)
+    env = dict(os.environ, PYTHONPATH=ROOT)
+    subprocess.run([sys.executable, str(script), str(pid_file)], timeout=120, check=True, env=env)
+    pid = int(pid_file.read_text())
+    deadline = time.monotonic() + 10
+    while _running(pid) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    alive = _running(pid)
+    if alive:
+        os.kill(pid, 9)
+    assert not alive, "the worker outlived its rank 0"

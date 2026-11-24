@@ -858,6 +858,14 @@ def cmd_engine(argv: list[str]) -> int:
     return 0
 
 
+# How long `serve` waits for its engines to exit after their SIGTERM before it kills them. An engine's own close takes
+# up to its step thread's stop (serve/api.py LOOP_STOP_WAIT_S, 120 s), then the bounded tensor-parallel stop
+# (engine/engine.py TP_STOP_WAIT_S, 120 s), then terminating and killing its workers (engine._stop_workers, 20 s): killed
+# before that ends, its workers were never stopped and held their NeuronCores (they now die with it, tp._dies_with_rank0,
+# but without the stop's log of the ranks that never answered). The engines stop at once, so one deadline covers them all.
+ENGINE_STOP_S = 300.0
+
+
 def _dies_with_parent() -> None:
     """In a child before exec: SIGTERM when the parent exits (Linux PR_SET_PDEATHSIG), so an engine holding its
     NeuronCores never outlives the server that started it."""
@@ -997,9 +1005,10 @@ def cmd_serve(argv: list[str]) -> int:
         for p in procs:
             if p.poll() is None:
                 p.send_signal(signal.SIGTERM)
+        deadline = time.monotonic() + ENGINE_STOP_S
         for p in procs:
             try:
-                p.wait(120)  # an engine's close stops its 31 workers
+                p.wait(max(0.0, deadline - time.monotonic()))  # an engine's close stops its 31 workers
             except subprocess.TimeoutExpired:
                 p.kill()
     return 0

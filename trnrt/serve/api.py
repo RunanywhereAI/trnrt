@@ -157,6 +157,9 @@ def _resolve(fut: asyncio.Future, value) -> None:
 # Engine loops of this process, held weakly: at exit each loop's thread stops after its step, then its engine closes
 # (LLMEngine.close is idempotent), which stops its tensor-parallel workers.
 _LOOPS: weakref.WeakSet = weakref.WeakSet()
+# How long a loop's stop waits for the step in flight before the engine closes anyway (EngineLoop.stop). `serve` gives an
+# engine this plus its tensor-parallel stop's bound to exit (__main__.ENGINE_STOP_S).
+LOOP_STOP_WAIT_S = 120.0
 
 
 @atexit.register
@@ -223,8 +226,9 @@ class EngineLoop:
             threading.Thread(target=self._watch_ranks, name="trnrt-rank-watch", daemon=True).start()
         _LOOPS.add(self)
 
-    def stop(self, wait: float = 120.0) -> None:
-        """End the engine thread after its current step (at exit, before the engine closes). Idempotent."""
+    def stop(self, wait: float = LOOP_STOP_WAIT_S) -> None:
+        """End the engine thread after its current step (at exit, before the engine closes), waiting at most `wait`
+        seconds for that step. Idempotent."""
         self._stopping.set()
         self.inbox.put(("wake", None))
         # A failed loop's thread is gone, or blocked for good in a collective with a dead rank (_watch_ranks)

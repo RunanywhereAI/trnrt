@@ -78,7 +78,10 @@ builds with `tools/graph_equiv.py` on CPU; the device check of this release's ow
 - The runner's side of the DSA selection's row classes: a plain decode batch in class-slot order, and a batch whose rows
   do not fit their classes sent to the next page bucket.
 - Closing an engine bounds the tensor-parallel stop (120 s): a rank that never answers is named in the log and the
-  workers are terminated, instead of holding the process.
+  workers are terminated, instead of holding the process. `serve` gives its engines 300 s together to close after
+  its SIGTERM, enough for the step thread's stop and the bounded stop (it gave each 120 s, and killed the first before
+  its bounded stop ran), and on Linux a worker is killed when its rank 0 exits, so none outlives its engine holding
+  a NeuronCore.
 - `--generation-config auto|none` for `serve` and `engine`: `none` serves the built-in sampling defaults (temperature
   and top_p 1.0) even when the checkpoint has a `generation_config.json`, on every endpoint (`/generate`, the
   Responses and Messages APIs, and `/model_info`'s `preferred_sampling_params` too). `auto`, the default, takes the
