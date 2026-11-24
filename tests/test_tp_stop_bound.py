@@ -319,13 +319,16 @@ def test_unacked_ranks_waits_for_a_close_in_progress_and_never_reads_the_unmappe
 
 
 class _Proc:
-    """A worker process that runs until it is terminated (multiprocessing.Process's surface that LLMEngine uses)."""
+    """A worker process that runs until it is terminated (multiprocessing.Process's surface that LLMEngine uses). It
+    sets its ready event (worker_main's last argument) when it starts, as a worker past its own start does."""
 
     def __init__(self, **kw):
         self.pid, self.exitcode, self.terminated = None, None, False
+        self.args = kw.get("args", ())
 
     def start(self):
         self.pid = 1 << 22
+        self.args[-1].set()
 
     def is_alive(self):
         return self.pid is not None and self.exitcode is None
@@ -370,7 +373,9 @@ def test_a_start_that_fails_after_its_workers_started_stops_them_and_gives_rank_
         kv_arena_close=lambda: events.append("arena closed"),
         release_slot=lambda req: None,
     )
-    monkeypatch.setattr(multiprocessing, "get_context", lambda kind: types.SimpleNamespace(Process=proc))
+    monkeypatch.setattr(
+        multiprocessing, "get_context", lambda kind: types.SimpleNamespace(Process=proc, Event=threading.Event)
+    )
     monkeypatch.setattr(TP, "free_port", lambda core_base=None: 0)
     monkeypatch.setattr(TP, "init_rank", lambda rank, world, port: events.append("process group up"))
     monkeypatch.setattr(TP, "restore_process_state", lambda saved: events.append("process restored"))
@@ -394,3 +399,78 @@ def test_a_start_that_fails_after_its_workers_started_stops_them_and_gives_rank_
     assert len(procs) == 1 and procs[0].terminated
     assert events == ["process group up", "process restored", "arena closed"]
     assert len(E._OPEN) == n_open and runner.tp_send is None  # nothing left for the exit hook to close
+
+
+class _DeadProc(_Proc):
+    """A worker that exits during its own start (its NUMA pin raised), before it is ready to join the process group."""
+
+    def start(self):
+        self.pid, self.exitcode = 1 << 22, 1
+
+
+def test_a_worker_that_dies_before_joining_fails_the_start_at_once(monkeypatch):
+    """A worker whose start fails (numa_pin raising NumaPinError, say) never joins the process group. Rank 0 used to
+    wait for it in the rendezvous for the gloo timeout (4 h); it now sees the worker gone before it joins, raises naming
+    the rank, stops the other workers and gives this process its state back."""
+    import multiprocessing
+
+    from trnrt.config import EngineConfig
+
+    procs: list[_Proc] = []
+    events: list[str] = []
+
+    def proc(**kw):
+        procs.append((_DeadProc if kw["args"][0] == 2 else _Proc)(**kw))
+        return procs[-1]
+
+    mcfg = types.SimpleNamespace(eos_token_ids=(0,), vocab_size=8)
+    monkeypatch.setattr(
+        multiprocessing, "get_context", lambda kind: types.SimpleNamespace(Process=proc, Event=threading.Event)
+    )
+    monkeypatch.setattr(TP, "free_port", lambda core_base=None: 0)
+    monkeypatch.setattr(TP, "init_rank", lambda rank, world, port: events.append("process group up"))
+    monkeypatch.setattr(TP, "restore_process_state", lambda saved: events.append("process restored"))
+    monkeypatch.setattr(E, "resolve_model_path", lambda path, revision=None: path)
+    monkeypatch.setattr(E.ModelConfig, "from_pretrained", classmethod(lambda cls, path: mcfg))
+    monkeypatch.setattr(E, "resolve_attention_tp", lambda m, c: 4)
+    monkeypatch.setattr(E, "pool_pages", lambda c, m: 16)
+    cfg = EngineConfig(model_path="no-model", device="cpu", tp=4)
+    t0 = time.monotonic()
+    with pytest.raises(RuntimeError, match=r"rank\(s\) 2 \(exit code 1\) exited before joining the process group"):
+        E.LLMEngine(cfg)
+    assert time.monotonic() - t0 < 10
+    assert events == ["process restored"]  # rank 0 never entered the rendezvous
+    assert [p.terminated for p in procs] == [True, False, True]  # the live workers stopped; the dead one is gone
+
+
+def _exit_at_once(code: int) -> None:
+    os._exit(code)
+
+
+def _ready_then_wait(ev) -> None:
+    ev.set()
+    time.sleep(30)
+
+
+def test_wait_joining_with_real_workers():
+    """tp.wait_joining over spawned processes: it returns once every worker is ready, and raises within a poll or two
+    when one exits first, naming its rank and exit code."""
+    import multiprocessing
+
+    ctx = multiprocessing.get_context("spawn")
+    ready = [ctx.Event(), ctx.Event()]
+    ws = [ctx.Process(target=_ready_then_wait, args=(ready[0],), daemon=True)]
+    ws.append(ctx.Process(target=_exit_at_once, args=(3,), daemon=True))
+    for w in ws:
+        w.start()
+    try:
+        t0 = time.monotonic()
+        with pytest.raises(RuntimeError, match=r"rank\(s\) 2 \(exit code 3\) exited before joining"):
+            TP.wait_joining(ws, ready)
+        assert time.monotonic() - t0 < 30
+        ready[1].set()  # both ready: it returns
+        TP.wait_joining(ws, ready)
+    finally:
+        for w in ws:
+            w.kill()
+            w.join(10)

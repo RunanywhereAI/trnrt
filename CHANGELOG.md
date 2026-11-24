@@ -108,6 +108,9 @@ builds with `tools/graph_equiv.py` on CPU; the device check of this release's ow
 - `TRNRT_DMA_HW=1` under every build.
 - An engine whose device listing fails, or whose launch CPU set cannot pin every rank to its NeuronCore's NUMA node,
   refuses to start; `TRNRT_NUMA_PIN_OPTIONAL=1` starts it anyway, with a warning. Rank 0 logs how many ranks pinned.
+  A worker whose own start fails (its listing failing on that rank alone, or any other error before it joins the
+  process group) fails the engine's start at once, naming its rank: rank 0 waits for every worker to be ready
+  before it joins, where it used to wait for the dead rank until the process group's 4-hour timeout.
 - Every engine warms every slot of its IO pool, so no slot's buffers are built on a serving call.
 
 ### Fixed

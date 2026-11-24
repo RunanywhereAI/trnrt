@@ -320,8 +320,11 @@ class LLMEngine:
 
             port = tp.free_port(cfg.tp_core_base if cfg.device == "neuron" else None)
             ctx = mp.get_context("spawn")
+            # each worker sets its event past its own start; rank 0 joins the process group only once all have, so a
+            # worker that fails before it joins (tp.wait_joining) fails the start now instead of hours later
+            ready = [ctx.Event() for _ in range(1, cfg.tp)]
             self._workers = [
-                ctx.Process(target=tp.worker_main, args=(r, cfg, path, num_pages, port), daemon=True)
+                ctx.Process(target=tp.worker_main, args=(r, cfg, path, num_pages, port, ready[r - 1]), daemon=True)
                 for r in range(1, cfg.tp)
             ]
             self._tp_saved = tp.process_state()
@@ -330,6 +333,7 @@ class LLMEngine:
                     w.start()
                 if cfg.device == "neuron":
                     tp.neuron_env(0, port, cfg.tp_core_base, world=cfg.tp)
+                tp.wait_joining(self._workers, ready)
                 tp.init_rank(0, cfg.tp, port)
             except BaseException:
                 self._stop_tp()

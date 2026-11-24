@@ -592,10 +592,37 @@ def drop_channel() -> None:
         ch.shm.unlink()
 
 
-def worker_main(rank: int, cfg, path: str, num_pages: int, port: int) -> None:
+# How often rank 0 looks at its workers while it waits for them to reach the process group (wait_joining).
+JOIN_POLL_S = 0.1
+
+
+def wait_joining(workers, ready) -> None:
+    """Rank 0, before its own init_rank: wait until every worker has set its `ready` event (worker_main sets it just
+    before it joins the process group), watching the workers meanwhile. A worker that exits first (its NUMA pin or its
+    device environment failed, or it crashed) fails the start at once, naming it: rank 0 would otherwise wait in the
+    rendezvous for a rank that never comes, until the process group's TIMEOUT (hours). workers[i] is rank i + 1."""
+    while True:
+        pending = [r for r, ev in enumerate(ready, 1) if not ev.is_set()]
+        if not pending:
+            return
+        dead = [(r, workers[r - 1].exitcode) for r in pending if workers[r - 1].exitcode is not None]
+        if dead:
+            gone = ", ".join(f"{r} (exit code {code})" for r, code in dead)
+            raise RuntimeError(
+                f"tensor-parallel rank(s) {gone} exited before joining the process group; the worker's error is logged "
+                "above"
+            )
+        ready[pending[0] - 1].wait(JOIN_POLL_S)
+
+
+def worker_main(rank: int, cfg, path: str, num_pages: int, port: int, ready=None) -> None:
+    """A tensor-parallel worker (rank > 0). `ready` (a multiprocessing Event): set once its own start (the device
+    environment and NUMA pin) is done, just before it joins the process group, which rank 0 waits for (wait_joining)."""
     configure_logging()  # a spawned process starts with no logging configuration
     if cfg.device == "neuron":
         neuron_env(rank, port, cfg.tp_core_base)
+    if ready is not None:
+        ready.set()
     init_rank(rank, cfg.tp, port)
     from .engine import build_shard
 
