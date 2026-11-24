@@ -316,6 +316,7 @@ def test_zero_width_stop_regexes_match_and_terminate():
         "(?:(?:a{0}|b{0})x)+y",
         "(?:(?=x)?x)+y",  # an optional empty part, repeated
         "(?:(?=x))?" * 5 + "y",
+        "(?:){1000000}X",  # an exact count of an empty part: every iteration runs
     ],
 )
 def test_stop_regex_refuses_patterns_that_backtrack(app, pattern):

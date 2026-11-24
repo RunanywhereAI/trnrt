@@ -1165,7 +1165,9 @@ def _backtracking(pattern: str) -> str | None:
                 if lo == hi == 1:
                     live = scan(body, live)
                     continue
-                if lo != hi and body.getwidth()[1] == 0:  # `?` too: an optional empty part is a second way
+                # `?` too (an optional empty part is a second way), and an exact count: re runs every mandatory
+                # iteration of an empty body, so (?:){1000000000}X spends seconds and memory on any text
+                if (hi > 1 or lo != hi) and body.getwidth()[1] == 0:
                     raise _Backtracking("it repeats a part that matches only the empty text")
                 if hi > 1 and not one_way(body):
                     raise _Backtracking(
