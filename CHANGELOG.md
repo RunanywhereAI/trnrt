@@ -87,6 +87,9 @@ and versions follow [Semantic Versioning](https://semver.org/). Rebuild the comp
 
 ### Fixed
 
+- An unknown field on `/v1/chat/completions` or `/v1/completions`, or a field of the other endpoint, is refused with
+  400 naming it, as AGENTS.md invariant 7 requires. It was ignored, and the request answered 200 as if it had been
+  applied (`prediction`, `modalities`, `audio`, a misspelled field).
 - The streaming tool-call parser no longer re-scans and re-renders the whole argument text on every push. A call
   whose value grows (a `write_file` content) cost O(n²) over the stream. Host CPU only (Apple M2, CPython 3.13.5;
   no Neuron SDK, model or precision involved): a GLM `write_file` call with tools enabled and 64 KB of content,

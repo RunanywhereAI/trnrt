@@ -48,6 +48,9 @@ curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -
   naming the flag.
 - Not supported, answered with 400: `tool_choice` `"required"` or a named tool, prompt logprobs (`prompt_logprobs`,
   `echo` with `logprobs`), and `min_new_tokens` on the OpenAI endpoints (use `min_tokens`).
+- An unknown request field is answered with 400 naming it, never ignored. So is a field of the other endpoint
+  (`prompt` on a chat request, `messages`, `tools` or `top_logprobs` on a completion). `model`, `user`,
+  `safety_identifier`, `metadata`, `store` and `prompt_cache_key` are accepted and do not change the output.
 - Status codes: 400 for a request that cannot be served as sent (a field of the wrong type or out of range, a prompt
   longer than the context, a chat template variable the template never reads); 500 for an error inside the engine;
   503 once the engine has failed, with the reason on `/health`, and 503 for a full queue
