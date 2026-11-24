@@ -8,7 +8,7 @@ set -euo pipefail
 IMAGE=${IMAGE:-trnrt}
 image_id=$(docker image inspect "$IMAGE" --format '{{.Id}}')
 revision=$(docker image inspect "$IMAGE" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' 2>/dev/null || true)
-inside=$(docker run --rm --entrypoint python3 "$IMAGE" - <<'PY'
+inside=$(docker run --rm -i --entrypoint python3 "$IMAGE" - <<'PY'
 import importlib.metadata as m, json, subprocess
 names = ("trnrt", "neuronx-cc", "libtorch-neuronx-lite", "nki", "torch", "transformers")
 py = {n: (m.version(n) if any(d.metadata["Name"] == n for d in m.distributions()) else None) for n in names}
