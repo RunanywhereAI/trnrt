@@ -8,7 +8,8 @@ Ownership rules:
 - A page referenced by a node belongs to the tree. It is freed only by eviction.
 - A running request holds a lock on the deepest node of its cached prefix, which pins
   every page on the path from the root to that node.
-- Eviction frees whole unlocked leaves in least-recently-used order.
+- Eviction frees whole unlocked leaves in the eviction policy's order (EVICTION_POLICIES), least recently used first by
+  default.
 - Session references: a finished request that carries a session_id registers its prefix under that
   session; eviction takes unreferenced prefixes first, then fewer-referenced ones, each least
   recently used first. Referenced KV is soft-protected, not pinned, and closing the session
@@ -28,6 +29,7 @@ from __future__ import annotations
 
 import heapq
 import itertools
+import math
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -54,6 +56,14 @@ class RadixNode:
     # The checkpoint ends a request's prompt (the prompt-end checkpoint, engine/scheduler.py): a returning turn whose
     # replayed reply differs from the cached one resumes there, so free_dominated keeps the nearest such one on a path.
     anchor: bool = False
+    # The eviction policies' bookkeeping (RadixCache.touch), read only by the policy that uses it: requests admitted on a
+    # path through this node (lfu, slru; a node starts at 1, for the request that inserted it), the highest importance of
+    # those requests (priority), and the tokens already evicted below it along its deepest evicted branch and the hashes
+    # of that branch's pages in order (tlru), so a branch that grows back page by page takes its tail back as it goes.
+    hit_count: int = 1
+    importance: float = -math.inf
+    tail_evicted: int = 0
+    tail_pages: tuple[int, ...] = ()
 
     def is_leaf(self) -> bool:
         return not self.children
@@ -69,8 +79,56 @@ class MatchResult:
         return len(self.pages)
 
 
+# The --radix-eviction-policy names. Each policy's own settings (--radix-eviction-policy-config) and their defaults;
+# tlru's have none.
+EVICTION_POLICIES = ("lru", "lfu", "slru", "priority", "tlru")
+POLICY_PARAMS: dict[str, dict[str, int | None]] = {
+    "slru": {"protected_threshold": 2},
+    "tlru": {"threshold": None, "next_prompt_estimate": None},
+}
+
+
+def policy_params(policy: str, config: dict | None = None) -> dict:
+    """An eviction policy's settings: its defaults (POLICY_PARAMS) updated from `config`. ValueError for an unknown
+    policy, a setting it does not take, a value that is not a non-negative integer, or tlru without its two settings."""
+    if policy not in EVICTION_POLICIES:
+        raise ValueError(f"the eviction policy must be one of {', '.join(EVICTION_POLICIES)}")
+    params = dict(POLICY_PARAMS.get(policy, {}))
+    for key, val in (config or {}).items():
+        if key not in params:
+            raise ValueError(f"{policy} eviction has no setting {key!r} (its settings: {', '.join(params) or 'none'})")
+        if type(val) is not int or val < 0:
+            raise ValueError(f"{policy} eviction's {key} must be a non-negative integer")
+        params[key] = val
+    if policy == "tlru":
+        th, est = params["threshold"], params["next_prompt_estimate"]
+        if th is None or est is None or not 0 <= est < th:
+            raise ValueError("tlru eviction needs threshold > next_prompt_estimate >= 0 (tokens)")
+    return params
+
+
 class RadixCache:
-    def __init__(self, pool: PagePool, page_size: int):
+    """`eviction_policy` orders what eviction (evict, evict_checkpoints) takes first, within each session-reference
+    class (unreferenced first, then fewer references):
+    - lru (the default): the prefix unused for longest;
+    - lfu: the fewest hits (requests admitted on a path through it), then the least recent;
+    - slru: every probationary prefix (fewer than protected_threshold hits) before any protected one, the least recent
+      first within each;
+    - priority: the lowest importance of the requests that used it, then the least recent;
+    - tlru (Tail-Optimized LRU, arXiv 2510.15152): first the tail of each cached sequence that its next turn can
+      recompute and still prefill at most `threshold` uncached tokens (threshold - next_prompt_estimate tokens from its
+      end), then plain recency.
+    `policy_config` holds the policy's own settings (POLICY_PARAMS); a key the policy does not take is an error."""
+
+    def __init__(self, pool: PagePool, page_size: int, eviction_policy: str = "lru", policy_config: dict | None = None):
+        params = policy_params(eviction_policy, policy_config)
+        self.tel_budget = 0
+        if eviction_policy == "tlru":
+            self.tel_budget = int(params["threshold"] or 0) - int(params["next_prompt_estimate"] or 0)
+        self.eviction_policy = eviction_policy
+        self.policy_params = params
+        # Whether admissions and inserts record hits and importance (touch): only for the policies that read them.
+        self.tracks_use = eviction_policy in ("lfu", "slru", "priority")
         self.pool = pool
         self.page_size = page_size
         self.root = RadixNode()
@@ -103,11 +161,37 @@ class RadixCache:
     def _page_key(self, ids: list[int], i: int) -> tuple[int, ...]:
         return tuple(ids[i : i + self.page_size])
 
-    @staticmethod
-    def _key(n: RadixNode):
+    def _page_hashes(self, key: list[int]) -> tuple[int, ...]:
+        """A page-aligned key's pages as hashes, one int a page: tlru's record of an evicted branch (RadixNode.tail_pages)
+        costs one int per page rather than its tokens."""
+        ps = self.page_size
+        return tuple(hash(tuple(key[i : i + ps])) for i in range(0, len(key), ps))
+
+    def _key(self, n: RadixNode):
         """Eviction order, smallest first: unreferenced before session-referenced, fewer references
-        first, then least recently used."""
-        return (n.session_refs > 0, n.session_refs, n.last_access)
+        first, then the eviction policy's order (lru: least recently used)."""
+        policy = self.eviction_policy
+        if policy == "lru":
+            return (n.session_refs > 0, n.session_refs, n.last_access)
+        refs = (n.session_refs > 0, n.session_refs)
+        if policy == "lfu":
+            return (*refs, n.hit_count, n.last_access)
+        if policy == "slru":
+            return (*refs, n.hit_count >= self.policy_params["protected_threshold"], n.last_access)
+        if policy == "priority":
+            return (*refs, n.importance, n.last_access)
+        safe = n.tail_evicted + len(n.key) <= self.tel_budget  # tlru: the next turn can recompute it within budget
+        return (*refs, not safe, n.last_access)
+
+    def touch(self, node: RadixNode, importance: float, hit: bool = True) -> None:
+        """A request of `importance` used the path to `node`: a hit on every node of it (hit), and each node's
+        importance raised to the request's. Called only when tracks_use."""
+        while node is not self.root:
+            if hit:
+                node.hit_count += 1
+            if importance > node.importance:
+                node.importance = importance
+            node = node.parent  # type: ignore[assignment]
 
     def match_prefix(self, ids: list[int], max_pages: int | None = None) -> MatchResult:
         """Longest page-aligned cached prefix of `ids`, at most `max_pages` pages.
@@ -151,6 +235,8 @@ class RadixCache:
             lock_ref=child.lock_ref,
             last_access=child.last_access,
             session_refs=child.session_refs,  # registrations stay on the deeper node
+            hit_count=child.hit_count,
+            importance=child.importance,
         )
         parent = child.parent
         if parent is None:
@@ -186,6 +272,16 @@ class RadixCache:
                 last_access=next(self._clock),
             )
             node.children[tuple(leaf.key[:ps])] = leaf
+            tail = node.tail_pages
+            # tlru: the evicted branch grew again (the leaf's first pages are its pages), so what it restored is no
+            # longer evicted. A regrowth shorter than the evicted tail leaves the rest on the new leaf, so evicting it
+            # again records the whole tail and a later insert below it takes back the next part. Another branch's
+            # insert (one that leaves the evicted pages anywhere) leaves the tail: that sequence's next turn must still
+            # recompute it.
+            if tail and (head := self._page_hashes(leaf.key[: len(tail) * ps])) == tail[: len(head)]:
+                rest = tail[len(head) :]  # empty when the leaf covers the whole tail
+                leaf.tail_evicted, leaf.tail_pages = max(0, node.tail_evicted - len(leaf.key)), rest
+                node.tail_evicted, node.tail_pages = 0, ()
             self.evictable_pages += len(leaf.pages)
             tree_pages.extend(leaf.pages)
             node = leaf
@@ -320,6 +416,9 @@ class RadixCache:
                 if parent is not self.root:
                     self._register(sid, parent)
             del parent.children[tuple(leaf.key[: self.page_size])]
+            tail = leaf.tail_evicted + len(leaf.key)
+            if self.eviction_policy == "tlru" and tail >= parent.tail_evicted:  # only tlru reads the evicted tails
+                parent.tail_evicted, parent.tail_pages = tail, self._page_hashes(leaf.key) + leaf.tail_pages
             leaf.parent = None
             if parent is not self.root and parent.is_leaf() and parent.lock_ref == 0:
                 heapq.heappush(heap, (self._key(parent), id(parent), parent))

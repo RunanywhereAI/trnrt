@@ -128,9 +128,9 @@ class EngineConfig:
     # published acceptance length, not for quality. The command line reads TRNRT_SPEC_SYNTH_AL when --spec-synth-al is absent.
     spec_synth_al: float | None = None
     # Dynamic speculation: no drafts above a batch size, with hysteresis, so a batch hovering at the threshold does not flip
-    # every step. While at most this many requests decode, they speculate, above it every decode step is the plain graph
-    # (0: always speculate). Once plain, speculation returns when at most spec_max_batch - spec_hysteresis requests decode.
-    # A flip drains the step in flight.
+    # every step. At most this many decoding requests speculate unless one needs host inputs (a mask or penalties); above
+    # it, every decode step is the plain graph (0: always speculate). Once plain, speculation returns when at most
+    # spec_max_batch - spec_hysteresis requests decode. A flip drains the step in flight.
     spec_max_batch: int = 0
     spec_hysteresis: int = 1
     # With dynamic speculation, the decode buckets each step family is warmed and picked at: the verify family (verify,
@@ -153,6 +153,13 @@ class EngineConfig:
     # state_spec_seats hold 1 + spec_k rows each (the ones that speculate) and the rest one row (None: all of them).
     state_seats: int | None = None
     state_spec_seats: int | None = None
+    # Graph variants with host inputs (engine/host_inputs.py), off by default: with them off every graph is the one an
+    # engine without them compiles. structured_outputs: decode and prefill-post graphs that take a token mask (guided
+    # decoding, thinking budgets, min_tokens); penalties: graphs that take penalty inputs at each of penalty_buckets'
+    # distinct-token counts, the vocabulary size always added as the last.
+    structured_outputs: bool = False
+    penalties: bool = False
+    penalty_buckets: tuple[int, ...] = (1024, 16384)
     # -- KDA, mHC and FFN-half routes (engine.set_decode_routes copies each into the module that reads it at trace) --
     # - kda_shell (models/hybrid.py KDA_SHELL): a KDA layer's decode attention block may run as the KDA shell's kernel
     #   (kernels/kda_shell.py; its packed blobs exist only then), up to kda_shell_max_rows rows and for verifies. Off,
@@ -317,6 +324,12 @@ class EngineConfig:
             raise ValueError(
                 f"state_spec_seats={self.state_spec_seats} must cover spec_max_batch {self.spec_max_batch} and fit the "
                 f"{self.state_seats or self.max_num_seqs} seats")
+        if (self.structured_outputs or self.penalties) and self.spec_method and not self.spec_max_batch:
+            raise ValueError(
+                "structured_outputs and penalties need plain decode steps, and speculation at every batch size "
+                "(spec_method without spec_max_batch) has none: its verify graph takes no token mask or penalties")
+        if any(m < 1 for m in self.penalty_buckets):
+            raise ValueError(f"penalty_buckets={self.penalty_buckets}: positive distinct-token counts")
         self._check_dsa_routes()  # the DSA block's checks
 
     def resolved_moe_kernel(self) -> str:
