@@ -6,9 +6,9 @@ positions, tokens and hidden-state row all depend on it. That host round trip si
 step.
 
 The way off that path is to keep the state on the device and schedule the next step blind:
-- every decode row is scheduled with 1 + k tokens, as if every draft is accepted;
-- the computed-token counts, the last sampled tokens and the drafts stay on the device, and the verify's rejection
-  sampling corrects the counts there;
+- every row of a speculative verify is scheduled with 1 + k tokens, as if every draft is accepted;
+- the accepted-draft counts, the last sampled tokens and the drafts stay on the device, where the verify's rejection
+  sampling writes them (the host's computed-token count catches up when it reads the step back);
 - the next step's input ids and positions are built on the device from those buffers, so no host read sits between
   two steps;
 - the sequence lengths and bonus tokens the next batch reads are published on the device, with slots reserved for
