@@ -10,10 +10,13 @@ parsed by the same GLM parsers as a chat response, is translated back into Respo
 | `content` | a `message` item with one `output_text` part |
 | each of `tool_calls` | a `function_call` item; its `call_id` is the chat call's id |
 
-Every other field goes to the chat path unchanged, which serves or refuses it as /v1/chat/completions does (sampling
-extras, `session_id`, `chat_template_kwargs`). A streamed response sends the Responses events: `response.created`,
-`response.in_progress`, then per item `response.output_item.added`, its deltas and its `.done` events, then
-`response.completed` (`response.incomplete` when max_output_tokens cut it off, `response.failed` on an engine error).
+Every other field goes to the chat path unchanged, which serves the chat fields it reads (sampling extras,
+`session_id`, `chat_template_kwargs`) and refuses those it cannot serve, as /v1/chat/completions does. Unlike that
+endpoint, a field that neither knows is ignored, not refused: a misspelled field cannot be told from a Responses field
+this list does not have yet, and refusing those would refuse valid requests. A streamed response sends the Responses
+events: `response.created`, `response.in_progress`, then per item `response.output_item.added`, its deltas and its
+`.done` events, then `response.completed` (`response.incomplete` when max_output_tokens cut it off, `response.failed`
+on an engine error).
 
 Nothing is stored: `store` true, `previous_response_id` and `background` are refused with a 400, and so are the fields
 whose meaning needs what no served graph computes (structured output in `text.format`, `top_logprobs`) or a server-side

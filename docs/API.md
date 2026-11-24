@@ -139,7 +139,9 @@ Nothing is stored. Refused with 400: `store: true`, `previous_response_id`, `bac
 `effort` and `summary`, `service_tier` other than `"auto"` or `"default"`, item references, non-text input parts and
 tools other than functions. `metadata`, `user`, `safety_identifier` and `prompt_cache_key` are accepted and change
 nothing: the prefix cache matches every prompt by its tokens, with no key. `GET`, `DELETE` and `cancel` of a response
-answer 404.
+answer 404. Unlike `/v1/chat/completions`, this endpoint ignores a field it does not know rather than refusing it,
+so a misspelled field (`temprature`) is served as if absent: a field it cannot tell from a newer Responses field
+is not refused. The chat fields it passes on are served or refused as on `/v1/chat/completions`.
 
 ## Anthropic Messages API
 
