@@ -46,8 +46,12 @@ curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -
 - Structured outputs, penalties, `min_tokens` and thinking budgets need an engine started with `--structured-outputs` or
   `--penalties` ([below](#structured-outputs-penalties-and-thinking-budgets)); otherwise they are answered with 400,
   naming the flag.
-- Not supported, answered with 400: `tool_choice` `"required"` or a named tool, prompt logprobs (`prompt_logprobs`,
-  `echo` with `logprobs`), and `min_new_tokens` on the OpenAI endpoints (use `min_tokens`).
+- Not supported, answered with 400: `tool_choice` `"required"` or a named tool, a function tool with `strict: true`
+  (no tool-call grammar is served: send `false` or leave it out, on `/v1/responses` too), prompt logprobs
+  (`prompt_logprobs`, `echo` with `logprobs`), and `min_new_tokens` on the OpenAI endpoints (use `min_tokens`).
+- `tools` must be an array of function tools whose `name` is 1-128 characters of `[A-Za-z0-9_-]`, with an object
+  `parameters` when given; `parallel_tool_calls` is `true`, `false` or null. Null `tools` and null `parameters` are the
+  same as leaving them out. Anything else is a 400 naming the field.
 - Status codes: 400 for a request that cannot be served as sent (a field of the wrong type or out of range, a prompt
   longer than the context, a chat template variable the template never reads); 500 for an error inside the engine;
   503 once the engine has failed, with the reason on `/health`, and 503 for a full queue

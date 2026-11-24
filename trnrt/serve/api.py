@@ -73,6 +73,7 @@ from .parsers import (
     parse_full,
     template_messages,
     tool_choice_error,
+    tools_error,
 )
 from .prodlog import ProdLog
 from .prompt_cache import PromptCache
@@ -1370,8 +1371,10 @@ def chat_prompt(tok, body: dict, cache: PromptCache | None = None) -> tuple[list
     is parsed with. HTTPException 400 on a malformed request. With `cache` (TRNRT_PROMPT_CACHE_MB) the ids come through
     the prompt token cache, the same ids."""
     messages = body.get("messages")
-    if not messages:
+    if messages is None or messages == []:
         raise HTTPException(status_code=400, detail="messages is required")
+    if not isinstance(messages, list):
+        raise _bad("messages must be an array")
     try:
         messages = template_messages(messages, developer_to_system=not template_knows_developer(tok))
     except ValueError as e:
@@ -1381,8 +1384,14 @@ def chat_prompt(tok, body: dict, cache: PromptCache | None = None) -> tuple[list
     error = tool_choice_error(tool_choice)
     if error:
         raise HTTPException(status_code=400, detail=error)
-    tools = body.get("tools") if tool_choice != "none" else None
-    if tools:
+    tools = body.get("tools")
+    error = tools_error(tools)  # with tool_choice "none" too: a malformed field is refused whatever else is sent
+    if error:
+        raise _bad(error)
+    parallel = _flag(body, "parallel_tool_calls", default=True)  # checked before the prompt is rendered
+    if tool_choice == "none":
+        tools = None  # rendered and parsed as if the request sent none, as before
+    elif tools:
         kwargs["tools"] = tools
     if cache is not None and cache.off is None:
         ids = _cached_ids(tok, messages, kwargs, cache, body.get("session_id"))
@@ -1401,7 +1410,7 @@ def chat_prompt(tok, body: dict, cache: PromptCache | None = None) -> tuple[list
         "tools": bool(tools),
         "thinking_open": tail.endswith(THINK_OPEN),
         "tool_defs": tools,
-        "parallel_tool_calls": body.get("parallel_tool_calls") is not False,
+        "parallel_tool_calls": parallel,
     }
     return ids, parse
 

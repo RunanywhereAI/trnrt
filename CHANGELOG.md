@@ -87,6 +87,10 @@ and versions follow [Semantic Versioning](https://semver.org/). Rebuild the comp
 
 ### Fixed
 
+- A malformed `tools` array, or a `parallel_tool_calls` that is not a boolean, is refused with a 400 that names the
+  field. Before, a non-array `tools` reached the chat template and raised there (a 500), and a malformed entry or
+  `"false"` was accepted silently: a different prompt, and parallel calls kept. A function tool with `strict: true` is
+  refused too (no tool-call grammar is served), on `/v1/chat/completions` and `/v1/responses`.
 - The streaming tool-call parser no longer re-scans and re-renders the whole argument text on every push. A call
   whose value grows (a `write_file` content) cost O(n²) over the stream. Host CPU only (Apple M2, CPython 3.13.5;
   no Neuron SDK, model or precision involved): a GLM `write_file` call with tools enabled and 64 KB of content,
