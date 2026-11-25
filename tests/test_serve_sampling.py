@@ -364,6 +364,7 @@ def test_zero_width_stop_regexes_match_and_terminate():
         r"(?:\w(?!\w{31}@))+@",
         r"\w+(?!\w{15}@)@",
         r"\w*(?:aa|a)(?:aa|a)(?:aa|a)(?:aa|a)@",
+        r"(?:a|a)(?:a|a)(?:a|a)(?:a|a)(\w)+@",  # a capturing group, marked at every iteration: 3 times \w+@'s steps
     ],
 )
 def test_stop_regex_refuses_patterns_that_backtrack(app, pattern):
@@ -440,6 +441,18 @@ def test_an_optional_part_that_can_match_the_empty_text_matches_it_two_ways():
     assert (_search_cost(chain)[0] or "").startswith("it has optional parts that can match the empty text"), chain
     assert _search_cost("(?:b?)?X") == (None, 2 * _search_cost("(?:b)?X")[1])
     assert _search_cost("".join(f"(?:{c}?)?+" for c in letters) + "X") == (None, 1)
+
+
+def test_a_capturing_group_in_a_repeat_costs_its_marks():
+    """The matcher marks a capturing group at both ends at every iteration, so (\\w)+@ took 2.8 times as long as \\w+@
+    over 2048 characters of "a" (CPython 3.13, one Apple M3 Max core), and after 16 ways 0.94 s against 0.34 s, where
+    both were priced 16. A group's two marks are now two steps of the repeat's walk: (\\w)+@ costs 3."""
+    from trnrt.serve.api import _search_cost
+
+    assert _search_cost(r"\w+@") == (None, 1) and _search_cost(r"(?:\w)+@") == (None, 1)
+    assert _search_cost(r"(\w)+@") == (None, 3)
+    why, cost = _search_cost(r"(?:a|a)(?:a|a)(?:a|a)(?:a|a)(\w)+@")
+    assert cost == 48 and (why or "").startswith("it can take 48 times as long to search"), why
 
 
 def test_a_requests_stop_regex_patterns_share_one_cost_bound(app):

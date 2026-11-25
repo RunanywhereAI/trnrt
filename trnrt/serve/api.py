@@ -1238,11 +1238,12 @@ def _search_cost(pattern: str) -> tuple[str | None, int]:
     def steps(items) -> int:
         """The most steps the matcher takes to match `items`, a part that matches one way (one_way), once at a position:
         one per character and per check, a lookaround's part's own, a fixed count's that many times, an alternation's
-        longest branch and one more per other branch it tries."""
+        longest branch and one more per other branch it tries, and two per capturing group, which the matcher marks at
+        both ends: (\\w)+@ took 2.8 times as long as \\w+@ over 2048 characters."""
         n = 0
         for op, av in items:
             if op is c.SUBPATTERN:
-                n += steps(av[3])
+                n += steps(av[3]) + (2 if av[0] is not None else 0)
             elif op in (c.ASSERT, c.ASSERT_NOT):
                 n += steps(av[1])
             elif op is c.ATOMIC_GROUP:
