@@ -458,6 +458,23 @@ if os.environ.get("TRNRT_DMA_HW", "0") == "1":
 from . import mix_wide as _MW  # noqa: E402
 
 MIX_REV = _MW.MIX_REV
+# MIX_ROW_SPLIT (EngineConfig.shell_mix_row_split, set on every rank by engine.build_shard): mix_in_h's mix with the
+# rows split over the LNC pair (mix_wide.mix_in_h_rsplit: each program mixes its half and reads the other's back from
+# S_out), exact. Read when a kernel is traced; mix_rev_term() is what a caller folds into its kernel's rev at the call.
+MIX_ROW_SPLIT = False
+
+
+def mix_rev_term() -> int:
+    """The call-time term of a mix_in_h caller's rev: mix_wide.RSPLIT_REV with the row split on, else 0."""
+    return _MW.RSPLIT_REV if MIX_ROW_SPLIT else 0
+
+
 if nisa is not None:
     mix_in_h_fin = mix_in_h  # fin's form (tests compare the served form against it)
-    mix_in_h = _MW.mix_in_h_wide_cast
+
+    def mix_in_h(sh, S, post_p, comb_p, Yp, S_out, hc: int, T: int, H: int, npg: int):  # noqa: F811
+        """The served mix: mix_wide's wide-cast, or with MIX_ROW_SPLIT its row-split form."""
+        if MIX_ROW_SPLIT:
+            _MW.mix_in_h_rsplit(sh, S, post_p, comb_p, Yp, S_out, hc, T, H, npg)
+        else:
+            _MW.mix_in_h_wide_cast(sh, S, post_p, comb_p, Yp, S_out, hc, T, H, npg)

@@ -76,7 +76,7 @@ def neuronx_cc_args(kv_dtype: torch.dtype, fp8_weights: bool = False) -> list[st
     trn2 FP8 is e4m3 with inf (max 240) and torch has no such dtype, so an fp8 KV cache or FP8 weights are
     float8_e4m3fn in the graph, which neuronx-cc rejects there: "[NCC_EVRF051] Data type F8E4M3FN is not supported
     on TRN1/TRN2 ... use the --experimental-unsafe-fp8e4m3fn-as-fp8e4m3 flag" (SDK 2.32). The values are clamped to
-    240 on write, so the cast is exact. trnrt/platform.py adds --logical-nc-config and vllm-neuron's argument set."""
+    240 on write, so the cast is exact. trnrt/platform.py adds --logical-nc-config and its own fixed argument set."""
     from .. import platform
 
     args = platform.neuronx_cc_args(platform.runtime_target(), fp8=kv_dtype == torch.float8_e4m3fn or fp8_weights)
@@ -411,9 +411,28 @@ def alloc_kv(shapes, slots: int, dtype, device):
     return ks, vs
 
 
+def page_runs(pages: list[int]) -> list[tuple[int, int, list[int]]]:
+    """A host-cache batch's device pages as runs of consecutive pages: (first page, count, the batch indices of its pages
+    in page order). A batch names each page once (fresh allocations; held pages are saved once)."""
+    if len(set(pages)) != len(pages):
+        raise ValueError(f"a host-cache batch names a page twice: {sorted(pages)}")
+    order = sorted(range(len(pages)), key=lambda j: pages[j])
+    runs, start = [], 0
+    for k in range(1, len(order) + 1):
+        if k == len(order) or pages[order[k]] != pages[order[k - 1]] + 1:
+            runs.append((pages[order[start]], k - start, order[start:k]))
+            start = k
+    return runs
+
+
+def _new_so_stats() -> dict:
+    """Save-once counters of one rank (ModelRunner.so_stats)."""
+    return dict(save_pages=0, load_calls=0, load_pages=0, load_peer_pages=0, wait_s=0.0, tag_checked=0)
+
+
 def state_checkpoint_rows(ecfg: EngineConfig) -> int:
     """Rows of a recurrent model's state pool kept for prefix-cache checkpoints: the configured
-    count, else twice max_num_seqs (SGLang v0.5.21 int8_mamba_ckpt_size's default: 2x the active
+    count, else twice max_num_seqs (2x the active
     mamba pool)."""
     return ecfg.state_checkpoints if ecfg.state_checkpoints is not None else 2 * ecfg.max_num_seqs
 
@@ -474,6 +493,7 @@ class ModelRunner:
         self.spec_page_set = self.spec_page_buckets != tuple(sorted(self.page_buckets))
         self.prefill_page_buckets = ecfg.resolved_prefill_page_buckets()
         self.prefill_page_min_rows = ecfg.prefill_page_min_rows
+        self.rc = rowclass_init(self, ecfg)  # the DSA selection's static row classes: the runner's side (file end)
         # A prefill chunk's MTP pass fills the draft layer's KV over the chunk: in one call of the chunk's bucket, or, with
         # mtp_fill_rows, in calls of at most that many rows over the same hidden states (spec_after_prefill). The pass's
         # scratchpad reservation grows with its rows (the compiler's figure at 4096 pages: 1.0 GiB at 512 rows, 1.5 at
@@ -499,7 +519,7 @@ class ModelRunner:
         self._free_slots = list(range(n_slots - 2, -1, -1))
         self._slot: dict[str, int] = {}
         self.compile_seconds: dict[tuple, float] = {}
-        self.exec_counts: dict[tuple, int] = {}  # graph executions by key (vllm-neuron's neff_execution_count)
+        self.exec_counts: dict[tuple, int] = {}  # graph executions by key (the neff execution count per graph)
         self.calls: dict[tuple, int] = defaultdict(int)
         # meta: trnrt/compile/capture.py traces the device run's graphs on a host without NeuronCores, through
         # a backend that writes each graph's HLO into the compile cache instead of compiling it.
@@ -535,9 +555,10 @@ class ModelRunner:
         bound = self.launch_bound = LaunchBound()
         # engine/iopool.py: a decode call's host arguments and outputs at fixed device addresses, so the runtime's IO
         # ring cache holds a few sets per NEFF instead of filling. Host-side only; on a NeuronCore only.
-        # A speculative engine pools the blind step's calls too, and warms every slot of the pool (iopool.pool_names).
+        # A speculative engine pools the blind step's calls too (iopool.pool_names). Every engine warms every slot of the
+        # pool, so no slot's buffers and DMA rings are built on a serving call after the engine said it was ready.
         self.iopool = (iopool.Pool(names=iopool.pool_names(bool(ecfg.spec_method), ecfg.mtp_kv_only),
-                                   rank=getattr(model, "tp_rank", 0), warm=bool(ecfg.spec_method))
+                                   rank=getattr(model, "tp_rank", 0), warm=True)
                        if device.type == "neuron" else None)
 
         def counted(c):
@@ -646,6 +667,25 @@ class ModelRunner:
             noise[i] = rng.random(noise.shape[1], dtype=np.float32)
         return temperature, top_p, top_k, min_p, noise
 
+    def _host_extras(self, rows: list[Request | None]) -> tuple[list, tuple]:
+        """A call's token mask and penalty inputs and its variant tag (engine/host_inputs.py), or ([], ()) when no row
+        needs them, so the call takes the graph an engine without --structured-outputs / --penalties takes. The grammar
+        backend is the engine's (runner.grammar, set on the first guided request)."""
+        if not (self.ecfg.structured_outputs or self.ecfg.penalties):
+            return [], ()
+        from . import host_inputs
+
+        return host_inputs.extras(self.ecfg, self.mcfg.vocab_size, self.mcfg.eos_token_ids,
+                                  getattr(self, "grammar", None), rows)
+
+    def host_variants(self) -> list[tuple]:
+        """The variant tags this engine warms (engine/host_inputs.py variant_tags): none without the flags."""
+        if not (self.ecfg.structured_outputs or self.ecfg.penalties):
+            return []
+        from . import host_inputs
+
+        return host_inputs.variant_tags(self.ecfg, self.mcfg.vocab_size)
+
     def pad_slots(self, shape) -> np.ndarray:
         """Cache slots for padded rows: slots 1 .. page_size - 1 of the null page in turn, never slot 0.
 
@@ -676,6 +716,11 @@ class ModelRunner:
             self._synth.forget(req.rid)
         if self.state is not None:
             self.state.release(req)
+        self.release_slot(req)
+
+    def release_slot(self, req: Request) -> None:
+        """Give req's token-board slot back (also at a preemption: its recompute takes a slot again and rewrites it). Its
+        sampling generator stays, so a seeded request draws on where it was."""
         s = self._slot.pop(req.rid, None)
         if s is not None:
             self._free_slots.append(s)
@@ -799,8 +844,11 @@ class ModelRunner:
         verify followed by the graphs of its blind step, and every prefill call by the MTP pass over its rows. With
         warm pools (iopool.Pool.warm) each such block runs once per pool slot, in the order a step runs it, so a graph's
         call count, and with it its slot, advances in step with its neighbours' as in serving."""
+        from . import host_inputs
+
         t0 = time.perf_counter()
         spec_q = 1 + self.ecfg.spec_k if self.ecfg.spec_method else None
+        variants = self.host_variants()
 
         def order(xs):
             return tuple(reversed(xs)) if reverse else tuple(xs)
@@ -817,9 +865,16 @@ class ModelRunner:
                     args = [np.zeros(B, np.int64), ids, table, np.ones(B, np.int64), self.pad_slots(B),
                             *self._sampling([None] * B), BOARD, np.full(B, -1, np.int64),
                             np.full(B, self.scratch_slot, np.int64)]
+                    base = args
                     args = self._with_state("decode", args, [0] * B)  # the scratch row
                     for _ in range(self._pool_warm_reps("decode") if plain and B in self.plain_buckets and P in self.page_buckets else 0):
                         self._exec("decode", ("decode", B, P), args)
+                    # the host-input variants (--structured-outputs, --penalties): the plain decode's family only, since a
+                    # request that needs them never speculates (engine.py _dyn_want_plain)
+                    for tag in variants if plain and B in self.plain_buckets and P in self.page_buckets else ():
+                        g = self._with_state("decode", base + host_inputs.dummy(tag, B, self.mcfg.vocab_size), [0] * B)
+                        for _ in range(self._pool_warm_reps("decode")):
+                            self._exec("decode", ("decode", B, P, *tag), g)
                     if spec_q and B in self.spec_buckets and P in self.spec_page_buckets:
                         z = np.zeros((B, spec_q), np.int64)
                         samp = self._sampling([None] * (B * spec_q))
@@ -837,10 +892,15 @@ class ModelRunner:
                     args = [np.zeros(C, np.int64), np.zeros(C, np.int64), np.full(P, NULL_PAGE, np.int64),
                             self.pad_slots(C), np.zeros(1, np.int64), *self._sampling([None]), BOARD,
                             np.full(1, self.scratch_slot, np.int64)]
+                    base = args
                     args = self._with_state("prefill", args, self._prefill_state(0, C))
                     self._exec("prefill", ("prefill", C, P), args)
                     if self._mtp is not None:
                         self._warm_after_prefill(C, P)
+                    for tag in variants:  # only the post graph differs (one per C); every (C, P) key is warmed
+                        g = self._with_state("prefill", base + host_inputs.dummy(tag, 1, self.mcfg.vocab_size),
+                                             self._prefill_state(0, C))
+                        self._exec("prefill", ("prefill", C, P, *tag), g)
             for n in self.copy_buckets if self.state is not None and self.state.num_ckpt_rows else ():
                 z = np.zeros(n, np.int64)
                 self._copy_state(z, z)  # the scratch row onto itself
@@ -973,7 +1033,7 @@ class ModelRunner:
         """B sequences x one token."""
         n = len(seqs)
         B = pick_family(n, self.plain_buckets, "plain decode")
-        P = pick_bucket(-(-max(s.end for s in seqs) // self.ps), self.page_buckets)
+        P = rowclass_page(self, seqs, B, pick_bucket(-(-max(s.end for s in seqs) // self.ps), self.page_buckets))
         ids = np.zeros(B, np.int64)
         pos = np.zeros(B, np.int64)
         table = np.full((B, P), NULL_PAGE, np.int64)
@@ -997,12 +1057,14 @@ class ModelRunner:
             slot[b] = r.pages[s.start // self.ps] * self.ps + s.start % self.ps
             rows[b] = r
         args = [ids, pos, table, ctx, slot, *self._sampling(rows), BOARD, read, write]
+        extra, tag = self._host_extras(rows)
+        args += extra  # nothing unless a row needs a mask or penalties (engine/host_inputs.py)
         if self.state is not None:
             srow = np.zeros(B, np.int64)  # padded rows: the scratch row
             for b, s in enumerate(seqs):
                 srow[b] = self.state.row(s.req)
             args = self._with_state("decode", args, srow)
-        out = self._exec("decode", ("decode", B, P), args)
+        out = self._exec("decode", ("decode", B, P, *tag), args)
         v = out[:n]
         self.launch_bound.alias(v, out)  # the engine reads v back: it marks out's execution done (LaunchBound)
         return v
@@ -1029,6 +1091,8 @@ class ModelRunner:
         if s.sample:
             write[0] = self.slot(r)
         args = [ids, pos, table, slot, last, *self._sampling([r if s.sample else None]), BOARD, write]
+        extra, tag = self._host_extras([r if s.sample else None])
+        args += extra  # only the post graph takes them (_piecewise)
         if self.state is not None:
             # [row, ckpt_row, k]: an in-chunk checkpoint copies the state after k of the chunk's tokens into ckpt_row;
             # none: the scratch row receives the chunk's end, k = C.
@@ -1036,7 +1100,7 @@ class ModelRunner:
             if s.mid is not None:
                 srow[1], srow[2] = s.mid[1], s.mid[0]
             args = self._with_state("prefill", args, srow)
-        return self._exec("prefill", ("prefill", C, P), args)
+        return self._exec("prefill", ("prefill", C, P, *tag), args)
 
     # -- speculative steps under overlap scheduling (engine/spec_async.py) ----------------
 
@@ -1068,6 +1132,9 @@ class ModelRunner:
         P = self.spec_page(pick_bucket(-(-min(max(s.start + Q for s in seqs), self.ecfg.max_model_len) // self.ps),
                                        self.page_buckets))
         B, slot_idx, valid, table, rows = self._spec_rows(seqs, Q, P)
+        held = [s.req.rid for s in seqs if s.req.needs_host_inputs]
+        if held:  # the verify graph takes no mask or penalties: such a request is stepped plain (engine.py)
+            raise RuntimeError(f"requests {held} need a mask or penalties and were scheduled into a speculative verify")
         cold = [(b, s) for b, s in enumerate(seqs) if not s.req.spec_ready]
         if cold:  # newest token a prompt token the host holds (engine/spec_async.py spec_host_init)
             tok, base, cur, v = (np.zeros(B, np.float32) for _ in range(4))
@@ -1237,19 +1304,198 @@ class ModelRunner:
     # Every rank holds its own share of each page and state row, so each call is broadcast and every rank copies its own.
 
     def kv_save(self, slot: int, page: int) -> None:
+        if getattr(self, "_so", None) is not None:
+            raise RuntimeError("the save-once host cache moves pages in batches only (host_cache_batch)")
         if self.tp_send is not None:
             self.tp_send(("kv_save", None, [slot, page]))
         self._kv_save(slot, page)
 
     def kv_load(self, slot: int, page: int) -> None:
+        if getattr(self, "_so", None) is not None:
+            raise RuntimeError("the save-once host cache moves pages in batches only (host_cache_batch)")
         if self.tp_send is not None:
             self.tp_send(("kv_load", None, [slot, page]))
         self._kv_load(slot, page)
 
     def kv_drop(self, slot: int) -> None:
+        if getattr(self, "_so", None) is not None:
+            return  # an arena slot is overwritten by its next save (its generation moves on): nothing is held per rank
         if self.tp_send is not None:
             self.tp_send(("kv_drop", None, [slot]))
         self._kv_drop(slot)
+
+    def kv_save_many(self, slots: list[int], pages: list[int], tags: list[int] | None = None) -> None:
+        """kv_save of every (slot, page) pair in ONE broadcast, each cache copied once per run of consecutive pages
+        (EngineConfig.host_cache_batch): the per-page broadcasts and the per-page, per-cache copies were the host cache's
+        cost at the KV wall, not its bytes. tags: under save-once, the pages' tag cells (host_arena.tag_of of each chain
+        hash), stamped beside the generation."""
+        if getattr(self, "_so", None) is not None:
+            if not slots:
+                return
+            self._so_seq += 1
+            gens = []
+            for s in slots:
+                self._so_gen[s] = self._so_gen.get(s, 0) + 1
+                gens.append(self._so_gen[s])
+            args = [list(slots), list(pages), gens, self._so_seq, None if tags is None else list(tags)]
+            if self.tp_send is not None:
+                self.tp_send(("kv_save_many_so", None, args))
+            self._kv_save_many_so(*args)
+            return
+        if self.tp_send is not None:
+            self.tp_send(("kv_save_many", None, [list(slots), list(pages)]))
+        self._kv_save_many(slots, pages)
+
+    def kv_load_many(self, slots: list[int], pages: list[int], tags: list[int] | None = None) -> None:
+        """kv_load of every (slot, page) pair in ONE broadcast, each cache written once per run of consecutive pages.
+        tags: under save-once, the tag each slot must carry (every rank checks it before copying)."""
+        if getattr(self, "_so", None) is not None:
+            if not slots:
+                return
+            self._so_seq += 1
+            gens = [self._so_gen[s] for s in slots]
+            for s in slots:
+                self._so_load_seq[s] = self._so_seq
+            args = [list(slots), list(pages), gens, self._so_seq, None if tags is None else list(tags)]
+            if self.tp_send is not None:
+                self.tp_send(("kv_load_many_so", None, args))
+            self._kv_load_many_so(*args)
+            return
+        if self.tp_send is not None:
+            self.tp_send(("kv_load_many", None, [list(slots), list(pages)]))
+        self._kv_load_many(slots, pages)
+
+    def _kv_save_many(self, slots: list[int], pages: list[int]) -> None:
+        if not slots:
+            return
+        caches, lps = self._paged_caches(), self.lps
+        for lo, n, idx in page_runs(pages):
+            sl = slice(lo * lps, (lo + n) * lps)
+            hosts = [c[sl].to("cpu", copy=True) for c in caches]  # one device-to-host copy per cache per run
+            for k, j in enumerate(idx):  # each slot its own copy, so it frees on its own (clone: not a view of the run)
+                self._host_kv[slots[j]] = [h[k * lps:(k + 1) * lps].clone() for h in hosts]
+
+    def _kv_load_many(self, slots: list[int], pages: list[int]) -> None:
+        if not slots:
+            return
+        self._settle()  # as _kv_load: once for the whole batch
+        caches, lps = self._paged_caches(), self.lps
+        for lo, n, idx in page_runs(pages):
+            sl = slice(lo * lps, (lo + n) * lps)
+            for i, c in enumerate(caches):  # one host-to-device copy per cache per run
+                hs = [self._host_kv[slots[j]][i] for j in idx]
+                c[sl].copy_(hs[0] if len(hs) == 1 else torch.cat(hs))
+
+    # -- save-once (engine/host_arena.py, EngineConfig.host_cache_save_once): a page is copied ONCE per CP index, into
+    # the arena of the row group that owns its host slot, and restored from there on every rank of that CP index ------
+
+    def so_possible(self) -> bool:
+        """Save-once needs at least two context-parallel row groups (the ranks of one CP index hold identical bytes)."""
+        return getattr(self.model, "cp_rows", 1) > 1 and getattr(self.model, "tp_size", 1) > 1
+
+    def kv_arena_init(self, tag: str, capacity_slots: int) -> list[str]:
+        """Create every rank's arena (and the completion board) for `capacity_slots` host slots in all. Rank 0 first
+        removes the stale segments of an engine with this tag (their names are returned), and refuses when the arenas'
+        worst case does not fit /dev/shm (host_arena.check_capacity)."""
+        from . import host_arena as HA
+
+        lay = HA.Layout(self._paged_caches(), self.lps)
+        R = self.model.attn_tp // self.model.cp
+        gone = HA.cleanup_stale(tag)
+        HA.check_capacity(HA.engine_bytes(self.model.tp_size, -(-capacity_slots // R), lay.slot_bytes), tag=tag)
+        if self.tp_send is not None:
+            self.tp_send(("kv_arena_init", None, [tag, capacity_slots]))
+        self._kv_arena_init(tag, capacity_slots)
+        return gone
+
+    def _kv_arena_init(self, tag: str, capacity_slots: int) -> None:
+        from . import host_arena as HA
+
+        rank = getattr(self.model, "tp_rank", 0)
+        self._so = HA.HostStore(tag, rank, self.model.tp_size, self.model.attn_tp, self.model.cp,
+                                HA.Layout(self._paged_caches(), self.lps), capacity_slots)
+        self._so.attach_board(create=rank == 0)
+        self._so.board.mark(rank, 0)
+        self._so_stats = _new_so_stats()
+        if rank == 0:
+            self._so_seq, self._so_gen, self._so_load_seq = 0, {}, {}
+
+    def kv_arena_close(self) -> None:
+        """Unlink this process's arena and (rank 0) the completion board; peers' arenas are only unmapped. The workers'
+        own go when they exit (LLMEngine.close stops them first)."""
+        st = getattr(self, "_so", None)
+        if st is not None:
+            self._so = None
+            st.close()
+
+    def so_active(self) -> bool:
+        """Whether the save-once arenas are up (the host cache then tags its saves and checks its restores)."""
+        return getattr(self, "_so", None) is not None
+
+    def so_stats(self) -> dict:
+        """This rank's save-once counters: pages it wrote into its arena, restores and the pages they brought
+        (load_peer_pages: those another row group's arena held), seconds spent waiting for an owner's save, tags
+        checked."""
+        st = getattr(self, "_so_stats", None)
+        return dict(st) if st is not None else {}
+
+    def so_busy(self, slot: int) -> bool:
+        """Rank 0: whether a restore that read this slot may still be running on some rank (its sequence number is past
+        the board's minimum). The host cache does not evict a busy slot: it stays pinned through the copy, not only
+        through the broadcast."""
+        if getattr(self, "_so", None) is None:
+            return False  # save-once off: the host cache asks on every eviction, and nothing is ever busy
+        seq = self._so_load_seq.get(slot)
+        if seq is None:
+            return False
+        if self._so.board.min_done() >= seq:
+            del self._so_load_seq[slot]
+            return False
+        return True
+
+    def _kv_save_many_so(self, slots: list[int], pages: list[int], gens: list[int], seq: int,
+                         tags: list[int] | None = None) -> None:
+        from .host_arena import NOTAG
+
+        st, caches, lps = self._so, self._paged_caches(), self.lps
+        tags = tags if tags is not None else [NOTAG] * len(slots)  # a caller without chain hashes: nothing to check
+        mine = [(s, p, g, t) for s, p, g, t in zip(slots, pages, gens, tags) if st.owner(s) == st.mine]
+        for lo, n, idx in page_runs([p for _, p, _, _ in mine]):  # one copy per cache per run of THIS row group's pages
+            sl = slice(lo * lps, (lo + n) * lps)
+            hosts = [c[sl].to("cpu", copy=True) for c in caches]
+            for k, j in enumerate(idx):
+                s, _, g, t = mine[j]
+                st.begin(s, g)  # before the payload: a reader copying right now fails its check_gen, it keeps no torn bytes
+                for v, h in zip(st.views(s), hosts):
+                    v.copy_(h[k * lps:(k + 1) * lps])
+                st.commit(s, g, t)  # after the payload: a reader that sees the generation sees the bytes and the tag
+        self._so_stats["save_pages"] += len(mine)
+        st.board.mark(st.rank, seq)
+
+    def _kv_load_many_so(self, slots: list[int], pages: list[int], gens: list[int], seq: int,
+                         tags: list[int] | None = None) -> None:
+        st, caches, lps, stats = self._so, self._paged_caches(), self.lps, self._so_stats
+        t0 = time.perf_counter()
+        for s, g in zip(slots, gens):
+            st.wait_gen(s, g)  # the owner's save of this generation finished (a timeout raises: never stale bytes)
+        stats["wait_s"] += time.perf_counter() - t0
+        if tags is not None:
+            for s, t in zip(slots, tags):
+                st.check_tag(s, t)  # the slot holds the page the host cache looked it up as, before a byte is copied
+            stats["tag_checked"] += len(slots)
+        self._settle()
+        views = {s: st.views(s) for s in slots}
+        for lo, n, idx in page_runs(pages):
+            sl = slice(lo * lps, (lo + n) * lps)
+            for i, c in enumerate(caches):
+                hs = [views[slots[j]][i] for j in idx]
+                c[sl].copy_(hs[0] if len(hs) == 1 else torch.cat(hs))
+        for s, g in zip(slots, gens):
+            st.check_gen(s, g)  # none was rewritten while it was copied (the busy rule prevents it; this makes a breach loud)
+        stats["load_calls"] += 1
+        stats["load_pages"] += len(slots)
+        stats["load_peer_pages"] += sum(st.owner(s) != st.mine for s in slots)
+        st.board.mark(st.rank, seq)
 
     def _paged_caches(self) -> list[torch.Tensor]:
         return self.k_caches + self.v_caches + self.aux_caches + self.s_caches
@@ -1317,7 +1563,9 @@ class ModelRunner:
         """Ranks > 0: execute every call rank 0 broadcasts, until it sends None."""
         local = {"state_copy": self._copy_state, "kv_save": self._kv_save, "kv_load": self._kv_load,
                  "kv_drop": self._kv_drop, "state_save": self._state_save, "state_load": self._state_load,
-                 "state_drop": self._state_drop}
+                 "state_drop": self._state_drop, "kv_save_many": self._kv_save_many,
+                 "kv_load_many": self._kv_load_many, "kv_arena_init": self._kv_arena_init,
+                 "kv_save_many_so": self._kv_save_many_so, "kv_load_many_so": self._kv_load_many_so}
         while True:
             msg = recv()
             if msg is None:
@@ -1343,14 +1591,51 @@ def state_pool_rows(ecfg: EngineConfig) -> int:
     return 1 + spec * per_req + (seats - spec) + state_checkpoint_rows(ecfg) + 1
 
 
+def plain_none_refusal(ecfg: EngineConfig) -> str | None:
+    """Why no plain decode buckets at all (EngineConfig.plain_decode False) are unsafe for this configuration, or None when
+    they are safe. With none, no plain decode graph is warmed or compiled, so a plain decode launch must be impossible by
+    construction:
+    - the engine's only plain launch is LLMEngine._launch's ModelRunner.decode, which picks its bucket with pick_family;
+    - a step decodes plain only in dynamic plain mode (LLMEngine._dyn_plain), entered only when more than spec_max_batch
+      requests decode, or when a request sits in a plain state seat (state_spec_seats);
+    - warmup's plain decode calls are gated on the plain buckets.
+    So all of: MTP speculation; dynamic speculation (spec_max_batch) covering the largest decode bucket and the running cap
+    (max_running, else max_num_seqs); no state_spec_seats."""
+    m = ecfg.spec_max_batch or 0
+    cap = ecfg.max_num_seqs if ecfg.max_running is None else min(ecfg.max_num_seqs, ecfg.max_running)
+    buckets = ecfg.resolved_decode_batch_buckets()
+    checks = (
+        (ecfg.spec_method == "mtp", f"spec_method is {ecfg.spec_method!r}, not mtp"),
+        (bool(m), "no dynamic speculation (spec_max_batch 0)"),
+        (m >= buckets[-1], f"spec_max_batch {m} < the largest decode bucket {buckets[-1]}"),
+        (cap <= m, f"the running cap {cap} > spec_max_batch {m} (dynamic speculation steps plain above it)"),
+        (ecfg.state_spec_seats is None, "state_spec_seats is set (a request in a plain seat steps plain)"),
+        (
+            not (getattr(ecfg, "structured_outputs", False) or getattr(ecfg, "penalties", False)),
+            "structured_outputs or penalties is set (a request with a mask or penalties steps plain)",
+        ),
+    )
+    bad = [why for ok, why in checks if not ok]
+    return "; ".join(bad) if bad else None
+
+
 def family_buckets(ecfg: EngineConfig, buckets: tuple[int, ...]) -> tuple[tuple[int, ...], tuple[int, ...]]:
     """(plain decode buckets, verify-family buckets): the decode buckets each step family is warmed and picked at; both the
     decode buckets when EngineConfig.spec_bucket_max and plain_bucket_min are 0. With dynamic speculation the two families
     use disjoint row counts: the verify family (verify, the speculative board graphs, the decode-side MTP pass) only runs
     while at most spec_max_batch requests decode, plain decode only above it (down to spec_max_batch - spec_hysteresis + 1).
     spec_bucket_max keeps the verify family to buckets <= B; plain_bucket_min keeps plain decode to buckets >= B, a smaller
-    batch padded up. Every kept graph's key is the same as without the knobs, and the dropped ones are never loaded."""
+    batch padded up. Every kept graph's key is the same as without the knobs, and the dropped ones are never loaded.
+    plain_decode False: no plain decode bucket at all, allowed only where plain_none_refusal finds no plain launch path."""
     lo, hi, m = ecfg.plain_bucket_min, ecfg.spec_bucket_max, ecfg.spec_max_batch
+    if not ecfg.plain_decode:
+        why = plain_none_refusal(ecfg)
+        if why:
+            raise ValueError(f"plain_decode False (no plain decode buckets) refused: {why}")
+        spec = tuple(b for b in buckets if not hi or b <= hi)
+        if not spec or spec[-1] < m:
+            raise ValueError(f"spec_bucket_max={hi}: the verify family's buckets {spec} do not cover spec_max_batch {m}")
+        return (), spec
     if not lo and not hi:
         return tuple(buckets), tuple(buckets)
     plain = tuple(b for b in buckets if not lo or b >= lo)
@@ -1364,7 +1649,11 @@ def family_buckets(ecfg: EngineConfig, buckets: tuple[int, ...]) -> tuple[tuple[
 
 def pick_family(n: int, buckets: tuple[int, ...], family: str) -> int:
     """pick_bucket over one step family's warmed buckets (family_buckets), raising a clear error past them: a launch outside
-    the warmed set must never compile or look up a missing graph at run time."""
+    the warmed set must never compile or look up a missing graph at run time; a family with no buckets (plain_decode False)
+    has no graph at all."""
+    if not buckets:
+        raise RuntimeError(f"a {family} launch of {n} rows on an engine with no {family} buckets (no {family} graph is "
+                           "warmed or compiled): refused")
     if n > buckets[-1]:
         raise RuntimeError(f"a {family} launch of {n} rows exceeds its warmed buckets {buckets}: not compiled, refused")
     return pick_bucket(n, buckets)
@@ -1383,3 +1672,89 @@ def spec_page_buckets(ecfg: EngineConfig, page_buckets: tuple[int, ...]) -> tupl
     if not set(sp) <= set(pb) or sp[-1] != pb[-1]:
         raise ValueError(f"spec_page_buckets {sp} must be page buckets {pb} including the largest (every context has a rung)")
     return sp
+
+
+# -- static row classes of the DSA selection, the runner's side -------------------------------------------------------------------
+# The row-class selection kernel (kernels/dsa_sel2gc.py) scores, for each batch slot s of a plain decode at its layout's page bucket,
+# only the slot's first 128 NG_s pages. The kernel needs the batch in class-slot order and a guard, both here, host only:
+# - rowclass_order (LLMEngine._launch): a plain decode chunk whose batch size has a layout is sorted by pages, longest first
+#   (stable), so the longest rows take the widest slots (slot s runs on LNC program s % 2; a layout's classes are contiguous,
+#   even and widest first);
+# - rowclass_page (decode()): at the layout's bucket, a batch whose rows don't fit their slots (pages > 128 NG_s) goes to the next
+#   page bucket (the unclassed graph); one that would fit sorted but arrived unsorted is refused (a caller skipped rowclass_order).
+# Every input, output, state save and hidden row follows the chunk's order (all keyed by request, not row), so nothing permutes on
+# the device. The engine has no data-parallel attention and no mixed batches, the paths that would reorder a chunk.
+
+
+def _row_class_layouts() -> dict:
+    """The selection kernel's layouts, {B: (NG per slot)} (kernels/dsa_sel2gc.py LAYOUTS, which set_decode_routes fills from
+    the configuration), or {} when the kernel is not in this tree or has none."""
+    import importlib.util
+
+    if importlib.util.find_spec("trnrt.kernels.dsa_sel2gc") is None:
+        return {}
+    from ..kernels import dsa_sel2gc
+
+    return {int(b): tuple(int(g) for g in ngs) for b, ngs in (getattr(dsa_sel2gc, "LAYOUTS", None) or {}).items()}
+
+
+def rowclass_init(runner, ecfg) -> dict:
+    """{B: NG per slot} when the selection kernel has layouts (else {}), after the checks that make an unguarded classed call
+    impossible to construct; installs the kernel's runner guard (dsa_sel2gc.RUNNER) only then. Off on a CPU engine: the
+    selection kernel runs on a NeuronCore (and in its capture, on the meta device) only."""
+    runner.rc_steps = runner.rc_fallbacks = 0  # classed calls / batches sent to the next page bucket (rowclass_page)
+    lay = _row_class_layouts() if getattr(runner, "device", None) is None or runner.device.type != "cpu" else {}
+    if not lay:
+        return {}
+    from ..kernels import dsa_sel2gc
+
+    why = []
+    pb = tuple(sorted(runner.page_buckets))
+    spec, Q = bool(getattr(ecfg, "spec_method", None)), 1 + int(getattr(ecfg, "spec_k", 0) or 0)
+    for B, ngs in sorted(lay.items()):
+        P = 128 * max(ngs)
+        if list(ngs) != sorted(ngs, reverse=True):
+            why.append(f"B {B}'s classes aren't widest first {ngs}")
+        if B not in runner.plain_buckets:
+            why.append(f"B {B} is not a plain decode bucket {tuple(runner.plain_buckets)}")
+        if P not in pb or P == pb[-1]:
+            why.append(f"B {B}'s bucket P {P} needs a larger page bucket for the guard's fallback (page buckets {pb})")
+        if spec and P in runner.spec_page_buckets and any(b == B or b * Q == B for b in runner.spec_buckets):
+            why.append(f"a verify or MTP call of {B} rows at P {P} (spec ladder {runner.spec_page_buckets}) would skip the guard")
+    if why:
+        raise ValueError("the DSA selection's row classes: " + "; ".join(why))
+    dsa_sel2gc.RUNNER = "trnrt.engine.model_runner.rowclass_page"
+    return lay
+
+
+def rowclass_order(runner, seqs: list) -> list:
+    """A plain decode chunk in class-slot order: sorted by pages, longest first, stable (ties keep the scheduler's order), when its
+    batch size has a layout; else the chunk unchanged. The caller keeps the returned list as the chunk (outputs and state saves
+    follow it)."""
+    lay = getattr(runner, "rc", None)
+    if not lay or len(seqs) < 2:
+        return seqs
+    B = next((b for b in runner.plain_buckets if b >= len(seqs)), None)
+    if B not in lay:
+        return seqs
+    ps = runner.ps
+    return sorted(seqs, key=lambda s: -s.end // ps)  # -pages (pages = ceil(end / ps), as decode() buckets them)
+
+
+def rowclass_page(runner, seqs, B: int, P: int) -> int:
+    """The page bucket of a plain decode of `seqs` at batch bucket B, given today's pick P: P itself unless P is B's classed bucket
+    and the rows, in their order, don't fit their slots (row b's pages <= 128 NG_b); then the next page bucket. Refuses an order
+    that would fit sorted (the caller skipped rowclass_order: the kernel would read a long row's first 128 NG_s pages only)."""
+    lay = runner.rc.get(B) if getattr(runner, "rc", None) else None
+    if lay is None or P != 128 * max(lay):
+        return P
+    caps = [128 * g for g in lay]
+    pages = [-(-s.end // runner.ps) for s in seqs]
+    if len(pages) <= len(caps) and all(p <= c for p, c in zip(pages, caps)):
+        runner.rc_steps += 1
+        return P
+    if len(pages) <= len(caps) and all(p <= c for p, c in zip(sorted(pages, reverse=True), caps)):
+        raise RuntimeError(f"plain decode of {len(pages)} rows at B {B} / P {P}: rows not in class-slot order (pages {pages}); "
+                           "the caller must order the chunk with rowclass_order")
+    runner.rc_fallbacks += 1
+    return pick_bucket(P + 1, tuple(sorted(runner.page_buckets)))

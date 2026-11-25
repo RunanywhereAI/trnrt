@@ -263,6 +263,8 @@ def satwf(*args, S, post_a, comb_a, blobs: dict, w_blob, ffn: dict, grid: int | 
     fargs = FH.run(S, (post_a, comb_a.c, S.new_zeros(1)), blobs, w_blob, grid=grid, build_only=True, **ffn)
     fargs.pop("Yp")  # built in the kernel
     fargs.pop("rev")  # REV carries FS.REV (through SATWF.REV)
+    # the FFN half's stream mix with its rows split (shell.MIX_ROW_SPLIT) is a different kernel: its term, as run()'s
+    sargs["rev"] = int(sargs["rev"]) ^ SH.mix_rev_term()
     fargs["fscale"], fargs["fwb"] = fargs.pop("scale"), fargs.pop("wb")
     clash = set(fargs) & set(sargs)
     if clash:

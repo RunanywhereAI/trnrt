@@ -7,9 +7,7 @@ calls reach the other ranks through a shared-memory channel (ShmChannel below; T
 sends them over gloo instead).
 
 On Neuron each rank sees exactly one NeuronCore (NEURON_RT_VISIBLE_CORES) and all ranks
-share one CCOM bootstrap endpoint (NEURON_RT_ROOT_COMM_ID), the arrangement vllm-neuron's
-worker uses (vllm_neuron/vllm/worker/neuron_worker.py, _init_neuron_distributed_environment
-_and_runtime and rendezvous_ccom_bootstrap). The CCOM port is the gloo port + 1 so the two
+share one CCOM bootstrap endpoint (NEURON_RT_ROOT_COMM_ID). The CCOM port is the gloo port + 1 so the two
 never collide (libtorch_neuronx_lite defaults the CCOM root to MASTER_PORT otherwise).
 """
 
@@ -21,6 +19,7 @@ import errno
 import logging
 import os
 import socket
+import threading
 from typing import Any
 
 import torch.distributed as dist
@@ -137,26 +136,76 @@ def parse_cpulist(s: str) -> set[int]:
     return out
 
 
-def neuron_devices() -> list[dict]:
-    """`neuron-ls --json-output`: one dict per Neuron device."""
+def fmt_cpus(cpus) -> str:
+    """A CPU set as a kernel CPU list ("0-47,96-143"), parse_cpulist's inverse."""
+    s, out, i = sorted(cpus), [], 0
+    while i < len(s):
+        j = i
+        while j + 1 < len(s) and s[j + 1] == s[j] + 1:
+            j += 1
+        out.append(str(s[i]) if i == j else f"{s[i]}-{s[j]}")
+        i = j + 1
+    return ",".join(out)
+
+
+def ls_records(out: str) -> list[dict]:
+    """neuron-ls's JSON as one dict per Neuron device: the `--json-output` form (a list of device records), or a
+    top-level object holding exactly one list of device records (dicts with neuron_device), the form announced for
+    `--output-format json` ("top-level fields for information that applies to more than one device"; its layout is
+    unverified here). Anything else is a ValueError, never a guess."""
     import json
+
+    d = json.loads(out)
+    if isinstance(d, list):
+        if d and all(isinstance(x, dict) and "neuron_device" in x for x in d):
+            return d
+        raise ValueError(f"neuron-ls JSON: a list of {len(d)} entries, not a device list")
+    if isinstance(d, dict):
+        lists = [
+            v
+            for v in d.values()
+            if isinstance(v, list) and v and all(isinstance(x, dict) and "neuron_device" in x for x in v)
+        ]
+        if len(lists) == 1:
+            return lists[0]
+        raise ValueError(f"neuron-ls JSON: no single device list among its top-level keys {sorted(d)[:8]}")
+    raise ValueError(f"neuron-ls JSON: a {type(d).__name__}, not a device list")
+
+
+def neuron_devices() -> list[dict]:
+    """neuron-ls's device records: `--json-output`, else `--output-format json` (announced to replace -j /
+    --json-output in a later Neuron SDK), also when the first exits 0 with output ls_records cannot read (a deprecated
+    flag's notice, another layout). Raises when neither gives a device list."""
     import shutil
     import subprocess
 
     exe = shutil.which("neuron-ls") or "/opt/aws/neuron/bin/neuron-ls"
-    return json.loads(
-        subprocess.run([exe, "--json-output"], capture_output=True, text=True, timeout=60, check=True).stdout
-    )
+    errs = []
+    for flags in (["--json-output"], ["--output-format", "json"]):
+        try:
+            r = subprocess.run([exe, *flags], capture_output=True, text=True, timeout=60, check=True)
+        except subprocess.CalledProcessError as e:
+            errs.append(f"{' '.join(flags)}: exit {e.returncode} ({(e.stderr or '').strip()[:120]})")
+            continue
+        try:
+            return ls_records(r.stdout)
+        except ValueError as e:  # json.JSONDecodeError is one
+            errs.append(f"{' '.join(flags)}: {e}")
+    raise RuntimeError("neuron-ls gave no device JSON: " + "; ".join(errs))
 
 
 def numa_cpus(core: int, devices: list[dict], lnc: int | None = None) -> set[int] | None:
     """The CPUs local to the device holding logical NeuronCore `core` at logical config `lnc` (default: the one
-    neuron-ls reports), or None if no device holds it."""
+    neuron-ls reports), or None if no device holds it. A record it cannot read (a field missing, null, not a number, a
+    zero core count) is a ValueError, which its callers take as a failed device listing."""
     for d in devices:
-        ls_lnc = int(d.get("logical_neuroncore_config") or 1)
-        per_device = int(d["nc_count"]) * ls_lnc // (lnc or ls_lnc)
-        if int(d["neuron_device"]) == core // per_device:
-            return parse_cpulist(d["cpu_affinity"])
+        try:
+            ls_lnc = int(d.get("logical_neuroncore_config") or 1)
+            per_device = int(d["nc_count"]) * ls_lnc // (lnc or ls_lnc)
+            if int(d["neuron_device"]) == core // per_device:
+                return parse_cpulist(d["cpu_affinity"])
+        except (AttributeError, KeyError, TypeError, ValueError, ZeroDivisionError) as e:
+            raise ValueError(f"neuron-ls device record {str(d)[:200]} cannot be read ({type(e).__name__}: {e})") from e
     return None
 
 
@@ -168,22 +217,67 @@ def pin_mask(core: int, devices: list[dict], launched, lnc: int | None = None) -
 # What numa_pin saw (core base, devices, launch mask, LNC), for rank_threads: which of the engine's ranks share this
 # rank's CPUs. None when the device listing failed (every rank then runs as launched).
 _PIN: dict | None = None
+# TRNRT_NUMA_PIN_OPTIONAL=1: a device listing that fails leaves the ranks unpinned with a warning instead of failing the
+# start, and the start check (engine/start_checks.py) lets an engine start with ranks it cannot pin.
+PIN_OPTIONAL = "TRNRT_NUMA_PIN_OPTIONAL"
 
 
-def numa_pin(rank: int, core_base: int, devices: list[dict] | None = None) -> set[int] | None:
+class NumaPinError(RuntimeError):
+    """The device listing failed, so a rank cannot be pinned to its node: the engine's start fails (unless
+    TRNRT_NUMA_PIN_OPTIONAL=1)."""
+
+
+def pin_count(core_base: int, world: int, devices: list[dict], launched, lnc: int | None = None) -> int:
+    """How many of an engine's `world` ranks from logical core `core_base` have a pin mask (pin_mask is not None)."""
+    return sum(pin_mask(core_base + r, devices, launched, lnc) is not None for r in range(world))
+
+
+def numa_pin(rank: int, core_base: int, devices: list[dict] | None = None, world: int | None = None) -> set[int] | None:
     """Pin the calling thread, and so every thread it starts after, to pin_mask of logical core core_base + rank
-    (the runtime's NEURON_LOGICAL_NC_CONFIG when set, else neuron-ls's). Returns the mask, or None."""
+    (the runtime's NEURON_LOGICAL_NC_CONFIG when set, else neuron-ls's). Returns the mask, or None.
+
+    A failed device listing (neuron-ls missing, failing, or JSON it cannot read; or a NEURON_LOGICAL_NC_CONFIG that is
+    not a number) raises NumaPinError, so the engine's start fails: it used to leave every rank unpinned with one warning each, which is easy to miss and costs host time
+    on every step. TRNRT_NUMA_PIN_OPTIONAL=1 runs unpinned instead, with a warning. A rank whose node has no CPU in the
+    launch mask still runs as launched (a launcher's CPU set bounds the pin by design), with a warning. `world` (rank 0
+    passes the engine's tp): also log the engine's NUMA-PIN line, how many of its ranks pin."""
+    import subprocess
+
     global _PIN  # noqa: PLW0603  # what the last pin saw, process-wide state that rank_threads reads (tests reset it)
     _PIN = None
     lnc = os.environ.get("NEURON_LOGICAL_NC_CONFIG")
     launched = os.sched_getaffinity(0)  # type: ignore[attr-defined, unused-ignore]  # Linux-only: mypy elsewhere has no os.sched_*affinity
     try:
+        if lnc and not lnc.strip().isdigit():
+            raise ValueError(f"NEURON_LOGICAL_NC_CONFIG={lnc!r} is not a logical core count")
+        lnc_i = int(lnc) if lnc else None
         devs = neuron_devices() if devices is None else devices
-        mask = pin_mask(core_base + rank, devs, launched, int(lnc) if lnc else None)
-    except (OSError, ValueError, KeyError, RuntimeError) as e:  # neuron-ls missing or failing: run as launched
-        logger.warning("NUMA pin: rank %s not pinned (%s: %s)", rank, type(e).__name__, e)
+        mask = pin_mask(core_base + rank, devs, launched, lnc_i)
+        n = pin_count(core_base, world, devs, launched, lnc_i) if world else 0  # every record of the engine's ranks
+    except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as e:
+        why = f"{type(e).__name__}: {e}"
+        if os.environ.get(PIN_OPTIONAL) != "1":
+            raise NumaPinError(
+                f"rank {rank} cannot be pinned to its NeuronCore's NUMA node: the device listing failed ({why}). Fix "
+                f"neuron-ls, or set {PIN_OPTIONAL}=1 to run unpinned"
+            ) from e
+        logger.warning("NUMA pin: rank %s NOT PINNED (%s); running as launched under %s=1", rank, why, PIN_OPTIONAL)
+        if world:
+            logger.warning("NUMA-PIN: off, 0/%s ranks pinned (%s; %s=1)", world, why, PIN_OPTIONAL)
         return None
-    _PIN = {"core_base": core_base, "devices": devs, "launched": set(launched), "lnc": int(lnc) if lnc else None}
+    _PIN = {"core_base": core_base, "devices": devs, "launched": set(launched), "lnc": lnc_i}
+    if world:
+        if n == world:
+            logger.info("NUMA-PIN: on, %s/%s ranks pinned", n, world)
+        else:
+            logger.warning(
+                "NUMA-PIN: %s, %s/%s ranks pinned; %s as launched (no CPU of their node in the launch mask %s)",
+                "partial" if n else "as launched",
+                n,
+                world,
+                world - n,
+                fmt_cpus(launched),
+            )
     if mask is None:
         logger.warning(
             "NUMA pin: rank %s not pinned (no CPU of core %s's node in the launch mask)", rank, core_base + rank
@@ -193,11 +287,12 @@ def numa_pin(rank: int, core_base: int, devices: list[dict] | None = None) -> se
     return mask
 
 
-def neuron_env(rank: int, port: int, core_base: int) -> None:
-    """Must run before libtorch_neuronx_lite is imported in this process."""
+def neuron_env(rank: int, port: int, core_base: int, world: int | None = None) -> None:
+    """Must run before libtorch_neuronx_lite is imported in this process. `world`: rank 0 passes the engine's tp, for
+    numa_pin's NUMA-PIN line."""
     os.environ["NEURON_RT_VISIBLE_CORES"] = str(core_base + rank)
     os.environ["NEURON_RT_ROOT_COMM_ID"] = f"127.0.0.1:{port + 1}"
-    numa_pin(rank, core_base)
+    numa_pin(rank, core_base, world=world)
 
 
 def rank_threads(world: int) -> int:
@@ -301,6 +396,9 @@ class ShmChannel:
         import numpy as np
 
         self.shm, self.world, self.rank, self.owner = shm, world, rank, owner
+        # close() holds it while it unmaps the segment, and lagging() while it reads the acknowledgements from another
+        # thread (engine._bounded_stop's log, as a late stop's own close may run): numpy views do not keep a mapping
+        self._lock = threading.Lock()
         # numpy arrays over the segment, None once the channel is closed (close, drop_channel): a party still waiting
         # then fails instead of reading an unmapped segment
         self.ctl: Any = np.ndarray((4,), dtype=np.uint64, buffer=shm.buf, offset=0)
@@ -401,9 +499,17 @@ class ShmChannel:
             raise RuntimeError(f"a shared-memory call in unknown mode {mode}")
         return pickle.loads(data)  # noqa: S301  # rank 0 of this engine wrote it, the trust of broadcast_object_list
 
+    def lagging(self) -> list[int] | None:
+        """The ranks whose acknowledged seq lags the last call written, or None once the channel is closed. Safe from a
+        thread other than the one that closes it."""
+        with self._lock:
+            acks = self.acks
+            return None if acks is None else [r for r in range(1, self.world) if int(acks[r]) < self.seen]
+
     def close(self) -> None:
-        self.ctl = self.acks = None
-        self.shm.close()
+        with self._lock:
+            self.ctl = self.acks = None
+            self.shm.close()
         if self.owner:
             self.shm.unlink()
 
@@ -415,6 +521,16 @@ def _parent_gone() -> bool:
 
     p = multiprocessing.parent_process()
     return p is not None and not p.is_alive()
+
+
+def unacked_ranks():
+    """For a stuck stop (engine._bounded_stop's log): over the shared-memory channel, the ranks whose acknowledged seq
+    lags the last call rank 0 wrote; over gloo (no channel open), a note that its broadcast gives no per-rank answer."""
+    ch = _CH["ch"]
+    if ch is None:
+        return "unknown (gloo broadcast: no per-rank acknowledgement)"
+    lag = ch.lagging()  # under the channel's lock: the stop's thread may be closing it right now
+    return "unknown (the channel closed meanwhile)" if lag is None else lag
 
 
 def send(msg) -> None:

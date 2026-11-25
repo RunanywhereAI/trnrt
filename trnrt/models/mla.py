@@ -14,8 +14,8 @@ its pool gate logits). Decode attends over the latent directly by weight absorpt
 W_UK^T q_nope; out = W_UV (p @ c)), so the per-head keys and values are never formed; a prefill
 chunk on the host decompresses its context.
 
-Tensor parallelism is SGLang v0.5.21's and vLLM v0.30.0's layout (srt/models/deepseek_v2.py
-DeepseekV2AttentionMLA; vllm/model_executor/models/deepseek_v2.py DeepseekV2MLAAttention):
+Tensor parallelism splits only the heads of the
+DeepSeek-V2-style MLA layer:
 q_a_proj and kv_a_proj_with_mqa are ReplicatedLinear, q_b_proj and kv_b_proj are
 ColumnParallelLinear over heads, o_proj is RowParallelLinear; so every rank computes the same
 latent, and only the heads are split, over the attention TP.
@@ -77,6 +77,18 @@ CP_SLOTS_SMALL = 128
 # turns it off (_local_k).
 CP_LOCAL_K = 120
 CP_LOCAL_F = 128
+# The failed rows' merge (attention_cp_rows) as dsa_long.cp_merge_rows_2k with both selections under a run-time trip of
+# (failed rows > 0) (kernels/dsa_topk_t.py): the same mask, masked by `live` as before, and when no row fails (every row
+# of real text so far) neither selection runs. Off: the merge with its tie search, at full size every call. The engine's
+# EngineConfig.dsa_cp_fail_trip, set on every rank before the shard is built; read when a prefill graph is traced.
+CP_FAIL_TRIP = False
+# The failed rows' attention (attention_cp_rows' _cp_attend_classes over the CP_LOCAL_F compacted entries) with both slot
+# classes counting the live entries only, so kernels/dsa_slots_n.py's run-time row loop runs no row when no row failed:
+# the 128-row masked call every DSA layer of a prefill chunk paid is gone. Exact: the live entries are compact()'s first
+# nf, so each class keeps them first and in order; each row's attention reads only its own q / rows / bias; and the
+# combine takes o_f / lse_f only at failed rows whose slot < CP_LOCAL_F, i.e. live entries (the others' are unwritten
+# on the device and never selected). EngineConfig.dsa_cp_fail_attn_trip, set as CP_FAIL_TRIP is.
+CP_FAIL_ATTN_TRIP = False
 VISIBLE_SCORE = -5e29  # kernels/dsa_topk.VISIBLE: scores at or below it are not candidates
 # A context-parallel layer's FP8 w_a (q_a + kv_a), q_b and o_proj are also kept as model-dtype copies
 # (w_a_dec, q_b_dec, o_dec: dequant of the stored FP8 and scales at load, so the same values), which
@@ -84,6 +96,24 @@ VISIBLE_SCORE = -5e29  # kernels/dsa_topk.VISIBLE: scores at or below it are not
 # ms of a 4.1 ms DSA layer, measured on trn1). Prefill keeps the FP8 weights. +22.5 MB per DSA layer
 # per rank at tp 32, +0.23 GiB over the 11 layers.
 DECODE_BF16_NAMES = ("w_a", "q_b", "o")
+# o_dec is not kept on a layer that has the fused layer calls' o_t (DecoderForCausalLM drops it once the layers are
+# built, before any load): the fused call reads o_t, which load_layer fills from the same dequant(o, o_scale) with or
+# without o_dec, and attention_cp's XLA decode branch falls back to model._w (_wd) when the copy is absent. When every
+# decode step runs the fused call (decode buckets up to dsa_layer_max_rows) no graph reads it: 43 MB a rank of HBM. The
+# MTP layer is not passed, so it keeps its own (its graphs read it). EngineConfig.dsa_drop_unread_o_dec, set on every
+# rank before the shard is built.
+ODEC_DROP = False
+
+
+def drop_unread_o_dec(layers) -> int:
+    """Remove o_dec from each layer that also has o_t (ODEC_DROP). Returns how many."""
+    n = 0
+    for layer in layers:
+        if getattr(layer, "o_t", None) is not None and "o_dec" in layer._parameters:
+            del layer._parameters["o_dec"]
+            layer._decode_only = tuple(x for x in getattr(layer, "_decode_only", ()) if x != "o_dec")
+            n += 1
+    return n
 # The decode shell's selection (kernels/dsa_shell.py select2): its page groups gathered ahead, its
 # page tiles in flight, and its compaction with each program's rows stacked up to 4 a tile.
 SEL2_PF = 5
@@ -193,7 +223,7 @@ def init_layer(layer, cfg: ModelConfig, spec: AttnSpec, p, lin, tp: int) -> None
     H, nh = cfg.hidden_size, spec.num_heads // tp
     dn, dr, dv, r = m.qk_nope_head_dim, m.qk_rope_head_dim, m.v_head_dim, m.kv_lora_rank
     layer.nh, layer.nkv, layer.kv_offset = nh, 1, 0
-    # q_a_proj and kv_a_proj_with_mqa read the same input and are replicated: one matmul (vLLM's
+    # q_a_proj and kv_a_proj_with_mqa read the same input and are replicated: one matmul (called
     # fused_qkv_a_proj).
     lin("w_a", "self_attn.q_a_proj", m.q_lora_rank + r + dr, H)
     layer.q_a_norm = p(m.q_lora_rank)
@@ -742,13 +772,15 @@ def attention_cp(model, layer, x, positions, slot_mapping, table, ffn=None):
                 from ..kernels import ffn_half as FH
 
                 S_, post_a, comb_a = ffn
-                blobs, fkw = FH.decode_args(model, layer, S_.shape[1])
+                # the graph's page-table width and rows: the FFN half's ring depth follows them (ffn_half.ring_for)
+                blobs, fkw = FH.decode_args(model, layer, S_.shape[1], pages=table.shape[-1], T=S_.shape[0])
                 r_ = dsa_satwf.satwf(q_p, w2.float() * scale, layer.pool_key.view(-1, dsa_shell.PPP * Di), table,
                                      nloc, positions, q_pre, layer.k_cache, layer.w_uv_t, layer.o_t, ident, keep, A,
                                      rank, model.tp_size, m.softmax_scale, S=S_, post_a=post_a, comb_a=comb_a,
                                      blobs=blobs, w_blob=layer.w_blob, ffn=fkw, kp=kp, ns=dsa_decode.NCH * 128,
                                      nr=SEL2_NR, pf=SEL2_PF, il=1, fz=1, ob=1, pw=1, rp=0, yb=1,
-                                     **({"pq": _mk_pq(T, A)} if _mk_pq(T, A) else {}), cs=SEL2_CS)
+                                     **({"pq": _mk_pq(T, A)} if _mk_pq(T, A) else {}), cs=SEL2_CS,
+                                     rowgroup=model.attn_rank // A)  # (form W: the rank's row group)
                 # fz 1 + ob 1 + pw 1 + rp 0 + yb 1: the measured-exact form of the join, every cross-program hand-off
                 # through outputs or program 0, none through internal shared scratch
                 Sn, post, comb, rp, sp = r_[10:15]
@@ -985,7 +1017,11 @@ def attention_cp_rows(model, layer, x, positions, slot_mapping, table):
         cpool_f = lp_f * A + rank.view(())
         ev_f = _cp_gather(model, lval_f).permute(1, 0, 2)  # [nF, A, keep]
         ec_f = _cp_gather(model, cpool_f.to(torch.float32)).permute(1, 0, 2)
-        chosen_f = _cp_chosen(_dsa_long.cp_merge(ev_f, ec_f, keep, None, Pl * A), rank, A, nF, keep) & live.view(nF, 1)
+        if CP_FAIL_TRIP:  # the selections run only when a row failed
+            chosen_f = _cp_chosen(_dsa_long.cp_merge(ev_f, ec_f, keep, None, Pl * A, two_k=True,
+                                                     trip=(nf > 0).to(torch.int32)), rank, A, nF, keep) & live.view(nF, 1)
+        else:
+            chosen_f = _cp_chosen(_dsa_long.cp_merge(ev_f, ec_f, keep, None, Pl * A), rank, A, nF, keep) & live.view(nF, 1)
         if getattr(layer, "cp_localk", None) is not None:
             nff = fail.to(torch.float32).sum().view(1)  # every failed row: compact's count stops at nF
             layer.cp_localk.add_(torch.cat([torch.full_like(nff, float(n)), nff, (nff - float(nF)).clamp(min=0.0)]))
@@ -1015,10 +1051,8 @@ def attention_cp_rows(model, layer, x, positions, slot_mapping, table):
                                         m.softmax_scale, kp, CP_SLOTS_SMALL, n_slots)
     else:  # every row in one buffer of CP_SLOTS_SMALL slots (its K entries and the tail), the failed rows replaced
         if glue:  # the buffer the glue kernel built (_cp_attend_classes single's, bit for bit)
-            from ..kernels import dsa_slots_n
-
-            o_r, lse_r = dsa_slots_n.attend(q_lat, layer.k_cache, g_rows, g_bias, m.softmax_scale,
-                                            torch.full((1,), n, dtype=torch.int64, device=q_lat.device), lse=True)
+            o_r, lse_r = _cp_slots_attend(q_lat, layer.k_cache, g_rows, g_bias, m.softmax_scale,
+                                          torch.full((1,), n, dtype=torch.int64, device=q_lat.device))
         else:
             o_r, lse_r = _cp_attend_classes(q_lat, layer.k_cache, rows_sel, rows_tail, chosen, tail_own, npool, pos_b,
                                             m.softmax_scale, kp, CP_SLOTS_SMALL, n_slots, single=True)
@@ -1027,7 +1061,7 @@ def attention_cp_rows(model, layer, x, positions, slot_mapping, table):
         rows_f = tb_f.gather(1, pg_f.clamp(max=tb_f.shape[1] - 1)) * ppl + (lp_f - pg_f * ppl)
         o_f, lse_f = _cp_attend_classes(q_lat[fi], layer.k_cache, rows_f, rows_tail[fi], chosen_f,
                                         tail_own[fi] & live, npool[fi], pos_b[fi], m.softmax_scale, kp,
-                                        CP_SLOTS_SMALL, n_slots)
+                                        CP_SLOTS_SMALL, n_slots, rows_live=live if CP_FAIL_ATTN_TRIP else None)
         slot = (torch.cumsum(fail.to(torch.float32), 0) - 1.0).clamp(min=0.0).to(torch.int64)  # its place in fi
         use = fail & (slot < nF)
         slot = slot.clamp(max=nF - 1)
@@ -1160,8 +1194,19 @@ def _cp_combine(model, layer, o_r, lse_r, T: int, A: int, nh: int, r: int, dv: i
     return F.linear(out, model._w(layer, "o"))
 
 
+def _cp_slots_attend(q, kc, rows, bias, scale: float, n):
+    """The local-K single buffer's slot attention (o, lse), attention_cp_rows' main rows: kernels/dsa_slots_n_p.py, the
+    split kernel's rows software-pipelined (its o / lse bit for bit), under its route (dsa_slots_n_p.PIPE_ROWS); else
+    dsa_slots_n.attend."""
+    from ..kernels import dsa_slots_n, dsa_slots_n_p
+
+    if (q.device.type != "cpu" or SH.HOST_SIM) and dsa_slots_n_p.takes():  # (the host runs dsa_slots_n's emulation)
+        return dsa_slots_n_p.attend(q, kc, rows, bias, scale, n, lse=True)
+    return dsa_slots_n.attend(q, kc, rows, bias, scale, n, lse=True)
+
+
 def _cp_attend_classes(q_all, kc, rows_sel, rows_tail, mine, tail_own, npool, positions, scale: float, kp: int,
-                       small: int, full: int, single: bool = False):
+                       small: int, full: int, single: bool = False, rows_live=None):
     """(o [T, H, R] fp32, lse [T, H] fp32): this rank's partial attention of every row over its selected local pools
     and its tail, as attention_cp's fixed slots give it, with each row in a buffer sized by where its selected entries
     end. The local lists come in the selection kernel's value order (score descending, pool ascending:
@@ -1171,7 +1216,8 @@ def _cp_attend_classes(q_all, kc, rows_sel, rows_tail, mine, tail_own, npool, po
     `mine` as in the fixed slots; every other row the full one (attention_cp's fixed layout, `full` >= keep + 1
     slots). Masking by `mine` keeps it exact whatever the order. Each buffer holds its rows first (compact over the
     rows) and kernels/dsa_slots_n.py runs only those: n_small c(small) + n_full c(full). No gather of the local list
-    (a per-element gather of [1024, 512] cost ~60 ms on trn1)."""
+    (a per-element gather of [1024, 512] cost ~60 ms on trn1). rows_live (CP_FAIL_ATTN_TRIP): the entries each class
+    counts, the others run no row."""
     from ..kernels import dsa_slots_n
 
     T, keep = mine.shape
@@ -1205,10 +1251,12 @@ def _cp_attend_classes(q_all, kc, rows_sel, rows_tail, mine, tail_own, npool, po
         rows = torch.where(sl < keep, rs, torch.where(sl == keep, rows_tail, torch.zeros_like(rows_tail)))
         ok = ((sl < keep) & ms).unsqueeze(-1) | ((sl == keep).unsqueeze(-1) & tail_tok)
         bias = torch.where(ok, 0.0, NEG_INF).to(torch.float32)
-        return dsa_slots_n.attend(q_all, kc, rows, bias, scale, torch.full((1,), T, dtype=torch.int64, device=dev),
-                                  lse=True)
+        return _cp_slots_attend(q_all, kc, rows, bias, scale, torch.full((1,), T, dtype=torch.int64, device=dev))
     out_o, out_l = [], []
-    for want, (C, L) in ((fits, (small, S1)), (~fits, (full, keep))):
+    w_small, w_full = fits, ~fits
+    if rows_live is not None:  # CP_FAIL_ATTN_TRIP: only the live entries count, so a class with none runs no row
+        w_small, w_full = fits & rows_live, ~fits & rows_live
+    for want, (C, L) in ((w_small, (small, S1)), (w_full, (full, keep))):
         idx, n = _dsa_long.compact(want.to(torch.float32).view(1, T), T)  # this buffer's rows first
         idx = idx.view(T)
         rows, bias = build(C, L)

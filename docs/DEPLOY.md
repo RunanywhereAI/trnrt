@@ -76,9 +76,9 @@ directory too, so `serve` below mounts the compile host's copy.
   hands it back once the steps are done.
 
 The arguments after `capture --` must be the engine arguments the server runs with, spelled out in full. Capture refuses
-any other; the server's own, such as `--engines` and `--port`, do not change the graphs. The defaults are the default
-configuration (batch 12), so `--model` alone is enough. For batch 8 ([Batch 8](CONFIGURATION.md#batch-8)), pass `--preset batch8` to
-both `capture` and `serve`.
+any other; the server's own, such as `--engines` and `--port`, do not change the graphs. The defaults are the `balanced`
+build (9 to 16 users per engine), so `--model` alone is enough. For another build ([CONFIGURATION.md](CONFIGURATION.md)),
+pass the same `--preset latency`, `--preset throughput` or `--preset auto --users N` to both `capture` and `serve`.
 
 ### 4. Download the checkpoint and serve (trn2.48xlarge)
 

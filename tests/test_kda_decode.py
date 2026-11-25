@@ -1,11 +1,13 @@
 """kernels/kda_decode.py: the KDA decode step kernel's emulation against models/linear_attn.py's decode form, its
 route (the decode form takes it on the device; the KDA shell's row cap decides which steps reach the decode form),
-and the kernel in the NKI simulator against its emulation, at grid 1 and split over the two programs of an LNC 2 core
-(rows that start from a zero state, a shared padding write row)."""
+the kernel's source (no PSUM accumulation group: on trn2 such a group lost its started term in each program's first
+row), and the kernel in the NKI simulator against its emulation, at grid 1 and split over the two programs of an LNC 2
+core (rows that start from a zero state, a shared padding write row, an odd row count: a partial chunk)."""
 
 from __future__ import annotations
 
 import importlib.util
+import inspect
 
 import pytest
 import torch
@@ -55,15 +57,29 @@ def test_emulation_is_the_decode_form():
 
 def test_takes_a_kda_step_of_128_wide_heads_on_the_device_only():
     dev, cpu = torch.empty(2, 8, device="meta"), torch.empty(2, 8)
-    assert kd.takes(dev, 128, 128, True)
-    assert not kd.takes(cpu, 128, 128, True)  # the CPU keeps the einsums
-    assert not kd.takes(dev, 128, 128, False)  # a scalar (GDN) gate
-    assert not kd.takes(dev, 64, 128, True) and not kd.takes(dev, 128, 64, True)
+    assert kd.takes(dev, 128, 128, True, 2)
+    assert not kd.takes(cpu, 128, 128, True, 2)  # the CPU keeps the einsums
+    assert not kd.takes(dev, 128, 128, False, 2)  # a scalar (GDN) gate
+    assert not kd.takes(dev, 64, 128, True, 2) and not kd.takes(dev, 128, 64, True, 2)
+
+
+@pytest.mark.parametrize("H", [1, 3, 4, 8])
+def test_takes_only_the_rings_two_heads_a_row(H):
+    """The kernel's ring (RING rows: two chunks of CH // 2 rows and PD ahead) is sized for H 2 and _body asserts it, so a
+    layer of another per-rank head count keeps the einsums instead of failing in the trace."""
+    assert kd.CH // 2 * 2 + kd.PD == kd.RING
+    assert not kd.takes(torch.empty(2, 8, device="meta"), 128, 128, True, H)
+
+
+def test_the_decode_form_passes_its_per_rank_head_count():
+    src = inspect.getsource(LA._mix_rows)
+    assert 'kda_decode.takes(x, dk, dv, sp.kind == "kda" and g.dim() == 3, nv)' in src
+    assert "nk, nv, dk, dv = layer.nk, layer.nv, sp.head_k_dim, sp.head_v_dim" in src
 
 
 def test_the_shell_cap_sends_16_and_24_row_steps_to_the_decode_form(monkeypatch):
-    """At the mtp-* presets' cap of 12 rows, every step up to 12 rows takes the KDA shell and never reaches the decode
-    form, so the kernel cannot move one of their graphs; mtp-batch24's 16- and 24-row steps take the decode form."""
+    """At a shell cap of 12 rows, every step up to 12 rows takes the KDA shell and never reaches the decode form; 16-
+    and 24-row steps take the decode form."""
     monkeypatch.setattr(hybrid, "KDA_SHELL_MAXB", 12)
     assert all(hybrid.kda_shell_rows(b) for b in (1, 2, 4, 6, 8, 12))
     assert not hybrid.kda_shell_rows(16) and not hybrid.kda_shell_rows(24)
@@ -125,14 +141,30 @@ def test_the_decode_form_runs_the_kernel_where_it_takes(flash, monkeypatch):
         eng.close()
 
 
+KERNEL_SPAN = ("try:  # the Neuron venv", "    kda_decode_kernel = None")
+
+
+def test_the_kernel_has_no_psum_accumulation_group():
+    """Every matmul of the kernel is a lone start (accumulate=False): the r1 - v accumulation group of the first form
+    lost its started term on trn2 (head 2's r1 = 0 in each program's first row), which the simulator does not model."""
+    import inspect
+
+    src = inspect.getsource(kd)
+    span = src[src.index(KERNEL_SPAN[0]) : src.index(KERNEL_SPAN[1])]
+    assert span.count("nisa.nc_matmul(") == 7  # the matvecs, the outer product and the prologue's four
+    assert "accumulate=True" not in span and "accumulate=(" not in span
+    assert span.count("accumulate=False") == span.count("nisa.nc_matmul(")
+
+
 @needs_nki
-@pytest.mark.parametrize("grid", [1, 2])
-def test_nki_simulator_matches_emulation(monkeypatch, grid):
-    """grid 2 with spl 1: each program runs its half of the rows (the served form at LNC 2)."""
+@pytest.mark.parametrize(("grid", "B"), [(2, 24), (2, 16), (2, 8), (2, 5), (1, 7)])
+def test_nki_simulator_matches_emulation(monkeypatch, grid, B):
+    """grid 2 with spl 1: each program runs its half of the rows (the served form at LNC 2); B 5 leaves each program a
+    partial chunk. H = 2 heads (the ring's sizing; the served shape at tp 32)."""
     import nki
 
     monkeypatch.setenv("NEURON_PLATFORM_TARGET_OVERRIDE", "trn2")
-    pool, slot, keep, q, k, v, g, beta = inputs(H=8)
+    pool, slot, keep, q, k, v, g, beta = inputs(B=B, R=64, H=2, seed=1000 + 10 * B + grid)
     slots = _slots(pool, slot, keep)
     o_want, pool_want = kd.emulate(pool, slots, q, k, v, g, beta)
     kern = kd.kda_decode_kernel if grid == 1 else kd.kda_decode_kernel[2]

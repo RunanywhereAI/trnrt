@@ -1,8 +1,8 @@
 """The HTTP layer (trnrt/serve/api.py) over a scripted stand-in for the engine, so it runs anywhere in seconds.
 
-The stand-in implements exactly the engine API the server uses (add_request, has_work, step, abort, dead_ranks,
-close_failed, close, tokenizer, cfg.tp, cfg.max_model_len, mcfg.vocab_size, scheduler, pool, radix) with real Request
-objects, and generates a fixed GLM-format output one token per step. Its tokenizer is a word-level one whose words are
+The stand-in implements exactly the engine API the server uses (add_request, has_work, step, abort, flush_cache,
+dead_ranks, close_failed, close, tokenizer, cfg.tp, cfg.max_model_len, cfg.page_size, cfg.model_path, mcfg.vocab_size,
+scheduler, pool, radix) with real Request objects, and generates a fixed GLM-format output one token per step. Its tokenizer is a word-level one whose words are
 GLM's tags and a few phrases, decoded by plain concatenation, and whose chat template opens `<think>` in the prompt
 unless enable_thinking is false. That switch is the stand-in's: GLM-5.3-Flash's own template has no enable_thinking and
 always opens `<think>` (tests/test_glm53_template.py runs the server on it). The real engine behind the same server:
@@ -12,6 +12,7 @@ tests/test_api*.py.
 from __future__ import annotations
 
 import json
+import os
 import time
 import types
 
@@ -94,7 +95,7 @@ class ScriptedEngine:
 
     def __init__(self, script: list[int]):
         self.tokenizer = _tokenizer()
-        self.cfg = types.SimpleNamespace(tp=1, max_model_len=64)
+        self.cfg = types.SimpleNamespace(tp=1, max_model_len=64, page_size=4, model_path="org/glm-test")
         self.mcfg = types.SimpleNamespace(vocab_size=len(self.tokenizer))
         self.scheduler = types.SimpleNamespace(running=[], waiting=[], num_preemptions=0)
         self.pool = types.SimpleNamespace(num_usable=100, num_free=90)
@@ -105,6 +106,7 @@ class ScriptedEngine:
         self.added: list[Request] = []
         self.closed = False
         self.step_delay = 0.0
+        self.flushes: list[int] = []  # at each flush_cache: the requests the engine held (LLMEngine.flush_cache)
 
     def add_request(self, prompt_ids, params, rid=None, session_id=None):
         why = unsupported(params)  # the engine's own refusal (LLMEngine.add_request)
@@ -142,6 +144,9 @@ class ScriptedEngine:
         self.aborted.append(req.rid)
         self.scheduler.running.remove(req)
         req.status, req.finish_reason = Status.FINISHED, "abort"
+
+    def flush_cache(self) -> None:
+        self.flushes.append(len(self.scheduler.running) + len(self.scheduler.waiting))
 
     def dead_ranks(self) -> list[int]:
         return list(self.dead)
@@ -204,6 +209,67 @@ def test_chat_returns_reasoning_content_and_a_tool_call(serve):
         "total_tokens": 2 + len(TOOL_TURN),
         "prompt_tokens_details": {"cached_tokens": 2},
     }
+
+
+def test_malformed_tools_and_parallel_tool_calls_are_400(serve):
+    """A tools entry the template or parser cannot read, and a non-boolean parallel_tool_calls, are refused before
+    the engine. The first was a template 500 (or, where the template ignores tools, a silently different prompt);
+    the second silently kept parallel calls (AGENTS.md invariant 7)."""
+    client, eng = serve(PLAIN)
+    body = {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 8}
+    for tools in (
+        "notalist",
+        [1],
+        [{"type": "function"}],
+        [{"type": "function", "function": {}}],
+        [{"type": "function", "function": {"name": ""}}],
+        [{"type": "function", "function": {"name": "bad name"}}],
+        [{"type": "function", "function": {"name": "f", "parameters": "x"}}],
+        [{"type": "function", "function": {"name": "f", "parameters": {"properties": ["x"]}}}],
+        [{"type": "function", "function": {"name": "f", "description": 1}}],
+        [{"type": "function", "function": {"name": "f", "strict": True}}],
+        [{"type": "function", "function": {"name": "f", "strict": "true"}}],
+        [{"type": "function", "function": {"name": "f", "strict": 1}}],
+        [{"type": "function", "function": {"name": "f", "strict": {}}}],
+        [{"type": "nope", "function": {"name": "f"}}],
+    ):
+        r = client.post("/v1/chat/completions", json={**body, "tools": tools})
+        assert r.status_code == 400, (tools, r.status_code, r.text)
+        assert "tools" in r.json()["detail"], (tools, r.json())
+    for value in ("false", 0, 1, {}):
+        r = client.post("/v1/chat/completions", json={**body, "parallel_tool_calls": value})
+        assert r.status_code == 400, (value, r.status_code, r.text)
+        assert "parallel_tool_calls" in r.json()["detail"], (value, r.json())
+    r = client.post("/v1/chat/completions", json={**body, "tools": "notalist", "tool_choice": "none"})
+    assert r.status_code == 400 and "tools" in r.json()["detail"], r.text  # malformed, whatever tool_choice says
+    r = client.post("/v1/chat/completions", json={**body, "messages": {"role": "user", "content": "hi"}})
+    assert r.status_code == 400 and "messages must be an array" in r.json()["detail"], r.text  # was a 500
+    for messages in ("", 0):  # falsy, but sent: still the wrong type
+        r = client.post("/v1/chat/completions", json={**body, "messages": messages})
+        assert r.status_code == 400 and "messages must be an array" in r.json()["detail"], (messages, r.text)
+    r = client.post(
+        "/v1/chat/completions", json={**body, "tools": [{"type": "function", "function": {"name": "f" * 129}}]}
+    )
+    assert r.status_code == 400 and "1-128" in r.json()["detail"], r.text
+    assert eng.added == []  # none reached the engine
+    r = client.post("/v1/chat/completions", json={**body, "tools": TOOLS, "tool_choice": "none"})
+    assert r.status_code == 200, r.text  # well-formed tools are discarded with tool_choice "none"
+    for value in (False, None):  # null is unset, as every other field: parallel calls stay on
+        r = client.post("/v1/chat/completions", json={**body, "tools": TOOLS, "parallel_tool_calls": value})
+        assert r.status_code == 200, (value, r.text)
+    for tools in (  # what OpenAI's schema allows: an empty array, null, no type, no parameters
+        [],
+        None,
+        [{"function": {"name": "f"}}],
+        [{"type": "function", "function": {"name": "f", "parameters": None}}],
+        [{"type": "function", "function": {"name": "f" * 128}}],  # the Messages API's longest name
+    ):
+        r = client.post("/v1/chat/completions", json={**body, "tools": tools})
+        assert r.status_code == 200, (tools, r.text)
+    for neutral_strict in (False, None):
+        neutral = [{"type": "function", "function": {"name": "f", "strict": neutral_strict}}]
+        r = client.post("/v1/chat/completions", json={**body, "tools": neutral})
+        assert r.status_code == 200, (neutral_strict, r.text)  # false and null are neutral, not unsupported
 
 
 def test_streamed_chat_gives_the_same_message_and_a_usage_chunk_when_asked(serve):
@@ -349,7 +415,6 @@ def test_an_sdk_request_with_every_neutral_field_is_served(serve):
         ("frequency_penalty", -0.2),
         ("repetition_penalty", 1.1),
         ("thinking_token_budget", 128),
-        ("n", 2),
         ("logit_bias", {"13": 5}),
         ("response_format", {"type": "json_object"}),
         ("prompt_logprobs", 0),
@@ -364,7 +429,8 @@ def test_an_sdk_request_with_every_neutral_field_is_served(serve):
 def test_health_stats_models_and_metrics(serve):
     client, _ = serve(PLAIN)
     assert client.get("/health").json() == {"status": "ok"}
-    assert client.get("/v1/stats").json() == {"gauges": {"kv_pages_used": 6, "kv_pages_total": 100}}
+    gauges = client.get("/v1/stats").json()["gauges"]
+    assert (gauges["kv_pages_used"], gauges["kv_pages_total"]) == (6, 100) and "spec" not in gauges  # the router's
     assert client.get("/v1/models").json()["data"][0]["id"] == "glm"
     client.post("/v1/completions", json={"prompt": [1, 2]})
     m = client.get("/metrics").text
@@ -420,8 +486,9 @@ def test_request_fields_are_checked_before_the_engine(serve):
         ("prompt", [-1]),
         ("prompt", [len(WORDS)]),
         ("prompt", [1, True]),
-        ("min_tokens", 4),
-        ("include_stop_str_in_output", True),
+        ("min_tokens", -1),
+        ("min_tokens", 100),  # above max_tokens (16, the completions default)
+        ("include_stop_str_in_output", "yes"),
         ("thinking_token_budget", "lots"),
         ("temperature", 10**400),
     ]
@@ -597,7 +664,7 @@ def test_a_client_that_disconnects_aborts_its_request(stream):
 
 def test_the_checkpoints_generation_config_sets_the_sampling_defaults(serve, tmp_path):
     """A request that sets no temperature or top_p samples at the checkpoint's generation_config.json values
-    (GLM-5.3-Flash's: temperature 1.0, top_p 0.95), as vLLM does by default; it sampled at top_p 1.0. A request's own
+    (GLM-5.3-Flash's: temperature 1.0, top_p 0.95); it sampled at top_p 1.0. A request's own
     values win; a value out of range in the file is not used; no file, the server's defaults (1.0, 1.0)."""
     from fastapi.testclient import TestClient
 
@@ -628,3 +695,269 @@ def test_the_checkpoints_generation_config_sets_the_sampling_defaults(serve, tmp
     assert params_with({"temperature": 0.6, "top_k": 20, "min_p": 0.05}, msgs) == (0.6, 1.0, 20, 0.05)
     assert params_with({"top_p": 0, "temperature": -1, "top_k": "x"}, msgs) == (1.0, 1.0, 0, 0.0)
     assert params_with(None, msgs) == (1.0, 1.0, 0, 0.0)
+
+
+def test_the_checkpoints_max_new_tokens_caps_a_request_without_a_token_limit(serve, tmp_path):
+    """A request that sets neither max_tokens nor max_completion_tokens generates at most the checkpoint's
+    generation_config.json max_new_tokens; a chat request ran to the end of the context. A request's own
+    limit wins, larger or smaller; a value that is not a positive integer is not used; a completion keeps its default
+    of 16 under a larger value."""
+    from fastapi.testclient import TestClient
+
+    from trnrt.serve import api
+
+    chat = {"messages": [{"role": "user", "content": "hi"}]}
+    text = {"prompt": [1]}
+
+    def max_new(gen: dict | None, body: dict, path: str = "/v1/chat/completions") -> int:
+        d = tmp_path / str(len(list(tmp_path.iterdir())))
+        d.mkdir()
+        if gen is not None:
+            (d / "generation_config.json").write_text(json.dumps(gen))
+        eng = ScriptedEngine(PLAIN)
+        eng.model_path = str(d)
+        with TestClient(api.build_app(eng, "glm")) as c:
+            r = c.post(path, json=body)
+            assert r.status_code == 200, r.text
+        for lp in [lp for lp in api._LOOPS if lp.engine is eng]:
+            lp.stop()
+        return eng.added[-1].params.max_new_tokens
+
+    room = max_new(None, chat)  # no file: the rest of the context
+    assert room > 6
+    assert max_new({"max_new_tokens": 4}, chat) == 4
+    assert max_new({"max_new_tokens": 4}, {**chat, "max_tokens": None}) == 4  # null: unset
+    assert max_new({"max_new_tokens": 4}, {**chat, "max_tokens": 6}) == 6
+    assert max_new({"max_new_tokens": 4}, {**chat, "max_completion_tokens": 2}) == 2
+    assert max_new({"max_new_tokens": 4}, {**chat, "max_completion_tokens": 6}) == 6  # larger: still the request's
+    assert max_new({"max_new_tokens": 4}, {**chat, "max_completion_tokens": None}) == 4
+    assert max_new({"max_new_tokens": room + 1000}, chat) == room  # never past the context
+    for bad in (0, -5, 4.0, "4", True):
+        assert max_new({"max_new_tokens": bad}, chat) == room
+    assert max_new({"max_new_tokens": 8}, text, "/v1/completions") == 8
+    assert max_new({"max_new_tokens": 32}, text, "/v1/completions") == 16  # the completions default is the smaller
+    assert max_new({"max_new_tokens": 8}, {**text, "max_tokens": 20}, "/v1/completions") == 20
+
+    d = tmp_path / "info"
+    d.mkdir()
+    (d / "generation_config.json").write_text(json.dumps({"max_new_tokens": 4, "temperature": 0.6}))
+    for kw, want_max, want_info in (({}, 4, {"temperature": 0.6}), ({"generation_config": "none"}, room, None)):
+        eng = ScriptedEngine(PLAIN)
+        eng.model_path = str(d)
+        with TestClient(api.build_app(eng, "glm", **kw)) as c:
+            assert c.post("/v1/chat/completions", json=chat).status_code == 200
+            # /model_info gives sampling defaults only: a client sending max_new_tokens back would set a limit
+            assert c.get("/model_info").json()["preferred_sampling_params"] == want_info
+        for lp in [lp for lp in api._LOOPS if lp.engine is eng]:
+            lp.stop()
+        assert eng.added[-1].params.max_new_tokens == want_max  # none drops the cap with the other defaults
+
+
+def test_generation_config_none_keeps_the_servers_sampling_defaults(tmp_path):
+    """--generation-config none: a checkpoint's generation_config.json sets no default (temperature and top_p stay
+    1.0), for an operator or benchmark that relied on them; auto, the default, takes the file's. A request's own
+    values win either way, and another setting is refused."""
+    from fastapi.testclient import TestClient
+
+    from trnrt.serve import api
+
+    (tmp_path / "generation_config.json").write_text(
+        json.dumps({"temperature": 0.6, "top_p": 0.95, "top_k": 20, "min_p": 0.05})
+    )
+    msgs = {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 2}
+
+    def params_with(body: dict, **kw):
+        eng = ScriptedEngine(PLAIN)
+        eng.model_path = str(tmp_path)
+        with TestClient(api.build_app(eng, "glm", **kw)) as c:
+            r = c.post("/v1/chat/completions", json=body)
+            assert r.status_code == 200, r.text
+        for lp in [lp for lp in api._LOOPS if lp.engine is eng]:
+            lp.stop()
+        p = eng.added[-1].params
+        return p.temperature, p.top_p, p.top_k, p.min_p
+
+    assert params_with(msgs, generation_config="none") == (1.0, 1.0, 0, 0.0)
+    assert params_with({**msgs, "top_p": 0.5}, generation_config="none") == (1.0, 0.5, 0, 0.0)
+    assert params_with(msgs, generation_config="auto") == (0.6, 0.95, 20, 0.05)
+    assert params_with(msgs) == (0.6, 0.95, 20, 0.05)  # auto is the default
+    with pytest.raises(ValueError, match="generation_config"):
+        api.build_app(ScriptedEngine(PLAIN), "glm", generation_config="vllm")
+
+    def preferred(**kw):
+        eng = ScriptedEngine(PLAIN)
+        eng.model_path = str(tmp_path)
+        with TestClient(api.build_app(eng, "glm", **kw)) as c:
+            got = c.get("/model_info").json()["preferred_sampling_params"]
+        for lp in [lp for lp in api._LOOPS if lp.engine is eng]:
+            lp.stop()
+        return got
+
+    assert preferred(generation_config="none") is None  # the native endpoints read the same defaults
+    assert preferred()["temperature"] == 0.6
+
+
+@pytest.mark.parametrize("prefix", ["", "/v1"])
+def test_tokenize_counts_what_the_engine_would_be_sent(serve, prefix):
+    """A chat request's tokens are the prompt /v1/chat/completions sends the engine for the same body (tools and
+    template arguments included); a prompt's are /v1/completions' encoding. No request reaches the engine."""
+    client, eng = serve(PLAIN)
+    chat = {
+        "messages": [{"role": "user", "content": "weather?"}],
+        "tools": TOOLS,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    r = client.post(prefix + "/tokenize", json=chat)
+    assert r.status_code == 200, r.text
+    assert eng.added == []
+    assert client.post("/v1/chat/completions", json={**chat, "max_tokens": 2}).status_code == 200
+    sent = eng.added[-1].prompt_ids
+    assert r.json() == {"tokens": sent, "count": len(sent), "max_model_len": 64}
+
+    r = client.post(prefix + "/tokenize", json={"prompt": "Hello !", "return_token_strs": True})
+    assert r.json() == {"tokens": [ID["Hello"], ID["!"]], "count": 2, "max_model_len": 64, "token_strs": ["Hello", "!"]}
+    r = client.post(prefix + "/tokenize", json={"prompt": ["Hello", "Hello !"], "add_special_tokens": False})
+    assert r.json() == {"tokens": [[ID["Hello"]], [ID["Hello"], ID["!"]]], "count": [1, 2], "max_model_len": 64}
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {},
+        {"prompt": "Hello", "messages": [{"role": "user", "content": "hi"}]},
+        {"prompt": [ID["Hello"]]},  # token ids: nothing to tokenize
+        {"prompt": []},
+        {"prompt": ["Hello", 3]},
+        {"prompt": "Hello", "add_special_tokens": "yes"},
+        {"messages": []},
+        {"messages": [{"role": "user", "content": "hi"}], "continue_final_message": True},
+        {"messages": [{"role": "user", "content": "hi"}], "add_generation_prompt": False},
+        {"messages": [{"role": "user", "content": "hi"}], "chat_template_kwargs": {"unread": 1}},
+    ],
+)
+def test_tokenize_refuses_what_it_cannot_answer_with_a_400(serve, body):
+    client, eng = serve(PLAIN)
+    r = client.post("/tokenize", json=body)
+    assert r.status_code == 400, r.text
+    assert eng.added == []
+
+
+@pytest.mark.parametrize("prefix", ["", "/v1"])
+def test_detokenize_answers_text_and_prompt(prefix):
+    from fastapi.testclient import TestClient
+
+    from trnrt.serve import api
+
+    eng = ScriptedEngine(PLAIN)
+    # <unk> registered as a special token (its id stays 0), so skip_special_tokens has one to drop
+    eng.tokenizer.add_special_tokens({"unk_token": "<unk>"})
+    with TestClient(api.build_app(eng, "glm")) as client:
+        _detokenize_checks(client, prefix)
+    for lp in [lp for lp in api._LOOPS if lp.engine is eng]:
+        lp.stop()
+
+
+def _detokenize_checks(client, prefix: str) -> None:
+    r = client.post(prefix + "/detokenize", json={"tokens": [ID["<unk>"], ID["Hello"], ID[" there"]]})
+    assert r.status_code == 200, r.text
+    assert r.json() == {"text": "Hello there", "prompt": "Hello there"}  # <unk> is special: skipped by default
+    r = client.post(prefix + "/detokenize", json={"tokens": [ID["<unk>"], ID["Hello"]], "skip_special_tokens": False})
+    assert r.json()["text"] == "<unk>Hello"
+    r = client.post(prefix + "/detokenize", json={"tokens": [[ID["Hello"]], [ID["Hello"], ID["!"]]]})
+    assert r.json() == {"text": ["Hello", "Hello!"], "prompt": ["Hello", "Hello!"]}
+    assert client.post(prefix + "/detokenize", json={"tokens": []}).json()["text"] == ""
+
+
+@pytest.mark.parametrize(
+    "tokens", [None, "Hello", [-1], [len(WORDS)], [True], [1.0], [[1], 2], [[1], [len(WORDS)]]], ids=repr
+)
+def test_detokenize_refuses_ids_outside_the_vocabulary(serve, tokens):
+    client, _ = serve(PLAIN)
+    r = client.post("/detokenize", json={} if tokens is None else {"tokens": tokens})
+    assert r.status_code == 400, r.text
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"bogus_field": 1},
+        {"top_a": 0.3},
+        {"prediction": {"type": "content", "content": "x"}},
+        {"modalities": ["audio"]},
+        {"audio": {"voice": "x"}},
+        {"web_search_options": {}},
+        {"max_token": 5},  # a typo of max_tokens
+    ],
+)
+def test_an_unknown_field_is_refused_with_a_400_that_names_it(serve, extra):
+    """AGENTS.md invariant 7: a field the server does not know was answered 200 as if it had been applied. Now 400,
+    naming the field; no request reaches the engine. The fields an SDK sends by default (SDK_CHAT, SDK_COMPLETION)
+    are still served (test_an_sdk_request_with_every_neutral_field_is_served)."""
+    client, eng = serve(PLAIN)
+    (name,) = extra
+    for path, base in (
+        ("/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}]}),
+        ("/v1/completions", {"prompt": [1]}),
+    ):
+        r = client.post(path, json={**base, "max_tokens": 2, **extra})
+        assert r.status_code == 400 and name in r.json()["detail"] and "unknown" in r.json()["detail"], r.text
+    assert eng.added == []
+
+
+def test_a_field_of_the_other_endpoint_is_refused(serve):
+    """`prompt` on a chat request, `messages` or `tools` on a completion: the endpoint would ignore them."""
+    client, eng = serve(PLAIN)
+    msgs = [{"role": "user", "content": "hi"}]
+    for extra in ({"prompt": "x"}, {"echo": False}, {"suffix": None}):  # a completion's fields, neutral there or not
+        r = client.post("/v1/chat/completions", json={"messages": msgs, **extra})
+        assert r.status_code == 400 and next(iter(extra)) in r.json()["detail"], r.text
+    r = client.post("/v1/chat/completions", json={"prompt": "x"})  # named before "messages is required"
+    assert r.status_code == 400 and "unknown field prompt" in r.json()["detail"], r.text
+    for extra in (
+        {"messages": msgs},
+        {"tools": TOOLS},
+        {"reasoning_effort": "low"},
+        {"top_logprobs": 2},
+        {"functions": []},
+    ):
+        r = client.post("/v1/completions", json={"prompt": [1], **extra})
+        assert r.status_code == 400 and next(iter(extra)) in r.json()["detail"], r.text
+    assert eng.added == []
+    for extra in (
+        {"user": "u"},
+        {"model": "glm"},
+        {"metadata": {"a": "b"}},
+        {"prompt_cache_key": "k"},
+        {"store": False},
+    ):
+        assert client.post("/v1/chat/completions", json={"messages": msgs, "max_tokens": 2, **extra}).status_code == 200
+    for path, base in (("/v1/chat/completions", {"messages": msgs}), ("/v1/completions", {"prompt": [1]})):
+        for store in (True, 0, "false"):  # only false or null: nothing is kept to retrieve later, and 0 is not false
+            r = client.post(path, json={**base, "store": store})
+            assert r.status_code == 400 and "store" in r.json()["detail"], (path, store, r.text)
+        assert client.post(path, json={**base, "max_tokens": 2, "store": None}).status_code == 200
+        assert client.post(path, json={**base, "max_tokens": 2, "min_new_tokens": 0.0}).status_code == 200  # 0.0 is 0
+
+
+def test_every_field_the_openai_endpoints_read_is_known():
+    """A field the chat or completion path reads but the accept lists (api._KNOWN) miss would refuse every request that
+    sends it: each `body.get("x")`, `_int(body, "x", ...)` and the like in serve/api.py and serve/structured.py is known
+    to at least one of the two endpoints. /tokenize's and /detokenize's own fields are theirs alone."""
+    import re
+    from pathlib import Path
+
+    from trnrt.serve import api
+
+    root = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "trnrt", "serve")
+    read = set()
+    for name in ("api.py", "structured.py"):
+        src = Path(root, name).read_text()
+        for pat in (
+            r'body\.get\("([a-z_]+)"',
+            r'body\["([a-z_]+)"\]',
+            r'\(\s*body,\s*"([a-z_]+)"',
+            r'\(\s*"([a-z_]+)",\s*lambda',
+        ):
+            read |= set(re.findall(pat, src))
+    tokenize_only = {"add_special_tokens", "return_token_strs", "tokens"}
+    assert read - tokenize_only - api._KNOWN[True] - api._KNOWN[False] == set()

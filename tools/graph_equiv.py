@@ -72,7 +72,15 @@ class Names:
         return self.name_map.get(out, out)
 
     def blob(self, b):
-        return self.rxb.sub(b"", b) if self.rxb else b
+        """A kernel binary's JSON frame with the package prefixes dropped and the name map applied: a renamed kernel's
+        module JSON names its functions too (functions[].name), so the map must reach them as well as func_name."""
+        out = self.rxb.sub(b"", b) if self.rxb else b
+        if not self.name_map:
+            return out
+        # one pass over every old name at once: a new name that is another entry's old name is not renamed again
+        olds = sorted(self.name_map, key=len, reverse=True)
+        rx = re.compile(rb"(?<![\w.])(?:" + b"|".join(re.escape(o.encode()) for o in olds) + rb")(?![\w.])")
+        return rx.sub(lambda m: self.name_map[m.group().decode()].encode(), out)
 
 
 # ---- captures ----
@@ -295,8 +303,9 @@ _KCACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
 
 
 def kernel_digest(path, names):
-    """{'json': sha of the normalized JSON frames, 'records': count, 'tables': [sha of each binary frame]}."""
-    key = (path, tuple(names.packages))
+    """{'json': sha of the normalized JSON frames, 'records': count, 'tables': [sha of each binary frame]}. Cached by
+    the path and everything the normalization reads (the prefixes and the name map)."""
+    key = (path, tuple(names.packages), tuple(sorted(names.name_map.items())))
     if key in _KCACHE:
         return _KCACHE[key]
     with open(path, "rb") as f:
