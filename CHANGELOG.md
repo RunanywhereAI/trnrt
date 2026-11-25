@@ -90,6 +90,8 @@ and versions follow [Semantic Versioning](https://semver.org/). Rebuild the comp
 
 ### Fixed
 
+- The router releases a streamed request whose client leaves before the first chunk. The relay never started, so the
+  worker's load count stayed one higher for good and the engine generated to `max_tokens` (#50).
 - An unknown field on `/v1/chat/completions` or `/v1/completions`, or a field of the other endpoint, is refused with
   400 naming it, as AGENTS.md invariant 7 requires. It was ignored, and the request answered 200 as if it had been
   applied (`prediction`, `modalities`, `audio`, a misspelled field).

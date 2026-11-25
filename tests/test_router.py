@@ -672,6 +672,94 @@ def test_a_plain_client_that_disconnects_from_the_router_aborts_its_request_on_t
     asyncio.run(main())
 
 
+@pytest.mark.parametrize("spec", ["2.3", "2.4"])
+def test_a_stream_whose_client_leaves_before_its_first_chunk_releases_its_worker(spec):
+    """A streamed request's load count, its upstream connection and the engine's request were released in the relay
+    generator's `finally`. A client that leaves before Starlette first steps the body never starts the generator, so
+    nothing ran it: the load stayed one higher for good and the worker generated to max_tokens (#50). ASGI 2.3 (what
+    uvicorn speaks) cancels the body once the disconnect arrives; 2.4 raises on the first send. The router app is
+    called directly with a client that is already gone; the stub worker streams slowly and watches its connection."""
+    import asyncio
+    import json
+    import time
+
+    from fastapi import FastAPI, Request
+    from fastapi.responses import StreamingResponse
+
+    from trnrt.serve.router import build_router_app
+
+    seen: list[str] = []
+    worker = FastAPI()
+
+    @worker.get("/health")
+    async def health():
+        return {"status": "ok"}
+
+    @worker.post("/v1/completions")
+    async def completions(req: Request):
+        await req.json()
+
+        async def tokens():
+            try:
+                for _ in range(100):
+                    yield b"data: {}\n\n"
+                    await asyncio.sleep(0.1)
+                seen.append("ran to the end")
+            except BaseException:
+                seen.append("aborted")
+                raise
+
+        return StreamingResponse(tokens(), media_type="text/event-stream")
+
+    async def call_gone_client(app, port_body: bytes) -> None:
+        sent: list[dict] = []
+        messages = [{"type": "http.request", "body": port_body, "more_body": False}]
+
+        async def receive():
+            return messages.pop(0) if messages else {"type": "http.disconnect"}
+
+        async def send(message):
+            if spec == "2.4" and message["type"] == "http.response.start":
+                raise OSError("client went away")
+            await asyncio.sleep(0)  # a server's send yields (uvicorn waits on its transport): the cancel lands here
+            sent.append(message)
+
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0", "spec_version": spec},
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/v1/completions",
+            "raw_path": b"/v1/completions",
+            "root_path": "",
+            "query_string": b"",
+            "headers": [(b"content-type", b"application/json")],
+            "client": ("127.0.0.1", 1),
+            "server": ("127.0.0.1", 2),
+        }
+        with contextlib.suppress(Exception):
+            await app(scope, receive, send)
+
+    async def main() -> None:
+        port = _free_port()
+        router = Router([f"http://127.0.0.1:{port}"])
+        servers, tasks = await _start([(worker, port)])
+        try:
+            app = build_router_app(router, poll_s=0)
+            body = json.dumps({"prompt": "hi", "max_tokens": 100, "stream": True}).encode()
+            await call_gone_client(app, body)
+            deadline = time.monotonic() + 5
+            while (router.load != [0] or not seen) and time.monotonic() < deadline:
+                await asyncio.sleep(0.05)
+            assert router.load == [0], router.load
+            assert seen == ["aborted"], seen
+        finally:
+            await _stop(servers, tasks)
+
+    asyncio.run(main())
+
+
 # One conversation in each API that carries one: a long shared system part, then the turns.
 SYSTEM = "You are a coding agent. Environment and file tree follow. " + "src/x.py " * 4500
 TURNS = [
