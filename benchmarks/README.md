@@ -62,8 +62,9 @@ TOKENIZER=/models/GLM-5.3-Flash benchmarks/agentx/client.sh agentx-c16 http://<s
 
 For the 8K/1K points, check out InferenceX at commit `47cdc9d02d2f50018efbbc207c0c3ce9e425dae4` and install what its
 client imports, at the versions InferenceX pins:
-- `aiohttp==3.14.5 numpy==2.5.4 transformers==5.22.1`, plus `tqdm==4.70.1 huggingface_hub==2.4.0` (InferenceX pins neither; the
-  published points ran these);
+- `aiohttp==3.14.5 numpy==2.5.4 transformers==5.22.1`, plus `tokenizers==0.23.3 tqdm==4.70.1 huggingface_hub==2.4.0`
+  (InferenceX pins none of these three; the published points ran these). tokenizers sets how the client counts and builds the
+  prompts' tokens;
 - `jinja2==3.1.6`, which the speculative points (`fixed-on-*`, `fixed-golden-*`) need for the chat template.
 
 The published points ran this client on the serving host, on CPUs the engine did not use:
