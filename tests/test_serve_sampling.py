@@ -338,6 +338,7 @@ def test_zero_width_stop_regexes_match_and_terminate():
         r"a*a*b",  # a power of the length: two repeats in a row that take the same characters
         r"\d+\s*\d+",
         r".*x.*y",
+        r"(x)?a*(?(1)b)a*c",  # a*a*c when group 1 is unset: a conditional with no "no" branch can match the empty text
         r"(?:)+",
         "(?:.|.)" * 5 + "x",  # alternations that can start alike, in a row: 32 ways to try
         "(?:a|ab)" * 3 + "(?:a|ab)(?:a|ab)",
@@ -405,6 +406,7 @@ def test_stop_regex_admits_ordinary_patterns():
         r'(?<!\\)"',
         r"<tool_call>.*?</tool_call>",
         r".*Final Answer:",
+        r"(<)?\w+(?(1)>)@",  # a conditional with no "no" branch, nothing after it that \w+ could take
     ]
     served = [r"x{3}", r"^there", r"Hel+o", r"ag\w+", r"<.*>", "$", "^", "again"]  # the other tests' patterns
     assert {p: _backtracking(p) for p in ordinary + served} == dict.fromkeys(ordinary + served)

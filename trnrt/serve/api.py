@@ -1308,10 +1308,10 @@ def _search_cost(pattern: str) -> tuple[str | None, int]:
                     out += scan(alt, list(live))
                 live = walked(merged(out), len(av[1]) - 1)
             elif op is c.GROUPREF_EXISTS:
-                out = []
-                for alt in (av[1], av[2]):
-                    if alt is not None:
-                        out += scan(alt, list(live))
+                out = scan(av[1], list(live))
+                # With no "no" branch, an unset group matches the empty text, so the repeats before it stay live:
+                # (x)?a*(?(1)b)a*c is a*a*c when group 1 is unset
+                out += list(live) if av[2] is None else scan(av[2], list(live))
                 live = merged(out)
             elif op in (c.MAX_REPEAT, c.MIN_REPEAT, c.POSSESSIVE_REPEAT):
                 lo, hi, body = av
