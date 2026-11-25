@@ -119,7 +119,7 @@ client's core count next to any number (ours pinned the harness to 48 logical CP
 above, then run one point per concurrency:
 
 ```bash
-pip install agentx-harness==1.0.12
+pip install agentx-harness==1.0.12 -c benchmarks/agentx/constraints.txt
 agentx profile \
   --url http://<server>:<port> \
   --endpoint /v1/chat/completions \
