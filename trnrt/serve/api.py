@@ -1025,12 +1025,12 @@ MAX_N = 128
 # grows faster than the square of the text's length, and it prices the rest in units of one plain repeat's search
 # (`\w+@` over a run of letters), whose time does grow with that square. A pattern may cost MAX_STOP_REGEX_COST, a
 # request MAX_STOP_REGEX_REQUEST_COST: its patterns' costs times its `n`, as each choice searches every pattern at each
-# of its streamed pieces. Measured over 2048 characters (CPython 3.13, one Apple M3 Max core, _search_cost's own
-# verdicts): one plain repeat, `\w+@\w+\.\w+` over a run of letters, 13 ms a search; the slowest admitted pattern found,
-# by hand and among 15,000 random admitted ones, `(?:a|a)(?:a|a)(?:a|a)(?:a|a)\w+@` (16 ways to match before a repeat),
-# 0.21 s over a run of `a`; so a request of two such, 0.4 s at every streamed piece. A search is slowest on a text its
-# pattern matches a long way into, such as a long run of one letter. The matches are those of a search over the whole
-# output but for one that starts more than the span before the newest text, which a stop pattern's match rarely does.
+# of its streamed pieces. Measured over 2048 characters (CPython 3.13, one Apple M3 Max core; across runs): the unit,
+# `\w+@` over a run of `a`, 13 to 21 ms a search; `(?:a|a)(?:a|a)(?:a|a)(?:a|a)\w+@` (16 ways to match before a
+# repeat, cost 16, the cap) 0.21 to 0.34 s over a run of `a`; so a request at its cap, about twice that at every
+# streamed piece. A search is slowest on a text its pattern matches a long way into, such as a long run of one letter.
+# The matches are those of a search over the whole output but for one that starts more than the span before the newest
+# text, which a stop pattern's match rarely does.
 MAX_STOP_REGEX = 16
 MAX_STOP_REGEX_CHARS = 1024
 MAX_STOP_REGEX_COST = 16
