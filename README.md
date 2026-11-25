@@ -61,7 +61,7 @@ priced at AWS's Capacity Block list prices.
   </picture>
 </p>
 
-| Users | Tokens per $: trn2 ÷ H200 | Tokens per $: trn2 ÷ H100 | P90 tok/s per user: trn2 / H200 |
+| Users | Tokens per $: trn2 ÷ H200 | Tokens per $: trn2 ÷ H100 | P90 interactivity, tok/s per user: trn2 / H200 |
 |---|---|---|---|
 | 1 | **1.64×** | **1.52×** | 62.2 / 272 |
 | 4 | **1.75×** | **1.74×** | 41.8 / 235 |
@@ -71,15 +71,19 @@ priced at AWS's Capacity Block list prices.
 | 24 | 0.86× | **5.16×** | 11.4 / 78.7 |
 | 32 | 0.81× | **4.95×** | 10.7 / 50.1 |
 
-**Where we're behind.** Each trn2 user decodes slower: 10.7-62.2 tok/s at P90 against H200's 50.1-272. At 24 and 32
+**Where we're behind.** Each trn2 user is slower: P90 interactivity (end to end, the wait for the first token
+included) is 10.7-62.2 tok/s per user against H200's 50.1-272. At 24 and 32
 users H200 delivers more tokens per dollar (0.81-0.86×), and on the 8K/1K fixed-length recipe, which has no prefix reuse,
 trn2 delivers 0.56-0.76× H200's. Where a decode step's time goes is in
 [docs/RESULTS.md](docs/RESULTS.md#where-a-decode-steps-time-goes).
 
 <sub>InferenceX AgentX harness 1.0.12, canonical workload, one hour per point; ratios compare the same concurrency. The
-1-8 user points use MTP at InferenceX's golden acceptance length (2.519; trn2's measured acceptance is 2.20). Prices per
-accelerator-hour, read 24 Nov 2026: trn2.48xlarge $2.235, p5.48xlarge (H100) $5.970, p5e.48xlarge (H200) $6.866. trn2
-on Neuron SDK 2.32; GPU numbers from InferenceX's public runs. Every table, source run and the method:
+1-8 user points use MTP at InferenceX's golden acceptance length (2.519; trn2's measured acceptance is 2.20). Prices,
+AWS Capacity Blocks list, read 24 Nov 2026: trn2.48xlarge $2.235 per Trainium2 chip-hour ($35.76 per instance-hour),
+p5.48xlarge $5.970 per H100-hour, p5e.48xlarge $6.866 per H200-hour. trn2 ran TrnRT's internal builds on Neuron SDK
+2.32 (GSM8K 97.4-97.7% on the MTP builds, needle recall passed); this release's builds are graph-equivalent to them, and
+a device run of release 0.2.0 itself is pending. GPU numbers are InferenceX's public runs, with accuracy as InferenceX
+checks it; we did not re-check them. Every table, source run and the method:
 [docs/RESULTS.md](docs/RESULTS.md#against-h100-and-h200-inferencex-agentx-and-8k1k).</sub>
 
 ## Highlights
@@ -195,7 +199,8 @@ builds replace. This repository passes these checks against that build
 - Graph equivalence: EQUAL on all 32 ranks, for all 157 graphs that build compiles in the default batch-12
   configuration.
 - Outputs: byte-identical to that build's on 384 of 384 requests.
-- Serving: the two-engine serve in the [Quickstart](#quickstart) passes end to end.
+- Serving: the two-engine serve in the [Quickstart](#quickstart) passed end to end on the device at release 0.1.0. On
+  this release it has run end to end on CPU only so far; the device run is pending.
 
 ## How it works
 

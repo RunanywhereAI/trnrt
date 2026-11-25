@@ -303,7 +303,8 @@ length of 3.6.
   prompts. trn2: measured on 10 Nov 2026, one run per concurrency. GPUs: the sweeps of InferenceX PRs #4926 and #4927
   (MTP off) and #4913 and #4914 (MTP on).
 - **Builds:** trn2's numbers come from TrnRT's internal builds on the dates above, the builds this release's builds are
-  graph-equivalent to; they are not a run of release 0.2.0's own commit. GPU numbers are from InferenceX's public runs.
+  graph-equivalent to; they are not a run of release 0.2.0's own commit. GPU numbers are from InferenceX's public runs,
+  with accuracy as InferenceX checks it; we did not re-check them.
 
 ## Methodology
 
