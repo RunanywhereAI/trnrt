@@ -56,16 +56,20 @@ On the load client, a separate CPU machine for AgentX (state its core count next
 CPU-bound):
 
 ```bash
-pip install agentx-harness==1.0.12
+pip install agentx-harness==1.0.12 -c benchmarks/agentx/constraints.txt   # the exact versions the published points ran
 TOKENIZER=/models/GLM-5.3-Flash benchmarks/agentx/client.sh agentx-c16 http://<server>:8000 runs/agentx-c16
 ```
 
 For the 8K/1K points, check out InferenceX at commit `47cdc9d02d2f50018efbbc207c0c3ce9e425dae4` and install what its
-client imports, at the versions InferenceX pins:
-- `aiohttp==3.14.5 numpy==2.5.4 transformers==5.22.1`, plus `tokenizers==0.23.3 tqdm==4.70.1 huggingface_hub==2.4.0`
-  (InferenceX pins none of these three; the published points ran these). tokenizers sets how the client counts and builds the
-  prompts' tokens;
-- `jinja2==3.1.6`, which the speculative points (`fixed-on-*`, `fixed-golden-*`) need for the chat template.
+client imports, constrained to the versions the published points ran:
+
+```bash
+pip install aiohttp numpy transformers tokenizers tqdm huggingface_hub jinja2 -c benchmarks/fixed_seq/constraints.txt
+```
+
+That gives aiohttp 3.14.5, numpy 2.5.4 and transformers 5.22.1 (InferenceX's own pins), tokenizers 0.23.3 (it sets how the client
+counts and builds the prompts' tokens), tqdm 4.70.1 and huggingface_hub 2.4.0. jinja2 3.1.6 is needed by the speculative points
+(`fixed-on-*`, `fixed-golden-*`) for the chat template.
 
 The published points ran this client on the serving host, on CPUs the engine did not use:
 
