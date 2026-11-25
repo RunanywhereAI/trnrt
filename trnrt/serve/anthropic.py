@@ -20,7 +20,9 @@ response, back into Anthropic content blocks:
 
 GLM-5.3-Flash always reasons (its template has no switch), so its reasoning comes back as a `thinking` block whether or
 not the request set `thinking`, with an empty `signature` (nothing here signs it). `tool_choice` `any` and `tool` need
-guided decoding and are refused, as the chat path refuses `required` and a named tool. Usage follows Anthropic's split:
+guided decoding and are refused, as the chat path refuses `required` and a named tool. A final assistant message (a
+prefill) is refused, as the chat path refuses `continue_final_message`: the template would close it and open a new
+turn, so the reply would not continue it. Usage follows Anthropic's split:
 `input_tokens` are the prompt tokens not read from the prefix cache, `cache_read_input_tokens` those that were.
 
 Errors use Anthropic's shape, `{"type": "error", "error": {"type": ..., "message": ...}}`. A thinking budget is
@@ -165,6 +167,14 @@ def messages(body: dict) -> list[dict]:
             out.append(msg)
         elif text:
             out.append({"role": "user", "content": "".join(text)})
+    if msgs[-1].get("role") == "assistant":
+        # Anthropic continues a final assistant message (a prefill). GLM's chat template renders it as a finished turn
+        # and opens a new one, so the reply would be a fresh answer, not its continuation: refused, as the chat path
+        # refuses continue_final_message
+        raise _bad(
+            "the last message is the assistant's (a prefill): continuing it is not supported, since the model would "
+            "answer with a new turn instead; end the messages with a user message"
+        )
     return out
 
 

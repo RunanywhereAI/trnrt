@@ -3,6 +3,7 @@ session, and the info, load, health, abort and flush routes sent to one worker o
 
 import asyncio
 import json
+import time
 
 import pytest
 
@@ -25,7 +26,13 @@ def test_generate_prompts_are_the_routing_text():
     assert _session_key("/generate", {"text": "abc"}) != _session_key("/generate", {"text": "abd"})
 
 
-def _native_worker(i: int, flush_status: int = 200, health_status: int = 200, flush_s: float = 0.0):
+# The longest a flush stub waits for its client to go away (until_gone): longer than any test waits for it to.
+UNTIL_GONE_S = 10.0
+
+
+def _native_worker(
+    i: int, flush_status: int = 200, health_status: int = 200, flush_s: float = 0.0, health_busy: bool = False
+):
     """A worker with the native routes: it answers each with its index, and records what it was sent. (No
     `from __future__ import annotations` in this module: FastAPI resolves a handler's `req: Request` in the module's
     globals, where this local import is not, and would take `req` for a query parameter.)"""
@@ -62,7 +69,7 @@ def _native_worker(i: int, flush_status: int = 200, health_status: int = 200, fl
     async def health_generate():
         if health_status != 200:
             return JSONResponse(status_code=health_status, content={"status": "failed", "error": "stuck"})
-        return {"status": "ok"}
+        return {"status": "ok", "busy": True} if health_busy else {"status": "ok"}
 
     @app.post("/abort_request")
     async def abort_request(req: Request):
@@ -79,6 +86,16 @@ def _native_worker(i: int, flush_status: int = 200, health_status: int = 200, fl
         hold = getattr(app.state, "hold", None)  # an asyncio.Event a test sets: a flush stuck until then
         if hold is not None:
             await hold.wait()
+        if getattr(app.state, "until_gone", False):  # a flush waiting for an idle engine until its client goes away
+            # at most its timeout, and UNTIL_GONE_S: a router that never closes its request then fails the test (no
+            # "flush withdrawn") instead of holding the servers' stop on this handler for ever
+            end = time.monotonic() + min(float(req.query_params.get("timeout", "0")), UNTIL_GONE_S)
+            while not await req.is_disconnected():
+                if time.monotonic() >= end:
+                    return PlainTextResponse("Cache not flushed: 2 requests are running or waiting.\n", status_code=400)
+                await asyncio.sleep(0.02)
+            app.state.seen.append(("flush withdrawn",))
+            return Response(status_code=499)
         if flush_status != 200:
             return PlainTextResponse("Cache not flushed: 2 requests are running or waiting.\n", status_code=400)
         return PlainTextResponse("Cache flushed.\n")
@@ -172,10 +189,19 @@ def test_health_generate_follows_every_worker():
     async def both(c, router) -> None:
         router.up = [False, False]
         r = await c.get("/health_generate")
-        assert r.status_code == 200 and r.json() == {"status": "ok", "down": []}
+        assert r.status_code == 200 and r.json() == {"status": "ok", "down": [], "busy": []}
         assert router.up == [True, True]  # each one generated: up
 
     _run([_native_worker(0), _native_worker(1)], both)
+
+    async def busy(c, router) -> None:
+        """An engine whose full queue refused the probe while its steps went on is serving: up, and named busy."""
+        router.up = [True, False]
+        r = await c.get("/health_generate")
+        assert r.status_code == 200 and r.json() == {"status": "ok", "down": [], "busy": [router.workers[1]]}, r.text
+        assert router.up == [True, True] and router.fails == [0, 0]
+
+    _run([_native_worker(0), _native_worker(1, health_busy=True)], busy)
 
 
 def test_abort_request_reaches_every_worker():
@@ -252,3 +278,61 @@ def test_flush_cache_bounds_its_wait_by_the_timeout_it_passes_on():
             await _stop(servers, tasks)
 
     asyncio.run(main())
+
+
+def test_a_flush_whose_client_went_away_closes_the_engines_flushes():
+    """A client that gives up on a /flush_cache still waiting at the engines: the router closes its requests to them,
+    so each engine sees its client gone and withdraws the flush (serve/native.py) instead of holding it, and refusing
+    every other flush, until its `timeout` passes."""
+    worker = _native_worker(0)
+    worker.state.until_gone = True
+
+    async def check(c, router) -> None:
+        port = int(str(c.base_url).rstrip("/").rsplit(":", 1)[1])
+        _, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(b"GET /flush_cache?timeout=3600 HTTP/1.1\r\nHost: x\r\n\r\n")
+        await writer.drain()
+        for _ in range(500):
+            if any(x[0] == "flush" for x in worker.state.seen):
+                break
+            await asyncio.sleep(0.01)
+        writer.close()
+        for _ in range(500):
+            if ("flush withdrawn",) in worker.state.seen:
+                break
+            await asyncio.sleep(0.01)
+        assert ("flush withdrawn",) in worker.state.seen, worker.state.seen
+        assert router.up == [True]
+
+    _run([worker], check)
+
+
+def test_a_flush_whose_client_went_away_clears_every_prefix_tree():
+    """The router drops the engines' answers to a flush whose client went away, so it cannot tell which engines flushed
+    first: it clears every engine's prefix tree, as a tree kept for one that flushed would route requests to an empty
+    cache. Engine 0 flushes at once; engine 1 waits until its client goes away and keeps its cache."""
+    w0, w1 = _native_worker(0), _native_worker(1)
+    w1.state.until_gone = True
+
+    async def check(c, router) -> None:
+        for tree in router.trees:
+            tree.insert("z" * 100)
+        port = int(str(c.base_url).rstrip("/").rsplit(":", 1)[1])
+        _, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(b"GET /flush_cache?timeout=3600 HTTP/1.1\r\nHost: x\r\n\r\n")
+        await writer.drain()
+        for _ in range(500):
+            if any(x[0] == "flush" for x in w0.state.seen) and any(x[0] == "flush" for x in w1.state.seen):
+                break
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.2)  # engine 0's answer reaches the router
+        assert [t.size for t in router.trees] == [100, 100]  # nothing cleared while the flush waits on engine 1
+        writer.close()
+        for _ in range(500):
+            if ("flush withdrawn",) in w1.state.seen and all(t.size == 0 for t in router.trees):
+                break
+            await asyncio.sleep(0.01)
+        assert ("flush withdrawn",) in w1.state.seen, w1.state.seen
+        assert [t.size for t in router.trees] == [0, 0]
+
+    _run([w0, w1], check)

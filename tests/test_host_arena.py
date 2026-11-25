@@ -107,6 +107,22 @@ def test_slot_ownership_is_round_robin_over_the_row_groups():
         st.close()
 
 
+def test_only_a_workers_store_closes_through_an_exit_hook(monkeypatch):
+    """At exit the hooks run last in, first out, and rank 0's store is made after the server's hooks, so its own hook
+    unmapped the arena and the board before the engine's step thread stopped. Rank 0's closes with its engine
+    (LLMEngine.close); a worker's, which nothing else closes, still has its hook."""
+    hooks: list = []
+    monkeypatch.setattr(H.atexit, "register", hooks.append)
+    tag, lay = _tag(), H.Layout(_caches(), 4)
+    rank0 = H.HostStore(tag, 0, 4, 4, 2, lay, 8)
+    worker = H.HostStore(tag, 2, 4, 4, 2, lay, 8)
+    try:
+        assert hooks == [worker.close]
+    finally:
+        rank0.close()
+        worker.close()
+
+
 def test_tag_of_keeps_zero_for_untagged():
     assert H.tag_of(0) == 1 and H.tag_of(-1) == (1 << 64) - 1 and H.tag_of(5) == 5 and H.NOTAG == 0
 

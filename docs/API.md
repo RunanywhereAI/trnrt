@@ -57,8 +57,10 @@ curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -
   same as leaving them out. Anything else is a 400 naming the field.
 - On `/v1/chat/completions` and `/v1/completions`, an unknown request field is answered with 400 naming it, never
   ignored. So is a field of the other endpoint (`prompt` on a chat request, `messages`, `tools` or `top_logprobs` on a
-  completion). `model`, `user`, `safety_identifier`, `metadata` and `prompt_cache_key` are accepted and do not change
-  the output; `store` is accepted only as `false` or null, since nothing is kept for later retrieval.
+  completion). A field sent as null is unset, as everywhere, and accepted whatever its name. `model`, `user`,
+  `safety_identifier`, `metadata`, `prompt_cache_key` and `prompt_cache_retention` are accepted and do not change
+  the output; `store` is accepted only as `false` or null, since nothing is kept for later retrieval, and a chat
+  request's `modalities` only as `["text"]` or null.
 - Status codes: 400 for a request that cannot be served as sent (a field of the wrong type or out of range, a prompt
   longer than the context, a chat template variable the template never reads); 500 for an error inside the engine;
   503 once the engine has failed, with the reason on `/health`, and 503 for a full queue
@@ -85,7 +87,9 @@ is first come, first served, with no queue limit.
 | `GET /dashboard` | each engine, and the router | one self-contained page (no CDN) that draws `/v1/stats` every 2 s. The router's shows one engine at a time, with a link to each (`?engine=i`) |
 
 The times are measured inside the engine, from when it receives a request (after the chat template and tokenization)
-to its last token, so they exclude the client's network round trip. A record holds counts and times, never a prompt or
+to its last token, so they exclude the client's network round trip. A choice that a `stop_regex` match ends is
+recorded as a stop, here, in the production log and in `/metrics`, though the server ends it by aborting the engine
+request; its last token is when the abort reaches the engine. A record holds counts and times, never a prompt or
 an output. Like the rest of the router, these endpoints have no authentication.
 
 ## Sampling extras
@@ -97,7 +101,7 @@ These fields work on `/v1/chat/completions` and `/v1/completions`.
 | `n` | Up to 128 choices of one prompt, each its own engine request. The prefix cache computes the shared prompt once: the scheduler holds the other choices until they can resume from the first one's prompt checkpoint. Each choice has its `index`, streamed chunks included. `usage` counts the prompt once and every choice's output; `cached_tokens` is the fewest any choice read from the cache. A client that disconnects aborts every choice. |
 | `best_of` | Accepted only equal to `n` (ranking extra candidates needs their logprobs, which no request returns). |
 | `seed` with `n` | Choice i samples with `seed + i`, so the choices differ and each is reproducible. |
-| `stop_regex` | A pattern or a list of up to 16, matched on the output text. The output ends at the end of the first match, the matched text included, with `finish_reason` `"stop"`. Each search reaches back about 2048 characters before the text already searched, so a match that starts further back is not found; a match may end anywhere after. With `min_tokens`, a match that ends among the first `min_tokens` output tokens is skipped and the output runs on to the next match, as for stop strings. A pattern whose search can take more than about quadratic time in the text's length (nested or overlapping repeats, such as `(a+)+` or `a*a*`) is refused with 400; repeats that cannot take the same characters, such as `\w+@\w+` (the `@` between them), are served. |
+| `stop_regex` | A pattern or a list of up to 16, matched on the output text. The output ends at the end of the first match, the matched text included, with `finish_reason` `"stop"`. Each search reaches back about 2048 characters before the text already searched, so a match that starts further back is not found; a match may end anywhere after. With `min_tokens`, a match that ends among the first `min_tokens` output tokens is skipped and the output runs on to the next match, as for stop strings. Patterns are searched on the server's event loop, so their search time is bounded before they run, and a pattern or request that could take too long is refused with 400 naming why. Refused outright: nested or overlapping repeats (`(a+)+`, `a*a*`, `.+.*+x`), and a lookaround that can match more than one way or at more than one length (`(?=.*x)`, `(?=\s\|$)`; one of fixed length, such as `foo(?!bar)`, is served). Repeats that cannot take the same characters, such as `\w+@\w+` (the `@` between them), are served. Every other pattern has a cost, in units of the search time of `\w+@`, a single repeat, over the same text: its ways to match (alternations whose branches can start alike multiply them, as optional parts that can match the empty text do) times one plus the steps the matcher takes again at every character a repeat gives back (a part after the repeat that it could also take, a lookaround). A pattern may cost at most 16 units. A request may cost at most 32: its patterns' costs added up, times `n`, as each choice searches every pattern. For example, `.*The final answer is:` costs 21 and is refused; `(?s)<think>.*</think>` costs 9, so it is served with `n` up to 3 and refused with `n` 4 (36). Every pattern costs at least 1, so a request of more than 32 choices takes no `stop_regex`. |
 | `include_stop_str_in_output`, `no_stop_trim` | Two names for one switch: keep the stop string, or the stop token's text, in the output. |
 | `skip_special_tokens` | `false` keeps special tokens in the output text. |
 | `stop_token_ids` | Tokens that end the request. The stop token (or EOS) is not part of the text. |
@@ -135,7 +139,9 @@ Nothing is stored. Refused with 400: `store: true`, `previous_response_id`, `bac
 `effort` and `summary`, `service_tier` other than `"auto"` or `"default"`, item references, non-text input parts and
 tools other than functions. `metadata`, `user`, `safety_identifier` and `prompt_cache_key` are accepted and change
 nothing: the prefix cache matches every prompt by its tokens, with no key. `GET`, `DELETE` and `cancel` of a response
-answer 404.
+answer 404. Unlike `/v1/chat/completions`, this endpoint ignores a field it does not know rather than refusing it,
+so a misspelled field (`temprature`) is served as if absent: a field it cannot tell from a newer Responses field
+is not refused. The chat fields it passes on are served or refused as on `/v1/chat/completions`.
 
 ## Anthropic Messages API
 
@@ -163,7 +169,10 @@ with 400: `thinking` `{"type": "disabled"}` (the template cannot turn reasoning 
 `budget_tokens` on an engine started without `--structured-outputs` (with it, the budget is enforced as
 `thinking_token_budget`), `tool_choice` `any` and `tool` (a tool-call grammar for GLM's format is not built),
 image and document blocks, `redacted_thinking`, a `tool_result` with `is_error` true (GLM's chat template cannot mark a
-failed call; put the error in the result's content), server tools, `mcp_servers`, `container` and `context_management`.
+failed call; put the error in the result's content), server tools, `mcp_servers`, `container` and `context_management`,
+and messages that end with an assistant message (a prefill): GLM's chat template closes that turn and opens a new
+one, so the reply would be a fresh answer rather than its continuation, as `continue_final_message` would be on the
+chat endpoint. `count_tokens` refuses it too.
 
 ## Tokenize and detokenize
 
@@ -200,14 +209,14 @@ that disconnects aborts its request. The router routes it like a completion, by 
 | `rid` | The request's id, which `/abort_request` names. A batch's ids are `rid_0`, `rid_1`, ..., or a list of one per prompt. A rid already running is refused. |
 | `session_id` | As on the OpenAI routes: the router pins the session to one engine. |
 | `return_prompt_token_ids` | Adds `prompt_token_ids` to the response. |
-| `log_metrics` | `false` leaves the request out of `/metrics`. |
-| `no_logs` | `true` keeps the request's record out of the production log (`TRNRT_PROD_DIR`); it is still counted in `/v1/stats`. |
+| `log_metrics` | `false` leaves the request out of `/metrics`, `/v1/stats` and the production log (`TRNRT_PROD_DIR`), as the `/health_generate` probe is. |
+| `no_logs` | `true` keeps the request's record out of the production log alone; it is still counted in `/metrics` and `/v1/stats`. |
 
 The response is one object for one prompt and a list for a batch:
 
 | Field | Value |
 |---|---|
-| `text` | The output, cut before a stop string. |
+| `text` | The output, cut before a stop string. The stop token that ends the request (EOS or a `stop_token_ids` entry) is not part of it, as on `/v1/completions`. |
 | `output_ids` | The output token ids. |
 | `meta_info.id` | The rid. |
 | `meta_info.finish_reason` | `{"type": "stop", "matched": <stop string or token id>}`, `{"type": "length", "length": n}`, `{"type": "abort", "message": "Aborted"}`, or `null` while a stream runs. |
@@ -243,9 +252,9 @@ all of them:
 | `GET /model_info`, `/get_model_info` | `model_path` (as passed to `--model`), `served_model_name`, `is_generation`, `preferred_sampling_params` (the checkpoint's defaults), `reasoning_parser` and `tool_call_parser` (the parsers in use: `glm45`, `glm47`), `model_type`, `architectures` | The first live engine |
 | `GET /server_info`, `/get_server_info` | The engine's configuration (every `EngineConfig` field), `tp_size`, `dp_size`, `context_length`, `preset`, `version`, `startup_seconds`, and `internal_states` (its `/get_load` entry) | The first answer, with `dp_size` the number of engines and `internal_states` one entry per engine |
 | `GET /get_load` | `[{dp_rank, num_reqs, num_running_reqs, num_waiting_reqs, num_tokens, num_pending_tokens, token_usage, ts_tic}]`: `num_tokens` is the KV tokens in use plus the waiting requests' tokens | Every engine's entry, `dp_rank` its index |
-| `GET /health_generate` | 200 once a step ends after a one-token probe is sent (the probe itself on an idle engine); 503 if none ends within 20 s, or once the engine failed. The probe is not counted in `/metrics` | Every engine: 200 `"ok"` or `"degraded"` while any generated, 503 `"down"` when none did, naming the engines down. An engine's 503 counts toward the router's `down_after`, as a stalled `/health` does, rather than marking it down at once |
+| `GET /health_generate` | 200 once a step ends after a one-token probe is sent (the probe itself on an idle engine); 503 if none ends within 20 s, or once the engine failed. A full waiting queue (`--max-queued-requests`, `--max-queued-tokens`) refuses the probe as it would any request: the engine is serving others, so once a step ends the answer is 200 `{"status": "ok", "busy": true}`. The probe is not counted in `/metrics` | Every engine: 200 `"ok"` or `"degraded"` while any generated, 503 `"down"` when none did, naming the engines down; a busy engine counts as one that generated, and `busy` names it. An engine's 503 counts toward the router's `down_after`, as a stalled `/health` does, rather than marking it down at once |
 | `POST /abort_request` | `{"rid": ...}` aborts that request (an exact match); `{"abort_all": true}` aborts every request. The aborted request answers with its output so far and finish reason `abort`. 200 whether or not the rid runs | Every engine: only the one holding the rid has it. 200 once any engine took it |
-| `GET` or `POST /flush_cache` | Drops the prefix cache (device pages, state checkpoints and the host-memory tier), only while no request runs or waits. `?timeout=<s>` (default 0) waits up to that long for the engine to be idle. 200 when flushed, 400 with the reason when not | Every engine; 200 only when all flushed. The router also forgets a flushed engine's prefixes. An engine with no answer after `timeout` plus the health timeout is named "no answer" in the 400 |
+| `GET` or `POST /flush_cache` | Drops the prefix cache (device pages, state checkpoints and the host-memory tier), only while no request runs or waits. `?timeout=<s>` (default 0) waits up to that long for the engine to be idle. 200 when flushed, 400 with the reason when not. A client that goes away while its flush waits withdraws it: the cache is not dropped later, and the next `/flush_cache` is not refused as another in progress | Every engine; 200 only when all flushed. The router also forgets a flushed engine's prefixes. An engine with no answer after `timeout` plus the health timeout is named "no answer" in the 400. A client that goes away closes the router's requests to the engines, which withdraws their waiting flushes, and the router forgets every engine's prefixes, as it cannot tell which engines flushed first |
 
 None of these returns a secret or a host path the operator did not pass.
 

@@ -217,6 +217,31 @@ def test_a_malformed_body_and_an_engine_failure_answer_in_anthropics_shape(clien
     }
 
 
+def test_a_final_assistant_message_is_refused_rather_than_answered_afresh(client):
+    """A prefill (the messages end with the assistant's) asks Anthropic to continue that text. GLM's template renders it
+    as a finished turn and opens a new one, so the reply would be a fresh answer that a client joining prefill + reply
+    reads as broken output: refused with a 400 that says why, as chat refuses continue_final_message, and by
+    count_tokens too, which counts what /v1/messages would send."""
+    c, eng = client(PLAIN)
+    prefill = {
+        **ASK,
+        "messages": [{"role": "user", "content": "Reply as JSON"}, {"role": "assistant", "content": '{"a":'}],
+    }
+    for path, body in (("/v1/messages", prefill), ("/v1/messages/count_tokens", {"messages": prefill["messages"]})):
+        r = c.post(path, json=body)
+        assert r.status_code == 400, (path, r.text)
+        err = r.json()["error"]
+        assert err["type"] == "invalid_request_error" and "prefill" in err["message"], err
+    blocks = [{"type": "text", "text": '{"a":'}]
+    r = c.post(
+        "/v1/messages", json={**prefill, "messages": [prefill["messages"][0], {"role": "assistant", "content": blocks}]}
+    )
+    assert r.status_code == 400 and "prefill" in r.json()["error"]["message"]
+    assert eng.added == []
+    turns = [*prefill["messages"], {"role": "user", "content": "go on"}]  # an assistant turn before the last is history
+    assert c.post("/v1/messages", json={**ASK, "messages": turns}).status_code == 200
+
+
 def test_count_tokens_counts_what_messages_would_send(client):
     """count_tokens renders the request exactly as /v1/messages does, so its count is that request's prompt length
     (and /tokenize's for the same chat messages). No request reaches the engine."""

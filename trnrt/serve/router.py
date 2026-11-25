@@ -807,7 +807,9 @@ def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: floa
         "degraded" when some did, 503 "down" when none did. Each body names the engines that did not ("down"). An
         engine answers 503 when no step of its ended within HEALTH_GENERATE_TIMEOUT_S, which a long prefill can do to
         an engine still serving: that 503 counts toward down_after, as a stalled /health does, and does not move the
-        sessions pinned there at once. A failed engine's /health answers 503 too, which the poll takes as down."""
+        sessions pinned there at once. A failed engine's /health answers 503 too, which the poll takes as down. An
+        engine whose full queue refused the probe while its steps went on answers 200 busy: it counts as one that
+        generated, and "busy" names it."""
         from .native import HEALTH_GENERATE_TIMEOUT_S
 
         rs = await each("GET", "/health_generate", HEALTH_GENERATE_TIMEOUT_S + 10, hard_503=False)
@@ -817,7 +819,12 @@ def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: floa
                 router.note_ok(w)
         status = "ok" if all(ok) else "degraded" if any(ok) else "down"
         down = [u for u, good in zip(router.workers, ok) if not good]
-        return JSONResponse({"status": status, "down": down}, status_code=503 if status == "down" else 200)
+        busy = [
+            u for u, r in zip(router.workers, rs) if isinstance(got := json_of(r), dict) and got.get("busy") is True
+        ]
+        return JSONResponse(
+            {"status": status, "down": down, "busy": busy}, status_code=503 if status == "down" else 200
+        )
 
     @app.post("/abort_request")
     async def abort_request(http: Request):
@@ -838,14 +845,22 @@ def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: floa
         flushed, else 400 naming the engines that did not and why. A flushed engine's prefix tree here is cleared:
         the tree stands for what its cache holds. An engine that has not answered `timeout` + health_timeout_s seconds
         after it was asked is one that did not flush ("no answer"): an engine answers once it flushed or its timeout
-        passed, so only one that is stuck takes longer."""
+        passed, so only one that is stuck takes longer. A client that goes away first closes the requests to the
+        engines, which withdraws a flush still waiting there; an engine may have flushed by then, and its answer is
+        dropped, so every engine's prefix tree here is cleared."""
         query = http.url.query
         try:
             wait = float(http.query_params.get("timeout", "0"))
         except ValueError:
             wait = 0.0  # each engine answers a malformed timeout with 400 at once
         wait = wait if math.isfinite(wait) and wait >= 0 else 0.0
-        rs = await each(http.method, "/flush_cache" + (f"?{query}" if query else ""), wait + health_timeout_s)
+        rs = await _unless_disconnected(
+            http, each(http.method, "/flush_cache" + (f"?{query}" if query else ""), wait + health_timeout_s)
+        )
+        if rs is None:  # which engines flushed is unknown: a tree kept for one that did would route to an empty cache
+            for w in range(len(router.workers)):
+                router.clear_tree(w)
+            return Response(status_code=499)  # nobody reads it
         failed = []
         for w, r in enumerate(rs):
             if r is not None and r.status_code == 200:

@@ -66,21 +66,24 @@ class Metrics:
         with self.lock:
             self.local_k, self.local_k_wanted = counts, False
 
-    def on_finish(self, req) -> None:
+    def on_finish(self, req, reason: str | None = None, done: float | None = None) -> None:
+        """A finished request. `reason` and `done` (time.monotonic()) stand in for the request's own finish reason and
+        time when the server ended it rather than the engine (a stop_regex match: the engine saw an abort)."""
+        reason = reason or req.finish_reason or "unknown"
+        done = req.finish_time if done is None else done
         with self.lock:
             n_out = len(req.output_ids)
             self.prompt_tokens += req.num_prompt
             self.generation_tokens += n_out
             self.prefix_cache_queries += req.num_prompt
             self.prefix_cache_hits += max(req.num_cached_tokens, 0)
-            reason = req.finish_reason or "unknown"
             self.finished[reason] = self.finished.get(reason, 0) + 1
             if req.first_token_time is not None:
                 self.ttft.observe(req.first_token_time - req.arrival_time)
-                if req.finish_time is not None and n_out > 1:
-                    self.tpot.observe((req.finish_time - req.first_token_time) / (n_out - 1))
-            if req.finish_time is not None:
-                self.e2e.observe(req.finish_time - req.arrival_time)
+                if done is not None and n_out > 1:
+                    self.tpot.observe((done - req.first_token_time) / (n_out - 1))
+            if done is not None:
+                self.e2e.observe(done - req.arrival_time)
 
     def render(self, engine) -> str:
         s = engine.scheduler

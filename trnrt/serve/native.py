@@ -276,9 +276,21 @@ def parse_generate(body: dict, tok, vocab: int, defaults: dict[str, float]) -> t
 class _Run:
     """One prompt of a /generate request in the engine: its output as it arrives, in /generate's shape."""
 
-    def __init__(self, item: _Item, sub: _Submit, tok, text_in_logprobs: bool, prompt_ids: bool, t0: float):
+    def __init__(
+        self,
+        item: _Item,
+        sub: _Submit,
+        tok,
+        text_in_logprobs: bool,
+        prompt_ids: bool,
+        t0: float,
+        eos: tuple[int, ...] = (),
+    ):
         self.item, self.sub, self.tok = item, sub, tok
         self.detok = _Detok(tok, item.params.stop, incremental=True, rid=sub.rid, protect=item.params.min_tokens)
+        # The ids whose token ends the request without being part of its text: EOS and the request's stop ids, as on the
+        # OpenAI routes (api.Run), since no_stop_trim false is the only value /generate serves.
+        self.stop_ids = frozenset(eos) | frozenset(item.params.stop_token_ids)
         self.text_in, self.prompt_ids, self.t0 = text_in_logprobs, prompt_ids, t0
         self.ids: list[int] = []
         # The logprob entries of the output so far, built once per token (a stream's events repeat them all)
@@ -299,7 +311,8 @@ class _Run:
             if self.item.top:
                 self.top_lps += [[self._entry(v, i) for i, v in zip(ti, tl)] for _, ti, tl in lps]
         self.ids += ids
-        delta = self.detok.push(ids, finish is not None)
+        drop = finish == "stop" and bool(ids) and ids[-1] in self.stop_ids
+        delta = self.detok.push(ids, finish is not None, drop_last=drop)
         self.text += delta
         self.finish = finish
         return bool(ids or delta or finish)
@@ -390,6 +403,7 @@ def add_routes(
     """The native routes on the app of one engine (serve/api.py build_app)."""
     engine = loop_.engine
     tok = engine.tokenizer
+    eos = tuple(getattr(engine.mcfg, "eos_token_ids", ()) or ())
     model_type, architectures = _checkpoint_ids(getattr(engine, "model_path", None))
 
     def load() -> dict:
@@ -463,7 +477,9 @@ def add_routes(
     async def health_generate():
         """One token generated from prompt [0] (greedy, not counted in /metrics). A step that ends after the probe is
         sent shows the engine serving, so a busy engine answers as soon as its current step ends (and the probe is
-        aborted); 503 if no step ends within HEALTH_GENERATE_TIMEOUT_S, or once the engine failed."""
+        aborted); 503 if no step ends within HEALTH_GENERATE_TIMEOUT_S, or once the engine failed. A full waiting queue
+        (--max-queued-requests, --max-queued-tokens) refuses the probe as it refuses any request: that is an engine
+        serving others, so the answer is 200 {"status": "ok", "busy": true} once a step ends, not a failure."""
         tic = time.monotonic()
         err = loop_.health_error()
         if err is None:
@@ -474,22 +490,31 @@ def add_routes(
         if err is not None:
             return JSONResponse(status_code=503, content={"status": "failed", "error": err})
 
-        async def finished() -> str | None:
+        async def finished() -> tuple[str | None, bool]:
+            """(the probe's error or None, whether a full queue refused it)."""
             while True:
                 kind, *rest = await cast("asyncio.Queue", sub.out).get()
                 if kind == "error":
-                    return str(rest[0])
+                    return str(rest[0]), len(rest) > 2 and bool(rest[2])
                 if kind == "tokens" and rest[1] is not None:
-                    return None
+                    return None, False
 
         done = asyncio.ensure_future(finished())
+        busy = False
         try:
-            while not done.done() and loop_.last_step <= tic and time.monotonic() < tic + HEALTH_GENERATE_TIMEOUT_S:
-                await asyncio.wait({done}, timeout=0.05)
+            while loop_.last_step <= tic and time.monotonic() < tic + HEALTH_GENERATE_TIMEOUT_S:
+                if not done.done():
+                    await asyncio.wait({done}, timeout=0.05)
+                elif done.result()[1]:  # refused for a full queue: a step that ends now shows the engine serving
+                    await asyncio.sleep(0.05)
+                else:
+                    break  # generated, or refused for another reason
             if done.done():
-                err = done.result()
-            elif loop_.last_step <= tic:
+                err, busy = done.result()
+            if (busy or not done.done()) and loop_.last_step <= tic:
                 err = f"no engine step ended within {HEALTH_GENERATE_TIMEOUT_S:.0f} s"
+            elif busy:
+                err = None
         finally:
             if not done.done():
                 done.cancel()
@@ -497,7 +522,7 @@ def add_routes(
         err = loop_.health_error() or err
         if err is not None:
             return JSONResponse(status_code=503, content={"status": "failed", "error": err})
-        return {"status": "ok"}
+        return {"status": "ok", "busy": True} if busy else {"status": "ok"}
 
     @app.post("/abort_request")
     async def abort_request(http: HTTPRequest):
@@ -520,7 +545,9 @@ def add_routes(
     async def flush_cache(http: HTTPRequest):
         """Drop the prefix cache (device pages, state checkpoints and the host tier), only while no request runs or
         waits; `timeout` (seconds, default 0) waits that long for the engine to be idle. 200 with the text of FLUSHED
-        when flushed, 400 with the reason when not."""
+        when flushed, 400 with the reason when not. A client that goes away first withdraws its flush: it would
+        otherwise still drop the cache once the engine is idle, which nobody asks for any more, and refuse every other
+        /flush_cache until then."""
         raw = http.query_params.get("timeout", "0")
         try:
             timeout = float(raw)
@@ -529,7 +556,11 @@ def add_routes(
         if not (math.isfinite(timeout) and timeout >= 0):
             raise _bad("timeout must be a number of seconds >= 0")
         f = loop_.flush(timeout)
-        flushed, message = await f.fut
+        got = await _unless_disconnected(http, f.fut)
+        if got is None:
+            loop_.unflush(f)
+            return Response(status_code=499)  # nginx's "client closed request"; nobody reads it
+        flushed, message = got
         if flushed:
             return PlainTextResponse(FLUSHED)
         return PlainTextResponse(message + "\n", status_code=400)
@@ -568,7 +599,7 @@ def add_routes(
                     loop_.abort(s.rid, s.out)
             raise _error(*bad[1:])  # a full queue's 503 keeps QUEUE_FULL_HEADER: the router keeps the engine up
         text_in, prompt_ids = _flag(body, "return_text_in_logprobs"), _flag(body, "return_prompt_token_ids")
-        runs = [_Run(it, s, tok, text_in, prompt_ids, t0) for it, s in zip(items, subs)]
+        runs = [_Run(it, s, tok, text_in, prompt_ids, t0, eos) for it, s in zip(items, subs)]
         for r, f in zip(runs, firsts):
             r.req = f[1]
 

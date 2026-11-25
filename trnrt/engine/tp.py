@@ -19,7 +19,9 @@ import errno
 import logging
 import os
 import socket
+import sys
 import threading
+import time
 from typing import Any
 
 import torch.distributed as dist
@@ -592,10 +594,66 @@ def drop_channel() -> None:
         ch.shm.unlink()
 
 
-def worker_main(rank: int, cfg, path: str, num_pages: int, port: int) -> None:
+# How often rank 0 looks at its workers while it waits for them to reach the process group (wait_joining).
+JOIN_POLL_S = 0.1
+
+
+def wait_joining(workers, ready) -> None:
+    """Rank 0, before its own init_rank: wait until every worker has set its `ready` event (worker_main sets it just
+    before it joins the process group), watching every worker's exit code at each poll meanwhile. A worker that exits
+    first, before or after it set its event (its NUMA pin or its device environment failed, or it crashed), fails the
+    start at once, naming it: rank 0 would otherwise wait in the rendezvous for a rank that never comes, until the
+    process group's TIMEOUT (hours). A worker still not ready after TIMEOUT fails it too, naming the ranks pending.
+
+    Not watched: a worker that dies after this returns (every worker ready) and before rank 0's rendezvous completes.
+    Rank 0 waits for it in init_rank until TIMEOUT, as 0.2.0 did for any worker. workers[i] is rank i + 1."""
+    deadline = time.monotonic() + TIMEOUT.total_seconds()
+    while True:
+        dead = [(r, w.exitcode) for r, w in enumerate(workers, 1) if w.exitcode is not None]
+        if dead:
+            gone = ", ".join(f"{r} (exit code {code})" for r, code in dead)
+            raise RuntimeError(
+                f"tensor-parallel rank(s) {gone} exited before joining the process group; the worker's error is logged "
+                "above"
+            )
+        pending = [r for r, ev in enumerate(ready, 1) if not ev.is_set()]
+        if not pending:
+            return
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"tensor-parallel rank(s) {', '.join(map(str, pending))} not ready to join the process group after "
+                f"{TIMEOUT.total_seconds():g} s (the process group's timeout); each is still running its own start"
+            )
+        ready[pending[0] - 1].wait(JOIN_POLL_S)
+
+
+def _dies_with_rank0() -> None:
+    """Linux: this worker is killed (SIGKILL) when rank 0 exits (PR_SET_PDEATHSIG), so it never outlives its engine
+    holding its NeuronCore. LLMEngine.close stops the workers itself; this covers a rank 0 that dies first (killed past
+    `serve`'s grace, or by the OOM killer), whose workers otherwise ran on until their own watchdog or the gloo timeout
+    ended them, and a restart was refused because their cores were taken. The signal comes when the thread that started
+    the worker exits: LLMEngine starts its workers on the thread that builds it, which the engine's life is bound to."""
+    if not sys.platform.startswith("linux"):
+        return
+    import ctypes
+    import multiprocessing
+    import signal
+
+    ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGKILL)  # PR_SET_PDEATHSIG
+    parent = multiprocessing.parent_process()
+    if parent is not None and os.getppid() != parent.pid:  # rank 0 exited before the prctl took effect
+        raise SystemExit("tensor-parallel rank 0 exited before this rank started")
+
+
+def worker_main(rank: int, cfg, path: str, num_pages: int, port: int, ready=None) -> None:
+    """A tensor-parallel worker (rank > 0). `ready` (a multiprocessing Event): set once its own start (the device
+    environment and NUMA pin) is done, just before it joins the process group, which rank 0 waits for (wait_joining)."""
+    _dies_with_rank0()
     configure_logging()  # a spawned process starts with no logging configuration
     if cfg.device == "neuron":
         neuron_env(rank, port, cfg.tp_core_base)
+    if ready is not None:
+        ready.set()
     init_rank(rank, cfg.tp, port)
     from .engine import build_shard
 

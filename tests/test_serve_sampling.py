@@ -233,6 +233,35 @@ def test_stop_regex_ends_the_output_after_its_match_and_aborts_the_request(app, 
     assert eng.aborted == [eng.added[-1].rid]
 
 
+def test_a_stop_regex_match_is_recorded_as_a_stop(app, monkeypatch, tmp_path):
+    """The server ends a stop_regex match by aborting the engine request, but the request finished as a stop: /v1/stats
+    counts it ok (so it is in the RPM and the latency percentiles), the production log records "stop", and /metrics
+    counts its finish reason and its latencies. An abort the client asks for is still an abort."""
+    from trnrt.serve import api
+    from trnrt.serve import prodlog as PL
+
+    monkeypatch.setenv(PL.ENV, str(tmp_path))
+    client, eng = app(PLAIN * 10, setup=lambda e: setattr(e, "step_delay", 0.01))
+    r = client.post("/v1/completions", json={"prompt": [1], "max_tokens": 40, "stop_regex": r"re\s?ag"})
+    assert r.json()["choices"][0]["finish_reason"] == "stop"
+    (lp,) = [lp for lp in api._LOOPS if lp.engine is eng]
+    deadline = time.monotonic() + 5
+    while not (eng.aborted and lp.prodlog.written["requests"]) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert eng.aborted == [eng.added[-1].rid]  # the engine request was aborted, as before
+    assert lp.stats.counts == {"ok": 1, "aborted": 0, "failed": 0}
+    (rec,) = lp.stats.records
+    assert rec["finish"] == "stop" and rec["e2e"] is not None and rec["output"] >= 3
+    w = client.get("/v1/stats").json()["windows"]["1m"]
+    assert w["ok"] == 1 and w["e2e"]["n"] == 1 and w["ttft"]["n"] == 1
+    m = client.get("/metrics").text
+    assert 'trnrt:request_success_total{finished_reason="stop"} 1' in m and 'finished_reason="abort"' not in m
+    assert "trnrt:e2e_request_latency_seconds_count 1" in m and "trnrt:time_per_output_token_seconds_count 1" in m
+    lp.stop()
+    (path,) = tmp_path.rglob("requests.jsonl")
+    assert [x["finish"] for x in PL.read_jsonl(str(path))] == ["stop"]
+
+
 def test_stop_regex_unbounded_and_anchored(app):
     """A pattern with an unbounded repeat is searched back over the text (STOP_REGEX_SPAN characters before the new
     text); an anchor keeps its meaning (the search starts at a position, never at a slice)."""
@@ -309,6 +338,7 @@ def test_zero_width_stop_regexes_match_and_terminate():
         r"a*a*b",  # a power of the length: two repeats in a row that take the same characters
         r"\d+\s*\d+",
         r".*x.*y",
+        r"(x)?a*(?(1)b)a*c",  # a*a*c when group 1 is unset: a conditional with no "no" branch can match the empty text
         r"(?:)+",
         "(?:.|.)" * 5 + "x",  # alternations that can start alike, in a row: 32 ways to try
         "(?:a|ab)" * 3 + "(?:a|ab)(?:a|ab)",
@@ -317,11 +347,30 @@ def test_zero_width_stop_regexes_match_and_terminate():
         "(?:(?=x)?x)+y",  # an optional empty part, repeated
         "(?:(?=x))?" * 5 + "y",
         "(?:){1000000}X",  # an exact count of an empty part: every iteration runs
+        "".join(f"(?:{c}?)?" for c in "bcdefghijklmnopq") + "X",  # optional parts that can match empty: 65,536 ways
+        # a lookaround that can match more than one way or length: the matcher runs it again at every position a repeat
+        # around it tries, cubic or worse (each about a second, or minutes, over 2048 characters of prose)
+        r"(?:[^\n](?=(?:[^\n](?=[^\n]*\n))+))+Y",
+        r"[^~]+(?=[^~]*~~)~",
+        r"(?:[^~](?![^~]*~~))+~~",
+        r"(?:.(?!.*@@))+@@",
+        r"[^\n]+(?=[^\n]*\n)Y",
+        r"\.(?=\s|$)",
+        # a possessive repeat or an atomic group after a repeat that can take its characters: cubic
+        r".+.*+@",
+        r".+(?>.*)@",
+        # quadratic, but walked again at every character a repeat gives back: past the cost bound
+        ".+" + "." * 1000 + "@",
+        r"(?:\w(?!\w{31}@))+@",
+        r"\w+(?!\w{15}@)@",
+        r"\w*(?:aa|a)(?:aa|a)(?:aa|a)(?:aa|a)@",
+        r"(?:a|a)(?:a|a)(?:a|a)(?:a|a)(\w)+@",  # a capturing group, marked at every iteration: 3 times \w+@'s steps
     ],
 )
 def test_stop_regex_refuses_patterns_that_backtrack(app, pattern):
     """CPython's re holds the GIL through a search and cannot be interrupted, so a pattern whose search can take
-    exponential time, or a power of the text's length, is refused with the reason before it runs on the event loop."""
+    exponential time, a power of the text's length, or many times a single repeat's quadratic time, is refused with the
+    reason before it runs on the event loop."""
     client, eng = app(PLAIN)
     r = client.post("/v1/completions", json={"prompt": [1], "stop_regex": ["again", pattern]})
     assert r.status_code == 400 and r.json()["detail"].startswith(f"stop_regex {pattern!r} is refused: it "), r.text
@@ -329,6 +378,8 @@ def test_stop_regex_refuses_patterns_that_backtrack(app, pattern):
 
 
 def test_stop_regex_admits_ordinary_patterns():
+    """Ordinary patterns, a lookaround that matches one way at one length, and every pattern this suite's requests send
+    and expect served, all pass the check."""
     from trnrt.serve.api import _backtracking
 
     ordinary = [
@@ -351,8 +402,94 @@ def test_stop_regex_admits_ordinary_patterns():
         r"(?:Answer|Ans):\s*(?:yes|y)\b",  # two alternations that start alike: 4 ways
         r"colou?r",
         r"https?://\S+",
+        r"foo(?!bar)",  # lookarounds of one width that match one way
+        r"(?<=\.)\s",
+        r"\n(?=\n)",
+        r'(?<!\\)"',
+        r"<tool_call>.*?</tool_call>",
+        r".*Final Answer:",
+        r"(<)?\w+(?(1)>)@",  # a conditional with no "no" branch, nothing after it that \w+ could take
     ]
-    assert {p: _backtracking(p) for p in ordinary} == dict.fromkeys(ordinary)
+    served = [r"x{3}", r"^there", r"Hel+o", r"ag\w+", r"<.*>", "$", "^", "again"]  # the other tests' patterns
+    assert {p: _backtracking(p) for p in ordinary + served} == dict.fromkeys(ordinary + served)
+
+
+def test_the_reported_lookaround_patterns_are_refused_for_their_lookaround():
+    """The shapes that got past the check: a lookaround's part was checked on its own, without the repeats around it, so
+    a repeat over a lookahead that scans to the end of the text was admitted, and its search was cubic or worse (about a
+    second, or minutes, over 2048 characters of prose)."""
+    from trnrt.serve.api import _backtracking
+
+    reported = [
+        r"(?:[^\n](?=(?:[^\n](?=[^\n]*\n))+))+Y",
+        r"[^~]+(?=[^~]*~~)~",
+        r"(?:[^~](?![^~]*~~))+~~",
+        r"(?:.(?!.*@@))+@@",
+    ]
+    for p in reported:
+        assert (_backtracking(p) or "").startswith("it has a lookaround that can match more than one way"), p
+
+
+def test_an_optional_part_that_can_match_the_empty_text_matches_it_two_ways():
+    """(?:b?)? matches the empty text two ways, taken empty and skipped, and the matcher tries both: sixteen such parts
+    in a row, admitted at cost 16, took 4.5 s a search over 2048 characters of "z" (65,536 tries at every position;
+    CPython 3.13, one Apple M3 Max core). A possessive one gives nothing back, so it matches one way."""
+    from trnrt.serve.api import _search_cost
+
+    letters = "bcdefghijklmnopq"
+    chain = "".join(f"(?:{c}?)?" for c in letters) + "X"
+    assert (_search_cost(chain)[0] or "").startswith("it has optional parts that can match the empty text"), chain
+    assert _search_cost("(?:b?)?X") == (None, 2 * _search_cost("(?:b)?X")[1])
+    assert _search_cost("".join(f"(?:{c}?)?+" for c in letters) + "X") == (None, 1)
+
+
+def test_a_capturing_group_in_a_repeat_costs_its_marks():
+    """The matcher marks a capturing group at both ends at every iteration, so (\\w)+@ took 2.8 times as long as \\w+@
+    over 2048 characters of "a" (CPython 3.13, one Apple M3 Max core), and after 16 ways 0.94 s against 0.34 s, where
+    both were priced 16. A group's two marks are now two steps of the repeat's walk: (\\w)+@ costs 3."""
+    from trnrt.serve.api import _search_cost
+
+    assert _search_cost(r"\w+@") == (None, 1) and _search_cost(r"(?:\w)+@") == (None, 1)
+    assert _search_cost(r"(\w)+@") == (None, 3)
+    why, cost = _search_cost(r"(?:a|a)(?:a|a)(?:a|a)(?:a|a)(\w)+@")
+    assert cost == 48 and (why or "").startswith("it can take 48 times as long to search"), why
+
+
+def test_a_requests_stop_regex_patterns_share_one_cost_bound(app):
+    """Each pattern is searched at every streamed piece, so the bound is the request's: two patterns at the
+    per-pattern bound (16 ways each) are served, a third is refused, though each alone would be served."""
+    from trnrt.serve.api import MAX_STOP_REGEX_COST, MAX_STOP_REGEX_REQUEST_COST, _search_cost
+
+    ways16 = [
+        r"(?:a|a)(?:a|a)(?:a|a)(?:a|a)\w+@",
+        r"(?:b|b)(?:b|b)(?:b|b)(?:b|b)\w+@",
+        r"(?:c|c)(?:c|c)(?:c|c)(?:c|c)\w+@",
+    ]
+    assert [_search_cost(p) for p in ways16] == [(None, MAX_STOP_REGEX_COST)] * 3
+    assert 2 * MAX_STOP_REGEX_COST <= MAX_STOP_REGEX_REQUEST_COST < 3 * MAX_STOP_REGEX_COST
+    client, eng = app(PLAIN)
+    assert client.post("/v1/completions", json={"prompt": [1], "stop_regex": ways16[:2]}).status_code == 200
+    r = client.post("/v1/completions", json={"prompt": [1], "stop_regex": ways16})
+    assert r.status_code == 400 and r.json()["detail"].startswith("stop_regex patterns are refused: together"), r.text
+    assert len(eng.added) == 1
+
+
+def test_a_requests_stop_regex_cost_counts_every_choice(app):
+    """Each of a request's `n` choices has its own detokenizer, which searches every pattern at each of its streamed
+    pieces, so the request's bound counts its patterns' cost once per choice: (?s)<think>.*</think> (cost 9) is served
+    with n = 3 (27) and refused with n = 4 (36), though alone it is served."""
+    from trnrt.serve.api import MAX_STOP_REGEX_REQUEST_COST, _search_cost
+
+    think = r"(?s)<think>.*</think>"
+    assert _search_cost(think) == (None, 9) and 3 * 9 <= MAX_STOP_REGEX_REQUEST_COST < 4 * 9
+    client, eng = app(PLAIN)
+    assert client.post("/v1/completions", json={"prompt": [1], "n": 3, "stop_regex": think}).status_code == 200
+    r = client.post("/v1/completions", json={"prompt": [1], "n": 4, "stop_regex": [think]})
+    assert r.status_code == 400, r.text
+    detail = r.json()["detail"]
+    assert detail.startswith("stop_regex patterns are refused: together they can take 9 times as long"), detail
+    assert "for each of the request's 4 choices, 36 in all, more than 32" in detail and "or fewer choices" in detail
+    assert len(eng.added) == 3  # the served request's three choices, none of the refused one's
 
 
 def test_stop_regex_search_reaches_back_at_most_the_span(monkeypatch):

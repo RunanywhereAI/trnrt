@@ -47,7 +47,7 @@ class FakeEngine:
         self.host, self.cmd, self.env = host, cmd, env
         self.port = int(_last(cmd, "--port"))
         self.ready, self.exit_status, self.ready_s, self.t0 = ready, exit_status, ready_s, time.monotonic()
-        self.polls, self.returncode, self.signals = 0, None, []
+        self.polls, self.returncode, self.signals, self.waits = 0, None, [], []
 
     def poll(self):
         return self.returncode
@@ -67,6 +67,7 @@ class FakeEngine:
         self.returncode = -sig
 
     def wait(self, timeout=None):
+        self.waits.append(timeout)
         return self.returncode
 
     def kill(self):
@@ -126,6 +127,17 @@ def test_serve_starts_one_engine_at_a_time_with_the_cache_hit_assertion(host):
         assert _last(e.cmd, "--core-base") == str(32 * i) and _last(e.cmd, "--host") == "127.0.0.1"
         assert "--engines" not in e.cmd and "--startup-timeout" not in e.cmd and "--allow-compile" not in e.cmd
         assert e.signals == [signal.SIGTERM]  # the router returned: serve stops its engines
+
+
+def test_serve_gives_its_engines_their_whole_close_to_stop(host):
+    """After their SIGTERM, the engines get ENGINE_STOP_S together, enough for an engine's whole close (its loop stop,
+    then its bounded tensor-parallel stop, then its workers' terminate and kill), not 120 s each: that killed engine 0
+    before its bounded stop could run, and left its workers holding their NeuronCores."""
+    assert cli.cmd_serve(["--model", "m"]) == 0
+    waits = [w for e in host.engines for w in e.waits]
+    assert len(waits) == 2 and all(cli.ENGINE_STOP_S - 10 < w <= cli.ENGINE_STOP_S for w in waits), waits
+    # the loop stop and the bounded stop, then the workers' exit, terminate and kill, each phase one deadline (engine.py)
+    assert cli.ENGINE_STOP_S > 2 * 120 + 30 + 2 * 10
 
 
 def test_serve_gives_the_router_its_keep_alive_and_not_the_engines(host):

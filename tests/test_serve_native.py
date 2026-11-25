@@ -118,6 +118,39 @@ def test_generate_answers_with_text_output_ids_and_meta_info(serve, method):
     assert p.stop == (" again", "!")
 
 
+@pytest.mark.parametrize("stream", [False, True])
+def test_generate_leaves_the_stop_token_out_of_the_text(serve, stream):
+    """A stop_token_ids entry (or EOS) that ends the request is not part of `text`, as on /v1/completions, even when the
+    tokenizer does not mark it special; output_ids keep it, and finish_reason names it."""
+
+    def text_of(client, body):
+        if not stream:
+            return client.post("/generate", json=body).json()
+        with client.stream("POST", "/generate", json={**body, "stream": True}) as r:
+            events = [json.loads(ln[6:]) for ln in r.iter_lines() if ln.startswith("data: {")]
+        return events[-1]
+
+    client, _ = serve(PLAIN)
+    out = text_of(client, {"input_ids": [1], "sampling_params": {"stop_token_ids": [ID["!"]]}})
+    assert out["text"] == "Hello there again" and out["output_ids"] == PLAIN
+    assert out["meta_info"]["finish_reason"] == {"type": "stop", "matched": ID["!"]}
+    assert text_of(client, {"input_ids": [1]})["text"] == "Hello there again!"  # "!" is no stop token here
+
+    from fastapi.testclient import TestClient
+
+    from trnrt.serve import api
+
+    eos = ScriptedEngine(PLAIN)
+    eos.mcfg.eos_token_ids = (ID["!"],)  # an engine whose EOS is "!", an ordinary token to its tokenizer
+    try:
+        with TestClient(api.build_app(eos, "glm")) as c:
+            out = text_of(c, {"input_ids": [1]})
+            assert out["text"] == "Hello there again" and out["meta_info"]["finish_reason"]["matched"] == ID["!"]
+    finally:
+        for lp in [lp for lp in api._LOOPS if lp.engine is eos]:
+            lp.stop()
+
+
 def test_a_stop_after_min_new_tokens_is_the_one_its_finish_reason_names(serve, monkeypatch):
     """A stop string inside min_new_tokens' protected text does not end the request, so finish_reason names the stop that
     did, not the first one anywhere in the output."""
@@ -354,6 +387,34 @@ def test_flush_cache_flushes_only_an_idle_engine():
             assert c.post(f"/flush_cache?timeout={t}").status_code == 400, t
 
 
+def test_a_flush_whose_client_went_away_is_withdrawn():
+    """A /flush_cache?timeout=T on a busy engine whose client gives up is withdrawn at once. Before, it held the engine's
+    one pending flush, so every other /flush_cache was refused until T passed, and it still dropped the whole prefix
+    cache once the engine was idle, which nobody asked for any more."""
+    import httpx
+
+    from trnrt.serve import api
+
+    eng = ScriptedEngine(PLAIN * 40)
+    eng.step_delay = 0.05
+    with _uvicorn(eng) as base, httpx.Client(base_url=base, timeout=30) as c:
+        busy = _background(lambda: c.post("/v1/completions", json={"prompt": [1], "max_tokens": 100}))  # 5 s
+        _wait_for(lambda: eng.scheduler.running)
+        (lp,) = [lp for lp in api._LOOPS if lp.engine is eng]
+        gone = socket.create_connection(("127.0.0.1", int(base.rsplit(":", 1)[1])))
+        gone.sendall(b"GET /flush_cache?timeout=3600 HTTP/1.1\r\nHost: x\r\n\r\n")
+        _wait_for(lambda: lp._flush is not None)  # the engine thread holds it, waiting for the engine to be idle
+        gone.close()
+        _wait_for(lambda: lp._flush is None, 3)
+        assert eng.scheduler.running  # withdrawn while the engine is still busy, not run
+        r = c.get("/flush_cache")
+        assert r.status_code == 400 and "requests are running or waiting" in r.text, r.text  # not "Another flush"
+        assert busy().status_code == 200
+        time.sleep(0.2)
+        assert eng.flushes == []  # nothing flushed once the engine went idle
+        assert c.get("/flush_cache").status_code == 200 and eng.flushes == [0]
+
+
 def test_health_generate_runs_a_token_through_the_engine(monkeypatch):
     """Idle: the probe (prompt [0], one greedy token) runs, and /metrics does not count it. Stuck in a step past the
     timeout: 503, and the probe is aborted. /v1/stats counts neither probe."""
@@ -390,6 +451,31 @@ def test_health_generate_runs_a_token_through_the_engine(monkeypatch):
         assert lp.stats.counts == {"ok": 3, "aborted": 0, "failed": 0}
         probes = {eng.added[0].rid, eng.added[3].rid}
         assert len(lp.stats.records) == 3 and not probes & {r["rid"] for r in lp.stats.records}
+
+
+def test_health_generate_reads_a_full_queue_as_busy_not_failed(monkeypatch):
+    """A full waiting queue (--max-queued-requests) refuses the probe as any request: while steps go on, the engine is
+    serving, so the answer is 200 busy, not 503 failed (a supervisor would restart a healthy, loaded engine). With no
+    step ending, it is still 503."""
+    import httpx
+
+    from tests.test_serve_sched import QueueEngine
+    from trnrt.engine.scheduler import Scheduling
+    from trnrt.serve import native
+
+    eng = QueueEngine(PLAIN * 40, Scheduling())
+    eng.step_delay = 0.02
+    with _uvicorn(eng) as base, httpx.Client(base_url=base, timeout=30) as c:
+        busy = _background(lambda: c.post("/v1/completions", json={"prompt": [1], "max_tokens": 100}))  # 2 s of steps
+        _wait_for(lambda: eng.scheduler.running)
+        eng.limit = 0  # the queue is full from here: the engine refuses every new request
+        r = c.get("/health_generate")
+        assert r.status_code == 200 and r.json() == {"status": "ok", "busy": True}, r.text
+        assert eng.priorities[-1] is None and len(eng.added) == 1  # the probe was refused, never added
+        assert busy().status_code == 200
+        monkeypatch.setattr(native, "HEALTH_GENERATE_TIMEOUT_S", 0.3)
+        r = c.get("/health_generate")  # idle, queue full: no step ends
+        assert r.status_code == 503 and "no engine step ended" in r.json()["error"], r.text
 
 
 def test_health_generate_is_503_once_a_rank_died(serve):
@@ -446,6 +532,26 @@ def test_no_logs_keeps_a_request_out_of_the_production_log(serve, monkeypatch, t
     (path,) = tmp_path.rglob("requests.jsonl")
     assert [rec["rid"] for rec in PL.read_jsonl(str(path))] == ["logged"]
     assert client.post("/generate", json={"input_ids": [1], "no_logs": "yes"}).status_code == 400
+
+
+def test_log_metrics_false_leaves_a_request_out_of_metrics_stats_and_the_log(serve, monkeypatch, tmp_path):
+    """docs/API.md: log_metrics false leaves the request out of /metrics, /v1/stats and the production log alike (the
+    server records it as it records a /health_generate probe: not at all); no_logs only out of the log."""
+    from trnrt.serve import api
+    from trnrt.serve import prodlog as PL
+
+    monkeypatch.setenv(PL.ENV, str(tmp_path))
+    client, eng = serve(PLAIN)
+    r = client.post("/generate", json={"input_ids": [1], "rid": "unseen", "log_metrics": False})
+    assert r.status_code == 200, r.text
+    assert client.post("/generate", json={"input_ids": [1], "rid": "seen"}).status_code == 200
+    (lp,) = [lp for lp in api._LOOPS if lp.engine is eng]
+    _wait_for(lambda: lp.stats.counts["ok"] == 1 and lp.prodlog.written["requests"] == 1)
+    assert lp.stats.counts == {"ok": 1, "aborted": 0, "failed": 0} and lp.stats.records[-1]["rid"] == "seen"
+    assert 'trnrt:request_success_total{finished_reason="stop"} 1' in client.get("/metrics").text
+    lp.stop()
+    (path,) = tmp_path.rglob("requests.jsonl")
+    assert [rec["rid"] for rec in PL.read_jsonl(str(path))] == ["seen"]
 
 
 def test_load_and_info_endpoints(serve):

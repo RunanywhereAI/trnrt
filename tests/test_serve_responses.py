@@ -225,6 +225,18 @@ def test_neutral_fields_are_served(client):
     assert r.json()["metadata"] == {"k": "v"}
 
 
+def test_a_field_it_does_not_know_is_ignored_not_refused(client):
+    """The limitation, pinned (docs/API.md): unlike /v1/chat/completions, a field neither the Responses translation nor
+    the chat path knows is ignored, so a misspelled one is served as if absent. A chat field the chat path cannot serve
+    is still refused."""
+    c, eng = client(PLAIN)
+    r = c.post("/v1/responses", json={"input": "hi", "temprature": 0, "max_output_tokens": 4})
+    assert r.status_code == 200, r.text
+    assert eng.added[-1].params.temperature != 0  # the typo was not applied
+    r = c.post("/v1/responses", json={"input": "hi", "logit_bias": {"1": 5}})
+    assert r.status_code == 400 and "logit_bias" in r.text, r.text
+
+
 def test_stored_responses_are_not_found(client):
     c, _ = client(PLAIN)
     for method, path in (("GET", "/v1/responses/resp_1"), ("DELETE", "/v1/responses/resp_1")):

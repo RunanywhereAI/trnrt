@@ -5,6 +5,53 @@ and versions follow [Semantic Versioning](https://semver.org/). Rebuild the comp
 
 ## [Unreleased]
 
+### Fixed
+
+- `stop_regex` refuses a pattern whose search could stall the server: one whose time can grow faster than the square
+  of the text's length (nested or overlapping repeats, also on either side of a conditional group with no "no"
+  branch, a possessive repeat or an atomic group after a repeat that can take its characters, a lookaround that can
+  match more than one way or length, an optional or exactly counted empty part, an alternation or an optional part
+  that can itself match the empty text), and one whose quadratic time has too large a factor (16 times a single
+  repeat's for a pattern, 32 for a request's patterns together, counted once for each of its `n` choices, which each
+  search every pattern). Some patterns 0.2.0 admitted are now refused with 400, among them `.*` followed by more
+  than about 15 characters, and a lookahead that can match more than one length, such as `\.(?=\s|$)`; a request of
+  more than 32 choices now takes no `stop_regex`. Measured on the host alone (CPython 3.13 on one Apple M3 Max core;
+  no Neuron SDK or model precision is involved), a search over 2048 characters took, across runs: 13 to 21 ms for
+  `\w+@` over a run of `a`, a single repeat and the cost's unit; 0.21 to 0.34 s for
+  `(?:a|a)(?:a|a)(?:a|a)(?:a|a)\w+@` over a run of `a`, a pattern at the cap of 16
+  (`test_a_requests_stop_regex_patterns_share_one_cost_bound`), so about twice that for a request at its cap, at
+  every streamed piece; and 1.5 s for `(?:.(?!.*@@))+@@` over repeated English text, a lookaround over the rest of
+  the text that 0.2.0 admitted (`test_the_reported_lookaround_patterns_are_refused_for_their_lookaround`).
+- An engine whose full waiting queue refuses the `/health_generate` probe while its steps go on answers 200 `busy`,
+  not 503: it is serving.
+- `/v1/messages` refuses messages that end with an assistant message (a prefill) with 400: the chat template would
+  answer with a new turn instead of continuing it.
+- The unknown-field check on `/v1/chat/completions` and `/v1/completions` takes a field sent as null as unset, as SDKs
+  send null for an argument passed as None. `prompt_cache_retention` is accepted and ignored, as `prompt_cache_key`
+  is, and chat's `modalities` is accepted as `["text"]` and refused with any other modality.
+- A choice that a `stop_regex` match ends counts as a stop, not an abort, in `/v1/stats`, the production log and
+  `/metrics`.
+- `/generate` leaves the stop token that ended a request (EOS or a `stop_token_ids` entry) out of its text when the
+  tokenizer does not mark it special, as the OpenAI endpoints do.
+- A `/flush_cache` whose client goes away while it waits for an idle engine is withdrawn, on the engine and through
+  the router. The router then forgets every engine's prefixes, as it cannot tell which engines flushed first.
+- A worker whose own start fails (its device listing failing on that rank alone, or any other error before it joins
+  the process group) fails the engine's start at once, naming its rank, whether it exits before or after it is ready
+  to join. Rank 0 waited for the dead rank until the process group's 4-hour timeout. A worker that never gets ready
+  fails the start at that timeout, naming the ranks still pending.
+- `serve` gives its engines 300 s together to close after its SIGTERM, enough for the step thread's stop, the
+  bounded tensor-parallel stop and the workers' exit, terminate and kill (it gave each 120 s, and killed the first
+  before its bounded stop ran). Those worker joins now share one deadline per phase, 30 s, 10 s and 10 s: joined one
+  by one, 31 hung workers could take 31 times as long. On Linux a worker is killed when its rank 0 exits, so none
+  outlives its engine holding a NeuronCore.
+- Rank 0's host arena and board close with its engine, after its step thread has stopped, not first among the exit
+  hooks.
+- docs/API.md: `/v1/responses` ignores a field it does not know, where `/v1/chat/completions` refuses it; the page
+  said both refuse. `log_metrics: false` leaves a request out of `/metrics`, `/v1/stats` and the production log; the
+  page named only `/metrics`.
+- docs/CONFIGURATION.md marks the arguments a build ignores: `--kda-shell-max-rows` in balanced and throughput (no KDA
+  shell), and `--plain-bucket-min`, `--dyn-mtp-kv` and `--spec-hysteresis` in latency (no plain decode steps).
+
 ## [0.2.0] - 2026-11-24
 
 Serving APIs for agent clients, and three builds chosen by users per engine in place of release 0.1.0's presets. Rebuild
@@ -21,7 +68,9 @@ builds with `tools/graph_equiv.py` on CPU; the device check of this release's ow
   routing state ([docs/API.md](docs/API.md)).
 - The native `/generate` (also PUT): `text` or `input_ids`, one prompt or a batch, `sampling_params`,
   streaming, output logprobs and request ids. The router routes it by its prompt or session
-  ([docs/API.md](docs/API.md#generate)).
+  ([docs/API.md](docs/API.md#generate)). A `/generate` that is cancelled (its client goes away) or refused (a rid
+  already in use, a full queue) aborts only its own requests, never another live request that holds the same rid,
+  as one from a client that reuses rids could.
 - `/model_info`, `/server_info`, `/get_load`, `/health_generate`, `/abort_request` and `/flush_cache` (and
   their `get_` names), on each engine and on the router, which asks one engine or all of them
   ([docs/API.md](docs/API.md#info-and-admin-endpoints)).

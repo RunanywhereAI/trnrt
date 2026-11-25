@@ -384,7 +384,12 @@ class HostStore:
         self._prev_term: Any = None
         if create:
             self.arenas[self.mine] = Arena.create(arena_name(tag, rank), self.per_arena, layout.slot_bytes)
-            atexit.register(self.close)
+            # A worker's store closes when the worker exits. Rank 0's closes with its engine (LLMEngine.close, after the
+            # step thread stopped and the workers are gone, through the engine module's exit hook): an exit hook of its
+            # own, registered after the server's, ran first at exit and unmapped the arena and the board under a step
+            # thread that could still move pages to the host cache.
+            if rank != 0:
+                atexit.register(self.close)
             self._hook_sigterm()
 
     def owner(self, slot: int) -> int:

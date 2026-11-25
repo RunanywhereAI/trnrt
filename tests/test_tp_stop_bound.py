@@ -10,11 +10,16 @@ terminated.
   terminated, a raising one too, a healthy one joins its worker, an engine left open is closed by the exit hook
   (its stop thread starts at interpreter exit), and without the bound close() hangs (the control); over gloo, the
   group close() destroys under a stuck stop broadcast does not hold close() and the next group of the process works;
-- a start that fails after its workers started (stand-in workers) stops them and gives rank 0 its state back."""
+- a start that fails after its workers started (stand-in workers) stops them and gives rank 0 its state back;
+- tp.wait_joining fails the start for a worker that exits, before or after it is ready, and at the process group's
+  timeout for one that never gets ready;
+- _stop_workers stops many hung workers by one deadline per phase, and serve's ENGINE_STOP_S covers an engine's whole
+  close."""
 
 from __future__ import annotations
 
 import contextlib
+import datetime as dt
 import logging
 import os
 import subprocess
@@ -319,13 +324,16 @@ def test_unacked_ranks_waits_for_a_close_in_progress_and_never_reads_the_unmappe
 
 
 class _Proc:
-    """A worker process that runs until it is terminated (multiprocessing.Process's surface that LLMEngine uses)."""
+    """A worker process that runs until it is terminated (multiprocessing.Process's surface that LLMEngine uses). It
+    sets its ready event (worker_main's last argument) when it starts, as a worker past its own start does."""
 
     def __init__(self, **kw):
         self.pid, self.exitcode, self.terminated = None, None, False
+        self.args = kw.get("args", ())
 
     def start(self):
         self.pid = 1 << 22
+        self.args[-1].set()
 
     def is_alive(self):
         return self.pid is not None and self.exitcode is None
@@ -370,7 +378,9 @@ def test_a_start_that_fails_after_its_workers_started_stops_them_and_gives_rank_
         kv_arena_close=lambda: events.append("arena closed"),
         release_slot=lambda req: None,
     )
-    monkeypatch.setattr(multiprocessing, "get_context", lambda kind: types.SimpleNamespace(Process=proc))
+    monkeypatch.setattr(
+        multiprocessing, "get_context", lambda kind: types.SimpleNamespace(Process=proc, Event=threading.Event)
+    )
     monkeypatch.setattr(TP, "free_port", lambda core_base=None: 0)
     monkeypatch.setattr(TP, "init_rank", lambda rank, world, port: events.append("process group up"))
     monkeypatch.setattr(TP, "restore_process_state", lambda saved: events.append("process restored"))
@@ -394,3 +404,263 @@ def test_a_start_that_fails_after_its_workers_started_stops_them_and_gives_rank_
     assert len(procs) == 1 and procs[0].terminated
     assert events == ["process group up", "process restored", "arena closed"]
     assert len(E._OPEN) == n_open and runner.tp_send is None  # nothing left for the exit hook to close
+
+
+class _DeadProc(_Proc):
+    """A worker that exits during its own start (its NUMA pin raised), before it is ready to join the process group."""
+
+    def start(self):
+        self.pid, self.exitcode = 1 << 22, 1
+
+
+class _ReadyThenDeadProc(_Proc):
+    """A worker that sets its ready event and then exits before it joins the process group."""
+
+    def start(self):
+        super().start()
+        self.exitcode = 1
+
+
+@pytest.mark.parametrize("dead", [_DeadProc, _ReadyThenDeadProc], ids=["before ready", "after ready"])
+def test_a_worker_that_dies_before_joining_fails_the_start_at_once(monkeypatch, dead):
+    """A worker whose start fails (numa_pin raising NumaPinError, say) never joins the process group. Rank 0 used to
+    wait for it in the rendezvous for the gloo timeout (4 h); it now sees the worker gone before it joins, raises naming
+    the rank, stops the other workers and gives this process its state back. So too for a worker that exits after it
+    set its ready event: rank 0 watched only the workers not yet ready, and went on into the rendezvous."""
+    import multiprocessing
+
+    from trnrt.config import EngineConfig
+
+    procs: list[_Proc] = []
+    events: list[str] = []
+
+    def proc(**kw):
+        procs.append((dead if kw["args"][0] == 2 else _Proc)(**kw))
+        return procs[-1]
+
+    def past_the_rendezvous(*a):
+        raise AssertionError("planted: rank 0 went on past a dead worker")
+
+    mcfg = types.SimpleNamespace(eos_token_ids=(0,), vocab_size=8)
+    monkeypatch.setattr(
+        multiprocessing, "get_context", lambda kind: types.SimpleNamespace(Process=proc, Event=threading.Event)
+    )
+    monkeypatch.setattr(TP, "free_port", lambda core_base=None: 0)
+    monkeypatch.setattr(TP, "init_rank", lambda rank, world, port: events.append("process group up"))
+    monkeypatch.setattr(TP, "restore_process_state", lambda saved: events.append("process restored"))
+    monkeypatch.setattr(E, "resolve_model_path", lambda path, revision=None: path)
+    monkeypatch.setattr(E.ModelConfig, "from_pretrained", classmethod(lambda cls, path: mcfg))
+    monkeypatch.setattr(E, "resolve_attention_tp", lambda m, c: 4)
+    monkeypatch.setattr(E, "pool_pages", lambda c, m: 16)
+    monkeypatch.setattr(E, "build_shard", past_the_rendezvous)
+    cfg = EngineConfig(model_path="no-model", device="cpu", tp=4)
+    t0 = time.monotonic()
+    with pytest.raises(RuntimeError, match=r"rank\(s\) 2 \(exit code 1\) exited before joining the process group"):
+        E.LLMEngine(cfg)
+    assert time.monotonic() - t0 < 10
+    assert events == ["process restored"]  # rank 0 never entered the rendezvous
+    assert [p.terminated for p in procs] == [True, False, True]  # the live workers stopped; the dead one is gone
+
+
+class _Worker:
+    """A worker process as tp.wait_joining sees it: its exit code, None while it runs."""
+
+    def __init__(self, exitcode: int | None = None):
+        self.exitcode = exitcode
+
+
+def _joining(workers, ready, bound: float = 10.0) -> BaseException | None:
+    """tp.wait_joining on a daemon thread, joined for at most `bound` seconds: what it raised, None if it returned. A
+    wait that never ends fails the test instead of hanging it."""
+    out: list[BaseException | None] = []
+
+    def run() -> None:
+        try:
+            TP.wait_joining(workers, ready)
+            out.append(None)
+        except BaseException as e:  # noqa: BLE001  handed to the test
+            out.append(e)
+
+    th = threading.Thread(target=run, daemon=True)
+    th.start()
+    th.join(bound)
+    assert not th.is_alive(), f"wait_joining still waiting after {bound} s"
+    return out[0]
+
+
+def test_wait_joining_watches_a_worker_after_it_is_ready():
+    """A worker that set its ready event and then exited (its init_rank failing, say) fails the start: wait_joining
+    checks every worker's exit code at each poll, not only the pending ones'. It used to return once the others were
+    ready, and rank 0 then waited in the rendezvous for the gone rank until the process group's TIMEOUT."""
+    ready = [threading.Event(), threading.Event()]
+    ready[0].set()
+    later = threading.Timer(0.5, ready[1].set)  # rank 2 is alive and ready a moment later
+    later.start()
+    try:
+        err = _joining([_Worker(exitcode=1), _Worker()], ready)
+    finally:
+        later.cancel()
+    assert isinstance(err, RuntimeError), err
+    assert "rank(s) 1 (exit code 1) exited before joining the process group" in str(err)
+
+
+def test_wait_joining_ends_at_the_process_groups_timeout(monkeypatch):
+    """A live worker that never sets its ready event (stuck in its own start) held rank 0 in wait_joining for ever; the
+    wait now ends at the process group's TIMEOUT, as the rendezvous would, naming the ranks still pending."""
+    monkeypatch.setattr(TP, "TIMEOUT", dt.timedelta(seconds=0.3))
+    ready = [threading.Event(), threading.Event(), threading.Event()]
+    ready[1].set()
+    t0 = time.monotonic()
+    err = _joining([_Worker(), _Worker(), _Worker()], ready)
+    assert 0.3 <= time.monotonic() - t0 < 5
+    assert isinstance(err, RuntimeError), err
+    assert "rank(s) 1, 3 not ready to join the process group after 0.3 s" in str(err)
+
+
+def _exit_at_once(code: int) -> None:
+    os._exit(code)
+
+
+def _ready_then_wait(ev) -> None:
+    ev.set()
+    time.sleep(30)
+
+
+def test_wait_joining_with_real_workers():
+    """tp.wait_joining over spawned processes: it raises within a poll or two when one exits first, naming its rank and
+    exit code, still when its event is set (a worker ready and then gone never joins), and returns once every live
+    worker is ready."""
+    import multiprocessing
+
+    ctx = multiprocessing.get_context("spawn")
+    ready = [ctx.Event(), ctx.Event()]
+    ws = [ctx.Process(target=_ready_then_wait, args=(ready[0],), daemon=True)]
+    ws.append(ctx.Process(target=_exit_at_once, args=(3,), daemon=True))
+    for w in ws:
+        w.start()
+    try:
+        t0 = time.monotonic()
+        with pytest.raises(RuntimeError, match=r"rank\(s\) 2 \(exit code 3\) exited before joining"):
+            TP.wait_joining(ws, ready)
+        assert time.monotonic() - t0 < 30
+        ready[1].set()  # rank 2 ready, but gone: it still fails the start
+        with pytest.raises(RuntimeError, match=r"rank\(s\) 2 \(exit code 3\) exited before joining"):
+            TP.wait_joining(ws, ready)
+        TP.wait_joining(ws[:1], ready[:1])  # every worker alive and ready: it returns
+    finally:
+        for w in ws:
+            w.kill()
+            w.join(10)
+
+
+def test_serve_waits_out_an_engines_whole_close():
+    """`serve` kills an engine ENGINE_STOP_S after its SIGTERM: longer than the engine's own close can take, its step
+    thread's stop, the bounded tensor-parallel stop, then the workers' exit once released and their terminate and kill
+    joins, each one deadline for all the workers (test_stopping_many_hung_workers_takes_one_deadline_per_phase)."""
+    from trnrt import __main__ as cli
+    from trnrt.serve import api
+
+    assert cli.ENGINE_STOP_S > api.LOOP_STOP_WAIT_S + E.TP_STOP_WAIT_S + E.WORKER_EXIT_WAIT_S + 2 * E.WORKER_STOP_WAIT_S
+
+
+class _Clock:
+    """A clock that only a stand-in worker's join moves."""
+
+    def __init__(self):
+        self.t = 0.0
+
+    def monotonic(self) -> float:
+        return self.t
+
+
+class _HungProc:
+    """A started worker that ignores rank 0's release and its SIGTERM: only a kill ends it, or (unkillable) nothing,
+    as for a process in uninterruptible sleep. While it is alive its join waits out the whole timeout, on `clock`."""
+
+    def __init__(self, clock: _Clock, unkillable: bool):
+        self.clock, self.unkillable = clock, unkillable
+        self.pid, self.exitcode = 1 << 22, None
+        self.signals: list[str] = []
+
+    def is_alive(self) -> bool:
+        return self.exitcode is None
+
+    def join(self, timeout=None) -> None:
+        assert timeout is not None, "an unbounded join"
+        if self.is_alive():
+            self.clock.t += timeout
+
+    def terminate(self) -> None:
+        self.signals.append("TERM")
+
+    def kill(self) -> None:
+        self.signals.append("KILL")
+        if not self.unkillable:
+            self.exitcode = -9
+
+
+@pytest.mark.parametrize("unkillable", [False, True], ids=["ended by kill", "never ended"])
+def test_stopping_many_hung_workers_takes_one_deadline_per_phase(monkeypatch, unkillable):
+    """_stop_workers gives the workers one deadline per phase, whatever their number: 8 workers that ignore their release
+    and their SIGTERM are stopped within `wait` + 2 * WORKER_STOP_WAIT_S, not 8 times that. Joined one by one, each with
+    its own timeout, the 31 workers of a tp-32 engine could take 31 times as long, past serve's ENGINE_STOP_S."""
+    clock = _Clock()
+    monkeypatch.setattr(E, "time", types.SimpleNamespace(monotonic=clock.monotonic))
+    workers = [_HungProc(clock, unkillable) for _ in range(8)]
+    eng = types.SimpleNamespace(runner=types.SimpleNamespace(tp_send=None), _workers=list(workers))  # released
+    E.LLMEngine._stop_workers(eng, E.WORKER_EXIT_WAIT_S)
+    bound = E.WORKER_EXIT_WAIT_S + 2 * E.WORKER_STOP_WAIT_S
+    assert clock.t <= bound, f"the stop took {clock.t:g} s, more than {bound:g} s"
+    assert all(w.signals == ["TERM", "KILL"] for w in workers) and eng._workers == []
+    assert [w.is_alive() for w in workers] == [unkillable] * 8
+
+
+DEATH = textwrap.dedent(
+    """
+    import multiprocessing as mp, os, sys, time
+    sys.path.insert(0, {root!r})
+
+    def worker(path):
+        from trnrt.engine import tp
+        tp._dies_with_rank0()
+        open(path, "w").write(str(os.getpid()))
+        while True:
+            time.sleep(1)
+
+    if __name__ == "__main__":
+        w = mp.get_context("spawn").Process(target=worker, args=(sys.argv[1],))  # not a daemon: only the signal ends it
+        w.start()
+        for _ in range(1200):
+            if os.path.exists(sys.argv[1]):
+                break
+            time.sleep(0.05)
+        os._exit(0)  # rank 0 dies without closing anything, as a kill past serve's grace would end it
+    """
+).format(root=ROOT)
+
+
+def _running(pid: int) -> bool:
+    """Whether pid is a live process (a zombie waiting for its new parent to reap it is not)."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().rsplit(")", 1)[1].split()[0] != "Z"
+    except FileNotFoundError:
+        return False
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="PR_SET_PDEATHSIG is Linux's")
+def test_process_a_worker_dies_with_its_rank_0(tmp_path):
+    """A worker is killed when its rank 0 exits (tp._dies_with_rank0), so a rank 0 that dies before its close stopped
+    the workers leaves none holding a NeuronCore."""
+    script, pid_file = tmp_path / "death.py", tmp_path / "worker.pid"
+    script.write_text(DEATH)
+    env = dict(os.environ, PYTHONPATH=ROOT)
+    subprocess.run([sys.executable, str(script), str(pid_file)], timeout=120, check=True, env=env)
+    pid = int(pid_file.read_text())
+    deadline = time.monotonic() + 10
+    while _running(pid) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    alive = _running(pid)
+    if alive:
+        os.kill(pid, 9)
+    assert not alive, "the worker outlived its rank 0"
