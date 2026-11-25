@@ -995,10 +995,14 @@ def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: floa
                 if released:
                     return
                 released = True
-                await resp.aclose()  # closing upstream aborts the request on the worker
-                router.load[ww] -= 1
-                if done and resp.status_code == 200:
-                    router.turn_done(sid, ww)
+                try:
+                    # Closing upstream aborts the request on the worker. Shielded, because Starlette cancels the
+                    # body through a cancel scope that cancels every await in it again (#54 review).
+                    await asyncio.shield(resp.aclose())
+                finally:
+                    router.load[ww] -= 1
+                    if done and resp.status_code == 200:
+                        router.turn_done(sid, ww)
 
             async def relay():
                 done = False

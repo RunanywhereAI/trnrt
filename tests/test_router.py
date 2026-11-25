@@ -760,6 +760,104 @@ def test_a_stream_whose_client_leaves_before_its_first_chunk_releases_its_worker
     asyncio.run(main())
 
 
+def test_a_stream_whose_upstream_close_is_cancelled_still_releases_its_worker(monkeypatch):
+    """The release marked itself done, then awaited `resp.aclose()` before taking the load back
+    down. Under ASGI 2.3 Starlette cancels the body through an anyio cancel scope, so that await
+    can be cancelled; the decrement was skipped and the wrapper's retry found the release done
+    (#54 review). The upstream close here closes, then raises CancelledError as a cancelled close
+    would; the client reads the first chunk, then leaves."""
+    import asyncio
+    import json
+    import time
+
+    import httpx
+    from fastapi import FastAPI, Request
+    from fastapi.responses import StreamingResponse
+
+    from trnrt.serve.router import build_router_app
+
+    close = httpx.Response.aclose
+
+    async def cancelled_close(self):
+        await close(self)
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(httpx.Response, "aclose", cancelled_close)
+
+    seen: list[str] = []
+    worker = FastAPI()
+
+    @worker.get("/health")
+    async def health():
+        return {"status": "ok"}
+
+    @worker.post("/v1/completions")
+    async def completions(req: Request):
+        await req.json()
+
+        async def tokens():
+            try:
+                for _ in range(100):
+                    yield b"data: {}\n\n"
+                    await asyncio.sleep(0.1)
+                seen.append("ran to the end")
+            except BaseException:
+                seen.append("aborted")
+                raise
+
+        return StreamingResponse(tokens(), media_type="text/event-stream")
+
+    async def call_client_that_leaves(app, body: bytes) -> None:
+        first_chunk = asyncio.Event()
+        messages = [{"type": "http.request", "body": body, "more_body": False}]
+
+        async def receive():
+            if messages:
+                return messages.pop(0)
+            await first_chunk.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            await asyncio.sleep(0)
+            if message["type"] == "http.response.body" and message.get("body"):
+                first_chunk.set()
+
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0", "spec_version": "2.3"},
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/v1/completions",
+            "raw_path": b"/v1/completions",
+            "root_path": "",
+            "query_string": b"",
+            "headers": [(b"content-type", b"application/json")],
+            "client": ("127.0.0.1", 1),
+            "server": ("127.0.0.1", 2),
+        }
+        with contextlib.suppress(Exception):
+            await app(scope, receive, send)
+
+    async def main() -> None:
+        port = _free_port()
+        router = Router([f"http://127.0.0.1:{port}"])
+        servers, tasks = await _start([(worker, port)])
+        try:
+            app = build_router_app(router, poll_s=0)
+            body = json.dumps({"prompt": "hi", "max_tokens": 100, "stream": True}).encode()
+            await call_client_that_leaves(app, body)
+            deadline = time.monotonic() + 5
+            while (router.load != [0] or not seen) and time.monotonic() < deadline:
+                await asyncio.sleep(0.05)
+            assert router.load == [0], router.load
+            assert seen == ["aborted"], seen
+        finally:
+            await _stop(servers, tasks)
+
+    asyncio.run(main())
+
+
 # One conversation in each API that carries one: a long shared system part, then the turns.
 SYSTEM = "You are a coding agent. Environment and file tree follow. " + "src/x.py " * 4500
 TURNS = [
