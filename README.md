@@ -38,6 +38,55 @@ How we built it, with the AgentX results: [Serving GLM-5.3-Flash on one Trainium
   </picture>
 </p>
 
+## Where TrnRT stands
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/standing-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="docs/assets/standing-light.svg">
+    <img alt="1.6 to 1.75 times H200's tokens per dollar at 1 to 8 users, 1.34 times at 12 users and 1.07 times at 16, and 3.5 to 5.2 times H100's at 12 to 32 users: InferenceX AgentX, one TrnRT engine of 8 Trainium2 chips against one 8-GPU node, at AWS Capacity Block prices." src="docs/assets/standing-dark.svg" width="100%">
+  </picture>
+</p>
+
+On [InferenceX](https://github.com/SemiAnalysisAI/InferenceX) AgentX, which replays real coding-agent sessions, one TrnRT
+engine (8 Trainium2 chips, half a `trn2.48xlarge`) delivers more tokens per dollar than one 8-GPU H200 node up to 16
+concurrent users, and 3.5-5.2× an H100 node's from 12 to 32 users. All three run GLM-5.3-Flash's FP8 weights and are
+priced at AWS's Capacity Block list prices.
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/results-agentx-users-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="docs/assets/results-agentx-users-light.png">
+    <img alt="AgentX total tokens per dollar by concurrent users: trn2 above H200 up to 16 users and above H100 at every concurrency, at AWS Capacity Block prices." src="docs/assets/results-agentx-users-dark.png" width="760">
+  </picture>
+</p>
+
+| Users | Tokens per $: trn2 ÷ H200 | Tokens per $: trn2 ÷ H100 | P90 interactivity, tok/s per user: trn2 / H200 |
+|---|---|---|---|
+| 1 | **1.64×** | **1.52×** | 62.2 / 272 |
+| 4 | **1.75×** | **1.74×** | 41.8 / 235 |
+| 8 | **1.61×** | **2.01×** | 25.8 / 168 |
+| 12 | **1.34×** | **3.53×** | 17.1 / 138 |
+| 16 | **1.07×** | **3.82×** | 14.2 / 87.8 |
+| 24 | 0.86× | **5.16×** | 11.4 / 78.7 |
+| 32 | 0.81× | **4.95×** | 10.7 / 50.1 |
+
+**Where we're behind.** Each trn2 user is slower: P90 interactivity (end to end, the wait for the first token
+included) is 10.7-62.2 tok/s per user against H200's 50.1-272. At 24 and 32
+users H200 delivers more tokens per dollar (0.81-0.86×), and on the 8K/1K fixed-length recipe, which has no prefix reuse,
+trn2 delivers 0.56-0.76× H200's. Where a decode step's time goes is in
+[docs/RESULTS.md](docs/RESULTS.md#where-a-decode-steps-time-goes).
+
+<sub>InferenceX AgentX harness 1.0.12, canonical workload, one hour per point; ratios compare the same concurrency. The
+1-8 user points use MTP at InferenceX's golden acceptance length (2.519; trn2's measured acceptance is 2.20). Prices,
+AWS Capacity Blocks list, read 24 Nov 2026: trn2.48xlarge $2.235 per Trainium2 chip-hour ($35.76 per instance-hour),
+p5.48xlarge $5.970 per H100-hour, p5e.48xlarge $6.866 per H200-hour. trn2 ran TrnRT's internal builds on Neuron SDK
+2.32 (GSM8K 97.4-97.7% on the MTP builds, strict exact match, 5-shot, all 1,319 problems; a needle test passed on the
+host-tier restore); this release's builds are graph-equivalent to them, and a device run of release 0.2.0 itself is
+pending. GPU numbers are InferenceX's public runs; we report no accuracy score for them and did not check them. Every
+table, source run and the method:
+[docs/RESULTS.md](docs/RESULTS.md#against-h100-and-h200-inferencex-agentx-and-8k1k).</sub>
+
 ## Highlights
 
 | Feature | What it does |
@@ -46,7 +95,10 @@ How we built it, with the AgentX results: [Serving GLM-5.3-Flash on one Trainium
 | **1M-token context** | Sparse attention (top 2,048) and linear attention, with fixed-size state. |
 | **Prefix cache** | A radix tree over FP8 KV pages, plus a host-memory tier for evicted pages and state checkpoints. |
 | **Two engines per box** | Each engine is tensor-parallel over 32 logical NeuronCores, behind a session-affine router. |
-| **OpenAI API** | Chat and completions, streaming, tool calls and reasoning output. |
+| **Three builds** | `latency`, `balanced` (the default) and `throughput`, each tuned for a band of users per engine; `--preset auto --users N` picks one. |
+| **Agent-ready APIs** | OpenAI chat, completions and Responses, the Anthropic Messages API, the native `/generate` and `/tokenize`: streaming, tool calls, reasoning output and `n` choices. |
+| **Structured outputs** | JSON schema, regex and EBNF through xgrammar, plus penalties and thinking budgets, each behind a flag. |
+| **Scheduling** | First-come, longest-prefix, shortest-prompt and priority scheduling, queue limits and five prefix-cache eviction policies. |
 | **Offline compile** | Every graph is built on a CPU host; the serving box loads them and compiles nothing by default. |
 
 ## Quickstart
@@ -104,7 +156,7 @@ reply = client.chat.completions.create(
 print(reply.choices[0].message.content)
 ```
 
-The full guide covers what each step needs, start-up checks, the batch 4, 8 and 12 configurations and every flag:
+The full guide covers what each step needs, start-up checks, the three builds and every flag:
 [deploy](docs/DEPLOY.md) · [API](docs/API.md) · [configuration](docs/CONFIGURATION.md).
 
 ## Supported hardware and models
@@ -141,13 +193,15 @@ Tokens count input (cached input included) and output. Spot price: $8.60/h, us-e
 at $35.76/h, the batch 12 cost is $0.167 per million tokens. Full tables, cold-prompt latencies, long prompts and
 methodology are in [docs/RESULTS.md](docs/RESULTS.md).
 
-These numbers were measured with an earlier build of TrnRT. This repository passes these checks against that build
+These numbers were measured with an earlier build of TrnRT, at release 0.1.0's batch presets, which this release's
+builds replace. This repository passes these checks against that build
 ([docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md#verification-status)):
 
 - Graph equivalence: EQUAL on all 32 ranks, for all 157 graphs that build compiles in the default batch-12
   configuration.
 - Outputs: byte-identical to that build's on 384 of 384 requests.
-- Serving: the two-engine serve in the [Quickstart](#quickstart) passes end to end.
+- Serving: the two-engine serve in the [Quickstart](#quickstart) passed end to end on the device at release 0.1.0. On
+  this release it has run end to end on CPU only so far; the device run is pending.
 
 ## How it works
 
