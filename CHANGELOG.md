@@ -5,6 +5,44 @@ and versions follow [Semantic Versioning](https://semver.org/). Rebuild the comp
 
 ## [Unreleased]
 
+### Fixed
+
+- `stop_regex` refuses a pattern whose search could stall the server: one whose time can grow faster than the square
+  of the text's length (nested or overlapping repeats, a possessive repeat or an atomic group after a repeat that can
+  take its characters, a lookaround that can match more than one way or length, an optional or exactly counted empty
+  part, an alternation that can match the empty text), and one whose quadratic time has too large a factor (16
+  times a single repeat's for a pattern, 32 for a request's patterns together). Over 2048 characters (CPython 3.13,
+  one Apple M3 Max core) the slowest admitted pattern found takes 0.21 s a search, a request 0.4 s at every streamed
+  piece; a lookaround over the rest of the text, which 0.2.0 admitted, took a second or more. Some patterns 0.2.0
+  admitted are now refused with 400, among them `.*` followed by more than about 15 characters, and a lookahead that
+  can match more than one length, such as `\.(?=\s|$)`.
+- An engine whose full waiting queue refuses the `/health_generate` probe while its steps go on answers 200 `busy`,
+  not 503: it is serving.
+- `/v1/messages` refuses messages that end with an assistant message (a prefill) with 400: the chat template would
+  answer with a new turn instead of continuing it.
+- The unknown-field check on `/v1/chat/completions` and `/v1/completions` takes a field sent as null as unset, as SDKs
+  send null for an argument passed as None. `prompt_cache_retention` is accepted and ignored, as `prompt_cache_key`
+  is, and chat's `modalities` is accepted as `["text"]` and refused with any other modality.
+- A choice that a `stop_regex` match ends counts as a stop, not an abort, in `/v1/stats`, the production log and
+  `/metrics`.
+- `/generate` leaves the stop token that ended a request (EOS or a `stop_token_ids` entry) out of its text when the
+  tokenizer does not mark it special, as the OpenAI endpoints do.
+- A `/flush_cache` whose client goes away while it waits for an idle engine is withdrawn, on the engine and through
+  the router.
+- A worker whose own start fails (its device listing failing on that rank alone, or any other error before it joins
+  the process group) fails the engine's start at once, naming its rank. Rank 0 waited for the dead rank until the
+  process group's 4-hour timeout.
+- `serve` gives its engines 300 s together to close after its SIGTERM, enough for the step thread's stop and the
+  bounded tensor-parallel stop (it gave each 120 s, and killed the first before its bounded stop ran). On Linux a
+  worker is killed when its rank 0 exits, so none outlives its engine holding a NeuronCore.
+- Rank 0's host arena and board close with its engine, after its step thread has stopped, not first among the exit
+  hooks.
+- docs/API.md: `/v1/responses` ignores a field it does not know, where `/v1/chat/completions` refuses it; the page
+  said both refuse. `log_metrics: false` leaves a request out of `/metrics`, `/v1/stats` and the production log; the
+  page named only `/metrics`.
+- docs/CONFIGURATION.md marks the arguments a build ignores: `--kda-shell-max-rows` in balanced and throughput (no KDA
+  shell), and `--plain-bucket-min`, `--dyn-mtp-kv` and `--spec-hysteresis` in latency (no plain decode steps).
+
 ## [0.2.0] - 2026-11-24
 
 Serving APIs for agent clients, and three builds chosen by users per engine in place of release 0.1.0's presets. Rebuild
@@ -26,30 +64,18 @@ builds with `tools/graph_equiv.py` on CPU; the device check of this release's ow
   as one from a client that reuses rids could.
 - `/model_info`, `/server_info`, `/get_load`, `/health_generate`, `/abort_request` and `/flush_cache` (and
   their `get_` names), on each engine and on the router, which asks one engine or all of them
-  ([docs/API.md](docs/API.md#info-and-admin-endpoints)). An engine whose full waiting queue refuses the
-  `/health_generate` probe while its steps go on answers 200 `busy`, not 503: it is serving. A `/flush_cache` whose
-  client goes away while it waits for an idle engine is withdrawn, on the engine and through the router.
+  ([docs/API.md](docs/API.md#info-and-admin-endpoints)).
 - `n` choices on `/v1/chat/completions` and `/v1/completions`, sharing the prompt through the prefix cache; a seed gives
   choice i `seed + i` ([docs/API.md](docs/API.md#sampling-extras)).
 - `stop_regex`, and keeping the stop text with `include_stop_str_in_output` or `no_stop_trim`.
 - `skip_special_tokens: false`, and `matched_stop` on every finished choice.
-- `stop_regex` refuses a pattern whose search could stall the server: one whose time can grow faster than the square
-  of the text's length (nested or overlapping repeats, a possessive repeat or an atomic group after a repeat that can
-  take its characters, a lookaround that can match more than one way or length, an optional or exactly counted empty
-  part, an alternation that can match the empty text), and one whose quadratic time has too large a factor (16
-  times a single repeat's for a pattern, 32 for a request's patterns together). Each search reaches back about 2048
-  characters before the text already searched, so a match must start there or later. Over 2048 characters
-  (CPython 3.13, one Apple M3 Max core) the slowest admitted pattern found takes 0.21 s a search, a request 0.4 s
-  at every streamed piece; a lookaround over the rest of the text, admitted before, took a second or more.
-- `no_logs` on `/generate`: the request's record stays out of the production log. `log_metrics: false` leaves it out
-  of `/metrics`, `/v1/stats` and the production log; docs/API.md named only `/metrics`.
+- `stop_regex` refuses a pattern whose search can take more than about quadratic time in the text's length. Each search
+  reaches back about 2048 characters before the text already searched, so a match must start there or later.
+- `no_logs` on `/generate`: the request's record stays out of the production log.
 - The OpenAI Responses API, `POST /v1/responses`, stateless: reasoning, message and function-call items, and the
-  Responses stream events ([docs/API.md](docs/API.md#responses-api)). A field it does not know is ignored, not
-  refused as on `/v1/chat/completions`; its documentation said otherwise.
+  Responses stream events ([docs/API.md](docs/API.md#responses-api)).
 - The Anthropic Messages API, `POST /v1/messages` and `/v1/messages/count_tokens`: thinking, text and tool-use blocks,
-  Anthropic's stream events and error shape ([docs/API.md](docs/API.md#anthropic-messages-api)). Messages that end
-  with an assistant message (a prefill) are refused with 400: the chat template would answer with a new turn instead
-  of continuing it.
+  Anthropic's stream events and error shape ([docs/API.md](docs/API.md#anthropic-messages-api)).
 - The router routes `/v1/responses` and `/v1/messages` by session and prefix as it routes chat, and sends
   `/v1/messages/count_tokens` to any live engine.
 - Scheduling flags, host only and per engine: `--schedule-policy` (`fcfs`, `lpm`, `lof`, `spf`),
@@ -58,8 +84,7 @@ builds with `tools/graph_equiv.py` on CPU; the device check of this release's ow
   `tlru`). The defaults schedule as before ([docs/CONFIGURATION.md](docs/CONFIGURATION.md#scheduling)).
 - `GET /v1/stats` adds the engine's live state and request rates, TTFT, decode-speed and end-to-end percentiles over
   recent windows, and `GET /dashboard` draws them; the router serves both for each engine
-  ([docs/API.md](docs/API.md#statistics-and-the-dashboard)). The fields the router reads are unchanged. A choice
-  that a `stop_regex` match ends counts as a stop there, in the production log and in `/metrics`, not as an abort.
+  ([docs/API.md](docs/API.md#statistics-and-the-dashboard)). The fields the router reads are unchanged.
 - `TRNRT_PROD_DIR`: an opt-in on-disk log of request records (counts and times only) and gauges.
 - `TRNRT_PROMPT_CACHE_MB`: an opt-in prompt token cache that builds a chat turn's prompt ids from the previous turn's,
   with the same ids as a full encode or none.
@@ -76,15 +101,11 @@ builds with `tools/graph_equiv.py` on CPU; the device check of this release's ow
   one shared copy of a page in /dev/shm instead of one each), ascending page allocation (`--pool-ascending`) and the
   checkpoints' share of the host cache (`--host-cache-ckpt-frac`). Host only; on in the balanced and throughput builds.
   An engine with save-once refuses to start when /dev/shm cannot hold its arenas beside those of engines already running.
-  Rank 0's arena and board close with its engine, after its step thread has stopped, not first among the exit hooks.
 - `--no-plain-decode`: no plain decode graph, for a build whose speculation never turns off.
 - The runner's side of the DSA selection's row classes: a plain decode batch in class-slot order, and a batch whose rows
   do not fit their classes sent to the next page bucket.
 - Closing an engine bounds the tensor-parallel stop (120 s): a rank that never answers is named in the log and the
-  workers are terminated, instead of holding the process. `serve` gives its engines 300 s together to close after
-  its SIGTERM, enough for the step thread's stop and the bounded stop (it gave each 120 s, and killed the first before
-  its bounded stop ran), and on Linux a worker is killed when its rank 0 exits, so none outlives its engine holding
-  a NeuronCore.
+  workers are terminated, instead of holding the process.
 - `--generation-config auto|none` for `serve` and `engine`: `none` serves the built-in sampling defaults (temperature
   and top_p 1.0) even when the checkpoint has a `generation_config.json`, on every endpoint (`/generate`, the
   Responses and Messages APIs, and `/model_info`'s `preferred_sampling_params` too). `auto`, the default, takes the
@@ -99,7 +120,7 @@ builds with `tools/graph_equiv.py` on CPU; the device check of this release's ow
   compare text by slices instead of one character at a time, so a large request stalls the streams it relays for less
   time (the JSON parser still holds the interpreter lock while it runs).
 - The stop token that ends a request (EOS or a `stop_token_ids` entry) is no longer part of its text when the tokenizer
-  does not mark it special, on the OpenAI endpoints and on `/generate`.
+  does not mark it special.
 - `min_new_tokens` on the OpenAI endpoints and `spaces_between_special_tokens: false` are refused with 400;
   they were ignored.
 - `service_tier` other than `"auto"` or `"default"` is refused with 400 on `/v1/chat/completions`, `/v1/completions`
@@ -110,24 +131,17 @@ builds with `tools/graph_equiv.py` on CPU; the device check of this release's ow
   `--users N` alone) picks the build for N users per engine ([docs/CONFIGURATION.md](docs/CONFIGURATION.md)). The
   earlier names still work and run the nearest build, with a deprecation warning: `batch8`, `mtp-batch8` and
   `mtp-always` run `latency`, `batch12` and `mtp-batch12` run `balanced`, `mtp-batch24` runs `throughput`. Every build
-  has its own graphs: rebuild the compile cache. docs/CONFIGURATION.md marks the arguments a build ignores:
-  `--kda-shell-max-rows` in balanced and throughput (no KDA shell), and `--plain-bucket-min`, `--dyn-mtp-kv` and
-  `--spec-hysteresis` in latency (no plain decode steps).
+  has its own graphs: rebuild the compile cache.
 - `TRNRT_DMA_HW=1` under every build.
 - An engine whose device listing fails, or whose launch CPU set cannot pin every rank to its NeuronCore's NUMA node,
   refuses to start; `TRNRT_NUMA_PIN_OPTIONAL=1` starts it anyway, with a warning. Rank 0 logs how many ranks pinned.
-  A worker whose own start fails (its listing failing on that rank alone, or any other error before it joins the
-  process group) fails the engine's start at once, naming its rank: rank 0 waits for every worker to be ready
-  before it joins, where it used to wait for the dead rank until the process group's 4-hour timeout.
 - Every engine warms every slot of its IO pool, so no slot's buffers are built on a serving call.
 
 ### Fixed
 
 - An unknown field on `/v1/chat/completions` or `/v1/completions`, or a field of the other endpoint, is refused with
   400 naming it, as AGENTS.md invariant 7 requires. It was ignored, and the request answered 200 as if it had been
-  applied (`prediction`, `audio`, a misspelled field). A field sent as null is unset and accepted, as SDKs send null
-  for an argument passed as None; `prompt_cache_retention` is accepted and ignored, as `prompt_cache_key` is; chat's
-  `modalities` is accepted as `["text"]` and refused with any other modality.
+  applied (`prediction`, `modalities`, `audio`, a misspelled field).
 - A malformed `tools` array, or a `parallel_tool_calls` that is not a boolean, is refused with a 400 that names the
   field. Before, a non-array `tools` reached the chat template and raised there (a 500), and a malformed entry or
   `"false"` was accepted silently: a different prompt, and parallel calls kept. A function tool with `strict: true` is
