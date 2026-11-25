@@ -3,6 +3,7 @@ session, and the info, load, health, abort and flush routes sent to one worker o
 
 import asyncio
 import json
+import time
 
 import pytest
 
@@ -23,6 +24,10 @@ def test_generate_prompts_are_the_routing_text():
     assert _request_text("/v1/completions", {"prompt": "x", "text": "y"}) == "x"
     assert _session_key("/generate", {"text": "abc"}) == _session_key("/v1/completions", {"prompt": "abc"})
     assert _session_key("/generate", {"text": "abc"}) != _session_key("/generate", {"text": "abd"})
+
+
+# The longest a flush stub waits for its client to go away (until_gone): longer than any test waits for it to.
+UNTIL_GONE_S = 10.0
 
 
 def _native_worker(
@@ -82,7 +87,12 @@ def _native_worker(
         if hold is not None:
             await hold.wait()
         if getattr(app.state, "until_gone", False):  # a flush waiting for an idle engine until its client goes away
+            # at most its timeout, and UNTIL_GONE_S: a router that never closes its request then fails the test (no
+            # "flush withdrawn") instead of holding the servers' stop on this handler for ever
+            end = time.monotonic() + min(float(req.query_params.get("timeout", "0")), UNTIL_GONE_S)
             while not await req.is_disconnected():
+                if time.monotonic() >= end:
+                    return PlainTextResponse("Cache not flushed: 2 requests are running or waiting.\n", status_code=400)
                 await asyncio.sleep(0.02)
             app.state.seen.append(("flush withdrawn",))
             return Response(status_code=499)
