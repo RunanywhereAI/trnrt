@@ -280,6 +280,27 @@ def test_a_result_names_no_machine():
     assert s["nested"] == [{"<path>/y": "ok"}]
 
 
+def test_a_result_keeps_the_neuron_runtime_versions(tmp_path):
+    # versions.sh's real output on 25 Nov: the runtime's four-part versions read as IPv4 addresses, and an earlier
+    # scrub replaced every one of them with <ip>
+    versions = {
+        "image": {"id": "sha256:c32de67d", "trnrt_revision": "704e7b6b"},
+        "image_contents": {
+            "deb": {"aws-neuronx-runtime-lib": "2.34.10.0-ac18d186d", "aws-neuronx-tools": "2.32.28.0-526c2b7f6"}
+        },
+        "host": {"neuron_driver": "2.30.2.0"},
+    }
+    score = tmp_path / "score.json"
+    score.write_text(json.dumps({"label": "agentx-c16", "requests_per_min": 1.0}))
+    (tmp_path / "v.json").write_text(json.dumps(versions))
+    out = tmp_path / "result.json"
+    argv = ["--point", "agentx-c16", "--score", str(score), "--versions", str(tmp_path / "v.json"), "--commit", "abc"]
+    assert record.main([*argv, "--note", "client at 10.0.0.7", "--out", str(out)]) == 0
+    r = json.loads(out.read_text())
+    assert r["versions"] == versions
+    assert r["note"] == "client at <ip>"  # everywhere else an address is still scrubbed
+
+
 def test_a_result_that_matches_a_private_pattern_is_refused(tmp_path, monkeypatch):
     pats = tmp_path / "p.json"
     pats.write_text(json.dumps({"patterns": [["a host", r"\bboxname\b", False, "host"]]}))

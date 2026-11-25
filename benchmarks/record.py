@@ -6,7 +6,9 @@
 The result file is what a published number cites. It records the point (benchmarks/points.csv) with its build and engine
 arguments, the score that a scorer printed, the versions (benchmarks/versions.sh), the load client's core count, the
 repository commit and the date. Every string is scrubbed before it is written: URLs lose their host, absolute paths
-keep only their last component, and IPv4 addresses are replaced, so a result names no machine. With
+keep only their last component, and IPv4 addresses are replaced, so a result names no machine. The versions are the
+exception to the address rule: versions.sh writes package versions only, and the Neuron runtime's are four-part
+numbers (2.34.10.0) that read as addresses. With
 TRNRT_TRACE_PATTERNS set (tests/test_no_trace.py's private patterns), a result that still matches one is refused.
 """
 
@@ -30,24 +32,24 @@ _IPV4 = re.compile(r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?!\w)(?!\.\d)")
 _PATH = re.compile(r"(?<![\w.:/])/(?:[\w.@+-]+/)+([\w.@+-]+)")
 
 
-def scrub(x):
-    """The same structure with every string scrubbed (module docstring)."""
+def scrub(x, ips: bool = True):
+    """The same structure with every string scrubbed (module docstring); `ips=False` keeps dotted numbers."""
     if isinstance(x, dict):
-        return {scrub(k): scrub(v) for k, v in x.items()}
+        return {scrub(k, ips): scrub(v, ips) for k, v in x.items()}
     if isinstance(x, list):
-        return [scrub(v) for v in x]
+        return [scrub(v, ips) for v in x]
     if isinstance(x, str):
         out, i = [], 0
         for m in _URL.finditer(x):
-            out += [_plain(x[i : m.start()]), f"{m.group(1)}<server>{m.group(2)}"]
+            out += [_plain(x[i : m.start()], ips), f"{m.group(1)}<server>{m.group(2)}"]
             i = m.end()
-        return "".join([*out, _plain(x[i:])])
+        return "".join([*out, _plain(x[i:], ips)])
     return x
 
 
-def _plain(s: str) -> str:
+def _plain(s: str, ips: bool) -> str:
     """Text outside URLs: addresses and absolute paths."""
-    return _PATH.sub(r"<path>/\1", _IPV4.sub("<ip>", s))
+    return _PATH.sub(r"<path>/\1", _IPV4.sub("<ip>", s) if ips else s)
 
 
 def private_hits(text: str) -> list[str]:
@@ -78,7 +80,7 @@ def build_record(
     p = points().get(point)
     if p is None:
         raise SystemExit(f"no point {point!r}: `python3 -I benchmarks/points.py list`")
-    return scrub(
+    rec = scrub(
         {
             "point": point,
             "benchmark": p["benchmark"],
@@ -90,13 +92,15 @@ def build_record(
             "precision": "FP8 weights as released, FP8 KV cache",
             "synthetic_acceptance": p["build"] == "latency-golden",
             "score": score,
-            "versions": versions,
+            "versions": None,
             "client_logical_cpus": client_cpus,
             "commit": commit,
             "date": dt.datetime.now(dt.UTC).strftime("%Y-%m-%d"),
             "note": note,
         }
     )
+    rec["versions"] = scrub(versions, ips=False)
+    return rec
 
 
 def main(argv: list[str] | None = None) -> int:
