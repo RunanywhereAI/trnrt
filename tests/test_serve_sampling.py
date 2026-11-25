@@ -347,6 +347,7 @@ def test_zero_width_stop_regexes_match_and_terminate():
         "(?:(?=x)?x)+y",  # an optional empty part, repeated
         "(?:(?=x))?" * 5 + "y",
         "(?:){1000000}X",  # an exact count of an empty part: every iteration runs
+        "".join(f"(?:{c}?)?" for c in "bcdefghijklmnopq") + "X",  # optional parts that can match empty: 65,536 ways
         # a lookaround that can match more than one way or length: the matcher runs it again at every position a repeat
         # around it tries, cubic or worse (each about a second, or minutes, over 2048 characters of prose)
         r"(?:[^\n](?=(?:[^\n](?=[^\n]*\n))+))+Y",
@@ -426,6 +427,19 @@ def test_the_reported_lookaround_patterns_are_refused_for_their_lookaround():
     ]
     for p in reported:
         assert (_backtracking(p) or "").startswith("it has a lookaround that can match more than one way"), p
+
+
+def test_an_optional_part_that_can_match_the_empty_text_matches_it_two_ways():
+    """(?:b?)? matches the empty text two ways, taken empty and skipped, and the matcher tries both: sixteen such parts
+    in a row, admitted at cost 16, took 4.5 s a search over 2048 characters of "z" (65,536 tries at every position;
+    CPython 3.13, one Apple M3 Max core). A possessive one gives nothing back, so it matches one way."""
+    from trnrt.serve.api import _search_cost
+
+    letters = "bcdefghijklmnopq"
+    chain = "".join(f"(?:{c}?)?" for c in letters) + "X"
+    assert (_search_cost(chain)[0] or "").startswith("it has optional parts that can match the empty text"), chain
+    assert _search_cost("(?:b?)?X") == (None, 2 * _search_cost("(?:b)?X")[1])
+    assert _search_cost("".join(f"(?:{c}?)?+" for c in letters) + "X") == (None, 1)
 
 
 def test_a_requests_stop_regex_patterns_share_one_cost_bound(app):

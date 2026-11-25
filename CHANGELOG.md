@@ -10,8 +10,8 @@ and versions follow [Semantic Versioning](https://semver.org/). Rebuild the comp
 - `stop_regex` refuses a pattern whose search could stall the server: one whose time can grow faster than the square
   of the text's length (nested or overlapping repeats, also on either side of a conditional group with no "no"
   branch, a possessive repeat or an atomic group after a repeat that can take its characters, a lookaround that can
-  match more than one way or length, an optional or exactly counted empty part, an alternation that can match the
-  empty text), and one whose quadratic time has too large a factor (16
+  match more than one way or length, an optional or exactly counted empty part, an alternation or an optional part
+  that can itself match the empty text), and one whose quadratic time has too large a factor (16
   times a single repeat's for a pattern, 32 for a request's patterns together). Over 2048 characters (CPython 3.13,
   one Apple M3 Max core) the slowest admitted pattern found takes 0.21 s a search, a request 0.4 s at every streamed
   piece; a lookaround over the rest of the text, which 0.2.0 admitted, took a second or more. Some patterns 0.2.0

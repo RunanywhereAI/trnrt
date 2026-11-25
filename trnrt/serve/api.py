@@ -1100,10 +1100,11 @@ def _search_cost(pattern: str) -> tuple[str | None, int]:
       matcher runs a lookaround again at every position a repeat around it tries, so `[^~]+(?=[^~]*~~)~` and
       `(?:.(?!.*@@))+@@` are cubic. A lookaround of one width that matches one way (`foo(?!bar)`) is served.
     The rest grows with the square of the length, times the cost: the ways to match, which alternations whose branches
-    can start alike multiply (`(?:Answer|Ans)` 2, `(?:.|.)` 2), times one plus the longest walk, the steps the matcher
-    takes again at every character a repeat gives back: the part after the repeat that the repeat could also take (`.*`
-    then 15 characters, 15) and a lookaround's part, after a repeat or inside one. Past MAX_STOP_REGEX_COST the pattern
-    is refused too: `.+` then a thousand `.`, or `(?:.(?!.{30}@))+@`, takes about a second over 2048 characters.
+    can start alike multiply (`(?:Answer|Ans)` 2, `(?:.|.)` 2), as an optional part that can match the empty text itself
+    does (`(?:b?)?` 2), times one plus the longest walk, the steps the matcher takes again at every character a repeat
+    gives back: the part after the repeat that the repeat could also take (`.*` then 15 characters, 15) and a
+    lookaround's part, after a repeat or inside one. Past MAX_STOP_REGEX_COST the pattern is refused too: `.+` then a
+    thousand `.`, or `(?:.(?!.{30}@))+@`, takes about a second over 2048 characters.
     `\\d+\\.\\d+`, `Answer:\\s*\\d+`, `\\n\\n+` cost 1; `(?:foo|bar)+` 2; `(?s)<think>.*</think>` 9."""
     try:
         parser = importlib.import_module("re._parser")
@@ -1327,6 +1328,17 @@ def _search_cost(pattern: str) -> tuple[str | None, int]:
                         "it repeats a part that can match more than one way (as (a+)+ or (a|a)* do), which Python's "
                         "backtracking matcher can take exponential time over"
                     )
+                if lo == 0 < hi and body.getwidth()[0] == 0 and op is not c.POSSESSIVE_REPEAT:
+                    # An optional part that can match the empty text itself matches it two ways, taken empty and
+                    # skipped, as an alternation with an empty branch does: sixteen of (?:b?)? (?:c?)? ... in a row
+                    # are 65,536 ways to try at every position
+                    ways[0] *= 2
+                    if ways[0] > MAX_STOP_REGEX_COST:
+                        raise _Backtracking(
+                            f"it has optional parts that can match the empty text themselves (as (?:b?)? does) or "
+                            f"alternations whose branches can start alike, more than {MAX_STOP_REGEX_COST} ways to match "
+                            "a text, which Python's backtracking matcher tries one by one"
+                        )
                 scan(body, [])
                 # An iterated part's steps past the characters it takes (a lookaround's, an alternation's tries): the
                 # matcher takes them for every iteration, so for about every character the repeat takes.
