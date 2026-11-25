@@ -90,6 +90,7 @@ import math
 import os
 import threading
 import time
+from typing import TYPE_CHECKING, Any
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -104,6 +105,9 @@ from fastapi.responses import (
 
 from .. import log
 from .dashboard import PAGE as DASHBOARD_PAGE
+
+if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
 
 logger = log.get("router")
 
@@ -668,6 +672,23 @@ async def _unless_disconnected(http: Request, aw):
     return task.result()
 
 
+class _ReleasingStreamingResponse(StreamingResponse):
+    """A relayed stream that releases its upstream however the response ends. The relay generator's own `finally`
+    misses a client that leaves before Starlette first steps the body: the generator never starts, so the load count
+    stayed one higher for good and the worker generated to max_tokens (#50). ASGI 2.3 cancels the body once the
+    disconnect arrives, which can land on the first send; 2.4 raises ClientDisconnect from it."""
+
+    def __init__(self, release: Callable[[bool], Awaitable[None]], *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._release = release
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            await self._release(False)  # a no-op when the relay already released it
+
+
 def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: float = 5.0) -> FastAPI:
     # A streaming request holds its connection to the worker until the last token, so the pool's connection cap is a cap
     # on requests in flight at every worker together. httpx's default (Limits(max_connections=100), shared by all hosts)
@@ -966,6 +987,22 @@ def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: floa
             break
         if body.get("stream"):
             ww = w
+            released = False
+
+            async def release(done: bool) -> None:
+                """Once per stream, however it ends: the load, the upstream request and (on a full 200) the turn."""
+                nonlocal released
+                if released:
+                    return
+                released = True
+                try:
+                    # Closing upstream aborts the request on the worker. Shielded, because Starlette cancels the
+                    # body through a cancel scope that cancels every await in it again (#54 review).
+                    await asyncio.shield(resp.aclose())
+                finally:
+                    router.load[ww] -= 1
+                    if done and resp.status_code == 200:
+                        router.turn_done(sid, ww)
 
             async def relay():
                 done = False
@@ -974,13 +1011,13 @@ def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: floa
                         yield chunk
                     done = True
                 finally:
-                    await resp.aclose()  # closing upstream aborts the request on the worker
-                    router.load[ww] -= 1
-                    if done and resp.status_code == 200:
-                        router.turn_done(sid, ww)
+                    await release(done)
 
-            return StreamingResponse(
-                relay(), status_code=resp.status_code, media_type=resp.headers.get("content-type", "text/event-stream")
+            return _ReleasingStreamingResponse(
+                release,
+                relay(),
+                status_code=resp.status_code,
+                media_type=resp.headers.get("content-type", "text/event-stream"),
             )
         router.load[w] -= 1
         if r.status_code == 200:
