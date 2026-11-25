@@ -18,7 +18,11 @@ the other half idle. [serve.sh](serve.sh) starts exactly that (`trnrt serve --en
 cost uses a price per chip-hour, so a point compares directly with an 8-GPU node. `trnrt serve`'s default of two engines
 is the deployment form for a whole box. Its numbers are per 16 chips.
 
-InferenceX's rule is one server deployment per concurrency, so start a fresh server for every point.
+InferenceX's rule is one server deployment per concurrency, so start a fresh server for every point. The published AgentX
+points each ran on a fresh server. The published 8K/1K points ran each build's points in ascending concurrency on one
+server: `fixed-off-c1` to `fixed-off-c16` on one `balanced` server, `fixed-off-c32` and `fixed-off-c64` on one `throughput`
+server, and `fixed-on-*` and `fixed-golden-*` on one server each. Their prompts are random, so no point reuses another's
+prefix cache.
 
 ## Builds
 
@@ -52,12 +56,15 @@ On the trn2.48xlarge, for each point:
 CACHE=/data/trnrt/cache NKI=/data/trnrt/nki MODEL=/models/GLM-5.3-Flash benchmarks/serve.sh agentx-c16
 ```
 
+The published points kept the engine off the CPUs the 8K/1K client and the host used:
+`DOCKER_ARGS=--cpuset-cpus=0-39,48-87,96-135,144-183`.
+
 On the load client, a separate CPU machine for AgentX (state its core count next to any number; the harness is
-CPU-bound):
+CPU-bound). The published points ran it on a c7i.48xlarge, pinned with `CPUS` to 48 logical CPUs (24 cores):
 
 ```bash
 pip install agentx-harness==1.0.12 -c benchmarks/agentx/constraints.txt   # the exact versions the published points ran
-TOKENIZER=/models/GLM-5.3-Flash benchmarks/agentx/client.sh agentx-c16 http://<server>:8000 runs/agentx-c16
+CPUS=48-71,144-167 TOKENIZER=/models/GLM-5.3-Flash benchmarks/agentx/client.sh agentx-c16 http://<server>:8000 runs/agentx-c16
 ```
 
 For the 8K/1K points, check out InferenceX at commit `47cdc9d02d2f50018efbbc207c0c3ce9e425dae4` and install what its
@@ -74,7 +81,7 @@ counts and builds the prompts' tokens), tqdm 4.70.1 and huggingface_hub 2.4.0. j
 The published points ran this client on the serving host, on CPUs the engine did not use:
 
 ```bash
-INFX=/src/InferenceX TOKENIZER=/models/GLM-5.3-Flash benchmarks/fixed_seq/client.sh fixed-off-c16 http://127.0.0.1:8000 runs/fixed-off-c16
+CPUS=40-47 INFX=/src/InferenceX TOKENIZER=/models/GLM-5.3-Flash benchmarks/fixed_seq/client.sh fixed-off-c16 http://127.0.0.1:8000 runs/fixed-off-c16
 ```
 
 Every script takes `--dry-run`, which prints the exact command without running it. `python3 -I benchmarks/points.py list`
@@ -86,7 +93,7 @@ On each build served with real acceptance (`latency`, `balanced`, `throughput`):
 
 ```bash
 benchmarks/accuracy/install_lm_eval.sh                       # once: lm-eval at InferenceX's pinned commit
-benchmarks/accuracy/gsm8k.sh http://127.0.0.1:8000 runs/gsm8k-latency
+benchmarks/accuracy/gsm8k.sh http://127.0.0.1:8000 runs/gsm8k-latency 8     # concurrency: 8 latency, 16 balanced, 24 throughput
 python3 -I benchmarks/accuracy/needle.py --server http://127.0.0.1:8000 --verdict runs/needle-latency.txt
 ```
 
