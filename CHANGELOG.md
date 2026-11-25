@@ -34,7 +34,7 @@ and versions follow [Semantic Versioning](https://semver.org/). Rebuild the comp
 - `/generate` leaves the stop token that ended a request (EOS or a `stop_token_ids` entry) out of its text when the
   tokenizer does not mark it special, as the OpenAI endpoints do.
 - A `/flush_cache` whose client goes away while it waits for an idle engine is withdrawn, on the engine and through
-  the router.
+  the router. The router then forgets every engine's prefixes, as it cannot tell which engines flushed first.
 - A worker whose own start fails (its device listing failing on that rank alone, or any other error before it joins
   the process group) fails the engine's start at once, naming its rank, whether it exits before or after it is ready
   to join. Rank 0 waited for the dead rank until the process group's 4-hour timeout. A worker that never gets ready

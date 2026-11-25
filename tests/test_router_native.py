@@ -305,3 +305,34 @@ def test_a_flush_whose_client_went_away_closes_the_engines_flushes():
         assert router.up == [True]
 
     _run([worker], check)
+
+
+def test_a_flush_whose_client_went_away_clears_every_prefix_tree():
+    """The router drops the engines' answers to a flush whose client went away, so it cannot tell which engines flushed
+    first: it clears every engine's prefix tree, as a tree kept for one that flushed would route requests to an empty
+    cache. Engine 0 flushes at once; engine 1 waits until its client goes away and keeps its cache."""
+    w0, w1 = _native_worker(0), _native_worker(1)
+    w1.state.until_gone = True
+
+    async def check(c, router) -> None:
+        for tree in router.trees:
+            tree.insert("z" * 100)
+        port = int(str(c.base_url).rstrip("/").rsplit(":", 1)[1])
+        _, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(b"GET /flush_cache?timeout=3600 HTTP/1.1\r\nHost: x\r\n\r\n")
+        await writer.drain()
+        for _ in range(500):
+            if any(x[0] == "flush" for x in w0.state.seen) and any(x[0] == "flush" for x in w1.state.seen):
+                break
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.2)  # engine 0's answer reaches the router
+        assert [t.size for t in router.trees] == [100, 100]  # nothing cleared while the flush waits on engine 1
+        writer.close()
+        for _ in range(500):
+            if ("flush withdrawn",) in w1.state.seen and all(t.size == 0 for t in router.trees):
+                break
+            await asyncio.sleep(0.01)
+        assert ("flush withdrawn",) in w1.state.seen, w1.state.seen
+        assert [t.size for t in router.trees] == [0, 0]
+
+    _run([w0, w1], check)

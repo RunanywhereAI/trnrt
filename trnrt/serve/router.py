@@ -846,7 +846,8 @@ def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: floa
         the tree stands for what its cache holds. An engine that has not answered `timeout` + health_timeout_s seconds
         after it was asked is one that did not flush ("no answer"): an engine answers once it flushed or its timeout
         passed, so only one that is stuck takes longer. A client that goes away first closes the requests to the
-        engines, which withdraws a flush still waiting there."""
+        engines, which withdraws a flush still waiting there; an engine may have flushed by then, and its answer is
+        dropped, so every engine's prefix tree here is cleared."""
         query = http.url.query
         try:
             wait = float(http.query_params.get("timeout", "0"))
@@ -856,7 +857,9 @@ def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: floa
         rs = await _unless_disconnected(
             http, each(http.method, "/flush_cache" + (f"?{query}" if query else ""), wait + health_timeout_s)
         )
-        if rs is None:
+        if rs is None:  # which engines flushed is unknown: a tree kept for one that did would route to an empty cache
+            for w in range(len(router.workers)):
+                router.clear_tree(w)
             return Response(status_code=499)  # nobody reads it
         failed = []
         for w, r in enumerate(rs):
