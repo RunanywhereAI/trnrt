@@ -136,7 +136,8 @@ def test_serve_gives_its_engines_their_whole_close_to_stop(host):
     assert cli.cmd_serve(["--model", "m"]) == 0
     waits = [w for e in host.engines for w in e.waits]
     assert len(waits) == 2 and all(cli.ENGINE_STOP_S - 10 < w <= cli.ENGINE_STOP_S for w in waits), waits
-    assert cli.ENGINE_STOP_S >= 2 * 120 + 20  # the loop stop and the bounded stop at their defaults, and the workers'
+    # the loop stop and the bounded stop, then the workers' exit, terminate and kill, each phase one deadline (engine.py)
+    assert cli.ENGINE_STOP_S > 2 * 120 + 30 + 2 * 10
 
 
 def test_serve_gives_the_router_its_keep_alive_and_not_the_engines(host):

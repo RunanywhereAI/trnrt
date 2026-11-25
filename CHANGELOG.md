@@ -39,9 +39,11 @@ and versions follow [Semantic Versioning](https://semver.org/). Rebuild the comp
   the process group) fails the engine's start at once, naming its rank, whether it exits before or after it is ready
   to join. Rank 0 waited for the dead rank until the process group's 4-hour timeout. A worker that never gets ready
   fails the start at that timeout, naming the ranks still pending.
-- `serve` gives its engines 300 s together to close after its SIGTERM, enough for the step thread's stop and the
-  bounded tensor-parallel stop (it gave each 120 s, and killed the first before its bounded stop ran). On Linux a
-  worker is killed when its rank 0 exits, so none outlives its engine holding a NeuronCore.
+- `serve` gives its engines 300 s together to close after its SIGTERM, enough for the step thread's stop, the
+  bounded tensor-parallel stop and the workers' exit, terminate and kill (it gave each 120 s, and killed the first
+  before its bounded stop ran). Those worker joins now share one deadline per phase, 30 s, 10 s and 10 s: joined one
+  by one, 31 hung workers could take 31 times as long. On Linux a worker is killed when its rank 0 exits, so none
+  outlives its engine holding a NeuronCore.
 - Rank 0's host arena and board close with its engine, after its step thread has stopped, not first among the exit
   hooks.
 - docs/API.md: `/v1/responses` ignores a field it does not know, where `/v1/chat/completions` refuses it; the page

@@ -49,6 +49,18 @@ def _close_open() -> None:
 # until an outer timeout killed it, 3,600 s twice in a row on trn2. Past the bound, close() logs the ranks that never
 # acknowledged and terminates the workers. A healthy stop is unchanged: the same call, joined well inside the bound.
 TP_STOP_WAIT_S = 120.0
+# How long the workers get, together, to exit once rank 0 released them (close()), and then again after their SIGTERM and
+# after their SIGKILL (_stop_workers). Each is one deadline for all the workers: joined one by one, each with its own
+# timeout, the 31 workers of a tp-32 engine that hang could take 31 times as long, far past serve's ENGINE_STOP_S.
+WORKER_EXIT_WAIT_S = 30.0
+WORKER_STOP_WAIT_S = 10.0
+
+
+def _join_by(workers, seconds: float) -> None:
+    """Join `workers` by one deadline, `seconds` from now: each join gets what is left of it."""
+    deadline = time.monotonic() + seconds
+    for w in workers:
+        w.join(timeout=max(0.0, deadline - time.monotonic()))
 
 
 def _bounded_stop(send, timeout: float | None = None) -> bool:
@@ -529,7 +541,7 @@ class LLMEngine:
         _OPEN.discard(self)
         if runner is not None and getattr(runner, "watchdog", None) is not None:
             runner.watchdog.close()
-        wait = 30.0
+        wait = WORKER_EXIT_WAIT_S
         if self._workers and runner is not None and runner.tp_send is not None:
             if self.dead_ranks():  # a broadcast to a dead peer raises or never returns: stop the rest instead
                 wait = 0.0
@@ -541,7 +553,7 @@ class LLMEngine:
         if arena_close is not None:
             arena_close()  # the save-once arenas: rank 0's own and the board, after the workers have gone
 
-    def _stop_tp(self, wait: float = 30.0) -> None:
+    def _stop_tp(self, wait: float = WORKER_EXIT_WAIT_S) -> None:
         """Workers that did not exit within `wait` seconds (and every worker of an engine whose
         construction failed, which no rank 0 will ever release) are terminated: a daemon worker
         otherwise lives as long as the process, blocked in a rendezvous or a broadcast."""
@@ -558,20 +570,21 @@ class LLMEngine:
             self._tp_saved = None
 
     def _stop_workers(self, wait: float) -> None:
-        """Each worker gets `wait` seconds to exit once rank 0 released it (none otherwise), then the rest are
-        terminated together and killed if that does not end them."""
+        """The workers get `wait` seconds together to exit once rank 0 released them (none otherwise); the rest are
+        terminated together and get WORKER_STOP_WAIT_S together, and those still alive are killed and get that again.
+        Each phase is one deadline for every worker, so the stop takes at most wait + 2 * WORKER_STOP_WAIT_S whatever
+        the number of workers."""
         released = getattr(self, "runner", None) is not None and self.runner.tp_send is None
         started = [w for w in self._workers if w.pid is not None]
-        for w in started:
-            w.join(timeout=wait if released else 0)
+        _join_by(started, wait if released else 0.0)
         late = [w for w in started if w.is_alive()]
-        for w in late:  # all at once: 31 hung workers of a failed engine take 10 s, not 310
+        for w in late:  # all at once, and joined by one deadline: 31 hung workers of a failed engine take 10 s, not 310
             w.terminate()
-        for w in late:
-            w.join(timeout=10)
-            if w.is_alive():  # still holding its NeuronCores
-                w.kill()
-                w.join(timeout=10)
+        _join_by(late, WORKER_STOP_WAIT_S)
+        stuck = [w for w in late if w.is_alive()]  # still holding their NeuronCores
+        for w in stuck:
+            w.kill()
+        _join_by(stuck, WORKER_STOP_WAIT_S)
         self._workers = []
 
     def warmup(self, reverse: bool = False) -> dict:

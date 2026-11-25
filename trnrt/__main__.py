@@ -860,9 +860,10 @@ def cmd_engine(argv: list[str]) -> int:
 
 # How long `serve` waits for its engines to exit after their SIGTERM before it kills them. An engine's own close takes
 # up to its step thread's stop (serve/api.py LOOP_STOP_WAIT_S, 120 s), then the bounded tensor-parallel stop
-# (engine/engine.py TP_STOP_WAIT_S, 120 s), then terminating and killing its workers (engine._stop_workers, 20 s): killed
-# before that ends, its workers were never stopped and held their NeuronCores (they now die with it, tp._dies_with_rank0,
-# but without the stop's log of the ranks that never answered). The engines stop at once, so one deadline covers them all.
+# (engine/engine.py TP_STOP_WAIT_S, 120 s), then its workers' exit (WORKER_EXIT_WAIT_S, 30 s) and their terminate and
+# kill (WORKER_STOP_WAIT_S, 10 s each), each one deadline for all the workers (engine._stop_workers): killed before that
+# ends, its workers were never stopped and held their NeuronCores (they now die with it, tp._dies_with_rank0, but
+# without the stop's log of the ranks that never answered). The engines stop at once, so one deadline covers them all.
 ENGINE_STOP_S = 300.0
 
 

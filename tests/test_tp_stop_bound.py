@@ -12,7 +12,9 @@ terminated.
   group close() destroys under a stuck stop broadcast does not hold close() and the next group of the process works;
 - a start that fails after its workers started (stand-in workers) stops them and gives rank 0 its state back;
 - tp.wait_joining fails the start for a worker that exits, before or after it is ready, and at the process group's
-  timeout for one that never gets ready."""
+  timeout for one that never gets ready;
+- _stop_workers stops many hung workers by one deadline per phase, and serve's ENGINE_STOP_S covers an engine's whole
+  close."""
 
 from __future__ import annotations
 
@@ -550,11 +552,64 @@ def test_wait_joining_with_real_workers():
 
 def test_serve_waits_out_an_engines_whole_close():
     """`serve` kills an engine ENGINE_STOP_S after its SIGTERM: longer than the engine's own close can take, its step
-    thread's stop and then the bounded tensor-parallel stop and the workers' terminate and kill joins (10 s each)."""
+    thread's stop, the bounded tensor-parallel stop, then the workers' exit once released and their terminate and kill
+    joins, each one deadline for all the workers (test_stopping_many_hung_workers_takes_one_deadline_per_phase)."""
     from trnrt import __main__ as cli
     from trnrt.serve import api
 
-    assert cli.ENGINE_STOP_S > api.LOOP_STOP_WAIT_S + E.TP_STOP_WAIT_S + 2 * 10
+    assert cli.ENGINE_STOP_S > api.LOOP_STOP_WAIT_S + E.TP_STOP_WAIT_S + E.WORKER_EXIT_WAIT_S + 2 * E.WORKER_STOP_WAIT_S
+
+
+class _Clock:
+    """A clock that only a stand-in worker's join moves."""
+
+    def __init__(self):
+        self.t = 0.0
+
+    def monotonic(self) -> float:
+        return self.t
+
+
+class _HungProc:
+    """A started worker that ignores rank 0's release and its SIGTERM: only a kill ends it, or (unkillable) nothing,
+    as for a process in uninterruptible sleep. While it is alive its join waits out the whole timeout, on `clock`."""
+
+    def __init__(self, clock: _Clock, unkillable: bool):
+        self.clock, self.unkillable = clock, unkillable
+        self.pid, self.exitcode = 1 << 22, None
+        self.signals: list[str] = []
+
+    def is_alive(self) -> bool:
+        return self.exitcode is None
+
+    def join(self, timeout=None) -> None:
+        assert timeout is not None, "an unbounded join"
+        if self.is_alive():
+            self.clock.t += timeout
+
+    def terminate(self) -> None:
+        self.signals.append("TERM")
+
+    def kill(self) -> None:
+        self.signals.append("KILL")
+        if not self.unkillable:
+            self.exitcode = -9
+
+
+@pytest.mark.parametrize("unkillable", [False, True], ids=["ended by kill", "never ended"])
+def test_stopping_many_hung_workers_takes_one_deadline_per_phase(monkeypatch, unkillable):
+    """_stop_workers gives the workers one deadline per phase, whatever their number: 8 workers that ignore their release
+    and their SIGTERM are stopped within `wait` + 2 * WORKER_STOP_WAIT_S, not 8 times that. Joined one by one, each with
+    its own timeout, the 31 workers of a tp-32 engine could take 31 times as long, past serve's ENGINE_STOP_S."""
+    clock = _Clock()
+    monkeypatch.setattr(E, "time", types.SimpleNamespace(monotonic=clock.monotonic))
+    workers = [_HungProc(clock, unkillable) for _ in range(8)]
+    eng = types.SimpleNamespace(runner=types.SimpleNamespace(tp_send=None), _workers=list(workers))  # released
+    E.LLMEngine._stop_workers(eng, E.WORKER_EXIT_WAIT_S)
+    bound = E.WORKER_EXIT_WAIT_S + 2 * E.WORKER_STOP_WAIT_S
+    assert clock.t <= bound, f"the stop took {clock.t:g} s, more than {bound:g} s"
+    assert all(w.signals == ["TERM", "KILL"] for w in workers) and eng._workers == []
+    assert [w.is_alive() for w in workers] == [unkillable] * 8
 
 
 DEATH = textwrap.dedent(
