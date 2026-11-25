@@ -10,11 +10,14 @@ terminated.
   terminated, a raising one too, a healthy one joins its worker, an engine left open is closed by the exit hook
   (its stop thread starts at interpreter exit), and without the bound close() hangs (the control); over gloo, the
   group close() destroys under a stuck stop broadcast does not hold close() and the next group of the process works;
-- a start that fails after its workers started (stand-in workers) stops them and gives rank 0 its state back."""
+- a start that fails after its workers started (stand-in workers) stops them and gives rank 0 its state back;
+- tp.wait_joining fails the start for a worker that exits, before or after it is ready, and at the process group's
+  timeout for one that never gets ready."""
 
 from __future__ import annotations
 
 import contextlib
+import datetime as dt
 import logging
 import os
 import subprocess
@@ -408,10 +411,20 @@ class _DeadProc(_Proc):
         self.pid, self.exitcode = 1 << 22, 1
 
 
-def test_a_worker_that_dies_before_joining_fails_the_start_at_once(monkeypatch):
+class _ReadyThenDeadProc(_Proc):
+    """A worker that sets its ready event and then exits before it joins the process group."""
+
+    def start(self):
+        super().start()
+        self.exitcode = 1
+
+
+@pytest.mark.parametrize("dead", [_DeadProc, _ReadyThenDeadProc], ids=["before ready", "after ready"])
+def test_a_worker_that_dies_before_joining_fails_the_start_at_once(monkeypatch, dead):
     """A worker whose start fails (numa_pin raising NumaPinError, say) never joins the process group. Rank 0 used to
     wait for it in the rendezvous for the gloo timeout (4 h); it now sees the worker gone before it joins, raises naming
-    the rank, stops the other workers and gives this process its state back."""
+    the rank, stops the other workers and gives this process its state back. So too for a worker that exits after it
+    set its ready event: rank 0 watched only the workers not yet ready, and went on into the rendezvous."""
     import multiprocessing
 
     from trnrt.config import EngineConfig
@@ -420,8 +433,11 @@ def test_a_worker_that_dies_before_joining_fails_the_start_at_once(monkeypatch):
     events: list[str] = []
 
     def proc(**kw):
-        procs.append((_DeadProc if kw["args"][0] == 2 else _Proc)(**kw))
+        procs.append((dead if kw["args"][0] == 2 else _Proc)(**kw))
         return procs[-1]
+
+    def past_the_rendezvous(*a):
+        raise AssertionError("planted: rank 0 went on past a dead worker")
 
     mcfg = types.SimpleNamespace(eos_token_ids=(0,), vocab_size=8)
     monkeypatch.setattr(
@@ -434,6 +450,7 @@ def test_a_worker_that_dies_before_joining_fails_the_start_at_once(monkeypatch):
     monkeypatch.setattr(E.ModelConfig, "from_pretrained", classmethod(lambda cls, path: mcfg))
     monkeypatch.setattr(E, "resolve_attention_tp", lambda m, c: 4)
     monkeypatch.setattr(E, "pool_pages", lambda c, m: 16)
+    monkeypatch.setattr(E, "build_shard", past_the_rendezvous)
     cfg = EngineConfig(model_path="no-model", device="cpu", tp=4)
     t0 = time.monotonic()
     with pytest.raises(RuntimeError, match=r"rank\(s\) 2 \(exit code 1\) exited before joining the process group"):
@@ -441,6 +458,61 @@ def test_a_worker_that_dies_before_joining_fails_the_start_at_once(monkeypatch):
     assert time.monotonic() - t0 < 10
     assert events == ["process restored"]  # rank 0 never entered the rendezvous
     assert [p.terminated for p in procs] == [True, False, True]  # the live workers stopped; the dead one is gone
+
+
+class _Worker:
+    """A worker process as tp.wait_joining sees it: its exit code, None while it runs."""
+
+    def __init__(self, exitcode: int | None = None):
+        self.exitcode = exitcode
+
+
+def _joining(workers, ready, bound: float = 10.0) -> BaseException | None:
+    """tp.wait_joining on a daemon thread, joined for at most `bound` seconds: what it raised, None if it returned. A
+    wait that never ends fails the test instead of hanging it."""
+    out: list[BaseException | None] = []
+
+    def run() -> None:
+        try:
+            TP.wait_joining(workers, ready)
+            out.append(None)
+        except BaseException as e:  # noqa: BLE001  handed to the test
+            out.append(e)
+
+    th = threading.Thread(target=run, daemon=True)
+    th.start()
+    th.join(bound)
+    assert not th.is_alive(), f"wait_joining still waiting after {bound} s"
+    return out[0]
+
+
+def test_wait_joining_watches_a_worker_after_it_is_ready():
+    """A worker that set its ready event and then exited (its init_rank failing, say) fails the start: wait_joining
+    checks every worker's exit code at each poll, not only the pending ones'. It used to return once the others were
+    ready, and rank 0 then waited in the rendezvous for the gone rank until the process group's TIMEOUT."""
+    ready = [threading.Event(), threading.Event()]
+    ready[0].set()
+    later = threading.Timer(0.5, ready[1].set)  # rank 2 is alive and ready a moment later
+    later.start()
+    try:
+        err = _joining([_Worker(exitcode=1), _Worker()], ready)
+    finally:
+        later.cancel()
+    assert isinstance(err, RuntimeError), err
+    assert "rank(s) 1 (exit code 1) exited before joining the process group" in str(err)
+
+
+def test_wait_joining_ends_at_the_process_groups_timeout(monkeypatch):
+    """A live worker that never sets its ready event (stuck in its own start) held rank 0 in wait_joining for ever; the
+    wait now ends at the process group's TIMEOUT, as the rendezvous would, naming the ranks still pending."""
+    monkeypatch.setattr(TP, "TIMEOUT", dt.timedelta(seconds=0.3))
+    ready = [threading.Event(), threading.Event(), threading.Event()]
+    ready[1].set()
+    t0 = time.monotonic()
+    err = _joining([_Worker(), _Worker(), _Worker()], ready)
+    assert 0.3 <= time.monotonic() - t0 < 5
+    assert isinstance(err, RuntimeError), err
+    assert "rank(s) 1, 3 not ready to join the process group after 0.3 s" in str(err)
 
 
 def _exit_at_once(code: int) -> None:

@@ -21,6 +21,7 @@ import os
 import socket
 import sys
 import threading
+import time
 from typing import Any
 
 import torch.distributed as dist
@@ -599,19 +600,29 @@ JOIN_POLL_S = 0.1
 
 def wait_joining(workers, ready) -> None:
     """Rank 0, before its own init_rank: wait until every worker has set its `ready` event (worker_main sets it just
-    before it joins the process group), watching the workers meanwhile. A worker that exits first (its NUMA pin or its
-    device environment failed, or it crashed) fails the start at once, naming it: rank 0 would otherwise wait in the
-    rendezvous for a rank that never comes, until the process group's TIMEOUT (hours). workers[i] is rank i + 1."""
+    before it joins the process group), watching every worker's exit code at each poll meanwhile. A worker that exits
+    first, before or after it set its event (its NUMA pin or its device environment failed, or it crashed), fails the
+    start at once, naming it: rank 0 would otherwise wait in the rendezvous for a rank that never comes, until the
+    process group's TIMEOUT (hours). A worker still not ready after TIMEOUT fails it too, naming the ranks pending.
+
+    Not watched: a worker that dies after this returns (every worker ready) and before rank 0's rendezvous completes.
+    Rank 0 waits for it in init_rank until TIMEOUT, as 0.2.0 did for any worker. workers[i] is rank i + 1."""
+    deadline = time.monotonic() + TIMEOUT.total_seconds()
     while True:
-        pending = [r for r, ev in enumerate(ready, 1) if not ev.is_set()]
-        if not pending:
-            return
-        dead = [(r, workers[r - 1].exitcode) for r in pending if workers[r - 1].exitcode is not None]
+        dead = [(r, w.exitcode) for r, w in enumerate(workers, 1) if w.exitcode is not None]
         if dead:
             gone = ", ".join(f"{r} (exit code {code})" for r, code in dead)
             raise RuntimeError(
                 f"tensor-parallel rank(s) {gone} exited before joining the process group; the worker's error is logged "
                 "above"
+            )
+        pending = [r for r, ev in enumerate(ready, 1) if not ev.is_set()]
+        if not pending:
+            return
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"tensor-parallel rank(s) {', '.join(map(str, pending))} not ready to join the process group after "
+                f"{TIMEOUT.total_seconds():g} s (the process group's timeout); each is still running its own start"
             )
         ready[pending[0] - 1].wait(JOIN_POLL_S)
 

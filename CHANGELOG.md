@@ -36,8 +36,9 @@ and versions follow [Semantic Versioning](https://semver.org/). Rebuild the comp
 - A `/flush_cache` whose client goes away while it waits for an idle engine is withdrawn, on the engine and through
   the router.
 - A worker whose own start fails (its device listing failing on that rank alone, or any other error before it joins
-  the process group) fails the engine's start at once, naming its rank. Rank 0 waited for the dead rank until the
-  process group's 4-hour timeout.
+  the process group) fails the engine's start at once, naming its rank, whether it exits before or after it is ready
+  to join. Rank 0 waited for the dead rank until the process group's 4-hour timeout. A worker that never gets ready
+  fails the start at that timeout, naming the ranks still pending.
 - `serve` gives its engines 300 s together to close after its SIGTERM, enough for the step thread's stop and the
   bounded tensor-parallel stop (it gave each 120 s, and killed the first before its bounded stop ran). On Linux a
   worker is killed when its rank 0 exits, so none outlives its engine holding a NeuronCore.
