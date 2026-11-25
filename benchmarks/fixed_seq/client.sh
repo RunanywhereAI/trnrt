@@ -10,7 +10,8 @@
 #   INFX=/src/InferenceX TOKENIZER=/models/GLM-5.3-Flash benchmarks/fixed_seq/client.sh [--dry-run] POINT URL OUT_DIR
 #
 # Environment: INFX (a checkout of SemiAnalysisAI/InferenceX at commit 47cdc9d02d2f50018efbbc207c0c3ce9e425dae4, the
-# one the published points used); PY (default python3: a Python with InferenceX's client requirements); TOKENIZER (the
+# one the published points used); PY (default python3: a Python with what the client imports, benchmarks/README.md; jinja2
+# for the speculative points' chat template); TOKENIZER (the
 # model's tokenizer files at revision eb9eb208eb0d988989d07a6a12d0fdeb5f52574a); CPUS (optional taskset -c CPUS).
 # URL: the router of benchmarks/serve.sh. The published points ran the client on the serving host over localhost, on
 # CPUs the engine did not use.

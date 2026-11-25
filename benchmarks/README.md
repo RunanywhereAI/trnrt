@@ -60,8 +60,12 @@ pip install agentx-harness==1.0.12
 TOKENIZER=/models/GLM-5.3-Flash benchmarks/agentx/client.sh agentx-c16 http://<server>:8000 runs/agentx-c16
 ```
 
-For the 8K/1K points, check out InferenceX at commit `47cdc9d02d2f50018efbbc207c0c3ce9e425dae4` and install its client
-requirements. The published points ran this client on the serving host, on CPUs the engine did not use:
+For the 8K/1K points, check out InferenceX at commit `47cdc9d02d2f50018efbbc207c0c3ce9e425dae4` and install what its
+client imports, at the versions InferenceX pins:
+- `aiohttp==3.14.5 numpy==2.5.4 transformers==5.22.1 tqdm huggingface_hub`;
+- `jinja2==3.1.6`, which the speculative points (`fixed-on-*`, `fixed-golden-*`) need for the chat template.
+
+The published points ran this client on the serving host, on CPUs the engine did not use:
 
 ```bash
 INFX=/src/InferenceX TOKENIZER=/models/GLM-5.3-Flash benchmarks/fixed_seq/client.sh fixed-off-c16 http://127.0.0.1:8000 runs/fixed-off-c16
