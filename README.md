@@ -81,9 +81,10 @@ trn2 delivers 0.56-0.76× H200's. Where a decode step's time goes is in
 1-8 user points use MTP at InferenceX's golden acceptance length (2.519; trn2's measured acceptance is 2.20). Prices,
 AWS Capacity Blocks list, read 24 Nov 2026: trn2.48xlarge $2.235 per Trainium2 chip-hour ($35.76 per instance-hour),
 p5.48xlarge $5.970 per H100-hour, p5e.48xlarge $6.866 per H200-hour. trn2 ran TrnRT's internal builds on Neuron SDK
-2.32 (GSM8K 97.4-97.7% on the MTP builds, needle recall passed); this release's builds are graph-equivalent to them, and
-a device run of release 0.2.0 itself is pending. GPU numbers are InferenceX's public runs, with accuracy as InferenceX
-checks it; we did not re-check them. Every table, source run and the method:
+2.32 (GSM8K 97.4-97.7% on the MTP builds, strict exact match, 5-shot, all 1,319 problems; a needle test passed on the
+host-tier restore); this release's builds are graph-equivalent to them, and a device run of release 0.2.0 itself is
+pending. GPU numbers are InferenceX's public runs; we report no accuracy score for them and did not check them. Every
+table, source run and the method:
 [docs/RESULTS.md](docs/RESULTS.md#against-h100-and-h200-inferencex-agentx-and-8k1k).</sub>
 
 ## Highlights

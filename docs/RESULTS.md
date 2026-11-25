@@ -294,7 +294,9 @@ length of 3.6.
   is end to end, so it includes the wait for the first token (the per-user measure under Methodology below).
 - **trn2, AgentX:** InferenceX AgentX harness 1.0.12, canonical workload, one hour per point. 1-8 users: an MTP build at
   golden acceptance, measured by 13 Nov 2026; 12 users: a build without MTP from the same period; 16, 24 and 32 users:
-  the production builds, measured on 24 Nov 2026. Accuracy: GSM8K 97.42-97.65% on the MTP builds; needle recall passed.
+  the production builds, measured on 24 Nov 2026. Accuracy: GSM8K 97.42-97.65% on the MTP builds (strict exact match,
+  5-shot, all 1,319 problems, as under [MTP speculative decoding](#mtp-speculative-decoding-one-engine)); the host-tier
+  restore passed a needle test.
 - **H200, AgentX:** InferenceX PR #4719, sweep run 42052004518 (2-32 users) and run 41968542163 (1 user).
 - **H100, AgentX:** InferenceX PR #4717, run 42026135483 (1-10 users, with HiCache) and run 41310662894 (12-32 users,
   the only H100 MTP points past 10 users; prefix-cache hit 7-13% there). Both runs use MTP speculation as that PR
@@ -303,8 +305,8 @@ length of 3.6.
   prompts. trn2: measured on 10 Nov 2026, one run per concurrency. GPUs: the sweeps of InferenceX PRs #4926 and #4927
   (MTP off) and #4913 and #4914 (MTP on).
 - **Builds:** trn2's numbers come from TrnRT's internal builds on the dates above, the builds this release's builds are
-  graph-equivalent to; they are not a run of release 0.2.0's own commit. GPU numbers are from InferenceX's public runs,
-  with accuracy as InferenceX checks it; we did not re-check them.
+  graph-equivalent to; they are not a run of release 0.2.0's own commit. GPU numbers are from InferenceX's public runs;
+  this page reports no accuracy score for them, and we did not check them.
 
 ## Methodology
 
