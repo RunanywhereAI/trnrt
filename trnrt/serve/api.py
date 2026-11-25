@@ -1020,17 +1020,17 @@ def _params(
 MAX_N = 128
 # stop_regex: patterns per request, and characters per pattern, at most. Each pattern is searched on the event loop at
 # every streamed piece of text, over the new text and the longest span a match can have, at most STOP_REGEX_SPAN
-# characters before it. CPython's re holds the GIL through a search and cannot be stopped, so its cost is bounded
-# before it runs. The span bounds the text, and _search_cost bounds the time over it: it refuses the shapes whose search
-# time grows faster than the square of the text's length, and it prices the rest in units of one plain repeat's search
+# characters before it. CPython's re holds the GIL through a search and cannot be stopped, so its cost is bounded before
+# it runs. The span bounds the text, and _search_cost bounds the time over it: it refuses the shapes whose search time
+# grows faster than the square of the text's length, and it prices the rest in units of one plain repeat's search
 # (`\w+@` over a run of letters), whose time does grow with that square. A pattern may cost MAX_STOP_REGEX_COST, a
-# request's patterns MAX_STOP_REGEX_REQUEST_COST in all. Measured over 2048 characters (CPython 3.13, one Apple M3 Max
-# core, _search_cost's own verdicts): one plain repeat, `\w+@\w+\.\w+` over a run of letters, 13 ms a search; the
-# slowest admitted pattern found, by hand and among 15,000 random admitted ones, `(?:a|a)(?:a|a)(?:a|a)(?:a|a)\w+@` (16
-# ways to match before a repeat), 0.21 s over a run of `a`; so a request of two such, 0.4 s at every streamed piece.
-# A search is slowest on a text its pattern matches a long way into, such as a long run of one letter. The matches are
-# those of a search over the whole output but for one that starts more than the span before the newest text, which a
-# stop pattern's match rarely does.
+# request MAX_STOP_REGEX_REQUEST_COST: its patterns' costs times its `n`, as each choice searches every pattern at each
+# of its streamed pieces. Measured over 2048 characters (CPython 3.13, one Apple M3 Max core, _search_cost's own
+# verdicts): one plain repeat, `\w+@\w+\.\w+` over a run of letters, 13 ms a search; the slowest admitted pattern found,
+# by hand and among 15,000 random admitted ones, `(?:a|a)(?:a|a)(?:a|a)(?:a|a)\w+@` (16 ways to match before a repeat),
+# 0.21 s over a run of `a`; so a request of two such, 0.4 s at every streamed piece. A search is slowest on a text its
+# pattern matches a long way into, such as a long run of one letter. The matches are those of a search over the whole
+# output but for one that starts more than the span before the newest text, which a stop pattern's match rarely does.
 MAX_STOP_REGEX = 16
 MAX_STOP_REGEX_CHARS = 1024
 MAX_STOP_REGEX_COST = 16
@@ -1395,8 +1395,9 @@ def _search_cost(pattern: str) -> tuple[str | None, int]:
 
 def _stop_rules(body: dict) -> StopRules:
     """The request's StopRules, checked: 400 for a pattern that does not compile or that _search_cost refuses, for
-    patterns that cost more than MAX_STOP_REGEX_REQUEST_COST in all, and for keep or skip_special_tokens that is not a
-    boolean."""
+    patterns that cost more than MAX_STOP_REGEX_REQUEST_COST in all, counted once for each of the request's `n` choices
+    (each has its own detokenizer, which searches every pattern at each of its streamed pieces), and for keep or
+    skip_special_tokens that is not a boolean."""
     rx = body.get("stop_regex")
     rx = [] if rx is None else [rx] if isinstance(rx, str) else rx
     if not (isinstance(rx, list) and all(isinstance(x, str) and x for x in rx)):
@@ -1414,11 +1415,13 @@ def _stop_rules(body: dict) -> StopRules:
         if why is not None:
             raise _bad(f"stop_regex {x!r} is refused: {why}")
         total += cost
-    if total > MAX_STOP_REGEX_REQUEST_COST:
+    n = _int(body, "n", 1, 1, MAX_N) if rx else 1
+    if total * n > MAX_STOP_REGEX_REQUEST_COST:
+        each = f" for each of the request's {n} choices, {total * n} in all" if n > 1 else ""
         raise _bad(
             f"stop_regex patterns are refused: together they can take {total} times as long to search as a single "
-            f"repeat (\\w+@), more than {MAX_STOP_REGEX_REQUEST_COST}, at every streamed piece of the output; send "
-            "fewer or simpler patterns"
+            f"repeat (\\w+@){each}, more than {MAX_STOP_REGEX_REQUEST_COST}, at every streamed piece of the output; "
+            f"send fewer or simpler patterns{', or fewer choices' if n > 1 else ''}"
         )
     include, no_trim = _flag(body, "include_stop_str_in_output"), _flag(body, "no_stop_trim")  # both checked, always
     keep = include or no_trim

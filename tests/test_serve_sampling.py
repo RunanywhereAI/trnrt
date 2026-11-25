@@ -474,6 +474,24 @@ def test_a_requests_stop_regex_patterns_share_one_cost_bound(app):
     assert len(eng.added) == 1
 
 
+def test_a_requests_stop_regex_cost_counts_every_choice(app):
+    """Each of a request's `n` choices has its own detokenizer, which searches every pattern at each of its streamed
+    pieces, so the request's bound counts its patterns' cost once per choice: (?s)<think>.*</think> (cost 9) is served
+    with n = 3 (27) and refused with n = 4 (36), though alone it is served."""
+    from trnrt.serve.api import MAX_STOP_REGEX_REQUEST_COST, _search_cost
+
+    think = r"(?s)<think>.*</think>"
+    assert _search_cost(think) == (None, 9) and 3 * 9 <= MAX_STOP_REGEX_REQUEST_COST < 4 * 9
+    client, eng = app(PLAIN)
+    assert client.post("/v1/completions", json={"prompt": [1], "n": 3, "stop_regex": think}).status_code == 200
+    r = client.post("/v1/completions", json={"prompt": [1], "n": 4, "stop_regex": [think]})
+    assert r.status_code == 400, r.text
+    detail = r.json()["detail"]
+    assert detail.startswith("stop_regex patterns are refused: together they can take 9 times as long"), detail
+    assert "for each of the request's 4 choices, 36 in all, more than 32" in detail and "or fewer choices" in detail
+    assert len(eng.added) == 3  # the served request's three choices, none of the refused one's
+
+
 def test_stop_regex_search_reaches_back_at_most_the_span(monkeypatch):
     """The search for an unbounded pattern starts STOP_REGEX_SPAN (+ 8) characters before the text already searched,
     which bounds its cost: a match starting further back is not found (the limitation, pinned), a later one is."""

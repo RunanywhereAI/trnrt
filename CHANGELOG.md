@@ -11,12 +11,13 @@ and versions follow [Semantic Versioning](https://semver.org/). Rebuild the comp
   of the text's length (nested or overlapping repeats, also on either side of a conditional group with no "no"
   branch, a possessive repeat or an atomic group after a repeat that can take its characters, a lookaround that can
   match more than one way or length, an optional or exactly counted empty part, an alternation or an optional part
-  that can itself match the empty text), and one whose quadratic time has too large a factor (16
-  times a single repeat's for a pattern, 32 for a request's patterns together). Over 2048 characters (CPython 3.13,
+  that can itself match the empty text), and one whose quadratic time has too large a factor (16 times a single
+  repeat's for a pattern, 32 for a request's patterns together, counted once for each of its `n` choices, which each
+  search every pattern). Over 2048 characters (CPython 3.13,
   one Apple M3 Max core) the slowest admitted pattern found takes 0.21 s a search, a request 0.4 s at every streamed
   piece; a lookaround over the rest of the text, which 0.2.0 admitted, took a second or more. Some patterns 0.2.0
   admitted are now refused with 400, among them `.*` followed by more than about 15 characters, and a lookahead that
-  can match more than one length, such as `\.(?=\s|$)`.
+  can match more than one length, such as `\.(?=\s|$)`; a request of more than 32 choices now takes no `stop_regex`.
 - An engine whose full waiting queue refuses the `/health_generate` probe while its steps go on answers 200 `busy`,
   not 503: it is serving.
 - `/v1/messages` refuses messages that end with an assistant message (a prefill) with 400: the chat template would
