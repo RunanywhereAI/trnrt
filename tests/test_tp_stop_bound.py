@@ -527,8 +527,9 @@ def _ready_then_wait(ev) -> None:
 
 
 def test_wait_joining_with_real_workers():
-    """tp.wait_joining over spawned processes: it returns once every worker is ready, and raises within a poll or two
-    when one exits first, naming its rank and exit code."""
+    """tp.wait_joining over spawned processes: it raises within a poll or two when one exits first, naming its rank and
+    exit code, still when its event is set (a worker ready and then gone never joins), and returns once every live
+    worker is ready."""
     import multiprocessing
 
     ctx = multiprocessing.get_context("spawn")
@@ -542,8 +543,10 @@ def test_wait_joining_with_real_workers():
         with pytest.raises(RuntimeError, match=r"rank\(s\) 2 \(exit code 3\) exited before joining"):
             TP.wait_joining(ws, ready)
         assert time.monotonic() - t0 < 30
-        ready[1].set()  # both ready: it returns
-        TP.wait_joining(ws, ready)
+        ready[1].set()  # rank 2 ready, but gone: it still fails the start
+        with pytest.raises(RuntimeError, match=r"rank\(s\) 2 \(exit code 3\) exited before joining"):
+            TP.wait_joining(ws, ready)
+        TP.wait_joining(ws[:1], ready[:1])  # every worker alive and ready: it returns
     finally:
         for w in ws:
             w.kill()
