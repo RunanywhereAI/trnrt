@@ -355,6 +355,38 @@ def test_compile_dry_run_captures_each_build_then_compiles_once():
     assert out.count(" compile compile ") == 1 and out.count(" compile strip ") == 1
 
 
+COMPILE_DOCKER = """#!/usr/bin/env bash
+# docker's stand-in for compile.sh: logs each step (the word after `compile`); FAIL names one to fail
+while [ $# -gt 0 ] && [ "$1" != compile ]; do shift; done
+echo "$2" >> "$LOG"
+[ "$2" != "${FAIL:-none}" ]
+"""
+
+
+@needs_bash
+def test_compile_redoes_the_model_steps_until_both_finished_for_the_revision(tmp_path):
+    import os
+
+    (tmp_path / "docker").write_text(COMPILE_DOCKER)
+    (tmp_path / "docker").chmod(0o755)
+    log, out = tmp_path / "log", tmp_path / "out"
+    base = {k: v for k, v in os.environ.items() if k not in SCRIPT_VARS}
+    path = f"{tmp_path}:{Path(sys.executable).parent}:{os.environ.get('PATH', '')}"
+
+    def run(**env):
+        log.write_text("")
+        e = {**base, "PATH": path, "OUT": str(out), "LOG": str(log), **env}
+        r = subprocess.run(
+            ["bash", str(B / "compile.sh"), "balanced"], capture_output=True, text=True, env=e, check=False
+        )
+        return r.returncode, log.read_text().split()
+
+    assert run(FAIL="decisions") == (1, ["shapes", "decisions"])  # decisions failed: nothing recorded
+    assert run() == (0, ["shapes", "decisions", "capture", "compile", "strip"])  # so both run again
+    assert run() == (0, ["capture", "compile", "strip"])  # finished for this revision: skipped
+    assert run(REV="0123abcd")[1][:2] == ["shapes", "decisions"]  # another revision: both again
+
+
 @needs_bash
 def test_docker_args_reach_every_container():
     out = _dry("compile.sh", "balanced", env={"OUT": "/o", "DOCKER_ARGS": "--cpuset-cpus=0-95"})

@@ -34,9 +34,15 @@ for b in "$@"; do  # every build's engine arguments, checked before anything run
 done
 
 [ "$dry" = 1 ] || mkdir -p "$OUT/nki" "$OUT/work"
-if [ ! -d "$OUT/shapes" ] || [ "$dry" = 1 ]; then
+# The model's shapes and load-time decisions, once per checkpoint revision: $OUT/model.rev records the revision both
+# steps finished for (written here, not under shapes/, which the containers own), so a step that failed, or another
+# REV, runs both again
+stamp="$OUT/model.rev"
+if [ "$dry" = 1 ] || [ "$(cat "$stamp" 2>/dev/null)" != "$REV" ]; then
+  [ "$dry" = 1 ] || rm -f "$stamp"
   run compile shapes zai-org/GLM-5.3-Flash --revision "$REV" --out "$OUT"
   run compile decisions --model zai-org/GLM-5.3-Flash --revision "$REV" --out "$OUT"
+  [ "$dry" = 1 ] || echo "$REV" > "$stamp"
 fi
 for i in "${!args[@]}"; do
   echo "# build $(( i + 1 )) of ${#args[@]}: ${*:i+1:1}"
