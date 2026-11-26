@@ -220,10 +220,11 @@ The simulator is necessary but not sufficient. It accepted forms the device comp
 into slices of one PSUM tile, unfenced in-kernel collectives, and cross-program reads of shared scratch. It also
 accepted forms the compiler rejects. So every new form gets a device run checked by value, with a control.
 
-This repository's own check: the graphs this code builds, and their kernel binaries, are compared with the build the
-published numbers were measured on. They must match modulo names and `rev` values
-([`tools/graph_equiv.py`](../tools/graph_equiv.py)). They do: all 157 graphs of the default batch-12 configuration read
-EQUAL on all 32 ranks.
+This repository's own check: the graphs this code builds, and their kernel binaries, are compared with a reference build
+measured on the device. They must match modulo names and `rev` values ([`tools/graph_equiv.py`](../tools/graph_equiv.py)).
+At release 0.1.0 they did against the build its published numbers were measured on: all 157 graphs of its default
+batch-12 configuration read EQUAL on all 32 ranks. In this release, `latency`, `balanced` and `throughput` read EQUAL
+against the builds we serve ([KNOWN_ISSUES.md](KNOWN_ISSUES.md#verification-status)).
 
 ## Prefill kernels
 
