@@ -48,16 +48,16 @@ How we built it, with the AgentX results: [Serving GLM-5.3-Flash on one Trainium
   </picture>
 </p>
 
-On [InferenceX](https://github.com/SemiAnalysisAI/InferenceX) AgentX, which replays real coding-agent sessions, one TrnRT
-engine (8 Trainium2 chips, half a `trn2.48xlarge`) delivers more tokens per dollar than one 8-GPU H200 node up to 16
-concurrent users, and 3.9-5.2× an H100 node's from 16 to 32 users. All three run GLM-5.3-Flash's FP8 weights and are
-priced at AWS's Capacity Block list prices.
+On [InferenceX](https://github.com/SemiAnalysisAI/InferenceX) AgentX, which replays real coding-agent sessions, one
+TrnRT engine (8 Trainium2 chips, half a `trn2.48xlarge`) delivers more tokens per dollar than one 8-GPU H200 node at 1,
+4, 8 and 16 concurrent users, and 3.9-5.2× an H100 node's at 16, 24 and 32 users. All three run GLM-5.3-Flash's FP8
+weights and are priced at AWS's Capacity Block list prices.
 
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/assets/results-agentx-users-dark.png">
     <source media="(prefers-color-scheme: light)" srcset="docs/assets/results-agentx-users-light.png">
-    <img alt="AgentX total tokens per dollar by concurrent users: trn2 above H200 up to 16 users and above H100 at every concurrency, at AWS Capacity Block prices." src="docs/assets/results-agentx-users-dark.png" width="760">
+    <img alt="AgentX total tokens per dollar by concurrent users: trn2 above H200 at 1, 4, 8 and 16 users and above H100 at every measured concurrency, at AWS Capacity Block prices." src="docs/assets/results-agentx-users-dark.png" width="760">
   </picture>
 </p>
 
