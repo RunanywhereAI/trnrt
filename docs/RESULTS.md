@@ -282,8 +282,9 @@ is 2.20, 0.87 of it. H200 runs EAGLE (k = 5) at InferenceX's golden acceptance l
 
 ### 8K/1K fixed-length, MTP on
 
-The GPU runs use synthetic acceptance at length 3.6 (k = 5). trn2's comparable build is `latency-golden`, synthetic
-acceptance at InferenceX's golden length for its k = 2, 2.519. The lengths differ because k differs.
+The GPU runs use synthetic acceptance at length 3.6; H200's draft 5 tokens a step (EAGLE, k = 5). trn2's comparable build
+is `latency-golden`, synthetic acceptance at InferenceX's golden length for its k = 2, 2.519. The lengths differ because
+the number of draft tokens differs.
 
 | Users | trn2 build | P90 tok/s per user: trn2 / H200 / H100 | Total tokens per $ (millions): trn2 / H200 / H100 | trn2 ÷ H200 | trn2 ÷ H100 |
 |---|---|---|---|---|---|
