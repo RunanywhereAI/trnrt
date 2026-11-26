@@ -23,17 +23,27 @@ def _rows(name: str) -> list[dict[str, str]]:
         return list(csv.DictReader(f))
 
 
+def _unique(rows: list[dict[str, str]], key: str, name: str) -> dict[str, dict[str, str]]:
+    """Rows by `key`; a repeated name is refused: the later row would replace the earlier with no error."""
+    out: dict[str, dict[str, str]] = {}
+    for r in rows:
+        if r[key] in out:
+            raise SystemExit(f"{name}: {key} {r[key]!r} appears twice")
+        out[r[key]] = r
+    return out
+
+
 def builds() -> dict[str, dict[str, str]]:
-    return {r["build"]: r for r in _rows("builds.csv")}
+    return _unique(_rows("builds.csv"), "build", "builds.csv")
 
 
 def points() -> dict[str, dict[str, str]]:
     b = builds()
     out = {}
-    for r in _rows("points.csv"):
+    for name, r in _unique(_rows("points.csv"), "point", "points.csv").items():
         if r["build"] not in b:
-            raise SystemExit(f"points.csv: {r['point']}: unknown build {r['build']!r} (builds.csv)")
-        out[r["point"]] = {**b[r["build"]], **r}
+            raise SystemExit(f"points.csv: {name}: unknown build {r['build']!r} (builds.csv)")
+        out[name] = {**b[r["build"]], **r}
     return out
 
 

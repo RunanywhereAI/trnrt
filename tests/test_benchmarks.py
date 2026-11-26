@@ -52,6 +52,22 @@ def test_every_point_has_a_build_whose_arguments_the_engine_accepts():
             assert a.spec_synth_al is None, name
 
 
+def test_a_point_or_build_named_twice_is_refused(tmp_path, monkeypatch):
+    for f in ("points.csv", "builds.csv"):
+        (tmp_path / f).write_text((B / f).read_text())
+    monkeypatch.setattr(points, "HERE", tmp_path)
+    assert points.points()  # the copies load as the originals do
+    rows = (B / "points.csv").read_text().splitlines()
+    (tmp_path / "points.csv").write_text("\n".join([*rows, rows[1]]) + "\n")
+    with pytest.raises(SystemExit, match="appears twice"):
+        points.points()
+    (tmp_path / "points.csv").write_text((B / "points.csv").read_text())
+    rows = (B / "builds.csv").read_text().splitlines()
+    (tmp_path / "builds.csv").write_text("\n".join([*rows, rows[1]]) + "\n")
+    with pytest.raises(SystemExit, match="appears twice"):
+        points.builds()
+
+
 def test_the_agentx_points_follow_the_builds_bands():
     """AgentX points at 1-8 users run the latency build at the golden length (InferenceX scores speculative decoding at a
     fixed acceptance length), 9-16 the balanced build, 17 and up the throughput build: --preset auto's bands."""
