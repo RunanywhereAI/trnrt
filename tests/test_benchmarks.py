@@ -12,8 +12,11 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+
+from trnrt.metrics import spec_stats
 
 ROOT = Path(__file__).resolve().parent.parent
 B = ROOT / "benchmarks"
@@ -149,23 +152,89 @@ def test_a_bad_price_is_refused(bad):
         agentx_score.parse_price(bad)
 
 
-def test_the_acceptance_mode_check():
-    golden = {"status": "ok", "benchmark_mode": {"synthetic_acceptance_length": GOLDEN, "drafts_verified": False}}
-    real = {"status": "ok"}
-    assert mode.check(real, "real") is None and mode.check(golden, "golden") is None
-    assert "benchmark mode" in mode.check(golden, "real")
-    assert "golden length" in mode.check(real, "golden")
-    other = {"benchmark_mode": {"synthetic_acceptance_length": 3.0}}
-    assert mode.check(other, "golden") is not None and mode.check(other, "real") is not None
-    both = {"benchmark_mode": {"synthetic_acceptance_length": [GOLDEN, 3.0]}}  # a router over engines in two modes
-    assert mode.check(both, "golden") is not None
+def _spec(synth_al):
+    """The speculation block an MTP engine's /v1/stats carries, as the server builds it (trnrt/metrics.py)."""
+    cfg = SimpleNamespace(spec_method="mtp", spec_k=2, spec_synth_al=synth_al, spec_max_batch=0)
+    e = SimpleNamespace(
+        cfg=cfg, spec_proposed=0, spec_accepted=0, spec_verifies=0, spec_pos_reached=[], spec_pos_accepted=[]
+    )
+    return spec_stats(e)
 
 
-def test_the_acceptance_mode_cli_refuses_with_status_2():
-    golden = json.dumps({"benchmark_mode": {"synthetic_acceptance_length": GOLDEN}})
-    assert mode.main(["--expect", "real", "--health-json", golden]) == 2
-    assert mode.main(["--expect", "golden", "--health-json", golden]) == 0
-    assert mode.main(["--expect", "real", "--health-json", "not json"]) == 2
+def _stats(*synth_als, missing=None):
+    """A router's /v1/stats over engines with these benchmark-mode lengths (None: real acceptance); `missing` an engine
+    that did not answer."""
+    engines = [
+        {"url": f"http://e{i}", "up": True, "stats": {"gauges": {"kv_pages_used": 1, "spec": _spec(al)}}}
+        for i, al in enumerate(synth_als)
+    ]
+    if missing is not None:
+        engines[missing] = {"url": f"http://e{missing}", "up": False, "stats": None, "error": "did not answer"}
+    return {"engines": engines, "router": {"workers": [e["url"] for e in engines]}}
+
+
+def test_the_acceptance_mode_check_reads_every_engine():
+    assert mode.check(_stats(None), "real") is None and mode.check(_stats(GOLDEN), "golden") is None
+    assert mode.check(_stats(None, None), "real") is None and mode.check(_stats(GOLDEN, GOLDEN), "golden") is None
+    assert "benchmark mode" in mode.check(_stats(GOLDEN), "real")
+    assert "golden length" in mode.check(_stats(None), "golden") and mode.check(_stats(3.0), "golden") is not None
+    # a router over engines in two modes: refused both ways (the router's /health block named only the synthetic one)
+    assert mode.check(_stats(GOLDEN, None), "golden") is not None and mode.check(_stats(GOLDEN, None), "real")
+    # no speculation at all (balanced, throughput): real acceptance
+    plain = {"engines": [{"url": "http://e0", "up": True, "stats": {"gauges": {"kv_pages_used": 1}}}]}
+    assert mode.check(plain, "real") is None and mode.check(plain, "golden") is not None
+    # one engine's own /v1/stats, and its /health (whose block is there from the start)
+    assert mode.check({"gauges": {"spec": _spec(GOLDEN)}}, "golden") is None
+    assert mode.check({"status": "ok"}, "real") is None
+    assert mode.check({"status": "ok", "benchmark_mode": {"synthetic_acceptance_length": [GOLDEN]}}, "golden") is None
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        [],
+        None,
+        "x",
+        {"engines": []},
+        {"engines": "x"},
+        _stats(None, missing=0),
+        {"gauges": None},
+        {"gauges": {"spec": "x"}},
+        {"gauges": {"spec": {"synth_al": "2.5"}}},
+        {"gauges": {"spec": {"synth_al": True}}},
+        {"status": "ok", "benchmark_mode": {"synthetic_acceptance_length": None}},
+        {"status": "ok", "benchmark_mode": []},
+        {"status": "ok", "workers": ["http://e0"], "benchmark_mode": {"synthetic_acceptance_length": [GOLDEN]}},
+    ],
+)
+def test_a_body_the_mode_cannot_be_read_from_is_refused_both_ways(body):
+    assert isinstance(mode.modes(body), str)
+    assert "cannot be read" in mode.check(body, "real") and "cannot be read" in mode.check(body, "golden")
+
+
+def test_the_acceptance_mode_cli_retries_only_what_it_cannot_read():
+    golden = json.dumps(_stats(GOLDEN))
+    assert mode.main(["--expect", "real", "--body-json", golden]) == 2
+    assert mode.main(["--expect", "golden", "--body-json", golden]) == 0
+    assert mode.main(["--expect", "real", "--body-json", "not json"]) == 2
+    bodies = [OSError("refused"), _stats(GOLDEN, GOLDEN, missing=1), _stats(GOLDEN, GOLDEN)]  # starting, then up
+    calls, naps = [], []
+
+    def get(url):
+        calls.append(url)
+        b = bodies[min(len(calls), len(bodies)) - 1]
+        if isinstance(b, Exception):
+            raise b
+        return b
+
+    assert mode.main(["--expect", "golden", "--url", "http://h:8000"], get=get, sleep=naps.append) == 0
+    assert len(calls) == 3 and len(naps) == 2
+    calls.clear()
+    bodies[:] = [_stats(None)]  # a wrong mode is refused at once, not waited on
+    assert mode.main(["--expect", "golden", "--url", "http://h:8000"], get=get, sleep=naps.append) == 2
+    assert len(calls) == 1
+    bodies[:] = [OSError("refused")]  # never readable: refused once --wait runs out
+    assert mode.main(["--expect", "real", "--url", "http://h:8000", "--wait", "0"], get=get, sleep=naps.append) == 2
 
 
 needs_bash = pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
