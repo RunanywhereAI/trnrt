@@ -194,14 +194,17 @@ at $35.76/h, the batch 12 cost is $0.167 per million tokens. Full tables, cold-p
 methodology are in [docs/RESULTS.md](docs/RESULTS.md).
 
 These numbers were measured with an earlier build of TrnRT, at release 0.1.0's batch presets, which this release's
-builds replace. This repository passes these checks against that build
+builds replace. At release 0.1.0, this repository passed these checks against that build
 ([docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md#verification-status)):
 
-- Graph equivalence: EQUAL on all 32 ranks, for all 157 graphs that build compiles in the default batch-12
+- Graph equivalence: EQUAL on all 32 ranks, for all 157 graphs that build compiles in its default batch-12
   configuration.
 - Outputs: byte-identical to that build's on 384 of 384 requests.
-- Serving: the two-engine serve in the [Quickstart](#quickstart) passed end to end on the device at release 0.1.0. On
-  this release it has run end to end on CPU only so far; the device run is pending.
+- Serving: the two-engine serve in the [Quickstart](#quickstart) passed end to end on the device.
+
+This release's builds read EQUAL against the builds we serve, with bitwise-equal outputs on the device, and its
+comparison with H100 and H200 above is a run of this repository. On this release the two-engine serve has run end to
+end on CPU only so far; the device run is pending.
 
 ## How it works
 
