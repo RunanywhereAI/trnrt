@@ -195,6 +195,25 @@ def test_the_startup_timeout_counts_from_each_engines_start(host, monkeypatch):
     assert host.router is not None and len(host.engines) == 2
 
 
+def test_serve_refuses_a_bad_benchmark_mode_or_combination_before_it_announces_the_mode(host, monkeypatch, capsys):
+    monkeypatch.setenv("TRNRT_SPEC_SYNTH_AL", "2.5x")
+    with pytest.raises(SystemExit) as e:
+        cli.cmd_serve(["--model", "m"])
+    out = capsys.readouterr()
+    assert e.value.code == 2 and "TRNRT_SPEC_SYNTH_AL='2.5x'" in out.err and "BENCHMARK MODE" not in out.out
+    monkeypatch.setenv("TRNRT_SPEC_SYNTH_AL", "2.518506")
+
+    def refused(argv):
+        raise ValueError("a combination the scheduler refuses")
+
+    monkeypatch.setattr(cli, "scheduling", refused)
+    with pytest.raises(SystemExit) as e:
+        cli.cmd_serve(["--model", "m"])
+    out = capsys.readouterr()
+    assert e.value.code == 2 and "the scheduler refuses" in out.err and "BENCHMARK MODE" not in out.out
+    assert host.engines == []
+
+
 def test_a_cache_miss_ends_serve_with_its_cause(host):
     host.plan = [{"ready": 2, "exit_status": cli.CACHE_MISS_STATUS}]
     with pytest.raises(SystemExit) as e:

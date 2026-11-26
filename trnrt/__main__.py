@@ -662,9 +662,17 @@ def add_host_sampling_args(ap: argparse.ArgumentParser) -> None:
 
 
 def _env_synth_al() -> float | None:
-    """TRNRT_SPEC_SYNTH_AL: the benchmark mode's mean acceptance length, when --spec-synth-al is not given."""
+    """TRNRT_SPEC_SYNTH_AL: the benchmark mode's mean acceptance length, when --spec-synth-al is not given. ValueError
+    for a value that is not a number."""
     v = os.environ.get("TRNRT_SPEC_SYNTH_AL")
-    return float(v) if v else None
+    if not v:
+        return None
+    try:
+        return float(v)
+    except ValueError:
+        raise ValueError(
+            f"TRNRT_SPEC_SYNTH_AL={v!r}: want the benchmark mode's mean acceptance length, a number"
+        ) from None
 
 
 def parse_engine_args(argv: list[str]) -> argparse.Namespace:
@@ -956,16 +964,17 @@ def cmd_serve(argv: list[str]) -> int:
     )
     add_compile_arg(ap)
     a = ap.parse_args(argv)
-    synth_al = a.spec_synth_al if a.spec_synth_al is not None else _env_synth_al()
-    # The benchmark mode says so before the engines start and again when the router serves (serve/benchmark_mode.py)
+    try:
+        synth_al = a.spec_synth_al if a.spec_synth_al is not None else _env_synth_al()
+        scheduling(argv)  # refused here, before any engine starts, rather than by every engine
+    except ValueError as e:
+        ap.error(str(e))
+    # The benchmark mode says so before the engines start and again when the router serves (serve/benchmark_mode.py),
+    # once the arguments are accepted: a refused start announces nothing
     if synth_al is not None:
         from .serve.benchmark_mode import banner
 
         print(banner(synth_al), flush=True)
-    try:
-        scheduling(argv)  # refused here, before any engine starts, rather than by every engine
-    except ValueError as e:
-        ap.error(str(e))
     # The engines start one at a time, each healthy (its weights loaded, every graph warmed) before the next starts. The
     # host-wide start lock stays on too (engine/start_lock.py: each graph's first call holds it): two engines whose
     # ranks load collective graphs at the same moment collide in the runtime's collectives bootstrap.
