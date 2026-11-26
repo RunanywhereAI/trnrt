@@ -16,6 +16,16 @@ and versions follow [Semantic Versioning](https://semver.org/). Rebuild the comp
   `GET /health` carries a `benchmark_mode` block, and every response of the engine and the router carries the header
   `x-trnrt-synthetic-acceptance`. The accuracy tools refuse a server in the mode.
 
+### Changed
+
+- The comparison with H100 and H200 ([docs/RESULTS.md](docs/RESULTS.md#against-h100-and-h200-inferencex-agentx-and-8k1k),
+  the README and its charts) is now a run of this repository: 25 Nov 2026, with `benchmarks/`, the image from
+  `docker/Dockerfile` and a compile cache built from source, each row naming the build that measured it. 0.2.0 published
+  numbers from internal builds and said this release's builds were graph-equivalent to them. That held at 16-32 users,
+  but the 1-8 and 12 user points and the 8K/1K recipe had run other builds. 12 users is no longer shown, as it was not
+  measured on this repository. AgentX against H200 moves to 1.63-1.89× at 1-8 users (was 1.61-1.75×) and 1.09× at 16
+  (was 1.07×); 8K/1K with MTP off moves to 0.52-1.00× at 1-64 users (was 0.56-0.76× at 1-32).
+
 ### Fixed
 
 - `stop_regex` refuses a pattern whose search could stall the server: one whose time can grow faster than the square
