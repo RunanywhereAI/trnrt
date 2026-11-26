@@ -2,14 +2,14 @@
 
 The stand-in models what the check depends on: documents of pages, a device pool that evicts the least recently used
 document's tail pages to a host tier, restores of the evicted suffix, the host-tier counters on /metrics (or none, as
-the server today), /health with or without the benchmark mode, and a model that reads the facts out of its prompt.
+the server today), /v1/stats with or without the benchmark mode, and a model that reads the facts out of its prompt.
 
 - With the counters, as the check was first written: a correct model passes and every needle crossed a restore; a wrong
   code at a depth whose page came back from the host fails, naming it; a needle that never crossed a restore is
   NO-RESULT, never PASS and never FAIL.
 - Without them: the answers alone are judged. A correct model passes and the verdict says that the restore was not
   observable; a wrong code after the churn fails.
-- Refused before any request: the benchmark mode (the /health block the server itself builds) and a /health that does
+- Refused before any request: the benchmark mode (on any engine of the server's /v1/stats) and a /v1/stats that does
   not answer. A cold miss and a request error are NO-RESULT.
 - The smoke's ladder finds a request profile on a small document before anything long is sent.
 - The transport reads the server's own metric names (built by trnrt/metrics.py, not restated here), reads nothing from a
@@ -30,8 +30,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from trnrt.metrics import spec_lines
-from trnrt.serve import benchmark_mode
+from trnrt.metrics import spec_lines, spec_stats
 
 ROOT = Path(__file__).resolve().parent.parent
 _spec = importlib.util.spec_from_file_location("bench_needle", ROOT / "benchmarks" / "accuracy" / "needle.py")
@@ -74,8 +73,8 @@ class Fake:
         boom_at=None,
         think_mode=None,
         wrong_when_cached=False,
-        health_body=None,
-        health_down=False,
+        stats_body=None,
+        stats_down=False,
         spec=False,
     ):
         self.think_mode, self.log, self.wrong_when_cached = think_mode, [], wrong_when_cached
@@ -87,14 +86,14 @@ class Fake:
         self.wrong_after_restore, self.wrong_always, self.cold_wrong = wrong_after_restore, wrong_always, cold_wrong
         self.counters, self.never_evict, self.spec = counters, never_evict, spec
         self.boom_at, self.n_asks = boom_at, 0
-        self.health_body = health_body if health_body is not None else {"status": "ok"}
-        self.health_down = health_down
+        self.stats_body = stats_body if stats_body is not None else engine_stats(None)
+        self.stats_down = stats_down
         self.flipped = 0
 
-    def health(self):
-        if self.health_down:
+    def stats(self):
+        if self.stats_down:
             raise ConnectionRefusedError("connection refused")
-        return self.health_body
+        return self.stats_body
 
     def metrics(self):
         out = {"num_requests_running": 0.0}
@@ -198,12 +197,24 @@ class Late(Fake):
 
 
 def drive(fake, **over):
-    return N.run(fake.ask, fake.metrics, fake.health, {**CFG, **over})
+    return N.run(fake.ask, fake.metrics, fake.stats, {**CFG, **over})
 
 
-def bench_health(lengths=(2.5,)):
-    """/health of a server in the benchmark mode, as the server builds it."""
-    return {"status": "ok", "benchmark_mode": benchmark_mode.health_block(list(lengths))}
+def engine_stats(synth_al):
+    """One engine's /v1/stats gauges with the speculation block the server builds (trnrt/metrics.py spec_stats):
+    synth_al None is real acceptance."""
+    cfg = SimpleNamespace(spec_method="mtp", spec_k=2, spec_synth_al=synth_al, spec_max_batch=0)
+    engine = SimpleNamespace(
+        cfg=cfg, spec_proposed=0, spec_accepted=0, spec_verifies=0, spec_pos_reached=[], spec_pos_accepted=[]
+    )
+    return {"gauges": {"kv_pages_used": 1, "spec": spec_stats(engine)}}
+
+
+def router_stats(*synth_als):
+    """The router's /v1/stats over engines with these lengths (None: real acceptance)."""
+    return {
+        "engines": [{"url": f"http://e{i}", "up": True, "stats": engine_stats(al)} for i, al in enumerate(synth_als)]
+    }
 
 
 def test_the_documents_share_no_prefix_hold_the_needles_at_their_depths_and_the_churn_ones_hold_none():
@@ -304,19 +315,23 @@ def test_PLANT_without_the_counters_a_wrong_code_after_the_churn_fails_naming_it
 
 
 def test_the_benchmark_mode_is_refused_before_any_request():
-    for body in (bench_health(), {**bench_health([2.5, 3.0]), "status": "degraded", "down": []}):  # engine, router
-        f = Fake(health_body=body)
+    # an engine in the mode, a router over two, a router with one engine in it and one not
+    for body in (engine_stats(2.5), router_stats(2.5, 3.0), router_stats(None, 2.5)):
+        f = Fake(stats_body=body)
         r = drive(f)
         assert r["verdict"] == "NO-RESULT" and r["why"].startswith("refused:") and "benchmark mode" in r["why"], r
         assert f.log == [] and f.n_asks == 0
-    r = drive(Fake(health_body={"status": "ok"}))  # control: real acceptance runs
+    r = drive(Fake(stats_body=router_stats(None, None)))  # control: real acceptance runs
     assert r["verdict"] == "PASS", r
 
 
 def test_a_health_that_does_not_answer_a_cold_miss_and_a_request_error_are_no_result():
-    f = Fake(health_down=True)
+    f = Fake(stats_down=True)
     r = drive(f)
-    assert r["verdict"] == "NO-RESULT" and "/health did not answer" in r["why"] and f.n_asks == 0, r
+    assert r["verdict"] == "NO-RESULT" and "/v1/stats did not answer" in r["why"] and f.n_asks == 0, r
+    f = Fake(stats_body={"status": "ok", "workers": ["http://e0"]})  # a router's /health shows no engine's mode
+    r = drive(f)
+    assert r["verdict"] == "NO-RESULT" and "cannot be read" in r["why"] and f.n_asks == 0, r
     r = drive(Fake(cold_wrong=True))
     assert r["verdict"] == "NO-RESULT" and "cold" in r["why"] and "wrong" in r["why"]
     r = drive(Fake(boom_at=3))
@@ -329,16 +344,34 @@ def test_the_cli_writes_the_verdict_file_and_exits_by_the_verdict(tmp_path, caps
         (Fake(wrong_after_restore=0.5), 1, "FAIL", "restored"),
         (Fake(counters=False), 0, "PASS", "host restore not observable"),
         (Fake(counters=False, wrong_after_restore=0.5), 1, "FAIL", "host restore not observable"),
-        (Fake(health_body=bench_health()), 2, "NO-RESULT", "refused"),
+        (Fake(stats_body=engine_stats(2.5)), 2, "NO-RESULT", "refused"),
         (Fake(cold_wrong=True), 2, "NO-RESULT", "cold"),
     )
     for i, (fake, rc, word, said) in enumerate(cases):
         vf = tmp_path / f"v-{i}"
         argv = ["--verdict", str(vf), "--context-words", "3000", "--page", str(PAGE), "--churn", "6", "--run-id", "t"]
-        got = N.main(argv, transport=(fake.ask, fake.metrics, fake.health))
+        got = N.main(argv, transport=(fake.ask, fake.metrics, fake.stats))
         out = capsys.readouterr().out
         assert got == rc and vf.read_text().split()[0] == word and said in out, (i, out)
         assert json.loads((tmp_path / "needle.json").read_text())["verdict"] == word
+
+
+def test_the_cli_refuses_a_depth_outside_the_document_before_any_request(tmp_path):
+    f = Fake()
+    for depths in ("0.1,1.5", "-0.1"):
+        argv = ["--verdict", str(tmp_path / "v"), "--depths", depths]
+        assert N.main(argv, transport=(f.ask, f.metrics, f.stats)) == 2
+    assert f.n_asks == 0 and not (tmp_path / "v").exists()
+
+
+def test_the_verdict_file_is_written_even_when_out_cannot_be(tmp_path, capsys):
+    f = Fake(counters=False)
+    blocker = tmp_path / "file"
+    blocker.write_text("x")  # --out under a regular file cannot be created
+    vf = tmp_path / "v"
+    argv = ["--verdict", str(vf), "--context-words", "3000", "--page", str(PAGE), "--churn", "6", "--run-id", "t"]
+    assert N.main([*argv, "--out", str(blocker / "sub")], transport=(f.ask, f.metrics, f.stats)) == 0
+    assert vf.read_text().split()[0] == "PASS" and "needle.json not written" in capsys.readouterr().err
 
 
 def test_the_cli_builds_its_transport_for_the_router_with_one_session_and_refuses_abbreviations(tmp_path, monkeypatch):
@@ -347,14 +380,14 @@ def test_the_cli_builds_its_transport_for_the_router_with_one_session_and_refuse
     def transport(*args):
         seen.append(args)
         f = Fake(counters=False)
-        return f.ask, f.metrics, f.health
+        return f.ask, f.metrics, f.stats
 
     monkeypatch.setattr(N, "make_transport", transport)
     argv = ["--verdict", str(tmp_path / "v"), "--context-words", "3000", "--page", str(PAGE), "--churn", "6"]
     assert N.main([*argv, "--run-id", "r1"]) == 0
-    server, api, _model, _timeout, _max_tokens, session = seen[0]
+    server, api, _model, _timeout, session = seen[0]
     assert server == "http://127.0.0.1:8000" and api == "chat" and session == "needle-r1"
-    assert N.main(argv) == 0 and seen[1][5] != seen[0][5]  # a random run id by default
+    assert N.main(argv) == 0 and seen[1][4] != seen[0][4]  # a random run id by default
     with pytest.raises(SystemExit):
         N.main(["--verd", str(tmp_path / "v")])
 
@@ -384,8 +417,8 @@ def test_the_transport_reads_usage_the_servers_metric_names_and_health_and_sends
         calls.append((url, payload))
         if url.endswith("/metrics"):
             return body
-        if url.endswith("/health"):
-            return b'{"status": "ok"}'
+        if url.endswith("/v1/stats"):
+            return json.dumps(engine_stats(None)).encode()
         return json.dumps(
             {
                 "choices": [{"message": {"content": "hi"}, "text": "yo"}],
@@ -394,12 +427,12 @@ def test_the_transport_reads_usage_the_servers_metric_names_and_health_and_sends
         ).encode()
 
     monkeypatch.setattr(N, "http", fake_http)
-    ask, metrics, health = N.make_transport("http://s:1/", "chat", "m", 5.0, 32, "needle-t")
+    ask, metrics, stats = N.make_transport("http://s:1/", "chat", "m", 5.0, "needle-t")
     got = ask("p")
     assert {k: v for k, v in got.items() if k != "raw"} == {"text": "hi", "prompt_tokens": 100, "cached_tokens": 64}
     assert got["raw"]["content"] == "hi" and calls[0][0] == "http://s:1/v1/chat/completions"
     assert calls[0][1]["temperature"] == 0 and calls[0][1]["model"] == "m" and calls[0][1]["session_id"] == "needle-t"
-    ask, _, _ = N.make_transport("http://s:1", "completions", None, 5.0, 32, "needle-t")
+    ask, _, _ = N.make_transport("http://s:1", "completions", None, 5.0, "needle-t")
     assert ask("p")["text"] == "yo" and calls[1][0] == "http://s:1/v1/completions"
     assert "model" not in calls[1][1] and calls[1][1]["session_id"] == "needle-t"
     m = metrics()
@@ -411,7 +444,8 @@ def test_the_transport_reads_usage_the_servers_metric_names_and_health_and_sends
         "spec_decode_num_accepted_tokens_total": 15.0,
     }
     assert set(N.SPEC) <= set(m)  # every speculative counter the check reads is one the server writes
-    assert health() == {"status": "ok"}
+    assert stats() == engine_stats(None)
+    assert "max_tokens" not in calls[0][1]  # every question's budget comes from its profile, each churn's is 1
 
 
 def test_the_speculative_counters_growth_gives_the_acceptance_length():
@@ -429,9 +463,9 @@ def test_the_metrics_of_a_server_without_metrics_are_empty_and_other_errors_rais
         raise urllib.error.HTTPError(url, code, "x", {}, io.BytesIO(b'{"detail": "x"}'))
 
     monkeypatch.setattr(N, "http", fake_http)
-    _, metrics, _ = N.make_transport("http://router:1", "chat", None, 5.0, 32, None)
+    _, metrics, _ = N.make_transport("http://router:1", "chat", None, 5.0, None)
     assert metrics() == {}  # the router of `trnrt serve`: no counters, so only the answers are judged
-    _, metrics, _ = N.make_transport("http://engine:1", "chat", None, 5.0, 32, None)
+    _, metrics, _ = N.make_transport("http://engine:1", "chat", None, 5.0, None)
     with pytest.raises(urllib.error.HTTPError):
         metrics()
 
@@ -478,7 +512,7 @@ def test_the_transport_merges_the_profile_reads_reasoning_when_content_is_empty_
         ).encode()
 
     monkeypatch.setattr(N, "http", fake_http)
-    ask, _, _ = N.make_transport("http://s:1", "chat", None, 5.0, 96, None)
+    ask, _, _ = N.make_transport("http://s:1", "chat", None, 5.0, None)
     out = ask("p", {"reasoning_effort": "low", "max_tokens": 1536})
     assert bodies[0]["reasoning_effort"] == "low" and bodies[0]["max_tokens"] == 1536 and bodies[0]["temperature"] == 0
     assert "session_id" not in bodies[0]

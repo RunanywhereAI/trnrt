@@ -13,8 +13,8 @@ How. Three facts ("The access code for vault <name> is <8 digits>.") are planted
 Every document opens with the run's id (--run-id, random by default), so no earlier run shares a prefix with it, and
 every request carries one `session_id`, so the router of `trnrt serve` sends them all to one engine: the churn must
 evict from the pool that holds the document.
-0. The server's /health must not report the benchmark mode (acceptance_mode.py). Its drafts are not verified, so its
-   answers are not the model's, and the check refuses before any request.
+0. Every engine of the server must run real acceptance, as its /v1/stats shows (acceptance_mode.py), not the benchmark
+   mode: its drafts are not verified, so its answers are not the model's, and the check refuses before any request.
 1. SMOKE: a small document with one needle, asked cold through a ladder of request profiles. GLM-5.3-Flash's chat
    template always opens a reasoning block and `max_tokens` counts reasoning, so a short budget can come back with no
    content. The first profile that answers correctly (PROFILES: reasoning effort "low", then the template's default
@@ -43,7 +43,7 @@ the prefix cache, device and host together.
 Verdicts, with exit status 0, 1 and 2:
 - PASS: every needle right cold and right after the revisit (with the counters: and every needle crossed a restore).
 - FAIL: a needle right cold is wrong after the revisit (with the counters: a needle that crossed a restore).
-- NO-RESULT: the benchmark mode, a /health that does not answer, no smoke profile answers, a cold code wrong, a request
+- NO-RESULT: the benchmark mode, a /v1/stats that does not show the mode, no smoke profile answers, a cold code wrong, a request
   error, or (with the counters only) a needle that did not cross a restore: the document was still partly on the
   device, so raise --churn. The depths that did cross are listed.
 The verdict file's first word is the verdict; the full JSON goes to needle.json in --out (default: the verdict file's
@@ -173,13 +173,13 @@ def spec_delta(before: dict, after: dict) -> dict:
     return d
 
 
-def refusal(health) -> str | None:
-    """Why the check must not run on this server, or None: its /health does not answer, or it reports the benchmark
-    mode (synthetic acceptance), whose text is not the model's."""
+def refusal(stats) -> str | None:
+    """Why the check must not run on this server, or None: its /v1/stats does not answer or does not show every
+    engine's mode, or an engine runs the benchmark mode (synthetic acceptance), whose text is not the model's."""
     try:
-        body = health()
+        body = stats()
     except (OSError, ValueError) as e:  # urllib's errors are OSErrors; a body that is not JSON a ValueError
-        return f"the server's /health did not answer: {type(e).__name__}: {str(e)[:200]}"
+        return f"the server's /v1/stats did not answer: {type(e).__name__}: {str(e)[:200]}"
     why = acceptance_mode.check(body, "real")
     return f"refused: {why}" if why else None
 
@@ -201,15 +201,15 @@ def smoke(ask, cfg: dict) -> tuple[dict | None, list[str]]:
     return None, seen
 
 
-def run(ask, metrics, health, cfg: dict) -> dict:
-    """The check. health() -> the server's /health body; ask(prompt, extra=None) -> {text, prompt_tokens, cached_tokens,
+def run(ask, metrics, stats, cfg: dict) -> dict:
+    """The check. stats() -> the server's /v1/stats body; ask(prompt, extra=None) -> {text, prompt_tokens, cached_tokens,
     raw}, with `extra` merged into the request body; metrics() -> {name: value} of /metrics' unlabelled trnrt: series
     ({} where there is no /metrics). Never raises: the verdict says what happened."""
     depths, page = cfg["depths"], cfg["page"]
     res: dict = {"verdict": "NO-RESULT", "why": "", "depths": depths}
     t0 = time.time()
     try:
-        why = refusal(health)
+        why = refusal(stats)
         if why:
             res["why"] = why
             return res
@@ -384,12 +384,13 @@ def http(url: str, body: dict | None, timeout: float) -> bytes:
         return r.read()
 
 
-def make_transport(server: str, api: str, model: str | None, timeout: float, max_tokens: int, session_id: str | None):
-    """(ask, metrics, health) over HTTP for `run`."""
+def make_transport(server: str, api: str, model: str | None, timeout: float, session_id: str | None):
+    """(ask, metrics, stats) over HTTP for `run`. Every request's max_tokens comes from its profile (PROFILES) or the
+    churn's 1."""
     base = server.rstrip("/")
 
     def ask(prompt: str, extra: dict | None = None) -> dict:
-        body: dict = {"max_tokens": max_tokens, "temperature": 0}
+        body: dict = {"temperature": 0}
         if api == "chat":
             body["messages"] = [{"role": "user", "content": prompt}]
             url = base + "/v1/chat/completions"
@@ -434,10 +435,10 @@ def make_transport(server: str, api: str, model: str | None, timeout: float, max
             raise
         return parse_metrics(body.decode())
 
-    def health() -> dict:
-        return json.loads(http(base + "/health", None, 30))
+    def stats() -> dict:
+        return json.loads(http(base + "/v1/stats", None, 30))
 
-    return ask, metrics, health
+    return ask, metrics, stats
 
 
 def main(argv: list[str] | None = None, transport=None) -> int:
@@ -465,9 +466,6 @@ def main(argv: list[str] | None = None, transport=None) -> int:
         "--run-id", default=None, help="opens every document and names the session (default: random), so runs differ"
     )
     ap.add_argument("--model", default=None)
-    ap.add_argument(
-        "--max-tokens", type=int, default=96, help="the base budget; the smoke's profile sets the questions'"
-    )
     ap.add_argument("--smoke-words", type=int, default=1200)
     ap.add_argument("--separate", action="store_true")
     ap.add_argument("--timeout", type=float, default=1800.0, help="seconds per request")
@@ -489,10 +487,11 @@ def main(argv: list[str] | None = None, transport=None) -> int:
     if len(cfg["depths"]) > len(NAMES):
         print(f"at most {len(NAMES)} depths", file=sys.stderr)
         return 2
-    ask, metrics, health = transport or make_transport(
-        a.server, a.api, a.model, a.timeout, a.max_tokens, f"needle-{run_id}"
-    )
-    r = run(ask, metrics, health, cfg)
+    if not all(0.0 <= d <= 1.0 for d in cfg["depths"]):  # a depth is a fraction of the document: the restore needs it
+        print(f"--depths: every depth is a fraction in [0, 1], got {cfg['depths']}", file=sys.stderr)
+        return 2
+    ask, metrics, stats = transport or make_transport(a.server, a.api, a.model, a.timeout, f"needle-{run_id}")
+    r = run(ask, metrics, stats, cfg)
     tier = {
         True: f" restored {r.get('pages_restored')} crossed {r.get('crossed')}",
         False: " host restore not observable",
@@ -502,14 +501,17 @@ def main(argv: list[str] | None = None, transport=None) -> int:
         f"doc_pages {r.get('doc_pages')}{tier} churned {r.get('churned')} | {r['why'][:400]}"
     )
     print(line, flush=True)
-    out = a.out or os.path.dirname(os.path.abspath(a.verdict))
-    os.makedirs(out, exist_ok=True)
-    with open(os.path.join(out, "needle.json"), "w") as f:
-        json.dump(r, f, indent=1)
     tmp = a.verdict + f".tmp.{os.getpid()}"
     with open(tmp, "w") as f:
         f.write(line + "\n")
     os.replace(tmp, a.verdict)  # atomic: a reader sees the old verdict or the new one, never half
+    out = a.out or os.path.dirname(os.path.abspath(a.verdict))
+    try:  # after the verdict, so an --out that cannot be written leaves the verdict in place
+        os.makedirs(out, exist_ok=True)
+        with open(os.path.join(out, "needle.json"), "w") as f:
+            json.dump(r, f, indent=1)
+    except OSError as e:
+        print(f"needle.json not written to {out}: {e}", file=sys.stderr)
     return {"PASS": 0, "FAIL": 1}.get(r["verdict"], 2)
 
 
