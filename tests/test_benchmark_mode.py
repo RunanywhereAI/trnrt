@@ -110,6 +110,7 @@ def test_the_router_takes_the_mode_from_its_workers_stats(caplog):
         router.note_stats(1, _stats(AL))
         router.note_stats(1, _stats(AL))  # warned once per change, not per poll
         assert caplog.text.count("BENCHMARK MODE") == 1
+        assert "trnrt.router: worker http://127.0.0.1:10: " in caplog.text  # the router's own log prefix
         h = c.get("/health")
         assert h.headers[H] == "2.51851" and h.json()["benchmark_mode"]["synthetic_acceptance_length"] == AL
         assert c.get("/v1/models").headers[H] == "2.51851"  # a 503 (no worker answers) says it too

@@ -508,7 +508,7 @@ class Router:
         al = spec.get("synth_al")
         al = float(al) if isinstance(al, (int, float)) else None
         if al is not None and self.synth_al[w] != al:
-            logger.warning("router: worker %s: %s", self.workers[w], benchmark_mode.banner(al))
+            logger.warning("trnrt.router: worker %s: %s", self.workers[w], benchmark_mode.banner(al))
         self.synth_al[w] = al
 
     def health(self) -> dict:
