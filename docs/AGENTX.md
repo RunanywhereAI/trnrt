@@ -76,8 +76,12 @@ draft count of every verify step is drawn from a minimum-variance schedule whose
 accepted drafts a step) is the given value. 2.518506 is the golden
 length for 2 draft tokens. InferenceX's SGLang runs on GPUs set the same thing with `SGLANG_SIMULATE_ACC_LEN`,
 `SGLANG_SIMULATE_ACC_METHOD=match-expected` and `SGLANG_SIMULATE_ACC_TOKEN_MODE=real-draft-token`. That draws one length
-for a whole verify batch, from the two values around the target. This mode draws per request from the same two values,
-so each request sees the same distribution and the same mean.
+for a whole verify batch, from the two values around the target. This mode draws per request and per verify step
+instead (`engine/spec_synth.py`): each request has its own seeded stream, and at each of its verify steps it accepts 1
+or 2 drafts, 2 with probability 0.518506. So every request sees the same two values and the same mean as under SGLang,
+and a verify step emits the same tokens on average, but the rows of one verify batch can accept different numbers of
+drafts where SGLang's take one. It matches InferenceX's acceptance length, not its batch-level draw; whether that
+difference moves throughput has not been measured.
 
 Drafting and verification still run for real, and the step costs what it costs; only which positions count as accepted is
 drawn. An accepted position takes its draft whether or not the target agrees, so the **text of a benchmark-mode run is not
@@ -88,11 +92,15 @@ The mode adds one input to one small graph (the draw's flags), so it needs its o
 A server in the mode says so wherever a client or an operator looks:
 - a warning from `trnrt serve` before the engines start and again when the router serves, and one in each engine's log;
 - a `benchmark_mode` block in `GET /health`, on the engine at once and on the router from its first poll of the engines;
-- the header `x-trnrt-synthetic-acceptance: <length>` on every response;
-- `gauges.spec.synth_al` in each engine's `GET /v1/stats`.
+- the header `x-trnrt-synthetic-acceptance: <length>` on every response of the engine, and on every response of the
+  router from its first poll of the engines;
+- `gauges.spec.synth_al` in each engine's `GET /v1/stats` from its start, and so in the router's, which asks every
+  engine at the moment of the request.
 
-The accuracy tools of [benchmarks/accuracy](../benchmarks/README.md#accuracy) refuse a server in the mode. The AgentX
-client of [benchmarks/agentx](../benchmarks/README.md#running-a-point) checks that a point's server runs that point's mode.
+The accuracy tools of [benchmarks/accuracy](../benchmarks/README.md#accuracy) refuse a server with any engine in the mode,
+read from `/v1/stats`. The clients of [benchmarks/](../benchmarks/README.md#running-a-point) check before a run that a
+point's server is one engine of the point's build, in the point's mode.
+
 
 ## Status
 
