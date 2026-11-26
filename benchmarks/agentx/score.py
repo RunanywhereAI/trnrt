@@ -33,7 +33,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from prices import DEFAULT_PRICES, parse_price, tokens_per_usd_millions  # after the path is set
+from prices import DEFAULT_PRICES, parse_price, positive_int, tokens_per_usd_millions  # after the path is set
 
 
 def percentile(data: list[float], p: float) -> float:
@@ -155,7 +155,7 @@ def score(artifact_dir: Path, chips: int, prices: dict[str, float], label: str |
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0], allow_abbrev=False)
     ap.add_argument("artifact_dir", type=Path)
-    ap.add_argument("--chips", type=int, default=8, help="chips behind the served endpoint (8: one engine)")
+    ap.add_argument("--chips", type=positive_int, default=8, help="chips behind the served endpoint (8: one engine)")
     ap.add_argument("--price", type=parse_price, action="append", default=None, help="NAME=USD_PER_CHIP_HOUR (repeat)")
     ap.add_argument("--label", default=None)
     a = ap.parse_args(argv)

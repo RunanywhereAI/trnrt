@@ -27,5 +27,16 @@ def parse_price(s: str) -> tuple[str, float]:
     return name, p
 
 
+def positive_int(s: str) -> int:
+    """A count such as --chips, for argparse: a positive integer (0 would divide by zero)."""
+    try:
+        n = int(s)
+    except ValueError:
+        n = 0
+    if n <= 0:
+        raise argparse.ArgumentTypeError(f"{s!r}: want a positive integer")
+    return n
+
+
 def tokens_per_usd_millions(tok_s_per_chip: float, prices: dict[str, float], digits: int = 3) -> dict[str, float]:
     return {k: round(tok_s_per_chip * 3600 / p / 1e6, digits) for k, p in prices.items()}

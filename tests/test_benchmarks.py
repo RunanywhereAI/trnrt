@@ -220,6 +220,14 @@ def _stats(*synth_als, missing=None):
     return {"engines": engines, "router": {"workers": [e["url"] for e in engines]}}
 
 
+@pytest.mark.parametrize("chips", ["0", "-8", "x", "2.5"])
+def test_both_scorers_refuse_a_chip_count_that_is_not_a_positive_integer(chips, tmp_path):
+    for scorer, target in ((agentx_score, tmp_path), (fixed_score, tmp_path / "c1.json")):
+        with pytest.raises(SystemExit) as e:
+            scorer.main([str(target), "--chips", chips])
+        assert e.value.code == 2  # argparse's refusal, before anything is read
+
+
 def test_the_acceptance_mode_check_reads_every_engine():
     assert mode.check(_stats(None), "real") is None and mode.check(_stats(GOLDEN), "golden") is None
     assert mode.check(_stats(None, None), "real") is None and mode.check(_stats(GOLDEN, GOLDEN), "golden") is None
