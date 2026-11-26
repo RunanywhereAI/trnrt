@@ -1,8 +1,10 @@
 # Benchmarks
 
 The recipes behind every trn2 number we publish for GLM-5.3-Flash: what was served, how the load was generated, and how a
-run is scored and checked for accuracy. One row of [points.csv](points.csv) is one measurement. Each point is served by a
-build from [builds.csv](builds.csv), and each build's engine arguments are the same for the compile cache and for `serve`.
+run is scored and checked for accuracy. One row of [points.csv](points.csv) is one measurement; its `published` column
+dates the run behind the point's published number, and is empty for the AgentX points at 2, 6, 7 and 12 users, which
+this repository has not measured. Each point is served by a build from [builds.csv](builds.csv), and each build's engine
+arguments are the same for the compile cache and for `serve`.
 
 | Benchmark | Load | Scored with | Points |
 |---|---|---|---|
@@ -19,10 +21,12 @@ cost uses a price per chip-hour, so a point compares directly with an 8-GPU node
 is the deployment form for a whole box. Its numbers are per 16 chips.
 
 InferenceX's rule is one server deployment per concurrency, so start a fresh server for every point. The published AgentX
-points each ran on a fresh server. The published 8K/1K points ran each build's points in ascending concurrency on one
-server: `fixed-off-c1` to `fixed-off-c16` on one `balanced` server, `fixed-off-c32` and `fixed-off-c64` on one `throughput`
-server, and `fixed-on-*` and `fixed-golden-*` on one server each. Their prompts are random, so no point reuses another's
-prefix cache.
+points each ran on a fresh server. **The published 8K/1K points did not follow that rule**: each build's points ran in
+ascending concurrency on one server, the form of our earlier 8K/1K runs. That was `fixed-off-c1` to `fixed-off-c16` on
+one `balanced` server, `fixed-off-c32` and `fixed-off-c64` on one `throughput` server, and `fixed-on-*` and
+`fixed-golden-*` on one server each. Their prompts are random, so no point reuses another's prefix cache, but they have
+not been rerun with a server each. To reproduce them as they ran, start a build's server once and run its points in that
+order; to follow the rule, start one per point.
 
 ## Builds
 
@@ -38,7 +42,8 @@ decoding at a fixed acceptance length, so its AgentX points use that length inst
 verification run for real, but an accepted position emits its draft whether or not the target agrees, so **the text such
 a server returns is not the model's**. The server says so in its log, in `GET /health` (`benchmark_mode`) and in the
 `x-trnrt-synthetic-acceptance` header on every response. The accuracy tools refuse it, and the clients check that a
-point's server runs the point's mode. Accuracy is always measured with real acceptance, on the `latency` build.
+point's server runs the point's mode. Accuracy is always measured with real acceptance, on every build that serves with
+it: `latency`, `balanced` and `throughput` ([Accuracy](#accuracy)).
 
 The mode adds one input to one small graph, so `latency-golden` has a compile cache of its own.
 
@@ -84,8 +89,8 @@ The published points ran this client on the serving host, on CPUs the engine did
 CPUS=40-47 INFX=/src/InferenceX TOKENIZER=/models/GLM-5.3-Flash benchmarks/fixed_seq/client.sh fixed-off-c16 http://127.0.0.1:8000 runs/fixed-off-c16
 ```
 
-Every script takes `--dry-run`, which prints the exact command without running it. `python3 -I benchmarks/points.py list`
-lists the points.
+`serve.sh`, `compile.sh` and the two `client.sh` scripts take `--dry-run`, which prints the exact command without running
+it. `python3 -I benchmarks/points.py list` lists the points.
 
 ## Accuracy
 
