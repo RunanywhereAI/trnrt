@@ -2,14 +2,26 @@
 
 ## Verification status
 
-The published numbers were measured with an earlier build of TrnRT. This repository passes these checks against that
-build ([RESULTS.md](RESULTS.md)):
+This release, checked on one trn2.48xlarge on 24-25 Nov 2026 (release 0.2.0's code with the serve fixes and
+`benchmarks/` that follow it):
 
 | Check | Result |
 |---|---|
-| Graph equivalence (`tools/graph_equiv.py`), all 32 ranks, default batch-12 configuration | EQUAL for all 157 graphs that build compiles |
+| Graph equivalence (`tools/graph_equiv.py`), ranks 0, 8, 16 and 24 | `balanced` and `throughput` EQUAL against the builds behind 0.2.0's 16-32 user numbers (122 and 110 distinct graphs); `latency` EQUAL against the latency build we serve (269). Controls: without the kernel name map, DIFFER on 36 (`balanced`) and 24 (`throughput`) graph pairs; with one planted constant, DIFFER on 72 |
+| Outputs on the device | Greedy output tokens and top-2 logprobs bitwise equal to the served builds' on 72, 144 and 216 requests (`latency`, `balanced`, `throughput`), prompts up to 131,072 tokens, with prefix-cache turns |
+| Accuracy (`benchmarks/accuracy/`) | GSM8K strict match 97.50% (`latency`, real acceptance), 97.42% (`balanced`), 97.57% (`throughput`); the needle check 3/3 on each |
+| Compile from source (`benchmarks/compile.sh`) | 490 graphs, 0 failed, 3 h 55 min; every graph each engine loaded was a hit |
+| The benchmark runs | 6 AgentX hours and 19 8K/1K points on 25 Nov 2026, one engine each ([RESULTS.md](RESULTS.md#against-h100-and-h200-inferencex-agentx-and-8k1k)) |
+| The README's two-engine serve | End to end on CPU; the device run is pending (the benchmark runs served one engine each) |
+
+At release 0.1.0, this repository passed these checks against the earlier build of TrnRT that measured the other numbers
+in [RESULTS.md](RESULTS.md):
+
+| Check | Result |
+|---|---|
+| Graph equivalence (`tools/graph_equiv.py`), all 32 ranks, its default batch-12 configuration | EQUAL for all 157 graphs that build compiles |
 | Outputs on the device | Byte-identical to that build's on 384 of 384 requests |
-| The README's two-engine serve | Passes end to end |
+| The README's two-engine serve | Passed end to end |
 
 ## Prompt processing: a small share of sparse-attention selections are inexact
 
