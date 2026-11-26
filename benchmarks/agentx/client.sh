@@ -12,8 +12,9 @@
 # agentx-harness 1.0.12 command); AGENTX_PYTHON (the Python that agentx-harness is installed in, default python3: the
 # version check); CPUS (optional: taskset -c CPUS for the harness).
 #
-# Before the run it checks the server against the point's build: a point of the latency-golden build needs the benchmark
-# mode at the golden length (the server's /health says so), any other point needs it off.
+# Before the run it checks the server against the point (benchmarks/preflight.py): one engine (the score is per its 8
+# chips), of the point's build, and in its acceptance mode on every engine (the benchmark mode at the golden length for
+# a latency-golden point, real acceptance for any other); a server still starting is waited for.
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -34,9 +35,7 @@ if [ "$dry" = 0 ]; then
   [ ! -e "$out" ] || { echo "$out exists: give each run a new directory" >&2; exit 2; }
   v=$("$AGENTX_PYTHON" -c 'import importlib.metadata as m; print(m.version("agentx-harness"))' 2>/dev/null || echo none)
   [ "$v" = "$WANT_VERSION" ] || { echo "agentx-harness $v installed; the published points used $WANT_VERSION" >&2; exit 2; }
-  health=$(curl -fsS "$url/health") || { echo "$url/health does not answer" >&2; exit 2; }
-  python3 -I "$here/../accuracy/acceptance_mode.py" --expect "$([ "$build" = latency-golden ] && echo golden || echo real)" \
-    --health-json "$health" || exit 2
+  python3 -I "$here/../preflight.py" "$point" "$url" || exit 2
 fi
 
 pin=()
