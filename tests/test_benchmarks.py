@@ -240,18 +240,33 @@ def test_the_acceptance_mode_cli_retries_only_what_it_cannot_read():
 needs_bash = pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
 
 
-def _dry(script: str, *args: str, env: dict[str, str] | None = None) -> str:
+# The scripts' own variables: one exported in the shell that runs the tests would change the commands they print
+SCRIPT_VARS = {"PORT", "IMAGE", "DOCKER_ARGS", "CPUS", "OUT", "CACHE", "NKI", "MODEL", "TOKENIZER", "INFX", "PY", "REV"}
+SCRIPT_VARS |= {"AGENTX", "AGENTX_PYTHON", "VENV", "MAX_MODEL_LEN", "HF_TOKEN"}
+
+
+def _dry(script: str, *args: str, env: dict[str, str] | None = None, cwd: Path | None = None) -> str:
     import os
 
+    base = {k: v for k, v in os.environ.items() if k not in SCRIPT_VARS}
     r = subprocess.run(
         ["bash", str(B / script), "--dry-run", *args],
         capture_output=True,
         text=True,
-        env={**os.environ, "PATH": f"{Path(sys.executable).parent}:{os.environ.get('PATH', '')}", **(env or {})},
+        env={**base, "PATH": f"{Path(sys.executable).parent}:{os.environ.get('PATH', '')}", **(env or {})},
+        cwd=cwd,
         check=False,
     )
     assert r.returncode == 0, r.stderr
     return r.stdout
+
+
+@needs_bash
+def test_an_exported_script_variable_does_not_reach_a_dry_run(monkeypatch):
+    monkeypatch.setenv("PORT", "9999")
+    monkeypatch.setenv("IMAGE", "other")
+    out = _dry("serve.sh", "agentx-c16", env={"CACHE": "/c", "NKI": "/n", "MODEL": "/m"})
+    assert "--port 8000 " in out and " trnrt serve " in out
 
 
 @needs_bash
