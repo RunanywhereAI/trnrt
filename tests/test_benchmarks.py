@@ -347,6 +347,35 @@ def test_serve_dry_run_is_one_engine_of_the_points_build(point):
 
 
 @needs_bash
+def test_serve_refuses_a_checkpoint_recorded_at_another_revision(tmp_path):
+    import os
+
+    rec = tmp_path / ".cache" / "huggingface" / "download"
+    rec.mkdir(parents=True)
+    base = {k: v for k, v in os.environ.items() if k not in SCRIPT_VARS}
+    env = {
+        **base,
+        "CACHE": "/c",
+        "NKI": "/n",
+        "MODEL": str(tmp_path),
+        "PATH": f"{Path(sys.executable).parent}:/usr/bin:/bin",
+    }
+
+    def serve():
+        argv = ["bash", str(B / "serve.sh"), "--dry-run", "agentx-c16"]
+        return subprocess.run(argv, capture_output=True, text=True, env=env, check=False)
+
+    r = serve()  # no download record: served, with a warning
+    assert r.returncode == 0 and "cannot be checked" in r.stderr
+    (rec / "config.json.metadata").write_text("eb9eb208eb0d988989d07a6a12d0fdeb5f52574a\netag\n1.0\n")
+    r = serve()
+    assert r.returncode == 0 and "warning" not in r.stderr
+    (rec / "config.json.metadata").write_text("0123456789abcdef\netag\n1.0\n")
+    r = serve()
+    assert r.returncode == 2 and "revision 0123456789abcdef" in r.stderr and "docker run" not in r.stdout
+
+
+@needs_bash
 def test_compile_dry_run_captures_each_build_then_compiles_once():
     out = _dry("compile.sh", "latency-golden", "throughput", env={"OUT": "/o"})
     caps = [ln for ln in out.splitlines() if " compile capture " in ln]

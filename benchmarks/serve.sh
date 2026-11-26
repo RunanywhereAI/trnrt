@@ -7,8 +7,11 @@
 #
 # Environment: CACHE, NKI (the compile output of benchmarks/compile.sh, copied here); MODEL (the checkpoint at revision
 # eb9eb208eb0d988989d07a6a12d0fdeb5f52574a, docs/DEPLOY.md step 4); IMAGE (default trnrt); PORT (default 8000: the
-# router; the engine is on PORT + 1, on 127.0.0.1); DOCKER_ARGS (optional, extra `docker run` arguments). The other
-# arguments are docs/DEPLOY.md step 4's. The box layout of
+# router; the engine is on PORT + 1, on 127.0.0.1); DOCKER_ARGS (optional, extra `docker run` arguments); REV (default
+# the checkpoint revision the published numbers were measured on). The other arguments are docs/DEPLOY.md step 4's.
+# The compile cache does not depend on the weights, so a checkpoint of another revision would serve without an error:
+# a checkpoint downloaded by `hf download --local-dir` (DEPLOY.md step 4) records the revision it is, and is refused if
+# that is not REV; one without that record is served with a warning that its revision could not be checked. The box layout of
 # two engines (the default of `trnrt serve`) is the deployment form; the published points are per 8 chips.
 set -euo pipefail
 
@@ -21,6 +24,14 @@ args=$(python3 -I "$here/points.py" get "$point" engine_args) || exit 2
 : "${CACHE:?set CACHE to the compile cache directory}" "${NKI:?set NKI to the NKI kernel directory}" "${MODEL:?set MODEL to the checkpoint directory}"
 IMAGE=${IMAGE:-trnrt}
 PORT=${PORT:-8000}
+REV=${REV:-eb9eb208eb0d988989d07a6a12d0fdeb5f52574a}
+meta="$MODEL/.cache/huggingface/download/config.json.metadata"  # huggingface_hub's record: the commit on its first line
+if [ -f "$meta" ]; then
+  got=$(head -n 1 "$meta")
+  [ "$got" = "$REV" ] || { echo "the checkpoint at $MODEL is revision $got; the published numbers used $REV" >&2; exit 2; }
+else
+  echo "warning: $MODEL has no Hugging Face download record, so its revision cannot be checked against $REV" >&2
+fi
 
 # shellcheck disable=SC2206  # the engine arguments and DOCKER_ARGS are words by design
 extra=(${DOCKER_ARGS:-})
