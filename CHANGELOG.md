@@ -7,14 +7,17 @@ and versions follow [Semantic Versioning](https://semver.org/). Rebuild the comp
 
 ### Added
 
-- `benchmarks/`: the recipe behind each published trn2 point, one row per point with the build that serves it. It
-  includes a script to compile each build and one to serve a point on one engine of 8 chips. It also has the AgentX
-  client and scorer (InferenceX's definitions, at SemiAnalysis's rate and at AWS's Capacity Block price), the 8K/1K
-  fixed-length client and scorer (InferenceX's fixed_seq recipe), and GSM8K by InferenceX's own eval plus a needle
-  check. Each script has a `--dry-run`.
+- `benchmarks/`: the recipe behind each published trn2 point, one row per point with the build that serves it and the
+  date of its published run. It includes a script to compile each build and one to serve a point on one engine of 8
+  chips. It also has the AgentX client and scorer (InferenceX's definitions, at SemiAnalysis's rate and at AWS's
+  Capacity Block price), the 8K/1K fixed-length client and scorer (InferenceX's fixed_seq recipe), and GSM8K by
+  InferenceX's own eval plus a needle check. Before a run, the clients check that the server is one engine of the
+  point's build in the point's acceptance mode. The compile, serve and client scripts have a `--dry-run`.
 - The benchmark mode (`--spec-synth-al`) announces itself. `trnrt serve` and the engines warn in their output and logs,
-  `GET /health` carries a `benchmark_mode` block, and every response of the engine and the router carries the header
-  `x-trnrt-synthetic-acceptance`. The accuracy tools refuse a server in the mode.
+  and `GET /health` carries a `benchmark_mode` block (the engine's from its start, a failed engine's 503 included; the
+  router's once its polls have seen an engine in the mode). Every response of the engine, and of the router once it has
+  seen the mode, carries the header `x-trnrt-synthetic-acceptance`. The accuracy tools read every engine's mode from
+  `/v1/stats` and refuse a server with any engine in it.
 
 ### Changed
 
@@ -28,6 +31,8 @@ and versions follow [Semantic Versioning](https://semver.org/). Rebuild the comp
 
 ### Fixed
 
+- `trnrt serve` refuses a `TRNRT_SPEC_SYNTH_AL` that is not a number with a usage error, where it stopped with a
+  traceback, and prints the benchmark-mode banner only once its arguments are accepted.
 - `stop_regex` refuses a pattern whose search could stall the server: one whose time can grow faster than the square
   of the text's length (nested or overlapping repeats, also on either side of a conditional group with no "no"
   branch, a possessive repeat or an atomic group after a repeat that can take its characters, a lookaround that can
