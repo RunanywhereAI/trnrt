@@ -5,7 +5,9 @@
 
 The result file is what a published number cites. It records the point (benchmarks/points.csv) with its build and engine
 arguments, the score that a scorer printed, the versions (benchmarks/versions.sh), the load client's core count, the
-repository commit and the date. Every string is scrubbed before it is written: URLs lose their host, absolute paths
+repository commit and the date. The commit is the served image's (versions.json's image.trnrt_revision); a --commit that
+contradicts it is refused, and without versions it is this checkout's HEAD, refused when the checkout has uncommitted
+changes (the result would cite code that did not run). Every string is scrubbed before it is written: URLs lose their host, absolute paths
 keep only their last component, and IPv4 addresses are replaced, so a result names no machine. The versions are the
 exception to the address rule: versions.sh writes package versions only, and the Neuron runtime's are four-part
 numbers (2.34.10.0) that read as addresses. With
@@ -29,7 +31,8 @@ from points import points  # after the path is set
 _URL = re.compile(r"\b(https?://)[^/\s\"']+([^\s\"']*)")  # the host goes, the URL's path stays
 # not inside a longer dotted number: version strings such as 2.11.0.1.0.1284 keep their digits
 _IPV4 = re.compile(r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?!\w)(?!\.\d)")
-_PATH = re.compile(r"(?<![\w.:/])/(?:[\w.@+-]+/)+([\w.@+-]+)")
+# an absolute path, also after "host:" and with no parent directory ("/tmp"); not inside a word ("tok/s") or a URL
+_PATH = re.compile(r"(?<![\w./])/(?:[\w.@+-]+/)*([\w.@+-]+)")
 
 
 def scrub(x, ips: bool = True):
@@ -61,17 +64,36 @@ def private_hits(text: str) -> list[str]:
     return sorted({label for label, rx, *_ in pats if re.search(rx, text, re.IGNORECASE)})
 
 
-def _commit() -> str | None:
+def _git(*args: str) -> str | None:
     try:
         r = subprocess.run(
-            ["git", "-C", str(Path(__file__).resolve().parent), "rev-parse", "HEAD"],
-            capture_output=True,
-            text=True,
-            check=True,
+            ["git", "-C", str(Path(__file__).resolve().parent), *args], capture_output=True, text=True, check=True
         )
     except (OSError, subprocess.CalledProcessError):
         return None
-    return r.stdout.strip()
+    return r.stdout
+
+
+def head() -> tuple[str | None, bool]:
+    """This checkout's HEAD and whether it has uncommitted changes."""
+    sha, status = _git("rev-parse", "HEAD"), _git("status", "--porcelain")
+    return (sha.strip() if sha else None), bool(status and status.strip())
+
+
+def commit_of(given: str | None, versions: dict | None) -> str | None:
+    """The commit a result cites (module docstring); SystemExit when it cannot be told truthfully."""
+    image = (versions or {}).get("image") or {}
+    served = image.get("trnrt_revision") if isinstance(image, dict) else None
+    if served:
+        if given and not (served.startswith(given) or given.startswith(served)):
+            raise SystemExit(f"--commit {given} contradicts the served image's revision {served} (--versions)")
+        return served
+    if given:
+        return given
+    sha, dirty = head()
+    if dirty:
+        raise SystemExit("this checkout has uncommitted changes: pass --versions (or --commit) to name what was served")
+    return sha
 
 
 def build_record(
@@ -109,18 +131,19 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--score", type=Path, required=True)
     ap.add_argument("--versions", type=Path, default=None)
     ap.add_argument("--client-cpus", type=int, default=None)
-    ap.add_argument("--commit", default=None, help="default: this checkout's HEAD")
+    ap.add_argument(
+        "--commit", default=None, help="default: the served image's revision, else this clean checkout's HEAD"
+    )
     ap.add_argument("--note", default=None)
     ap.add_argument("--out", type=Path, required=True)
     a = ap.parse_args(argv)
-    rec = build_record(
-        a.point,
-        json.loads(a.score.read_text()),
-        json.loads(a.versions.read_text()) if a.versions else None,
-        a.client_cpus,
-        a.commit or _commit(),
-        a.note,
-    )
+    versions = json.loads(a.versions.read_text()) if a.versions else None
+    try:
+        commit = commit_of(a.commit, versions)
+    except SystemExit as e:
+        print(f"refused: {e}", file=sys.stderr)
+        return 2
+    rec = build_record(a.point, json.loads(a.score.read_text()), versions, a.client_cpus, commit, a.note)
     text = json.dumps(rec, indent=1) + "\n"
     hits = private_hits(text)
     if hits:

@@ -559,6 +559,8 @@ def test_a_result_names_no_machine():
             "lnl": "2.11.0.1.0.1284+f49d8626",
             "neuronx_cc": "2.27.5334.0",
             "nested": [{"/data/x/y": "ok"}],
+            "remote": "copied from box:/home/someone/runs/x and /tmp",
+            "units": "P90 tok/s, 1/2 of the requests, 2.27.5334.0",
         }
     )
     assert s["url"] == "http://<server>/v1/chat/completions"
@@ -566,6 +568,8 @@ def test_a_result_names_no_machine():
     assert s["tokenizer_id"] == "<path>/GLM-5.3-Flash"
     assert s["lnl"] == "2.11.0.1.0.1284+f49d8626" and s["neuronx_cc"] == "2.27.5334.0"  # versions keep their digits
     assert s["nested"] == [{"<path>/y": "ok"}]
+    assert s["remote"] == "copied from box:<path>/x and <path>/tmp"  # after a host's colon, and with no parent
+    assert s["units"] == "P90 tok/s, 1/2 of the requests, 2.27.5334.0"  # not paths
 
 
 def test_a_result_keeps_the_neuron_runtime_versions(tmp_path):
@@ -582,11 +586,26 @@ def test_a_result_keeps_the_neuron_runtime_versions(tmp_path):
     score.write_text(json.dumps({"label": "agentx-c16", "requests_per_min": 1.0}))
     (tmp_path / "v.json").write_text(json.dumps(versions))
     out = tmp_path / "result.json"
-    argv = ["--point", "agentx-c16", "--score", str(score), "--versions", str(tmp_path / "v.json"), "--commit", "abc"]
+    argv = ["--point", "agentx-c16", "--score", str(score), "--versions", str(tmp_path / "v.json")]
     assert record.main([*argv, "--note", "client at 10.0.0.7", "--out", str(out)]) == 0
     r = json.loads(out.read_text())
     assert r["versions"] == versions
     assert r["note"] == "client at <ip>"  # everywhere else an address is still scrubbed
+    assert r["commit"] == "704e7b6b"  # the served image's revision, not this checkout's HEAD
+
+
+def test_a_result_cites_the_served_commit_and_refuses_one_it_cannot_tell(monkeypatch):
+    served = {"image": {"trnrt_revision": "704e7b6b4f0db1be"}}
+    assert record.commit_of(None, served) == "704e7b6b4f0db1be"
+    assert record.commit_of("704e7b6b", served) == "704e7b6b4f0db1be"  # a prefix of it agrees
+    with pytest.raises(SystemExit, match="contradicts"):
+        record.commit_of("abc", served)
+    assert record.commit_of("abc", None) == "abc"
+    monkeypatch.setattr(record, "head", lambda: ("1234abcd", False))
+    assert record.commit_of(None, None) == "1234abcd"
+    monkeypatch.setattr(record, "head", lambda: ("1234abcd", True))  # uncommitted changes: not what ran
+    with pytest.raises(SystemExit, match="uncommitted"):
+        record.commit_of(None, None)
 
 
 def test_a_result_that_matches_a_private_pattern_is_refused(tmp_path, monkeypatch):
