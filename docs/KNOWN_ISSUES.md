@@ -2,8 +2,8 @@
 
 ## Verification status
 
-This release, checked on one trn2.48xlarge on 24-25 Nov 2026 (release 0.2.0's code with the serve fixes and
-`benchmarks/` that follow it):
+Checked on one trn2.48xlarge on 24-25 Nov 2026, on release 0.2.0's code plus the serve fixes and `benchmarks/` added
+after it (no traced file has changed since: kernels, models and the graph-building modules pyproject.toml lists):
 
 | Check | Result |
 |---|---|
@@ -11,7 +11,7 @@ This release, checked on one trn2.48xlarge on 24-25 Nov 2026 (release 0.2.0's co
 | Outputs on the device | Greedy output tokens and top-2 logprobs bitwise equal to the served builds' on 72, 144 and 216 requests (`latency`, `balanced`, `throughput`), prompts up to 131,072 tokens, with prefix-cache turns |
 | Accuracy (`benchmarks/accuracy/`) | GSM8K strict match 97.50% (`latency`, real acceptance), 97.42% (`balanced`), 97.57% (`throughput`); the needle check 3/3 on each |
 | Compile from source (`benchmarks/compile.sh`) | 490 graphs, 0 failed, 3 h 55 min; every graph each engine loaded was a hit |
-| The benchmark runs | 6 AgentX hours and 19 8K/1K points on 25 Nov 2026, one engine each ([RESULTS.md](RESULTS.md#against-h100-and-h200-inferencex-agentx-and-8k1k)) |
+| The benchmark runs | 6 AgentX hours and 15 8K/1K points on 25 Nov 2026, one engine each ([RESULTS.md](RESULTS.md#against-h100-and-h200-inferencex-agentx-and-8k1k)) |
 | The README's two-engine serve | End to end on CPU; the device run is pending (the benchmark runs served one engine each) |
 
 At release 0.1.0, this repository passed these checks against the earlier build of TrnRT that measured the other numbers
