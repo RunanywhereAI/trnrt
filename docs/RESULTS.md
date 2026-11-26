@@ -213,14 +213,25 @@ NeuronCores at LNC 2) against one 8-GPU node (H200: p5e.48xlarge; H100: p5.48xla
 FP8 weights on every system, scored with InferenceX's definitions. All three are priced on one purchase type, AWS EC2
 Capacity Blocks, from AWS's public price list read on 24 Nov 2026: trn2.48xlarge $2.235 per chip-hour ($35.76 per
 instance-hour), p5.48xlarge $5.970 and p5e.48xlarge $6.866 per GPU-hour. trn2.48xlarge has no on-demand price in any US
-region. trn2 ran on Neuron SDK 2.32 (neuronx-cc 2.27), the SDK `docker/Dockerfile` pins.
+region.
 
-- **AgentX:** at the concurrencies both measured, trn2 delivers 1.61-1.75× H200's total tokens per $ at 1-8 users (with
-  MTP at InferenceX's golden acceptance, 2.519, not trn2's measured 2.20), 1.34× at 12, 1.07× at 16, 0.86× at 24 and
-  0.81× at 32. Each trn2 user is slower: P90 interactivity is 10.7-62.2 tok/s per user on trn2 against 50.1-272 on H200,
-  and where the two ranges overlap (50-62 tok/s), H200 delivers more tokens per $.
-- **8K/1K, MTP off on every system:** at the concurrencies both measured (1-32 users), trn2 delivers 0.56-0.76× H200's
-  tokens per $. This recipe has no prefix reuse.
+**Every trn2 number in this section was measured on 25 Nov 2026 from this repository's source** (release 0.2.0 plus the
+serve fixes and [benchmarks/](../benchmarks/README.md) that follow it), with the recipe in `benchmarks/`:
+- the image built from `docker/Dockerfile`: Neuron SDK 2.32 (neuronx-cc 2.27.5334, libtorch-neuronx-lite 2.11.0.1.0.1284, the
+  Neuron runtime 2.34.10);
+- the compile cache built from source with `benchmarks/compile.sh` (3 h 55 min on one trn2.48xlarge). Every graph each
+  engine loaded was a hit in it;
+- one engine per point, started by `benchmarks/serve.sh`;
+- the load from `benchmarks/agentx/client.sh` and `benchmarks/fixed_seq/client.sh`.
+
+Each row names the build that measured it ([builds](../benchmarks/README.md#builds)).
+
+- **AgentX:** at the concurrencies both measured, trn2 delivers 1.63-1.89× H200's total tokens per $ at 1-8 users (with
+  MTP at InferenceX's golden acceptance, 2.519, not trn2's measured 2.20), 1.09× at 16, 0.87× at 24 and 0.81× at 32. Each
+  trn2 user is slower: P90 interactivity is 10.7-66.3 tok/s per user on trn2 against 50.1-272 on H200, and where the two
+  ranges overlap (50-66 tok/s), H200 delivers more tokens per $.
+- **8K/1K, MTP off on every system:** trn2 delivers 0.89-1.00× H200's tokens per $ at 1-8 users, 0.82× at 16, 0.64× at
+  32 and 0.52× at 64. This recipe has no prefix reuse.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/results-agentx-users-dark.png">
@@ -241,72 +252,81 @@ region. trn2 ran on Neuron SDK 2.32 (neuronx-cc 2.27), the SDK `docker/Dockerfil
 
 | Users | trn2 build | P90 tok/s per user: trn2 / H200 / H100 | Total tokens per $ (millions): trn2 / H200 / H100 | trn2 ÷ H200 | trn2 ÷ H100 |
 |---|---|---|---|---|---|
-| 1 | MTP, golden acceptance, by 13 Nov | 62.2 / 272 / 243 | 1.97 / 1.20 / 1.30 | 1.64× | 1.52× |
-| 2 | MTP, golden acceptance, by 13 Nov | 35.6 / 242 / 214 | 2.12 / 1.28 / 1.43 | 1.65× | 1.48× |
-| 4 | MTP, golden acceptance, by 13 Nov | 41.8 / 235 / 187 | 3.33 / 1.90 / 1.92 | 1.75× | 1.74× |
-| 6 | MTP, golden acceptance, by 13 Nov | 34.4 / – / 163 | 4.11 / – / 2.19 | – | 1.87× |
-| 7 | MTP, golden acceptance, by 13 Nov | 30.1 / – / – | 5.00 / – / – | – | – |
-| 8 | MTP, golden acceptance, by 13 Nov | 25.8 / 168 / 123 | 5.39 / 3.34 / 2.69 | 1.61× | 2.01× |
-| 12 | no MTP, by 13 Nov | 17.1 / 138 / 25.3 | 5.50 / 4.12 / 1.56 | 1.34× | 3.53× |
-| 16 | no MTP, 24 Nov | 14.2 / 87.8 / 25.3 | 6.10 / 5.69 / 1.60 | 1.07× | 3.82× |
-| 24 | no MTP, 24 Nov | 11.4 / 78.7 / 18.3 | 8.10 / 9.38 / 1.57 | 0.86× | 5.16× |
-| 32 | no MTP, 24 Nov | 10.7 / 50.1 / 14.6 | 8.01 / 9.87 / 1.62 | 0.81× | 4.95× |
+| 1 | `latency-golden` | 66.3 / 272 / 243 | 2.08 / 1.20 / 1.30 | 1.73× | 1.60× |
+| 4 | `latency-golden` | 51.3 / 235 / 187 | 3.60 / 1.90 / 1.92 | 1.89× | 1.88× |
+| 8 | `latency-golden` | 27.6 / 168 / 123 | 5.43 / 3.34 / 2.69 | 1.63× | 2.02× |
+| 16 | `balanced` | 14.2 / 87.8 / 25.3 | 6.21 / 5.69 / 1.60 | 1.09× | 3.89× |
+| 24 | `throughput` | 11.5 / 78.7 / 18.3 | 8.13 / 9.38 / 1.57 | 0.87× | 5.17× |
+| 32 | `throughput` | 10.7 / 50.1 / 14.6 | 8.01 / 9.87 / 1.62 | 0.81× | 4.95× |
 
-*trn2 ÷ GPU compares tokens per $ at the same concurrency. "Golden acceptance": MTP speculation (k = 2) at InferenceX's
-reference acceptance length, 2.519 (`--spec-synth-al`); trn2's real acceptance on SPEED-Bench coding is 2.20, 0.87 of it.
-H200 runs EAGLE (k = 5) at InferenceX's golden acceptance length, 3.60.*
+*trn2 ÷ GPU compares tokens per $ at the same concurrency. `latency-golden`: MTP speculation (k = 2) at InferenceX's
+reference acceptance length, 2.519 (the benchmark mode, `--spec-synth-al`); trn2's real acceptance on SPEED-Bench coding
+is 2.20, 0.87 of it. H200 runs EAGLE (k = 5) at InferenceX's golden acceptance length, 3.60. trn2 was not measured at 2,
+6, 7 or 12 users on this repository.*
 
 ### 8K/1K fixed-length, MTP off on every system
 
-| Users | P90 tok/s per user: trn2 / H200 / H100 | Total tokens per $ (millions): trn2 / H200 / H100 | trn2 ÷ H200 | trn2 ÷ H100 |
-|---|---|---|---|---|
-| 1 | 26.8 / 138 / 133 | 0.047 / 0.077 / 0.086 | 0.61× | 0.54× |
-| 2 | – / 123 / 116 | – / 0.140 / 0.153 | – | – |
-| 4 | 23.7 / 105 / 97.5 | 0.164 / 0.238 / 0.255 | 0.69× | 0.64× |
-| 8 | 20.1 / 85.6 / 78.2 | 0.286 / 0.392 / 0.372 | 0.73× | 0.77× |
-| 16 | 16.1 / 65.2 / 59.7 | 0.460 / 0.604 / 0.637 | 0.76× | 0.72× |
-| 32 | 11.3 / 46.1 / 42.3 | 0.498 / 0.883 / 0.926 | 0.56× | 0.54× |
-| 64 | – / 22.1 / 25.7 | – / 1.10 / 1.22 | – | – |
-| 128 | – / 15.8 / – | – / 1.40 / – | – | – |
+| Users | trn2 build | P90 tok/s per user: trn2 / H200 / H100 | Total tokens per $ (millions): trn2 / H200 / H100 | trn2 ÷ H200 | trn2 ÷ H100 |
+|---|---|---|---|---|---|
+| 1 | `balanced` | 39.9 / 138 / 133 | 0.069 / 0.077 / 0.086 | 0.89× | 0.80× |
+| 2 | `balanced` | 37.1 / 123 / 116 | 0.129 / 0.140 / 0.153 | 0.92× | 0.84× |
+| 4 | `balanced` | 33.5 / 105 / 97.5 | 0.233 / 0.238 / 0.255 | 0.98× | 0.91× |
+| 8 | `balanced` | 27.6 / 85.6 / 78.2 | 0.393 / 0.392 / 0.372 | 1.00× | 1.06× |
+| 16 | `balanced` | 17.2 / 65.2 / 59.7 | 0.497 / 0.604 / 0.637 | 0.82× | 0.78× |
+| 32 | `throughput` | 12.8 / 46.1 / 42.3 | 0.563 / 0.883 / 0.926 | 0.64× | 0.61× |
+| 64 | `throughput` | 13.0 / 22.1 / 25.7 | 0.574 / 1.10 / 1.22 | 0.52× | 0.47× |
+| 128 | – | – / 15.8 / – | – / 1.40 / – | – | – |
 
 ### 8K/1K fixed-length, MTP on
 
-Not like-for-like: trn2 uses its real acceptance (about 2.2 accepted tokens per step), the GPUs a synthetic acceptance
-length of 3.6.
+The GPU runs use synthetic acceptance at length 3.6 (k = 5). trn2's comparable build is `latency-golden`, synthetic
+acceptance at InferenceX's golden length for its k = 2, 2.519. The lengths differ because k differs.
 
-| Users | P90 tok/s per user: trn2 / H200 / H100 | Total tokens per $ (millions): trn2 / H200 / H100 | trn2 ÷ H200 | trn2 ÷ H100 |
-|---|---|---|---|---|
-| 1 | 94.6 / 313 / 286 | 0.161 / 0.168 / 0.179 | 0.95× | 0.90× |
-| 2 | – / 258 / 227 | – / 0.283 / 0.293 | – | – |
-| 4 | 43.4 / 198 / 176 | 0.306 / 0.434 / 0.451 | 0.71× | 0.68× |
-| 8 | 20.0 / 136 / 126 | 0.285 / 0.527 / 0.553 | 0.54× | 0.52× |
-| 16 | 15.8 / 97.8 / 90.3 | 0.458 / 0.884 / 0.927 | 0.52× | 0.49× |
-| 32 | 11.1 / 56.7 / 50.9 | 0.490 / 1.05 / 1.10 | 0.47× | 0.44× |
-| 64 ‡ | – / 45.8 / 43.0 | – / 1.30 / 1.41 | – | – |
-| 128 ‡ | – / 46.6 / – | – / 1.33 / – | – | – |
+| Users | trn2 build | P90 tok/s per user: trn2 / H200 / H100 | Total tokens per $ (millions): trn2 / H200 / H100 | trn2 ÷ H200 | trn2 ÷ H100 |
+|---|---|---|---|---|---|
+| 1 | `latency-golden` | 125.7 / 313 / 286 | 0.195 / 0.168 / 0.179 | 1.16× | 1.09× |
+| 2 | `latency-golden` | 80.6 / 258 / 227 | 0.275 / 0.283 / 0.293 | 0.97× | 0.94× |
+| 4 | `latency-golden` | 53.0 / 198 / 176 | 0.366 / 0.434 / 0.451 | 0.84× | 0.81× |
+| 8 | `latency-golden` | 30.4 / 136 / 126 | 0.435 / 0.527 / 0.553 | 0.83× | 0.79× |
+| 16 | – | – / 97.8 / 90.3 | – / 0.884 / 0.927 | – | – |
+| 32 | – | – / 56.7 / 50.9 | – / 1.05 / 1.10 | – | – |
+| 64 ‡ | – | – / 45.8 / 43.0 | – / 1.30 / 1.41 | – | – |
+| 128 ‡ | – | – / 46.6 / – | – / 1.33 / – | – | – |
 
 *‡: a GPU point capped at 48 running requests, so the requests above 48 queue.*
+
+With trn2's real acceptance (the `latency` build; about 2.2 accepted tokens per step), the same points give:
+- 1 user: 0.169M tok/$ (1.01× H200), P90 101.4;
+- 2 users: 0.223M (0.79×), P90 64.9;
+- 4 users: 0.333M (0.77×), P90 48.3;
+- 8 users: 0.403M (0.77×), P90 27.8.
 
 ### How these were measured
 
 - **Metric:** total tokens per $ = tokens per second per accelerator × 3,600 ÷ price per accelerator-hour. P90
-  interactivity = 1000 ÷ the P90 time per output token in milliseconds, as InferenceX scores it. For AgentX that time
-  is end to end, so it includes the wait for the first token (the per-user measure under Methodology below).
-- **trn2, AgentX:** InferenceX AgentX harness 1.0.12, canonical workload, one hour per point. 1-8 users: an MTP build at
-  golden acceptance, measured by 13 Nov 2026; 12 users: a build without MTP from the same period; 16, 24 and 32 users:
-  the production builds, measured on 24 Nov 2026. Accuracy: GSM8K 97.42-97.65% on the MTP builds (strict exact match,
-  5-shot, all 1,319 problems, as under [MTP speculative decoding](#mtp-speculative-decoding-one-engine)); the host-tier
-  restore passed a needle test.
+  interactivity = 1000 ÷ the P90 time per output token in milliseconds, as InferenceX scores it. For AgentX that time is
+  end to end, so it includes the wait for the first token.
+- **trn2, AgentX:** agentx-harness 1.0.12 (installed with `benchmarks/agentx/constraints.txt`), the canonical workload,
+  one hour per point. The harness ran on a separate CPU machine (a c7i.48xlarge), pinned to 48 logical CPUs (24 cores).
+  One engine on half the box, with the other half idle and a fresh server per point.
+- **trn2, 8K/1K:** InferenceX's fixed-sequence recipe at commit 47cdc9d0 (`benchmarks/fixed_seq/client.sh`): input 8,192
+  and output 1,024 tokens, range ratio 0.8, 10 × concurrency prompts, the client on the serving host's spare CPUs. One
+  run per concurrency; each build's points ran in order on one server.
+- **Accuracy of the measured builds** (`benchmarks/accuracy/`, the same image and compile cache), GSM8K strict match
+  (5-shot, 1,319 problems, InferenceX's eval):
+  - `latency` (MTP, real acceptance): 97.50%;
+  - `balanced`: 97.42%;
+  - `throughput`: 97.57%;
+  - each passed the needle check.
+
+  `latency-golden` returns text that is not the model's (its drafts are not verified), so it has no accuracy score;
+  `latency` is the same build with real acceptance.
 - **H200, AgentX:** InferenceX PR #4719, sweep run 42052004518 (2-32 users) and run 41968542163 (1 user).
-- **H100, AgentX:** InferenceX PR #4717, run 42026135483 (1-10 users, with HiCache) and run 41310662894 (12-32 users,
-  the only H100 MTP points past 10 users; prefix-cache hit 7-13% there). Both runs use MTP speculation as that PR
-  configures it, at InferenceX's golden acceptance length.
-- **8K/1K:** InferenceX's fixed-sequence recipe: input 8,192 and output 1,024 tokens, range ratio 0.8, 10 × concurrency
-  prompts. trn2: measured on 10 Nov 2026, one run per concurrency. GPUs: the sweeps of InferenceX PRs #4926 and #4927
-  (MTP off) and #4913 and #4914 (MTP on).
-- **Builds:** trn2's numbers come from TrnRT's internal builds on the dates above, the builds this release's builds are
-  graph-equivalent to; they are not a run of release 0.2.0's own commit. GPU numbers are from InferenceX's public runs;
-  this page reports no accuracy score for them, and we did not check them.
+- **H100, AgentX:** InferenceX PR #4717, run 42026135483 (1-10 users, with HiCache) and run 41310662894 (12-32 users, the
+  only H100 MTP points past 10 users; prefix-cache hit 7-13% there). Both runs use MTP speculation as that PR configures
+  it, at InferenceX's golden acceptance length.
+- **GPUs, 8K/1K:** the sweeps of InferenceX PRs #4926 and #4927 (MTP off) and #4913 and #4914 (MTP on).
+- GPU numbers are from InferenceX's public runs. This page reports no accuracy score for them, and we did not check them.
 
 ## Methodology
 
