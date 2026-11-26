@@ -40,9 +40,10 @@ order; to follow the rule, start one per point.
 `latency-golden` is the benchmark mode ([AGENTX.md](../docs/AGENTX.md#benchmark-mode)). InferenceX scores speculative
 decoding at a fixed acceptance length, so its AgentX points use that length instead of the draft head's. Drafting and
 verification run for real, but an accepted position emits its draft whether or not the target agrees, so **the text such
-a server returns is not the model's**. The server says so in its log, in `GET /health` (`benchmark_mode`) and in the
-`x-trnrt-synthetic-acceptance` header on every response. The accuracy tools refuse it, and the clients check that a
-point's server runs the point's mode. Accuracy is always measured with real acceptance, on every build that serves with
+a server returns is not the model's**. The server says so in its log, in `GET /health` (`benchmark_mode`), in each
+engine's `GET /v1/stats` and in the `x-trnrt-synthetic-acceptance` header on every response (the router's once its polls
+have seen the mode). The accuracy tools refuse it, and the clients check before a run that a point's server is one
+engine of the point's build, in the point's mode ([preflight.py](preflight.py)). Accuracy is always measured with real acceptance, on every build that serves with
 it: `latency`, `balanced` and `throughput` ([Accuracy](#accuracy)).
 
 The mode adds one input to one small graph, so `latency-golden` has a compile cache of its own.
