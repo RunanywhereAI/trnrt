@@ -14,11 +14,13 @@
 # Refuses a server in the benchmark mode (synthetic acceptance): its drafts are not verified, so its answers are not the
 # model's. Speculative builds are checked with real acceptance, the only mode a quality number may come from.
 # Pass bar used for this repository's builds: strict match >= 94% (H100 with MTP scores 97.42% on the same eval).
+# Exit status 0: strict match at or above the bar; 1: below it, or no result from lm-eval; 2: refused before the run.
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
 [ $# -ge 2 ] || { echo "usage: $0 URL OUT_DIR [CONCURRENCY]" >&2; exit 2; }
 url=${1%/} out=$2 c=${3:-32}
+out=$(python3 -I -c 'import os, sys; print(os.path.abspath(sys.argv[1]))' "$out")  # lm-eval runs from $here, below
 VENV=${VENV:-$HOME/.venvs/trnrt-lm-eval}
 ctx=${MAX_MODEL_LEN:-1048576}
 mt=$(( ctx > 4096 ? ctx - 4096 : ctx / 2 ))
@@ -39,7 +41,14 @@ echo "GSM8K: $url, model $model, concurrency $c, context $ctx, max output tokens
 "$VENV/bin/python" - "$out" <<'PY'
 import glob, json, sys
 fs = sorted(glob.glob(f"{sys.argv[1]}/**/results*.json", recursive=True))
+if not fs:
+    sys.exit(f"GSM8K: no lm-eval results under {sys.argv[1]} (see lm_eval.log there)")
 r = json.load(open(fs[-1]))["results"]["gsm8k"]
 strict, flexible = r.get("exact_match,strict-match"), r.get("exact_match,flexible-extract")
-print(f"GSM8K strict-match {strict:.4f} flexible-extract {flexible:.4f} ({'PASS' if strict >= 0.94 else 'FAIL'} at 0.94) {fs[-1]}")
+if not isinstance(strict, (int, float)):
+    sys.exit(f"GSM8K: no strict-match score in {fs[-1]}")
+ok = strict >= 0.94
+flex = f"{flexible:.4f}" if isinstance(flexible, (int, float)) else "n/a"
+print(f"GSM8K strict-match {strict:.4f} flexible-extract {flex} ({'PASS' if ok else 'FAIL'} at 0.94) {fs[-1]}")
+sys.exit(0 if ok else 1)
 PY

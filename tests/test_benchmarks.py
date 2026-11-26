@@ -6,6 +6,7 @@ prints the exact command a run would execute. Nothing here starts a server or a 
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import json
 import shutil
@@ -355,6 +356,83 @@ def test_a_client_refuses_a_point_of_the_other_benchmark():
         check=False,
     )
     assert r.returncode == 2 and "not an AgentX point" in r.stderr
+
+
+@contextlib.contextmanager
+def _server(routes: dict[str, object]):
+    """A local HTTP server answering GET path -> JSON body, for the scripts that query a server before their run."""
+    import http.server
+    import threading
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = routes.get(self.path)
+            self.send_response(404 if body is None else 200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            if body is not None:
+                self.wfile.write(json.dumps(body).encode())
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    try:
+        yield f"http://127.0.0.1:{srv.server_address[1]}"
+    finally:
+        srv.shutdown()
+
+
+FAKE_LM_EVAL = """#!/usr/bin/env bash
+# lm-eval's stand-in: writes a results file under --output_path, resolved against the current directory as lm-eval does
+if [ "$1" = "-m" ]; then
+  while [ $# -gt 0 ]; do [ "$1" = "--output_path" ] && out=$2; shift; done
+  mkdir -p "$out/glm"
+  printf '{"results": {"gsm8k": {"exact_match,strict-match": %s, "exact_match,flexible-extract": %s}}}' \\
+    "$FAKE_STRICT" "$FAKE_STRICT" > "$out/glm/results_1.json"
+  exit 0
+fi
+exec python3 "$@"
+"""
+
+
+@needs_bash
+@pytest.mark.skipif(shutil.which("curl") is None, reason="needs curl")
+def test_gsm8k_takes_a_relative_out_dir_and_exits_by_the_bar(tmp_path):
+    import os
+
+    venv = tmp_path / "venv"
+    (venv / "bin").mkdir(parents=True)
+    (venv / "bin" / "python").write_text(FAKE_LM_EVAL)
+    (venv / "bin" / "python").chmod(0o755)
+    base = {k: v for k, v in os.environ.items() if k not in SCRIPT_VARS}
+    env = {**base, "VENV": str(venv), "PATH": f"{Path(sys.executable).parent}:{os.environ.get('PATH', '')}"}
+    routes = {"/v1/stats": {"gauges": {"kv_pages_used": 0}}, "/v1/models": {"data": [{"id": "glm"}]}}
+    with _server(routes) as url:
+        for run, strict, rc, word in (("runs/pass", "0.97", 0, "PASS"), ("runs/fail", "0.90", 1, "FAIL")):
+            r = subprocess.run(
+                ["bash", str(B / "accuracy" / "gsm8k.sh"), url, run, "4"],
+                capture_output=True,
+                text=True,
+                env={**env, "FAKE_STRICT": strict},
+                cwd=tmp_path,
+                check=False,
+            )
+            assert r.returncode == rc, r.stdout + r.stderr
+            assert f"({word} at 0.94)" in r.stdout and (tmp_path / run / "glm" / "results_1.json").exists()
+        # a server in the benchmark mode is refused before lm-eval runs
+        routes["/v1/stats"] = {"gauges": {"spec": _spec(GOLDEN)}}
+        r = subprocess.run(
+            ["bash", str(B / "accuracy" / "gsm8k.sh"), url, "runs/refused", "4"],
+            capture_output=True,
+            text=True,
+            env={**env, "FAKE_STRICT": "0.97"},
+            cwd=tmp_path,
+            check=False,
+        )
+        assert r.returncode == 2 and "benchmark mode" in r.stderr and not (tmp_path / "runs" / "refused").exists()
 
 
 preflight = _load("bench_preflight", B / "preflight.py")
