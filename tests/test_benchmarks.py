@@ -328,6 +328,64 @@ def test_a_client_refuses_a_point_of_the_other_benchmark():
     assert r.returncode == 2 and "not an AgentX point" in r.stderr
 
 
+preflight = _load("bench_preflight", B / "preflight.py")
+
+
+def _info(build, **over):
+    """/server_info of one engine of `build`, as serve/native.py shapes it (the fields the preflight reads)."""
+    e = preflight.expected(points.builds()[build]["engine_args"])
+    return {"dp_size": 1, "tp_size": 32, "preset": e["preset"], "spec_synth_al": e["spec_synth_al"], **over}
+
+
+@pytest.mark.parametrize("build", list(points.builds()))
+def test_the_preflight_accepts_one_engine_of_each_build_and_refuses_the_others(build):
+    args = points.builds()[build]["engine_args"]
+    assert preflight.mismatch(_info(build), args) is None
+    for other in points.builds():
+        if other != build:
+            assert preflight.mismatch(_info(other), args) is not None, (build, other)
+    assert "2 engines" in preflight.mismatch(_info(build, dp_size=2), args)  # trnrt serve's default: two engines
+    assert "tp_size" in preflight.mismatch(_info(build, tp_size=64), args)
+    assert preflight.mismatch(None, args) is not None
+
+
+def test_the_preflight_waits_for_a_starting_server_then_reads_every_engines_mode():
+    calls, naps = [], []
+    golden = _info("latency-golden")
+
+    def get(url, path):
+        calls.append(path)
+        if len(calls) == 1:
+            raise OSError("connection refused")  # still starting
+        return golden if path == "/server_info" else _stats(GOLDEN)
+
+    assert preflight.main(["agentx-c4", "http://h:8000"], get=get, sleep=naps.append) == 0
+    assert calls == ["/server_info", "/server_info", "/v1/stats"] and len(naps) == 1
+    calls.clear()
+    # the right configuration but an engine on real acceptance (/v1/stats asks every engine): refused
+    assert preflight.main(
+        ["agentx-c4", "http://h:8000"], get=lambda u, p: golden if p == "/server_info" else _stats(None)
+    )
+    # the wrong build: refused at once, without waiting or reading the mode
+    seen = []
+
+    def wrong(url, path):
+        seen.append(path)
+        return _info("balanced")
+
+    assert preflight.main(["agentx-c4", "http://h:8000"], get=wrong, sleep=naps.append) == 2 and seen == [
+        "/server_info"
+    ]
+    assert preflight.main(["no-such-point", "http://h:8000"], get=wrong) == 2
+
+
+def test_the_preflight_refuses_a_server_that_never_answers():
+    def down(url, path):
+        raise OSError("connection refused")
+
+    assert preflight.main(["agentx-c16", "http://h:8000", "--wait", "0"], get=down) == 2
+
+
 record = _load("bench_record", B / "record.py")
 
 
