@@ -68,6 +68,18 @@ def test_a_point_or_build_named_twice_is_refused(tmp_path, monkeypatch):
         points.builds()
 
 
+def test_each_builds_decode_batches_are_its_presets():
+    from trnrt.__main__ import PRESETS, parse_engine_args
+
+    for name, b in points.builds().items():
+        buckets = PRESETS[parse_engine_args(["--model", "/m", *b["engine_args"].split()]).preset]["decode_buckets"]
+        cell = b["decode_batches"]
+        if cell.startswith("up to "):
+            assert int(cell.removeprefix("up to ")) == max(buckets), name
+        else:
+            assert tuple(int(x) for x in cell.split(",")) == tuple(buckets), name
+
+
 def test_the_agentx_points_follow_the_builds_bands():
     """AgentX points at 1-8 users run the latency build at the golden length (InferenceX scores speculative decoding at a
     fixed acceptance length), 9-16 the balanced build, 17 and up the throughput build: --preset auto's bands."""
