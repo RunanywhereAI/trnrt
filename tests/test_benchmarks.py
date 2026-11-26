@@ -270,6 +270,20 @@ def test_an_exported_script_variable_does_not_reach_a_dry_run(monkeypatch):
 
 
 @needs_bash
+def test_the_fixed_length_client_resolves_a_relative_tokenizer_before_it_changes_directory(tmp_path):
+    (tmp_path / "tok").mkdir()
+    out = _dry(
+        "fixed_seq/client.sh",
+        "fixed-off-c1",
+        "http://h:8000",
+        "/nonexistent/out",
+        env={"TOKENIZER": "tok", "INFX": "/i"},
+        cwd=tmp_path,
+    )
+    assert f"--tokenizer {tmp_path.resolve()}/tok" in out
+
+
+@needs_bash
 @pytest.mark.parametrize("point", list(points.points()))
 def test_serve_dry_run_is_one_engine_of_the_points_build(point):
     out = _dry("serve.sh", point, env={"CACHE": "/c", "NKI": "/n", "MODEL": "/m"})

@@ -14,7 +14,8 @@
 # for the speculative points' chat template); TOKENIZER (the
 # model's tokenizer files at revision eb9eb208eb0d988989d07a6a12d0fdeb5f52574a); CPUS (optional taskset -c CPUS).
 # URL: the router of benchmarks/serve.sh. The published points ran the client on the serving host over localhost, on
-# CPUs the engine did not use.
+# CPUs the engine did not use. Before the run it checks the server against the point (benchmarks/preflight.py): one
+# engine of the point's build, in its acceptance mode on every engine; a server still starting is waited for.
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -36,11 +37,13 @@ if [ "$dry" = 0 ]; then
   [ ! -e "$out" ] || { echo "$out exists: give each run a new directory" >&2; exit 2; }
   got=$(git -C "$INFX" rev-parse HEAD 2>/dev/null || echo none)
   [ "$got" = "$WANT_COMMIT" ] || { echo "InferenceX at $got; the published points used $WANT_COMMIT" >&2; exit 2; }
-  python3 -I "$here/../accuracy/acceptance_mode.py" --expect "$([ "$build" = latency-golden ] && echo golden || echo real)" \
-    --url "$url" || exit 2
+  python3 -I "$here/../preflight.py" "$point" "$url" || exit 2
   mkdir -p "$out"
   out=$(cd "$out" && pwd)  # absolute: the client runs from the InferenceX checkout
 fi
+# A tokenizer directory or a Python given by a relative path is resolved here, before the client changes directory
+if [ -d "$TOKENIZER" ]; then TOKENIZER=$(cd "$TOKENIZER" && pwd); fi
+if [[ "$PY" == */* && -e "$PY" ]]; then PY="$(cd "$(dirname "$PY")" && pwd)/$(basename "$PY")"; fi
 
 pin=()
 [ -z "${CPUS:-}" ] || pin=(taskset -c "$CPUS")
