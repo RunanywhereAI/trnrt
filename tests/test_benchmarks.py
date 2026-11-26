@@ -80,6 +80,13 @@ def test_each_builds_decode_batches_are_its_presets():
             assert tuple(int(x) for x in cell.split(",")) == tuple(buckets), name
 
 
+def test_only_the_points_with_a_published_number_carry_a_date():
+    unpublished = {n for n, p in points.points().items() if not p["published"]}
+    # AgentX at 2, 6, 7 and 12 users: defined by the recipe, not measured on this repository (docs/RESULTS.md)
+    assert unpublished == {"agentx-c2", "agentx-c6", "agentx-c7", "agentx-c12"}
+    assert {p["published"] for p in points.points().values()} == {"", "2026-11-25"}
+
+
 def test_the_agentx_points_follow_the_builds_bands():
     """AgentX points at 1-8 users run the latency build at the golden length (InferenceX scores speculative decoding at a
     fixed acceptance length), 9-16 the balanced build, 17 and up the throughput build: --preset auto's bands."""

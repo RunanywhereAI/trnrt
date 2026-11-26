@@ -1,12 +1,14 @@
 """The benchmark points (points.csv) and the builds that serve them (builds.csv).
 
-    python3 -I benchmarks/points.py list                 # every point: benchmark, concurrency, build, engine arguments
+    python3 -I benchmarks/points.py list                 # every point: benchmark, concurrency, build, engine arguments,
+                                                         # and when its published number was measured
     python3 -I benchmarks/points.py get POINT FIELD      # one field of a point; FIELD may be a build field
     python3 -I benchmarks/points.py build-args BUILD     # the engine arguments of a build
 
 A point is one measurement: one benchmark at one concurrency on one engine of 8 chips (half a trn2.48xlarge, the other
 half idle), served by one build. The build is the engine arguments, the same for `trnrt compile capture` and for `trnrt
-serve`, so a point's compile cache is its build's.
+serve`, so a point's compile cache is its build's. `published` is the date of the run behind the point's published
+number (docs/RESULTS.md), empty for a point the recipe defines that has not been measured on this repository.
 """
 
 from __future__ import annotations
@@ -50,7 +52,8 @@ def points() -> dict[str, dict[str, str]]:
 def main(argv: list[str]) -> int:
     if argv[:1] == ["list"]:
         for name, p in points().items():
-            print(f"{name}\t{p['benchmark']}\tC {p['concurrency']}\t{p['build']}\t{p['engine_args']}")
+            when = f"published {p['published']}" if p["published"] else "not measured on this repository"
+            print(f"{name}\t{p['benchmark']}\tC {p['concurrency']}\t{p['build']}\t{p['engine_args']}\t{when}")
         return 0
     if len(argv) == 3 and argv[0] == "get":
         p = points().get(argv[1])
