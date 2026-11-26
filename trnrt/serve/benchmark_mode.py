@@ -7,10 +7,13 @@ client or an operator looks:
 
 - a WARNING when the engine's app starts and when the router first sees an engine in the mode, and a status line from
   `trnrt serve`;
-- the header `x-trnrt-synthetic-acceptance: <mean acceptance length>` on every HTTP response of the engine, and on every
-  response of the router once its polls have seen an engine in the mode;
-- a `benchmark_mode` block in GET /health (engine and router). GET /v1/stats already carries the length as
-  `gauges.spec.synth_al`, which the accuracy tools read to refuse a run (benchmarks/accuracy).
+- the header `x-trnrt-synthetic-acceptance: <mean acceptance length>` on every HTTP response the engine's app produces,
+  and on every response of the router once its polls have seen an engine in the mode. An unhandled exception's 500 is
+  sent by Starlette's outermost ServerErrorMiddleware, outside this one, and goes without it;
+- a `benchmark_mode` block in GET /health: the engine's, including its 503 once it failed, and the router's once its
+  polls have seen an engine in the mode. GET /v1/stats carries each engine's length as `gauges.spec.synth_al` from its
+  start (through the router, every engine's at the moment of the request), which the benchmark tools read to refuse a
+  run (benchmarks/accuracy/acceptance_mode.py).
 
 All of it is host code: nothing here is traced, so no graph changes.
 """
