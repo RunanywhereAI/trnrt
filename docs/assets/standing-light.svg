@@ -1,23 +1,23 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1280" height="240" viewBox="0 0 1280 240" role="img" aria-labelledby="title desc">
 <title id="title">Where TrnRT stands</title>
-<desc id="desc">Total tokens per dollar on InferenceX AgentX, one TrnRT engine (8 Trainium2 chips) against one 8-GPU node, at AWS Capacity Block prices: 1.6 to 1.75 times H200's at 1 to 8 users, 1.34 times at 12 users and 1.07 times at 16, and 3.5 to 5.2 times H100's at 12 to 32 users</desc>
+<desc id="desc">Total tokens per dollar on InferenceX AgentX, one TrnRT engine (8 Trainium2 chips) against one 8-GPU node, at AWS Capacity Block prices: 1.63 to 1.89 times H200's at 1 to 8 users and 1.09 times at 16 (0.87 times at 24 and 0.81 times at 32), and 3.9 to 5.2 times H100's at 16 to 32 users</desc>
 <defs><linearGradient id="ra" x1="6" y1="6" x2="38.8354" y2="35.7082" gradientUnits="userSpaceOnUse"><stop stop-color="#FF6900"/><stop offset="1" stop-color="#FB2C36"/></linearGradient><radialGradient id="glow" cx="0.5" cy="0.5" r="0.5"><stop offset="0" stop-color="#ff6900" stop-opacity="0.12"/><stop offset="1" stop-color="#ff6900" stop-opacity="0"/></radialGradient><pattern id="dots" width="24" height="24" patternUnits="userSpaceOnUse"><circle cx="2" cy="2" r="1.1" fill="#10182b" fill-opacity="0.07"/></pattern></defs>
 <rect x="0.75" y="0.75" width="408.5" height="238.5" rx="24" fill="#ffffff" stroke="#10182b" stroke-opacity="0.1" stroke-width="1.5"/>
 <rect x="36" y="30" width="28" height="4" rx="2" fill="#ff6900"/>
 <text x="36" y="66" font-family="'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="16" font-weight="500" letter-spacing="2.6" fill="#10182b">VS H200, 1-8 USERS</text>
-<text x="33" y="138" font-family="'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="72" font-weight="600" letter-spacing="-2" fill="#10182b">1.6-1.75×</text>
+<text x="33" y="138" font-family="'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="72" font-weight="600" letter-spacing="-2" fill="#10182b">1.6-1.9×</text>
 <text x="36" y="176" font-family="'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="24" font-weight="500" fill="#10182b" fill-opacity="0.82">H200's tokens per $</text>
 <text x="36" y="212" font-family="'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="18" fill="#10182b" fill-opacity="0.62">AgentX, 8 chips vs 8 GPUs, AWS prices</text>
 <rect x="434.75" y="0.75" width="408.5" height="238.5" rx="24" fill="#ffffff" stroke="#10182b" stroke-opacity="0.1" stroke-width="1.5"/>
 <rect x="470" y="30" width="28" height="4" rx="2" fill="#ff6900"/>
-<text x="470" y="66" font-family="'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="16" font-weight="500" letter-spacing="2.6" fill="#10182b">VS H200, 12 USERS</text>
-<text x="467" y="138" font-family="'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="72" font-weight="600" letter-spacing="-2" fill="#10182b">1.34×</text>
+<text x="470" y="66" font-family="'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="16" font-weight="500" letter-spacing="2.6" fill="#10182b">VS H200, 16 USERS</text>
+<text x="467" y="138" font-family="'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="72" font-weight="600" letter-spacing="-2" fill="#10182b">1.09×</text>
 <text x="470" y="176" font-family="'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="24" font-weight="500" fill="#10182b" fill-opacity="0.82">H200's tokens per $</text>
-<text x="470" y="212" font-family="'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="18" fill="#10182b" fill-opacity="0.62">AgentX; 1.07× at 16 users</text>
+<text x="470" y="212" font-family="'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="18" fill="#10182b" fill-opacity="0.62">AgentX; 0.87× at 24 users, 0.81× at 32</text>
 <rect x="868.75" y="0.75" width="408.5" height="238.5" rx="24" fill="#ffffff" stroke="#10182b" stroke-opacity="0.1" stroke-width="1.5"/>
 <rect x="904" y="30" width="28" height="4" rx="2" fill="#ff6900"/>
-<text x="904" y="66" font-family="'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="16" font-weight="500" letter-spacing="2.6" fill="#10182b">VS H100, 12-32 USERS</text>
-<text x="901" y="138" font-family="'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="72" font-weight="600" letter-spacing="-2" fill="#10182b">3.5-5.2×</text>
+<text x="904" y="66" font-family="'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="16" font-weight="500" letter-spacing="2.6" fill="#10182b">VS H100, 16-32 USERS</text>
+<text x="901" y="138" font-family="'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="72" font-weight="600" letter-spacing="-2" fill="#10182b">3.9-5.2×</text>
 <text x="904" y="176" font-family="'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="24" font-weight="500" fill="#10182b" fill-opacity="0.82">H100's tokens per $</text>
 <text x="904" y="212" font-family="'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="18" fill="#10182b" fill-opacity="0.62">AgentX, at AWS Capacity Block prices</text>
 </svg>
