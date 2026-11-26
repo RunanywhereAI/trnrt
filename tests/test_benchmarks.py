@@ -1,7 +1,10 @@
-"""benchmarks/: the points and builds tables, the two scorers, the acceptance-mode check, and every script's dry run.
+"""benchmarks/: the points and builds tables, the two scorers, the acceptance-mode check and the preflight, the result
+file, and the scripts.
 
-The scorers are checked against hand-computed values on small synthetic runs; the scripts by their --dry-run output, which
-prints the exact command a run would execute. Nothing here starts a server or a client.
+The scorers are checked against hand-computed values on small synthetic runs. serve.sh, compile.sh and the two clients
+by their --dry-run output, which prints the exact command a run would execute; gsm8k.sh, versions.sh, compile.sh's
+model steps and serve.sh's revision check by running them against stand-ins (a local HTTP server, a fake docker or
+lm-eval on PATH). Nothing here starts a real server, engine or client.
 """
 
 from __future__ import annotations
