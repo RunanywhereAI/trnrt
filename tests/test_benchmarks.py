@@ -547,6 +547,63 @@ def test_the_preflight_refuses_a_server_that_never_answers():
     assert preflight.main(["agentx-c16", "http://h:8000", "--wait", "0"], get=down) == 2
 
 
+image_versions = _load("bench_image_versions", B / "image_versions.py")
+
+
+def test_the_image_inventory_finds_each_distribution_by_name_and_refuses_an_empty_one():
+    import importlib.metadata as m
+    from types import SimpleNamespace as NS
+
+    def version(n):
+        if n == "nki":
+            raise m.PackageNotFoundError(n)
+        return f"{n}-v"
+
+    got = image_versions.python_versions(version)
+    assert got["nki"] is None and got["libtorch-neuronx-lite"] == "libtorch-neuronx-lite-v"
+    ok = NS(returncode=0, stdout="aws-neuronx-runtime-lib 2.34.10.0-ac18d186d\naws-neuronx-gpsimd \n", stderr="")
+    assert image_versions.deb_versions(lambda *a, **k: ok) == {"aws-neuronx-runtime-lib": "2.34.10.0-ac18d186d"}
+    for bad in (NS(returncode=1, stdout="", stderr="no packages found"), NS(returncode=0, stdout="", stderr="")):
+        with pytest.raises(SystemExit, match="no aws-neuronx"):
+            image_versions.deb_versions(lambda *a, b=bad, **k: b)
+
+    def missing(*a, **k):
+        raise FileNotFoundError("dpkg-query")
+
+    with pytest.raises(SystemExit, match="did not run"):
+        image_versions.deb_versions(missing)
+
+
+FAKE_DOCKER = """#!/usr/bin/env bash
+# docker's stand-in: `image inspect` prints an id or a revision; `run ... python3 -` runs stdin with the local Python,
+# where dpkg-query is FAKE_DPKG
+case "$1 $2" in
+  "image inspect") case "$*" in *revision*) echo 704e7b6b;; *) echo sha256:abc;; esac ;;
+  "run --rm") exec python3 - ;;
+  *) exit 9 ;;
+esac
+"""
+
+
+@needs_bash
+def test_versions_sh_fails_when_the_image_has_no_neuron_packages(tmp_path):
+    import os
+
+    for name, body in (("docker", FAKE_DOCKER), ("dpkg-query", "#!/usr/bin/env bash\nexit 1\n")):
+        (tmp_path / name).write_text(body)
+        (tmp_path / name).chmod(0o755)
+    base = {k: v for k, v in os.environ.items() if k not in SCRIPT_VARS}
+    r = subprocess.run(
+        ["bash", str(B / "versions.sh")],
+        capture_output=True,
+        text=True,
+        env={**base, "PATH": f"{tmp_path}:{Path(sys.executable).parent}:{os.environ.get('PATH', '')}"},
+        check=False,
+    )
+    assert r.returncode != 0 and r.stdout == "", r.stdout
+    assert "not installed in the image" in r.stderr or "no aws-neuronx" in r.stderr, r.stderr
+
+
 record = _load("bench_record", B / "record.py")
 
 
