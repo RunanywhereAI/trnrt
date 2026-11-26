@@ -60,6 +60,21 @@ def test_the_engine_announces_the_mode_on_every_response_and_in_health(caplog):
         _stop(eng)
 
 
+def test_a_failed_engine_still_announces_the_mode_in_its_503():
+    from trnrt.serve import api
+
+    client, eng = _engine_client(AL)
+    try:
+        with client:
+            loop = next(lp for lp in api._LOOPS if lp.engine is eng)
+            loop.health_error = lambda: "rank 3 died"  # as EngineLoop._fail leaves it
+            h = client.get("/health")
+            assert h.status_code == 503 and h.json()["status"] == "failed" and h.json()["error"] == "rank 3 died"
+            assert h.json()["benchmark_mode"]["synthetic_acceptance_length"] == AL and h.headers[H] == "2.51851"
+    finally:
+        _stop(eng)
+
+
 def test_without_the_mode_the_engine_adds_nothing():
     client, eng = _engine_client(None)
     try:

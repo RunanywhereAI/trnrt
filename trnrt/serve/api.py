@@ -1920,7 +1920,10 @@ def build_app(
     async def health():
         err = loop_.health_error()
         if err is not None:  # the router and any supervisor stop sending to a dead engine
-            return JSONResponse(status_code=503, content={"status": "failed", "error": err})
+            failed = {"status": "failed", "error": err}
+            if synth_al is not None:  # still said: what it served was not the model's text
+                failed["benchmark_mode"] = benchmark_mode.health_block([synth_al])
+            return JSONResponse(status_code=503, content=failed)
         if synth_al is not None:
             return {"status": "ok", "benchmark_mode": benchmark_mode.health_block([synth_al])}
         return {"status": "ok"}
