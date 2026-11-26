@@ -8,7 +8,7 @@
 | [CONFIGURATION.md](CONFIGURATION.md) | Every `serve` flag, the batch 4, 8 and 12 configurations, the `mtp-*` presets, environment variables |
 | [AGENTX.md](AGENTX.md) | MTP speculative decoding: the preset for each concurrency, running and scoring an AgentX point, the benchmark mode |
 | [RESULTS.md](RESULTS.md) | Benchmarks: AgentX, long prompts, cost, methodology |
-| [benchmarks/](../benchmarks/README.md) | The recipe for every published point: builds, serve and client scripts, scorers, accuracy checks |
+| [benchmarks/](../benchmarks/README.md) | The recipe for the comparison with H100 and H200 (AgentX and 8K/1K): builds, serve and client scripts, scorers, accuracy checks |
 | [MEGAKERNELS.md](MEGAKERNELS.md) | How the decode megakernels work, and the rules every kernel follows |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Repository map, request path, compile pipeline, adding a model family |
 | [DEVELOPMENT.md](DEVELOPMENT.md) | Tests, lint, CI and releases |
