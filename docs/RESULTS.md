@@ -1,11 +1,14 @@
 # Results
 
-GLM-5.3-Flash on one AWS trn2.48xlarge, measured with an earlier build of TrnRT, in the configurations this repository
-reproduces ([CONFIGURATION.md](CONFIGURATION.md)). The graph-equivalence check (`tools/graph_equiv.py`) holds this
-repository to compiling the same graphs as that build. It read EQUAL on all 32 ranks, for all 157 graphs that build
-compiles in the default batch-12 configuration. Its positive control (one constant changed in one prefill kernel) read
-DIFFER on exactly the graphs that kernel builds. On the device, this repository's outputs were byte-identical to that
-build's on 384 of 384 requests, and the README's two-engine serve passes end to end.
+GLM-5.3-Flash on one AWS trn2.48xlarge. Except where a section says otherwise, these numbers were measured with an
+earlier build of TrnRT, at release 0.1.0's batch presets, which this release's builds replace
+([CONFIGURATION.md](CONFIGURATION.md#earlier-preset-names)). At release 0.1.0, the graph-equivalence check
+(`tools/graph_equiv.py`) held this repository to compiling the same graphs as that build. It read EQUAL on all 32 ranks,
+for all 157 graphs that build compiles in its default batch-12 configuration. Its positive control (one constant changed
+in one prefill kernel) read DIFFER on exactly the graphs that kernel builds. On the device, this repository's outputs were
+byte-identical to that build's on 384 of 384 requests, and the README's two-engine serve passed end to end. The
+[comparison with H100 and H200](#against-h100-and-h200-inferencex-agentx-and-8k1k) is a run of this release; its checks
+are in [KNOWN_ISSUES.md](KNOWN_ISSUES.md#verification-status).
 
 ## Serving layout
 
