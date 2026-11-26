@@ -44,13 +44,15 @@ How we built it, with the AgentX results: [Serving GLM-5.3-Flash on one Trainium
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/assets/standing-dark.svg">
     <source media="(prefers-color-scheme: light)" srcset="docs/assets/standing-light.svg">
-    <img alt="1.6 to 1.9 times H200's tokens per dollar at 1 to 8 users and 1.09 times at 16, and 3.9 to 5.2 times H100's at 16 to 32 users: InferenceX AgentX, one TrnRT engine of 8 Trainium2 chips against one 8-GPU node, at AWS Capacity Block prices." src="docs/assets/standing-dark.svg" width="100%">
+    <img alt="1.6 to 1.9 times H200's tokens per dollar at 1, 4 and 8 users (MTP at InferenceX's golden acceptance length) and 1.09 times at 16, and 3.9 to 5.2 times H100's at 16, 24 and 32 users: InferenceX AgentX, one TrnRT engine of 8 Trainium2 chips against one 8-GPU node, at AWS Capacity Block prices." src="docs/assets/standing-dark.svg" width="100%">
   </picture>
 </p>
 
 On [InferenceX](https://github.com/SemiAnalysisAI/InferenceX) AgentX, which replays real coding-agent sessions, one
 TrnRT engine (8 Trainium2 chips, half a `trn2.48xlarge`) delivers more tokens per dollar than one 8-GPU H200 node at 1,
-4, 8 and 16 concurrent users, and 3.9-5.2× an H100 node's at 16, 24 and 32 users. All three run GLM-5.3-Flash's FP8
+4, 8 and 16 concurrent users, and 3.9-5.2× an H100 node's at 16, 24 and 32 users. At 1, 4 and 8 users it runs the
+`latency-golden` build: MTP speculation at InferenceX's golden acceptance length (2.519), the benchmark mode, whose
+output text is not the model's, so those points are a throughput comparison only. All three run GLM-5.3-Flash's FP8
 weights and are priced at AWS's Capacity Block list prices.
 
 <p align="center">
