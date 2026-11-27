@@ -549,6 +549,7 @@ def _server(routes: dict[str, object]):
 FAKE_LM_EVAL = """#!/usr/bin/env bash
 # lm-eval's stand-in: writes a results file under --output_path, resolved against the current directory as lm-eval does
 if [ "$1" = "-m" ]; then
+  [ -z "${FAKE_LM_EXIT:-}" ] || exit "$FAKE_LM_EXIT"
   while [ $# -gt 0 ]; do [ "$1" = "--output_path" ] && out=$2; shift; done
   mkdir -p "$out/glm"
   printf '{"results": {"gsm8k": {"exact_match,strict-match": %s, "exact_match,flexible-extract": %s}}}' \\
@@ -594,6 +595,18 @@ def test_gsm8k_takes_a_relative_out_dir_and_exits_by_the_bar(tmp_path):
             check=False,
         )
         assert r.returncode == 2 and "benchmark mode" in r.stderr and not (tmp_path / "runs" / "refused").exists()
+        routes["/v1/stats"] = {"gauges": {"kv_pages_used": 0}}
+
+        def gsm8k(run, **extra):
+            argv = ["bash", str(B / "accuracy" / "gsm8k.sh"), url, run, "4"]
+            e = {**env, "FAKE_STRICT": "0.97", **extra}
+            return subprocess.run(argv, capture_output=True, text=True, env=e, cwd=tmp_path, check=False)
+
+        r = gsm8k("runs/lm-failed", FAKE_LM_EXIT="3")  # lm-eval's own status 3: no result, so 1
+        assert r.returncode == 1 and "lm-eval failed" in r.stderr, r.stderr
+        del routes["/v1/models"]  # the server does not name its model: refused before the run, 2 (not curl's 22)
+        r = gsm8k("runs/no-model")
+        assert r.returncode == 2 and "did not answer with a model" in r.stderr, r.stderr
 
 
 preflight = _load("bench_preflight", B / "preflight.py")

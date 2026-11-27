@@ -14,7 +14,8 @@
 # Refuses a server in the benchmark mode (synthetic acceptance): its drafts are not verified, so its answers are not the
 # model's. Speculative builds are checked with real acceptance, the only mode a quality number may come from.
 # Pass bar used for this repository's builds: strict match >= 94% (H100 with MTP scores 97.42% on the same eval).
-# Exit status 0: strict match at or above the bar; 1: below it, or no result from lm-eval; 2: refused before the run.
+# Exit status 0: strict match at or above the bar; 1: below it, or no result (lm-eval failed or wrote none); 2: refused
+# before the run (the benchmark mode, a server that does not answer, an existing OUT_DIR, no lm-eval venv).
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -28,16 +29,20 @@ mt=$(( ctx > 4096 ? ctx - 4096 : ctx / 2 ))
 [ ! -e "$out" ] || { echo "$out exists: give each run a new directory" >&2; exit 2; }
 [ -x "$VENV/bin/python" ] || { echo "no lm-eval venv at $VENV: run benchmarks/accuracy/install_lm_eval.sh" >&2; exit 2; }
 python3 -I "$here/acceptance_mode.py" --expect real --url "$url" || exit 2
-model=$(curl -fsS "$url/v1/models" | python3 -I -c 'import json, sys; print(json.load(sys.stdin)["data"][0]["id"])')
+model=$(curl -fsS --max-time 30 "$url/v1/models" | python3 -I -c 'import json, sys; print(json.load(sys.stdin)["data"][0]["id"])') ||
+  { echo "GSM8K: $url/v1/models did not answer with a model" >&2; exit 2; }
 
 export OPENAI_API_KEY=${OPENAI_API_KEY:-EMPTY}
 export PYTHONPATH="$here/lm_eval_patch${PYTHONPATH:+:$PYTHONPATH}"
 mkdir -p "$out"
 echo "GSM8K: $url, model $model, concurrency $c, context $ctx, max output tokens $mt -> $out"
-(cd "$here" && "$VENV/bin/python" -m lm_eval --model local-chat-completions --apply_chat_template --tasks gsm8k.yaml \
+if ! (cd "$here" && "$VENV/bin/python" -m lm_eval --model local-chat-completions --apply_chat_template --tasks gsm8k.yaml \
   --output_path "$out" --log_samples \
   --model_args "model=$model,base_url=$url/v1/chat/completions,api_key=$OPENAI_API_KEY,eos_string=</s>,max_retries=5,num_concurrent=$c,timeout=1800,tokenized_requests=False,max_length=$ctx" \
-  --gen_kwargs "max_tokens=$mt,temperature=0,top_p=1") 2>&1 | tee "$out/lm_eval.log"
+  --gen_kwargs "max_tokens=$mt,temperature=0,top_p=1") 2>&1 | tee "$out/lm_eval.log"; then
+  echo "GSM8K: lm-eval failed (see $out/lm_eval.log)" >&2
+  exit 1
+fi
 "$VENV/bin/python" - "$out" <<'PY'
 import glob, json, sys
 fs = sorted(glob.glob(f"{sys.argv[1]}/**/results*.json", recursive=True))
