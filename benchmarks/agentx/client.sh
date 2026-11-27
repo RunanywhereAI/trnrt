@@ -10,7 +10,8 @@
 # Environment: TOKENIZER (a directory with the model's tokenizer files at revision
 # eb9eb208eb0d988989d07a6a12d0fdeb5f52574a; the chat template changed after it); AGENTX (default `agentx`: the
 # agentx-harness 1.0.12 command); AGENTX_PYTHON (the Python that agentx-harness is installed in, default python3: the
-# version check); CPUS (optional: taskset -c CPUS for the harness).
+# version check); CPUS (optional: taskset -c CPUS for the harness); PREFLIGHT_WAIT (default 3600: seconds the preflight
+# waits for a server still loading and warming its graphs, as long as `trnrt serve`'s --startup-timeout).
 #
 # Before the run it checks the server against the point (benchmarks/preflight.py): one engine (the score is per its 8
 # chips), of the point's build, and in its acceptance mode on every engine (the benchmark mode at the golden length for
@@ -31,11 +32,13 @@ AGENTX=${AGENTX:-agentx}
 AGENTX_PYTHON=${AGENTX_PYTHON:-python3}
 WANT_VERSION=1.0.12
 
+WAIT=${PREFLIGHT_WAIT:-3600}
+pre=(python3 -I "$here/../preflight.py" "$point" "$url" --wait "$WAIT")
 if [ "$dry" = 0 ]; then
   [ ! -e "$out" ] || { echo "$out exists: give each run a new directory" >&2; exit 2; }
   v=$("$AGENTX_PYTHON" -c 'import importlib.metadata as m; print(m.version("agentx-harness"))' 2>/dev/null || echo none)
   [ "$v" = "$WANT_VERSION" ] || { echo "agentx-harness $v installed; the published points used $WANT_VERSION" >&2; exit 2; }
-  python3 -I "$here/../preflight.py" "$point" "$url" || exit 2
+  "${pre[@]}" || exit 2
 fi
 
 pin=()
@@ -43,6 +46,7 @@ pin=()
 cmd=(${pin[@]+"${pin[@]}"} "$AGENTX" profile --url "$url" --endpoint /v1/chat/completions --model glm
   --tokenizer "$TOKENIZER" --tokenizer-trust-remote-code --max-context-length 1048576 --concurrency "$conc"
   --public-dataset semianalysis_cc_traces_weka_062126 --output-artifact-dir "$out/artifacts")
+[ "$dry" = 0 ] || echo "+ ${pre[*]}"
 echo "point $point: AgentX at concurrency $conc on build $build"
 echo "+ ${cmd[*]}"
 [ "$dry" = 1 ] && exit 0

@@ -500,6 +500,14 @@ def test_the_fixed_length_client_waits_for_a_starting_server_as_long_as_serve_do
 
 
 @needs_bash
+def test_the_agentx_client_waits_for_a_starting_server_as_long_as_serve_does():
+    out = _dry("agentx/client.sh", "agentx-c16", "http://h:8000", "/nonexistent/out", env={"TOKENIZER": "/t"})
+    assert "preflight.py agentx-c16 http://h:8000 --wait 3600" in out
+    out = _dry("agentx/client.sh", "agentx-c16", "http://h:8000", "/x", env={"TOKENIZER": "/t", "PREFLIGHT_WAIT": "60"})
+    assert "--wait 60" in out
+
+
+@needs_bash
 def test_a_client_refuses_a_point_of_the_other_benchmark():
     r = subprocess.run(
         ["bash", str(B / "agentx" / "client.sh"), "--dry-run", "fixed-off-c4", "http://h:8000", "/nonexistent/out"],
