@@ -30,7 +30,7 @@ def deb_versions(run=subprocess.run) -> dict[str, str]:
     """The installed aws-neuronx-* Debian packages and their versions; SystemExit if there are none."""
     try:
         r = run(
-            ["dpkg-query", "-W", "-f", "${Package} ${Version}\n", "aws-neuronx-*"],
+            ["dpkg-query", "-W", "-f", "${db:Status-Abbrev}\t${Package}\t${Version}\n", "aws-neuronx-*"],
             capture_output=True,
             text=True,
             check=False,
@@ -39,8 +39,10 @@ def deb_versions(run=subprocess.run) -> dict[str, str]:
         raise SystemExit(f"image_versions: dpkg-query did not run: {e}") from None
     debs = {}
     for line in r.stdout.splitlines():
-        name, _, version = line.partition(" ")
-        if name and version.strip():  # a package dpkg knows of but has not installed has no version
+        status, name, version = ([*line.split("\t"), "", ""])[:3]
+        # "ii": installed. dpkg also lists packages removed with their configuration kept ("rc", with the old version)
+        # and ones it only knows of ("un", no version): neither is in the image
+        if status.startswith("ii") and name and version.strip():
             debs[name] = version.strip()
     if r.returncode != 0 or not debs:
         why = (r.stderr or "").strip()[:200]

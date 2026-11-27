@@ -632,8 +632,16 @@ def test_the_image_inventory_finds_each_distribution_by_name_and_refuses_an_empt
 
     got = image_versions.python_versions(version)
     assert got["nki"] is None and got["libtorch-neuronx-lite"] == "libtorch-neuronx-lite-v"
-    ok = NS(returncode=0, stdout="aws-neuronx-runtime-lib 2.34.10.0-ac18d186d\naws-neuronx-gpsimd \n", stderr="")
+    rows = [
+        "ii \taws-neuronx-runtime-lib\t2.34.10.0-ac18d186d",
+        "rc \taws-neuronx-collectives\t2.30.0.0-old",  # removed, its configuration kept: not in the image
+        "un \taws-neuronx-gpsimd\t",  # known to dpkg, never installed
+    ]
+    ok = NS(returncode=0, stdout="\n".join(rows) + "\n", stderr="")
     assert image_versions.deb_versions(lambda *a, **k: ok) == {"aws-neuronx-runtime-lib": "2.34.10.0-ac18d186d"}
+    only_removed = NS(returncode=0, stdout=rows[1] + "\n", stderr="")
+    with pytest.raises(SystemExit, match="no aws-neuronx"):
+        image_versions.deb_versions(lambda *a, **k: only_removed)
     for bad in (NS(returncode=1, stdout="", stderr="no packages found"), NS(returncode=0, stdout="", stderr="")):
         with pytest.raises(SystemExit, match="no aws-neuronx"):
             image_versions.deb_versions(lambda *a, b=bad, **k: b)
