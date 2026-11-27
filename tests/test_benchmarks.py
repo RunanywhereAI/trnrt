@@ -326,7 +326,7 @@ needs_bash = pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash
 
 # The scripts' own variables: one exported in the shell that runs the tests would change the commands they print
 SCRIPT_VARS = {"PORT", "IMAGE", "DOCKER_ARGS", "CPUS", "OUT", "CACHE", "NKI", "MODEL", "TOKENIZER", "INFX", "PY", "REV"}
-SCRIPT_VARS |= {"AGENTX", "AGENTX_PYTHON", "VENV", "MAX_MODEL_LEN", "HF_TOKEN"}
+SCRIPT_VARS |= {"AGENTX", "AGENTX_PYTHON", "VENV", "MAX_MODEL_LEN", "HF_TOKEN", "PREFLIGHT_WAIT"}
 
 
 def _dry(script: str, *args: str, env: dict[str, str] | None = None, cwd: Path | None = None) -> str:
@@ -488,6 +488,15 @@ def test_client_dry_runs_take_the_points_concurrency():
         env={"TOKENIZER": "/t", "INFX": "/i"},
     )
     assert "on build latency-golden" in out and out.rstrip().endswith("--use-chat-template)")
+
+
+@needs_bash
+def test_the_fixed_length_client_waits_for_a_starting_server_as_long_as_serve_does():
+    env = {"TOKENIZER": "/t", "INFX": "/i"}
+    out = _dry("fixed_seq/client.sh", "fixed-off-c4", "http://h:8000", "/nonexistent/out", env=env)
+    assert "preflight.py fixed-off-c4 http://h:8000 --wait 3600" in out  # serve's --startup-timeout
+    out = _dry("fixed_seq/client.sh", "fixed-off-c4", "http://h:8000", "/x", env={**env, "PREFLIGHT_WAIT": "60"})
+    assert "--wait 60" in out
 
 
 @needs_bash
