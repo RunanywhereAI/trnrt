@@ -196,6 +196,25 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
+def _dead_port() -> int:
+    """A port for a dead worker, where a connect is refused: a low port nothing serves. Not a port found free by
+    _free_port: under a full test run another test's server or collective store can take it, or a connect to it from
+    the ephemeral range can meet itself (TCP self-connect), and the dead worker then answers. A low port is outside the
+    ephemeral range and an unprivileged process cannot bind it; the one used is checked to refuse."""
+    import socket
+
+    for port in (1, 7, 9):
+        with socket.socket() as s:
+            s.settimeout(2)
+            try:
+                s.connect(("127.0.0.1", port))
+            except ConnectionRefusedError:
+                return port
+            except OSError:
+                continue
+    pytest.skip("no refused low port on 127.0.0.1 (1, 7, 9) for a dead worker")
+
+
 async def _start(apps_ports):
     import asyncio
 
@@ -362,7 +381,7 @@ def test_tokenize_and_detokenize_go_to_a_live_worker_and_change_no_routing_state
     from trnrt.serve.router import build_router_app
 
     async def main() -> None:
-        ports = [_free_port() for _ in range(4)]  # ports[0] serves nothing: a dead worker
+        ports = [_dead_port()] + [_free_port() for _ in range(3)]  # ports[0] serves nothing: a dead worker
         router = Router([f"http://127.0.0.1:{p}" for p in ports[:3]])
         failed, ok = _stub_worker(1, chat_status=503), _stub_worker(2)
         servers, tasks = await _start(

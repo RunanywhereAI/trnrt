@@ -54,6 +54,9 @@ The Responses API's and the Messages API's requests (/v1/responses, /v1/messages
 its instructions or system part leads it as its system messages, so they are routed by session and prefix the same way
 (_conversation). /v1/messages/count_tokens, like /tokenize, goes to any live worker and touches no routing state.
 
+Once its polls see a worker in the benchmark mode (synthetic acceptance, serve/benchmark_mode.py), the router warns, adds
+a `benchmark_mode` block to /health and the x-trnrt-synthetic-acceptance header to every response.
+
 The router's own endpoints:
 - GET /health: 200 {"status": "ok"} while every worker is up; 200 {"status": "degraded"} while some are (requests and
   sessions go to the live ones, so a load balancer in front keeps sending); 503 {"status": "down"} once none is. Each
@@ -103,6 +106,7 @@ from fastapi.responses import (
 )
 
 from .. import log
+from . import benchmark_mode
 from .dashboard import PAGE as DASHBOARD_PAGE
 
 logger = log.get("router")
@@ -274,6 +278,8 @@ class Router:
         self.kv_used: list[float | None] = [None] * len(
             workers
         )  # KV pages in use / total, from the worker's /v1/stats; None unknown
+        # Each worker's benchmark-mode acceptance length (serve/benchmark_mode.py) from its /v1/stats; None: real acceptance
+        self.synth_al: list[float | None] = [None] * len(workers)
         # The prefix trees are matched and inserted in worker threads (pick_off_loop): the threading lock guards the
         # trees, the asyncio lock orders the requests from match to insert.
         self._trees_lock = threading.Lock()
@@ -491,6 +497,20 @@ class Router:
         n = sum(self.up)
         return "ok" if n == len(self.workers) else "degraded" if n else "down"
 
+    def benchmark_lengths(self) -> list[float]:
+        """The distinct synthetic acceptance lengths the workers reported (serve/benchmark_mode.py); [] if none."""
+        return sorted({x for x in self.synth_al if x is not None})
+
+    def note_stats(self, w: int, stats: dict) -> None:
+        """A worker's /v1/stats: its KV in use, and whether it runs the benchmark mode (warned once per change)."""
+        self.kv_used[w] = _kv_used(stats)
+        spec = (stats.get("gauges") or {}).get("spec") or {}
+        al = spec.get("synth_al")
+        al = float(al) if isinstance(al, (int, float)) else None
+        if al is not None and self.synth_al[w] != al:
+            logger.warning("trnrt.router: worker %s: %s", self.workers[w], benchmark_mode.banner(al))
+        self.synth_al[w] = al
+
     def health(self) -> dict:
         return {
             "workers": self.workers,
@@ -697,7 +717,10 @@ def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: floa
                 if router.up[i]:
                     try:
                         s = await client.get(u + "/v1/stats", timeout=health_timeout_s)
-                        router.kv_used[i] = _kv_used(s.json()) if s.status_code == 200 else None
+                        if s.status_code == 200:
+                            router.note_stats(i, s.json())
+                        else:
+                            router.kv_used[i] = None
                     except (httpx.HTTPError, ValueError):
                         router.kv_used[i] = None
             router.prune()
@@ -714,14 +737,22 @@ def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: floa
 
     app = FastAPI(title="TrnRT router", lifespan=lifespan)
 
+    def _benchmark_header() -> str | None:
+        lengths = router.benchmark_lengths()
+        return benchmark_mode.header_value(lengths) if lengths else None
+
+    # Every response says so once a worker reported the benchmark mode (serve/benchmark_mode.py; from the first poll)
+    app.add_middleware(benchmark_mode.HeaderMiddleware, value=_benchmark_header)
+
     @app.get("/health")
     async def health():
         """200 while any worker is up ("ok" or "degraded"), 503 once none is (module docstring)."""
         status = router.status()
         down = [u for u, ok in zip(router.workers, router.up) if not ok]
-        return JSONResponse(
-            {"status": status, "down": down, **router.health()}, status_code=503 if status == "down" else 200
-        )
+        body = {"status": status, "down": down, **router.health()}
+        if router.benchmark_lengths():
+            body["benchmark_mode"] = benchmark_mode.health_block(router.benchmark_lengths())
+        return JSONResponse(body, status_code=503 if status == "down" else 200)
 
     async def first_live(path: str) -> JSONResponse:
         """What every worker answers the same (one model): the first live one that answers, least loaded first. A

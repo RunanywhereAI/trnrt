@@ -5,8 +5,34 @@ and versions follow [Semantic Versioning](https://semver.org/). Rebuild the comp
 
 ## [Unreleased]
 
+### Added
+
+- `benchmarks/`: the recipe behind each published trn2 point, one row per point with the build that serves it and the
+  date of its published run. It includes a script to compile each build and one to serve a point on one engine of 8
+  chips. It also has the AgentX client and scorer (InferenceX's definitions, at SemiAnalysis's rate and at AWS's
+  Capacity Block price), the 8K/1K fixed-length client and scorer (InferenceX's fixed_seq recipe), and GSM8K by
+  InferenceX's own eval plus a needle check. Before a run, the clients check that the server is one engine of the
+  point's build in the point's acceptance mode. The compile, serve and client scripts have a `--dry-run`.
+- The benchmark mode (`--spec-synth-al`) announces itself. `trnrt serve` and the engines warn in their output and logs,
+  and `GET /health` carries a `benchmark_mode` block (the engine's from its start, a failed engine's 503 included; the
+  router's once its polls have seen an engine in the mode). Every response of the engine, and of the router once it has
+  seen the mode, carries the header `x-trnrt-synthetic-acceptance`. The accuracy tools read every engine's mode from
+  `/v1/stats` and refuse a server with any engine in it.
+
+### Changed
+
+- The comparison with H100 and H200 ([docs/RESULTS.md](docs/RESULTS.md#against-h100-and-h200-inferencex-agentx-and-8k1k),
+  the README and its charts) is now a run of this repository: 25 Nov 2026, with `benchmarks/`, the image from
+  `docker/Dockerfile` and a compile cache built from source, each row naming the build that measured it. 0.2.0 published
+  numbers from internal builds and said this release's builds were graph-equivalent to them. That held at 16-32 users,
+  but the 1-8 and 12 user points and the 8K/1K recipe had run other builds. 12 users is no longer shown, as it was not
+  measured on this repository. AgentX against H200 moves to 1.63-1.89× at 1-8 users (was 1.61-1.75×) and 1.09× at 16
+  (was 1.07×); 8K/1K with MTP off moves to 0.52-1.00× at 1-64 users (was 0.56-0.76× at 1-32).
+
 ### Fixed
 
+- `trnrt serve` refuses a `TRNRT_SPEC_SYNTH_AL` that is not a number with a usage error, where it stopped with a
+  traceback, and prints the benchmark-mode banner only once its arguments are accepted.
 - `stop_regex` refuses a pattern whose search could stall the server: one whose time can grow faster than the square
   of the text's length (nested or overlapping repeats, also on either side of a conditional group with no "no"
   branch, a possessive repeat or an atomic group after a repeat that can take its characters, a lookaround that can

@@ -16,6 +16,9 @@
 - The native API (serve/native.py): POST /generate, the info endpoints /model_info and /server_info, /get_load,
   /health_generate, /abort_request and /flush_cache.
 
+In the benchmark mode (synthetic acceptance) every response carries the x-trnrt-synthetic-acceptance header and /health a
+`benchmark_mode` block (serve/benchmark_mode.py).
+
 A request may ask for `n` choices: each is its own engine request (Run), sharing the prompt through the prefix cache.
 
 TRNRT_PROD_DIR keeps each finished request's record and the gauges on disk (serve/prodlog.py), and
@@ -64,6 +67,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Res
 from ..engine.request import Request, SamplingParams, Status
 from ..engine.scheduler import QueueFull
 from ..metrics import Metrics, kv_pages, spec_stats
+from . import benchmark_mode
 from .dashboard import PAGE as DASHBOARD_PAGE
 from .parsers import (
     THINK_CLOSE,
@@ -1906,12 +1910,22 @@ def build_app(
     gen_defaults = generation_defaults(getattr(engine, "model_path", None)) if generation_config == "auto" else {}
     if gen_defaults:
         logger.info("trnrt: sampling defaults from the checkpoint's generation_config.json: %s", gen_defaults)
+    # The benchmark mode (synthetic acceptance) is announced on every response and in /health (serve/benchmark_mode.py)
+    synth_al = getattr(getattr(engine, "cfg", None), "spec_synth_al", None)
+    if synth_al is not None:
+        logger.warning("trnrt: %s", benchmark_mode.banner(synth_al))
+        app.add_middleware(benchmark_mode.HeaderMiddleware, value=lambda: benchmark_mode.header_value([synth_al]))
 
     @app.get("/health")
     async def health():
         err = loop_.health_error()
         if err is not None:  # the router and any supervisor stop sending to a dead engine
-            return JSONResponse(status_code=503, content={"status": "failed", "error": err})
+            failed: dict[str, object] = {"status": "failed", "error": err}
+            if synth_al is not None:  # still said: what it served was not the model's text
+                failed["benchmark_mode"] = benchmark_mode.health_block([synth_al])
+            return JSONResponse(status_code=503, content=failed)
+        if synth_al is not None:
+            return {"status": "ok", "benchmark_mode": benchmark_mode.health_block([synth_al])}
         return {"status": "ok"}
 
     def live_gauges() -> dict:

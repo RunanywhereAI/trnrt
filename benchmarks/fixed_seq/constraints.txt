@@ -1,0 +1,44 @@
+# pip constraints for the 8K/1K client (InferenceX 47cdc9d0's fixed_seq): the exact versions of the venv the published
+# 8K/1K points ran with (Python 3.12.3, 25 Nov 2026):
+#   pip install aiohttp numpy transformers tokenizers tqdm huggingface_hub jinja2 -c benchmarks/fixed_seq/constraints.txt
+aiohappyeyeballs==2.7.1
+aiohttp==3.14.5
+aiosignal==1.4.0
+annotated-doc==0.0.7
+annotated-types==0.8.0
+anyio==4.16.0
+attrs==26.1.0
+click==8.5.1
+filelock==4.3.1
+frozenlist==1.8.0
+fsspec==2026.9.0
+h11==0.16.0
+hf-xet==1.8.0
+httpcore2==2.16.2
+httpx2==2.16.2
+huggingface_hub==2.4.0
+idna==3.20
+Jinja2==3.1.6
+markdown-it-py==4.3.0
+MarkupSafe==3.0.4
+mdurl==0.1.2
+multidict==7.2.1
+numpy==2.5.4
+packaging==26.4
+propcache==0.5.4
+pydantic==2.14.4
+pydantic_core==2.50.5
+Pygments==2.21.0
+PyYAML==6.0.4
+regex==2026.11.23
+rich==15.0.0
+safetensors==0.8.0
+shellingham==1.5.4
+tokenizers==0.23.3
+tqdm==4.70.1
+transformers==5.22.1
+truststore==0.10.5
+typer==0.29.2
+typing-inspection==0.4.5
+typing_extensions==4.16.0
+yarl==1.25.1

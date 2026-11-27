@@ -19,6 +19,8 @@
 | `trnrt/serve/api.py` | The OpenAI-compatible server for one engine: request validation, chat template, streaming. |
 | `trnrt/serve/native.py` | The native API on one engine: `/generate`, the info and load endpoints, `/health_generate`, `/abort_request`, `/flush_cache`. |
 | `trnrt/serve/router.py` | The session-affine, prefix-aware router in front of the engines, with failover. |
+| `trnrt/serve/benchmark_mode.py` | The benchmark mode's announcement: the warning, the `/health` block and the response header. |
+| `benchmarks/` | The published points' recipes: builds, serve and client scripts, scorers, accuracy checks. |
 | `trnrt/serve/parsers.py` | GLM reasoning and tool-call parsing, streamed and whole. |
 | `trnrt/serve/responses.py`, `anthropic.py` | The OpenAI Responses API and the Anthropic Messages API, translated into the chat path. |
 | `trnrt/serve/stats.py`, `trnrt/serve/dashboard.py` | `GET /v1/stats`'s request rates, latency percentiles and time series per engine, and the page `GET /dashboard` draws from them. |

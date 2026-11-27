@@ -19,6 +19,18 @@ def _restore_trnrt_logging():
     root.propagate = propagate
 
 
+@pytest.fixture(autouse=True)
+def _off_neuron_host(monkeypatch):
+    """The CPU suite sees an off-Neuron host wherever it runs. trnrt.platform.target() reads the EC2 instance type and the
+    driver's device names, so on a trn2 host it says trn2 and the kernels' program count becomes the runtime's LNC (2):
+    the tiny test models then fail kda_half.takes_spec (H // programs must be a multiple of 512) and the shells never run.
+    A test that needs the trn2 target sets NEURON_PLATFORM_TARGET_OVERRIDE, which target() reads first."""
+    from trnrt import platform
+
+    monkeypatch.setattr(platform, "DMI_PRODUCT", "/nonexistent/trnrt-tests/product_name")
+    monkeypatch.setattr(platform, "SYSFS_DEVICE_NAME", "/nonexistent/trnrt-tests/neuron*/device_name")
+
+
 # Every module engine.set_decode_routes writes (tests/test_decode_route_modules.py checks the list against its imports).
 ROUTE_MODULES = (
     "trnrt.kernels.dense_half",

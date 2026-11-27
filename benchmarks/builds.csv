@@ -1,0 +1,5 @@
+build,engine_args,speculation,decode_batches,note
+latency-golden,--preset latency --spec-synth-al 2.518506,"every step, synthetic acceptance at InferenceX's golden length for 2 drafts",up to 8,the benchmark mode: drafts are emitted unverified; throughput comparison only (docs/AGENTX.md#benchmark-mode)
+latency,--preset latency,every step (real acceptance),up to 8,
+balanced,--preset balanced,none,"8, 16, 24",
+throughput,--preset throughput,none,"16, 24",
