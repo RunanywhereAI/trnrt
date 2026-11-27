@@ -311,6 +311,12 @@ def test_the_acceptance_mode_cli_retries_only_what_it_cannot_read():
     bodies[:] = [_stats(None)]  # a wrong mode is refused at once, not waited on
     assert mode.main(["--expect", "golden", "--url", "http://h:8000"], get=get, sleep=naps.append) == 2
     assert len(calls) == 1
+    import http.client
+
+    calls.clear()
+    bodies[:] = [http.client.IncompleteRead(b"{"), _stats(GOLDEN)]  # cut off mid-body, then whole: retried
+    assert mode.main(["--expect", "golden", "--url", "http://h:8000"], get=get, sleep=naps.append) == 0
+    assert len(calls) == 2
     bodies[:] = [OSError("refused")]  # never readable: refused once --wait runs out
     assert mode.main(["--expect", "real", "--url", "http://h:8000", "--wait", "0"], get=get, sleep=naps.append) == 2
 

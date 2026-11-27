@@ -19,6 +19,7 @@ it is not, or it could not be read.
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import sys
 import time
@@ -122,7 +123,8 @@ def main(argv: list[str] | None = None, get=fetch, sleep=time.sleep) -> int:
             body = get(a.url) if a.url else json.loads(a.body_json)
             found = modes(body)
             unreadable = found if isinstance(found, str) else None
-        except (OSError, ValueError) as e:  # urllib's errors are OSErrors; a body that is not JSON a ValueError
+        # urllib's errors are OSErrors, a response cut off mid-body an HTTPException, a body that is not JSON a ValueError
+        except (OSError, http.client.HTTPException, ValueError) as e:
             body, found, unreadable = None, None, f"/v1/stats unreadable: {e}"
         if unreadable is None or time.monotonic() >= deadline:
             break
