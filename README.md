@@ -52,7 +52,8 @@ On [InferenceX](https://github.com/SemiAnalysisAI/InferenceX) AgentX, which repl
 TrnRT engine (8 Trainium2 chips, half a `trn2.48xlarge`) delivers more tokens per dollar than one 8-GPU H200 node at 1,
 4, 8 and 16 concurrent users, and 3.9-5.2× an H100 node's at 16, 24 and 32 users. At 1, 4 and 8 users it runs the
 `latency-golden` build: MTP speculation at InferenceX's golden acceptance length (2.519), the benchmark mode, whose
-output text is not the model's, so those points are a throughput comparison only. All three run GLM-5.3-Flash's FP8
+output text is not the model's. Both columns of those rows, tokens per dollar and tok/s per user, are at that synthetic
+acceptance (as H200's are at theirs), so they compare speed, never output quality. All three run GLM-5.3-Flash's FP8
 weights and are priced at AWS's Capacity Block list prices.
 
 <p align="center">
@@ -73,9 +74,9 @@ weights and are priced at AWS's Capacity Block list prices.
 | 32 | `throughput` | 0.81× | **4.95×** | 10.7 / 50.1 |
 
 **Where we're behind.** Each trn2 user is slower: P90 interactivity (end to end, the wait for the first token included)
-is 10.7-66.3 tok/s per user against H200's 50.1-272. At 24 and 32 users H200 delivers more tokens per dollar
-(0.81-0.87×), and on the 8K/1K fixed-length recipe, which has no prefix reuse, trn2 delivers 0.89-1.00× H200's at 1-8
-users and 0.52-0.82× at 16-64. Where a decode step's time goes is in
+is 10.7-66.3 tok/s per user against H200's 50.1-272 (at 1-8 users both at synthetic golden acceptance). At 24 and 32
+users H200 delivers more tokens per dollar (0.81-0.87×), and on the 8K/1K fixed-length recipe, which has no prefix
+reuse, trn2 delivers 0.89-1.00× H200's at 1-8 users and 0.52-0.82× at 16-64. Where a decode step's time goes is in
 [docs/RESULTS.md](docs/RESULTS.md#where-a-decode-steps-time-goes).
 
 <sub>InferenceX AgentX harness 1.0.12, canonical workload, one hour per point; ratios compare the same concurrency. The
