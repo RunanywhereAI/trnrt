@@ -608,8 +608,9 @@ def test_the_preflight_waits_for_a_starting_server_then_reads_every_engines_mode
     assert calls == ["/server_info", "/server_info", "/v1/stats"] and len(naps) == 1
     calls.clear()
     # the right configuration but an engine on real acceptance (/v1/stats asks every engine): refused
-    assert preflight.main(
-        ["agentx-c4", "http://h:8000"], get=lambda u, p: golden if p == "/server_info" else _stats(None)
+    assert (
+        preflight.main(["agentx-c4", "http://h:8000"], get=lambda u, p: golden if p == "/server_info" else _stats(None))
+        == 2
     )
     # the wrong build: refused at once, without waiting or reading the mode
     seen = []
@@ -622,6 +623,21 @@ def test_the_preflight_waits_for_a_starting_server_then_reads_every_engines_mode
         "/server_info"
     ]
     assert preflight.main(["no-such-point", "http://h:8000"], get=wrong) == 2
+
+
+def test_the_preflight_retries_a_response_cut_off_mid_body():
+    import http.client
+
+    calls = []
+
+    def get(url, path):
+        calls.append(path)
+        if len(calls) == 1:
+            raise http.client.IncompleteRead(b"{")  # the server dropped the connection mid-body
+        return _info("balanced") if path == "/server_info" else _stats(None)
+
+    assert preflight.main(["agentx-c16", "http://h:8000"], get=get, sleep=lambda s: None) == 0
+    assert calls == ["/server_info", "/server_info", "/v1/stats"]
 
 
 def test_the_preflight_refuses_a_server_that_never_answers():

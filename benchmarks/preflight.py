@@ -16,6 +16,7 @@ the point; 2: it does not, or it did not answer.
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import sys
 import time
@@ -82,7 +83,9 @@ def main(argv: list[str] | None = None, get=fetch, sleep=time.sleep) -> int:
         try:
             info = get(a.url, "/server_info")
             break
-        except (OSError, ValueError) as e:  # urllib's errors are OSErrors; a body that is not JSON a ValueError
+        # urllib's errors are OSErrors, a response cut off mid-body (IncompleteRead, BadStatusLine) an HTTPException, a
+        # body that is not JSON a ValueError
+        except (OSError, http.client.HTTPException, ValueError) as e:
             if time.monotonic() >= deadline:
                 print(f"preflight: {a.url}/server_info did not answer: {e}", file=sys.stderr)
                 return 2
