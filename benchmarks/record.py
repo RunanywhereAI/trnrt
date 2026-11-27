@@ -80,7 +80,7 @@ def head() -> tuple[str | None, bool]:
     return (sha.strip() if sha else None), bool(status and status.strip())
 
 
-def commit_of(given: str | None, versions: dict | None) -> str | None:
+def commit_of(given: str | None, versions: dict | None) -> str:
     """The commit a result cites (module docstring); SystemExit when it cannot be told truthfully."""
     image = (versions or {}).get("image") or {}
     served = image.get("trnrt_revision") if isinstance(image, dict) else None
@@ -91,6 +91,8 @@ def commit_of(given: str | None, versions: dict | None) -> str | None:
     if given:
         return given
     sha, dirty = head()
+    if sha is None:
+        raise SystemExit("this checkout's HEAD cannot be read (no git, or not a checkout): pass --versions or --commit")
     if dirty:
         raise SystemExit("this checkout has uncommitted changes: pass --versions (or --commit) to name what was served")
     return sha

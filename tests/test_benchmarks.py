@@ -734,6 +734,9 @@ def test_a_result_cites_the_served_commit_and_refuses_one_it_cannot_tell(monkeyp
     monkeypatch.setattr(record, "head", lambda: ("1234abcd", True))  # uncommitted changes: not what ran
     with pytest.raises(SystemExit, match="uncommitted"):
         record.commit_of(None, None)
+    monkeypatch.setattr(record, "head", lambda: (None, False))  # no git, or not a checkout: no commit to cite
+    with pytest.raises(SystemExit, match="cannot be read"):
+        record.commit_of(None, None)
 
 
 def test_a_result_that_matches_a_private_pattern_is_refused(tmp_path, monkeypatch):
