@@ -77,7 +77,7 @@ def _total(recs: list[dict], key: str) -> int:
         v = _metric(r, key)
         try:
             n += int(v)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):  # OverflowError: an infinite count (JSON's Infinity)
             raise SystemExit(f"a profiled record has no {key} ({v!r}): {json.dumps(r)[:200]}") from None
     return n
 
@@ -86,14 +86,15 @@ def load(artifact_dir: Path) -> tuple[list[dict], dict]:
     """The profiled records and the accounting of the dropped ones."""
     recs: list[dict] = []
     acc: dict = {"total": 0, "warmup_dropped": 0, "error_dropped": 0, "errors": {}}
-    lines = [ln for ln in (artifact_dir / "profile_export.jsonl").read_text().splitlines() if ln.strip()]
-    for i, ln in enumerate(lines):
+    lines = (artifact_dir / "profile_export.jsonl").read_text().splitlines()
+    records = [(i, ln) for i, ln in enumerate(lines, 1) if ln.strip()]  # the file's own line numbers, blanks skipped
+    for i, ln in records:
         try:
             o = json.loads(ln)
         except ValueError:
-            if i == len(lines) - 1:  # a half-written last line of a file still being written
+            if i == records[-1][0]:  # a half-written last record of a file still being written
                 continue
-            raise SystemExit(f"profile_export.jsonl line {i + 1} of {len(lines)} is not JSON: {ln[:120]!r}") from None
+            raise SystemExit(f"profile_export.jsonl line {i} of {len(lines)} is not JSON: {ln[:120]!r}") from None
         acc["total"] += 1
         phase = o.get("metadata", {}).get("benchmark_phase")
         warm = phase is not None and phase != "profiling"

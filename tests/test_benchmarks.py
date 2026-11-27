@@ -172,6 +172,19 @@ def test_agentx_score_tolerates_only_a_half_written_last_line(tmp_path):
         agentx_score.score(tmp_path, 8, {"sa": 0.58}, "t")
     (tmp_path / "profile_export.jsonl").write_text("\n".join([*good, "{half a line"]))
     assert agentx_score.score(tmp_path, 8, {"sa": 0.58}, "t")["total"] == 2
+    # blank lines are skipped, and an error names the file's own line: here line 4 of 5
+    (tmp_path / "profile_export.jsonl").write_text("\n".join([good[0], "", "", "{half a line", good[1]]) + "\n")
+    with pytest.raises(SystemExit, match="line 4 of 5"):
+        agentx_score.score(tmp_path, 8, {"sa": 0.58}, "t")
+
+
+def test_agentx_score_refuses_an_infinite_token_count(tmp_path):
+    bad = _rec(20, 50, 2000, 200, 1500, 30000, 40)
+    bad["metrics"]["input_sequence_length"]["value"] = float("inf")  # written as JSON's Infinity, read back as inf
+    lines = [json.dumps(_rec(10, 30, 1000, 100, 500, 20000, 20)), json.dumps(bad)]
+    (tmp_path / "profile_export.jsonl").write_text("\n".join(lines) + "\n")
+    with pytest.raises(SystemExit, match="input_sequence_length"):
+        agentx_score.score(tmp_path, 8, {"sa": 0.58}, "t")
 
 
 def test_agentx_score_refuses_a_run_without_profiled_records(tmp_path):
